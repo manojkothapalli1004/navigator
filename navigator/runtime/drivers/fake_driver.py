@@ -16,5 +16,5 @@ class FakeSubagentDriver:
                                 file_writes=[("navigator_touch.py", "# navigator v0 fake change\n")],
                                 summary="wrote 1 file")
         return DriverResult(role=Role.verifier,
-                            commands=[["python","-m","py_compile","navigator_touch.py"]],
+                            commands=[["python3","-m","py_compile","navigator_touch.py"]],
                             summary="verify via py_compile")

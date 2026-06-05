@@ -9,4 +9,4 @@ def test_fake_driver_roles_are_deterministic():
     build = d.run_role(DriverRequest(role=Role.builder, context={}, worktree_path="/tmp/x"))
     assert build.file_writes == [("navigator_touch.py", "# navigator v0 fake change\n")]
     verify = d.run_role(DriverRequest(role=Role.verifier, context={}, worktree_path="/tmp/x"))
-    assert verify.commands == [["python","-m","py_compile","navigator_touch.py"]]
+    assert verify.commands == [["python3","-m","py_compile","navigator_touch.py"]]

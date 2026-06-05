@@ -25,6 +25,17 @@ in v0. Harden these before enabling the real Claude Agent SDK driver in v1.
   `from_env()` — they always use dataclass defaults. Intentional for v0's fixed safe
   defaults; document or wire env overrides if v1 needs per-deploy tuning.
 
+## Phases (Phase 4 — robustness, not v0 bugs)
+Verified non-breaking under v0's fake-driver-only path; harden before a real driver.
+- **`run_build_and_verify` worktree-escape guard treats `relpath="."`/`""` as allowed**
+  (resolves to the worktree root, passes the `target == wt.resolve()` branch), then
+  `write_text` raises `IsADirectoryError` instead of the clean `ValueError`. Not an escape;
+  the fake driver only writes `navigator_touch.py`. If the guard means "must be a file inside
+  the worktree," make `target == wt.resolve()` a reject.
+- **Verifier with zero commands is a silent pass**: empty `verify.commands` leaves
+  `verify_returncode` at its default `0`. The fake verifier always emits one command, so v0
+  never hits it. For a real driver, require ≥1 verify command or default the code to non-zero.
+
 ## Clients & runtime primitives (Phase 3 — robustness, not v0 bugs)
 Verified non-breaking under v0's plan-as-written usage; harden when the surfaces get real callers.
 - **`FakeACTClient.list_*` return live object references** (no `model_copy`). A future caller

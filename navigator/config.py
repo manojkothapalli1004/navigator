@@ -3,7 +3,7 @@ from dataclasses import dataclass, field
 
 DEFAULT_ALLOWLIST = [
     "git status", "git diff", "git log",
-    "pytest", "python -m py_compile", "uv run pytest",
+    "pytest", "python3 -m py_compile", "uv run pytest",
 ]
 
 @dataclass
