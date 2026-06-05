@@ -25,6 +25,23 @@ in v0. Harden these before enabling the real Claude Agent SDK driver in v1.
   `from_env()` — they always use dataclass defaults. Intentional for v0's fixed safe
   defaults; document or wire env overrides if v1 needs per-deploy tuning.
 
+## Executor & loop (Phase 5 — robustness, not v0 bugs)
+Verified non-breaking under v0's deterministic path; the no-auto-merge and dry_run-no-mutation
+invariants hold. Harden the failure-evidence contract before a real driver / production use.
+- **`execute_proposal` calls `create_worktree` BEFORE the try block** (`executor.py`). If
+  worktree creation raises (branch collision, bad base sha, disk full), the run is left
+  `status=executing` with no `known_failures` ORC lesson — `reconcile_on_startup` will abort
+  it next boot, but the lesson is lost. Can't trigger in v0 (ULID run-ids never collide,
+  base shas are always valid). Fix: move `create_worktree` inside the try / write a failure
+  Outcome before re-raising.
+- **`reconcile_on_startup` records no ORC `known_failures` lesson** for aborted stale runs and
+  does not reconstruct/preserve the worktree handle (the dir still exists on disk). This
+  matches the plan's Task 23 code exactly — a deliberate v0 minimalism. For post-mortem value,
+  write an ORC note per aborted run in v1.
+- Minor: exception path leaves `run.phase=building` (status is authoritative, so harmless);
+  dead double-assignment to `run.branch`; `_write_outcome` return value intentionally discarded
+  (no Outcome store in v0).
+
 ## Phases (Phase 4 — robustness, not v0 bugs)
 Verified non-breaking under v0's fake-driver-only path; harden before a real driver.
 - **`run_build_and_verify` worktree-escape guard treats `relpath="."`/`""` as allowed**
