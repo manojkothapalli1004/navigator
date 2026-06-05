@@ -24,3 +24,22 @@ in v0. Harden these before enabling the real Claude Agent SDK driver in v1.
   `max_run_duration_s`, `max_failed_tests`, `allowed_commands`) are NOT read from env by
   `from_env()` — they always use dataclass defaults. Intentional for v0's fixed safe
   defaults; document or wire env overrides if v1 needs per-deploy tuning.
+
+## Clients & runtime primitives (Phase 3 — robustness, not v0 bugs)
+Verified non-breaking under v0's plan-as-written usage; harden when the surfaces get real callers.
+- **`FakeACTClient.list_*` return live object references** (no `model_copy`). A future caller
+  that mutates a returned object without `update_run` would silently corrupt the in-memory
+  store. v0's executor/loop hold their own `run` ref + call `update_run`, and
+  `set_proposal_status` mutates by id, so no current path is corrupted. Consider returning
+  `model_copy()` when the fake gains more callers / richer tests.
+- **`runtime/checkpoint.py: diff_artifact` lacks `check=True`** — a git failure (bad sha /
+  wrong cwd) would return `""` silently. In v0 the sha is always valid and cwd is the
+  worktree, so it never triggers. Add `check=True` (+ `text=True` on the add/commit calls)
+  when hardening.
+- **`HTTPORCClient` GET methods lack `raise_for_status()`** (POST has it). Not used in v0's
+  loop (Fake is default). Add for consistency before HTTPORCClient gets real traffic.
+- **`runtime/lock.py`**: fd leak if `os.write` raises (lock still released via unlink);
+  no stale-lock TTL/PID recovery if the process dies. Acceptable for v0 single-process use.
+- **Worktree leak on orchestration throw**: if `create_worktree` succeeds but the orchestrator
+  throws before `remove_worktree`/`preserve_failed`, the dir + `nav/<run_id>` branch persist.
+  v1 orchestration concern.
