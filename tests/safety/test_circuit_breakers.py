@@ -21,3 +21,10 @@ def test_duration_trips():
                          max_run_duration_s=0, max_failed_tests=99)
     with pytest.raises(BreakerTripped):
         cb.check_duration(started_monotonic=-1.0)
+
+def test_failed_tests_trip():
+    cb = CircuitBreakers(max_tool_failures=99, max_identical_failures=99,
+                         max_run_duration_s=999, max_failed_tests=5)
+    cb.check_failed_tests(4)  # under threshold, ok
+    with pytest.raises(BreakerTripped):
+        cb.check_failed_tests(5)
