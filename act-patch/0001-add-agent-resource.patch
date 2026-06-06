@@ -1,0 +1,1324 @@
+From b864109b467e5c2f97cfc23476035bff80ed5897 Mon Sep 17 00:00:00 2001
+From: Manoj Kothapalli <31705961+manojkothapalli1004@users.noreply.github.com>
+Date: Sat, 6 Jun 2026 02:02:14 -0400
+Subject: [PATCH 1/4] feat(agent): models + migration for Navigator agent
+ resource
+
+Add AgentProposalRow, AgentRunRow, AgentApprovalRow (String(64) prefixed
+ids, JSON payload + explicit queryable columns mirroring EventRow) plus
+alembic 0004 (down_revision f5d07542c346) creating/dropping the three
+tables with indexes. Register the rows in migrations/env.py.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ backend/act/persistence/migrations/env.py     |   3 +
+ .../versions/0004_add_agent_resource.py       | 109 ++++++++++++++++++
+ backend/act/persistence/models.py             |  65 +++++++++++
+ 3 files changed, 177 insertions(+)
+ create mode 100644 backend/act/persistence/migrations/versions/0004_add_agent_resource.py
+
+diff --git a/backend/act/persistence/migrations/env.py b/backend/act/persistence/migrations/env.py
+index 20d6e37..ed085b5 100644
+--- a/backend/act/persistence/migrations/env.py
++++ b/backend/act/persistence/migrations/env.py
+@@ -6,6 +6,9 @@ from sqlalchemy import engine_from_config, pool
+ from act.config import settings
+ from act.persistence import Base
+ from act.persistence.models import (  # noqa: F401  (register tables with Base.metadata)
++    AgentApprovalRow,
++    AgentProposalRow,
++    AgentRunRow,
+     AlertRow,
+     CursorRow,
+     EventRow,
+diff --git a/backend/act/persistence/migrations/versions/0004_add_agent_resource.py b/backend/act/persistence/migrations/versions/0004_add_agent_resource.py
+new file mode 100644
+index 0000000..90b50b0
+--- /dev/null
++++ b/backend/act/persistence/migrations/versions/0004_add_agent_resource.py
+@@ -0,0 +1,109 @@
++"""add agent resource tables
++
++Navigator agent resource — agent_proposals, agent_runs, agent_approvals.
++
++Revision ID: a1b2c3d4e5f6
++Revises: f5d07542c346
++Create Date: 2026-06-06 00:00:00.000000
++
++"""
++from collections.abc import Sequence
++
++import sqlalchemy as sa
++from alembic import op
++
++# revision identifiers, used by Alembic.
++revision: str = 'a1b2c3d4e5f6'
++down_revision: str | Sequence[str] | None = 'f5d07542c346'
++branch_labels: str | Sequence[str] | None = None
++depends_on: str | Sequence[str] | None = None
++
++
++def upgrade() -> None:
++    """Upgrade schema."""
++    op.create_table(
++        'agent_proposals',
++        sa.Column('id', sa.String(length=64), nullable=False),
++        sa.Column('schema_version', sa.Integer(), nullable=False),
++        sa.Column('status', sa.String(length=16), nullable=False),
++        sa.Column('origin', sa.String(length=64), nullable=False),
++        sa.Column('proposal_origin_hash', sa.String(length=64), nullable=False),
++        sa.Column('repo', sa.String(length=256), nullable=False),
++        sa.Column('base_commit_sha', sa.String(length=64), nullable=False),
++        sa.Column('risk_tier', sa.String(length=16), nullable=False),
++        sa.Column('priority', sa.Integer(), nullable=False),
++        sa.Column('created_at', sa.DateTime(), nullable=False),
++        sa.Column('payload', sa.JSON(), nullable=False, server_default='{}'),
++        sa.PrimaryKeyConstraint('id'),
++    )
++    op.create_index(
++        'idx_agent_proposals_status_created',
++        'agent_proposals',
++        ['status', 'created_at'],
++    )
++    op.create_index('ix_agent_proposals_status', 'agent_proposals', ['status'])
++    op.create_index(
++        'ix_agent_proposals_proposal_origin_hash',
++        'agent_proposals',
++        ['proposal_origin_hash'],
++    )
++
++    op.create_table(
++        'agent_runs',
++        sa.Column('id', sa.String(length=64), nullable=False),
++        sa.Column('schema_version', sa.Integer(), nullable=False),
++        sa.Column('proposal_id', sa.String(length=64), nullable=False),
++        sa.Column('status', sa.String(length=16), nullable=False),
++        sa.Column('phase', sa.String(length=32), nullable=False),
++        sa.Column('base_commit_sha', sa.String(length=64), nullable=False),
++        sa.Column('branch', sa.String(length=256), nullable=False),
++        sa.Column('worktree_path', sa.String(length=512), nullable=True),
++        sa.Column('correlation_id', sa.String(length=64), nullable=True),
++        sa.Column('started_at', sa.DateTime(), nullable=False),
++        sa.Column('ended_at', sa.DateTime(), nullable=True),
++        sa.Column('cost_usd', sa.Float(), nullable=False, server_default='0.0'),
++        sa.Column('payload', sa.JSON(), nullable=False, server_default='{}'),
++        sa.PrimaryKeyConstraint('id'),
++    )
++    op.create_index('ix_agent_runs_proposal_id', 'agent_runs', ['proposal_id'])
++    op.create_index('ix_agent_runs_status', 'agent_runs', ['status'])
++
++    op.create_table(
++        'agent_approvals',
++        sa.Column('id', sa.String(length=64), nullable=False),
++        sa.Column('schema_version', sa.Integer(), nullable=False),
++        sa.Column('target', sa.String(length=64), nullable=False),
++        sa.Column('gate', sa.String(length=16), nullable=False),
++        sa.Column('decision', sa.String(length=16), nullable=False),
++        sa.Column('actor', sa.String(length=64), nullable=True),
++        sa.Column('decided_at', sa.DateTime(), nullable=True),
++        sa.Column('note', sa.Text(), nullable=True),
++        sa.Column('correlation_id', sa.String(length=64), nullable=True),
++        sa.PrimaryKeyConstraint('id'),
++    )
++    op.create_index('ix_agent_approvals_target', 'agent_approvals', ['target'])
++    op.create_index('ix_agent_approvals_gate', 'agent_approvals', ['gate'])
++    op.create_index(
++        'ix_agent_approvals_decision', 'agent_approvals', ['decision']
++    )
++
++
++def downgrade() -> None:
++    """Downgrade schema."""
++    op.drop_index('ix_agent_approvals_decision', table_name='agent_approvals')
++    op.drop_index('ix_agent_approvals_gate', table_name='agent_approvals')
++    op.drop_index('ix_agent_approvals_target', table_name='agent_approvals')
++    op.drop_table('agent_approvals')
++
++    op.drop_index('ix_agent_runs_status', table_name='agent_runs')
++    op.drop_index('ix_agent_runs_proposal_id', table_name='agent_runs')
++    op.drop_table('agent_runs')
++
++    op.drop_index(
++        'ix_agent_proposals_proposal_origin_hash', table_name='agent_proposals'
++    )
++    op.drop_index('ix_agent_proposals_status', table_name='agent_proposals')
++    op.drop_index(
++        'idx_agent_proposals_status_created', table_name='agent_proposals'
++    )
++    op.drop_table('agent_proposals')
+diff --git a/backend/act/persistence/models.py b/backend/act/persistence/models.py
+index c60b220..8c21301 100644
+--- a/backend/act/persistence/models.py
++++ b/backend/act/persistence/models.py
+@@ -136,3 +136,68 @@ class VideoJobRow(Base):
+     cost_usd_total: Mapped[float] = mapped_column(default=0.0)                 # reserved for v1
+     created_at: Mapped[datetime]
+     updated_at: Mapped[datetime]
++
++
++# ---------------------------------------------------------------------------
++# Navigator agent resource — three tables: agent_proposals, agent_runs,
++# agent_approvals. Ids are prefixed strings (e.g. "proposal-<ulid>") so the
++# PKs are String(64), not String(26). Identifying / queryable fields are
++# explicit columns; the full object lives in a JSON `payload` column, exactly
++# like EventRow. See docs/superpowers/specs/2026-05-27-navigator-v0-plan.md.
++# ---------------------------------------------------------------------------
++
++
++class AgentProposalRow(Base):
++    __tablename__ = "agent_proposals"
++
++    id: Mapped[str] = mapped_column(String(64), primary_key=True)         # "proposal-<ulid>"
++    schema_version: Mapped[int]
++    # proposed|approved|declined|expired|superseded
++    status: Mapped[str] = mapped_column(String(16), index=True)
++    origin: Mapped[str] = mapped_column(String(64))
++    proposal_origin_hash: Mapped[str] = mapped_column(String(64), index=True)
++    repo: Mapped[str] = mapped_column(String(256))
++    base_commit_sha: Mapped[str] = mapped_column(String(64))
++    risk_tier: Mapped[str] = mapped_column(String(16))
++    priority: Mapped[int]
++    created_at: Mapped[datetime]
++    payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
++
++    __table_args__ = (
++        Index("idx_agent_proposals_status_created", "status", "created_at"),
++    )
++
++
++class AgentRunRow(Base):
++    __tablename__ = "agent_runs"
++
++    id: Mapped[str] = mapped_column(String(64), primary_key=True)         # "run-<ulid>"
++    schema_version: Mapped[int]
++    proposal_id: Mapped[str] = mapped_column(String(64), index=True)
++    # executing|completed|failed|rolled_back|aborted
++    status: Mapped[str] = mapped_column(String(16), index=True)
++    phase: Mapped[str] = mapped_column(String(32))
++    base_commit_sha: Mapped[str] = mapped_column(String(64))
++    branch: Mapped[str] = mapped_column(String(256))
++    worktree_path: Mapped[str | None] = mapped_column(String(512))
++    correlation_id: Mapped[str | None] = mapped_column(String(64))
++    started_at: Mapped[datetime]
++    ended_at: Mapped[datetime | None]
++    cost_usd: Mapped[float] = mapped_column(default=0.0)
++    payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
++
++
++class AgentApprovalRow(Base):
++    __tablename__ = "agent_approvals"
++
++    id: Mapped[str] = mapped_column(String(64), primary_key=True)         # "approval-<ulid>"
++    schema_version: Mapped[int]
++    target: Mapped[str] = mapped_column(String(64), index=True)
++    # review|merge|architecture|destructive|budget|deploy
++    gate: Mapped[str] = mapped_column(String(16), index=True)
++    # pending|approved|declined
++    decision: Mapped[str] = mapped_column(String(16), index=True)
++    actor: Mapped[str | None] = mapped_column(String(64))
++    decided_at: Mapped[datetime | None]
++    note: Mapped[str | None] = mapped_column(Text)
++    correlation_id: Mapped[str | None] = mapped_column(String(64))
+-- 
+2.50.1 (Apple Git-155)
+
+
+From 7dd51b032907088f8dddb674f686920316a3463f Mon Sep 17 00:00:00 2001
+From: Manoj Kothapalli <31705961+manojkothapalli1004@users.noreply.github.com>
+Date: Sat, 6 Jun 2026 02:02:21 -0400
+Subject: [PATCH 2/4] feat(agent): repositories + API routes + navigator events
+
+Add Agent{Proposal,Run,Approval}Repository, navigator event-kind module
+(NAVIGATOR_SOURCE="navigator" + payload builders), pydantic request/
+response schemas, and the /api/v1/agent router (proposals, runs,
+approvals). Each create/transition persists an EventRow with
+source="navigator" in the request session and best-effort publishes on
+the bus. Router registered unconditionally in api/v1/__init__.py.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ backend/act/api/v1/__init__.py          |   2 +
+ backend/act/api/v1/agent.py             | 376 ++++++++++++++++++++++++
+ backend/act/api/v1/schemas.py           | 107 +++++++
+ backend/act/events/navigator.py         |  76 +++++
+ backend/act/persistence/repositories.py | 132 +++++++++
+ 5 files changed, 693 insertions(+)
+ create mode 100644 backend/act/api/v1/agent.py
+ create mode 100644 backend/act/events/navigator.py
+
+diff --git a/backend/act/api/v1/__init__.py b/backend/act/api/v1/__init__.py
+index 5a051b0..31a6ae5 100644
+--- a/backend/act/api/v1/__init__.py
++++ b/backend/act/api/v1/__init__.py
+@@ -2,6 +2,7 @@ from fastapi import APIRouter
+ 
+ from act.config import settings
+ 
++from .agent import router as agent_router
+ from .alerts import router as alerts_router
+ from .events import router as events_router
+ from .health import router as health_router
+@@ -18,6 +19,7 @@ router.include_router(stream_router)
+ router.include_router(health_router)
+ router.include_router(metrics_router)
+ router.include_router(version_router)
++router.include_router(agent_router)
+ 
+ # Video Intelligence v0 — mounted only when the subsystem is enabled.
+ # When the flag is off, the /api/v1/video/* routes return 404 by virtue
+diff --git a/backend/act/api/v1/agent.py b/backend/act/api/v1/agent.py
+new file mode 100644
+index 0000000..685ea18
+--- /dev/null
++++ b/backend/act/api/v1/agent.py
+@@ -0,0 +1,376 @@
++"""Navigator agent-resource API.
++
++Endpoints serve Navigator's HTTPACTClient — proposals, runs, approvals. Each
++create / transition persists its row AND an EventRow with source="navigator"
++in the same request session (so the event is durable and transactionally
++consistent with the state change), then best-effort publishes on the bus to
++mirror ACT's existing event-driven path.
++"""
++from __future__ import annotations
++
++from datetime import UTC, datetime
++from typing import Any
++
++import structlog
++from fastapi import APIRouter, Depends, HTTPException, Query
++from sqlalchemy.orm import Session
++
++from act.api.v1.deps import get_session
++from act.api.v1.schemas import (
++    ApprovalCreateRequest,
++    ApprovalDecideRequest,
++    ApprovalResponse,
++    ProposalCreateRequest,
++    ProposalResponse,
++    ProposalStatusRequest,
++    RunCreateRequest,
++    RunResponse,
++    RunUpdateRequest,
++)
++from act.domain.event import Event, Severity
++from act.domain.ids import new_ulid
++from act.events.bus import get_bus
++from act.events.navigator import (
++    KIND_APPROVAL_CREATED,
++    KIND_APPROVAL_DECIDED,
++    KIND_PROPOSAL_CREATED,
++    KIND_PROPOSAL_STATUS_CHANGED,
++    KIND_RUN_CREATED,
++    KIND_RUN_UPDATED,
++    NAVIGATOR_SOURCE,
++    payload_approval_created,
++    payload_approval_decided,
++    payload_proposal_created,
++    payload_proposal_status_changed,
++    payload_run_created,
++    payload_run_updated,
++)
++from act.persistence.models import (
++    AgentApprovalRow,
++    AgentProposalRow,
++    AgentRunRow,
++)
++from act.persistence.repositories import (
++    AgentApprovalRepository,
++    AgentProposalRepository,
++    AgentRunRepository,
++    EventRepository,
++)
++
++router = APIRouter(prefix="/agent", tags=["agent"])
++
++log = structlog.get_logger()
++
++MAX_LIMIT = 500
++DEFAULT_LIMIT = 100
++
++
++def _emit(
++    s: Session,
++    *,
++    kind: str,
++    payload: dict[str, Any],
++    correlation_id: str | None,
++    severity: Severity = "info",
++) -> Event:
++    """Persist a navigator event into the request session (caller commits)."""
++    ev = Event(
++        id=new_ulid(),
++        source=NAVIGATOR_SOURCE,
++        kind=kind,
++        severity=severity,
++        ts=datetime.now(UTC),
++        payload=payload,
++        correlation_id=correlation_id,
++        agent_id=None,
++    )
++    EventRepository(s).add(ev)
++    return ev
++
++
++async def _publish(ev: Event) -> None:
++    try:
++        await get_bus().publish(ev)
++    except Exception:  # event publish must never break the response
++        log.exception("navigator_event_publish_failed", kind=ev.kind)
++
++
++# ---- proposals ------------------------------------------------------------
++
++
++def _proposal_to_response(row: AgentProposalRow) -> ProposalResponse:
++    return ProposalResponse(
++        id=row.id,
++        schema_version=row.schema_version,
++        status=row.status,
++        origin=row.origin,
++        proposal_origin_hash=row.proposal_origin_hash,
++        repo=row.repo,
++        base_commit_sha=row.base_commit_sha,
++        risk_tier=row.risk_tier,
++        priority=row.priority,
++        created_at=row.created_at,
++        payload=row.payload,
++    )
++
++
++@router.post("/proposals", response_model=ProposalResponse)
++async def create_proposal(
++    req: ProposalCreateRequest,
++    s: Session = Depends(get_session),  # noqa: B008
++) -> ProposalResponse:
++    now = datetime.now(UTC)
++    proposal_id = f"proposal-{new_ulid()}"
++    row = AgentProposalRow(
++        id=proposal_id,
++        schema_version=req.schema_version,
++        status="proposed",
++        origin=req.origin,
++        proposal_origin_hash=req.proposal_origin_hash,
++        repo=req.repo,
++        base_commit_sha=req.base_commit_sha,
++        risk_tier=req.risk_tier,
++        priority=req.priority,
++        created_at=now,
++        payload=req.payload,
++    )
++    AgentProposalRepository(s).add(row)
++    ev = _emit(
++        s,
++        kind=KIND_PROPOSAL_CREATED,
++        payload=payload_proposal_created(
++            proposal_id=proposal_id,
++            origin=req.origin,
++            repo=req.repo,
++            risk_tier=req.risk_tier,
++            priority=req.priority,
++        ),
++        correlation_id=proposal_id,
++    )
++    s.commit()
++    await _publish(ev)
++    return _proposal_to_response(row)
++
++
++@router.get("/proposals", response_model=list[ProposalResponse])
++def list_proposals(
++    status: str | None = Query(default=None),
++    limit: int = Query(default=DEFAULT_LIMIT, ge=1),
++    s: Session = Depends(get_session),  # noqa: B008
++) -> list[ProposalResponse]:
++    rows = AgentProposalRepository(s).list(status=status, limit=min(limit, MAX_LIMIT))
++    return [_proposal_to_response(r) for r in rows]
++
++
++@router.post("/proposals/{proposal_id}/status", response_model=ProposalResponse)
++async def set_proposal_status(
++    proposal_id: str,
++    req: ProposalStatusRequest,
++    s: Session = Depends(get_session),  # noqa: B008
++) -> ProposalResponse:
++    row = AgentProposalRepository(s).set_status(proposal_id, req.status)
++    if row is None:
++        raise HTTPException(status_code=404, detail="proposal_not_found")
++    ev = _emit(
++        s,
++        kind=KIND_PROPOSAL_STATUS_CHANGED,
++        payload=payload_proposal_status_changed(
++            proposal_id=proposal_id, status=req.status
++        ),
++        correlation_id=proposal_id,
++    )
++    s.commit()
++    await _publish(ev)
++    return _proposal_to_response(row)
++
++
++# ---- runs -----------------------------------------------------------------
++
++
++def _run_to_response(row: AgentRunRow) -> RunResponse:
++    return RunResponse(
++        id=row.id,
++        schema_version=row.schema_version,
++        proposal_id=row.proposal_id,
++        status=row.status,
++        phase=row.phase,
++        base_commit_sha=row.base_commit_sha,
++        branch=row.branch,
++        worktree_path=row.worktree_path,
++        correlation_id=row.correlation_id,
++        started_at=row.started_at,
++        ended_at=row.ended_at,
++        cost_usd=row.cost_usd,
++        payload=row.payload,
++    )
++
++
++@router.post("/runs", response_model=RunResponse)
++async def create_run(
++    req: RunCreateRequest,
++    s: Session = Depends(get_session),  # noqa: B008
++) -> RunResponse:
++    now = datetime.now(UTC)
++    run_id = f"run-{new_ulid()}"
++    row = AgentRunRow(
++        id=run_id,
++        schema_version=req.schema_version,
++        proposal_id=req.proposal_id,
++        status="executing",
++        phase=req.phase,
++        base_commit_sha=req.base_commit_sha,
++        branch=req.branch,
++        worktree_path=req.worktree_path,
++        correlation_id=req.correlation_id,
++        started_at=now,
++        ended_at=None,
++        cost_usd=req.cost_usd,
++        payload=req.payload,
++    )
++    AgentRunRepository(s).add(row)
++    ev = _emit(
++        s,
++        kind=KIND_RUN_CREATED,
++        payload=payload_run_created(
++            run_id=run_id,
++            proposal_id=req.proposal_id,
++            branch=req.branch,
++            base_commit_sha=req.base_commit_sha,
++        ),
++        correlation_id=req.correlation_id or run_id,
++    )
++    s.commit()
++    await _publish(ev)
++    return _run_to_response(row)
++
++
++@router.get("/runs", response_model=list[RunResponse])
++def list_open_runs(
++    limit: int = Query(default=DEFAULT_LIMIT, ge=1),
++    s: Session = Depends(get_session),  # noqa: B008
++) -> list[RunResponse]:
++    rows = AgentRunRepository(s).list_open(limit=min(limit, MAX_LIMIT))
++    return [_run_to_response(r) for r in rows]
++
++
++@router.post("/runs/{run_id}", response_model=RunResponse)
++async def update_run(
++    run_id: str,
++    req: RunUpdateRequest,
++    s: Session = Depends(get_session),  # noqa: B008
++) -> RunResponse:
++    repo = AgentRunRepository(s)
++    row = repo.update(
++        run_id,
++        status=req.status,
++        phase=req.phase,
++        worktree_path=req.worktree_path,
++        ended_at=req.ended_at,
++        cost_usd=req.cost_usd,
++        payload=req.payload,
++    )
++    if row is None:
++        raise HTTPException(status_code=404, detail="run_not_found")
++    severity: Severity = "error" if row.status == "failed" else "info"
++    ev = _emit(
++        s,
++        kind=KIND_RUN_UPDATED,
++        payload=payload_run_updated(
++            run_id=run_id, status=row.status, phase=row.phase
++        ),
++        correlation_id=row.correlation_id or run_id,
++        severity=severity,
++    )
++    s.commit()
++    await _publish(ev)
++    return _run_to_response(row)
++
++
++# ---- approvals ------------------------------------------------------------
++
++
++def _approval_to_response(row: AgentApprovalRow) -> ApprovalResponse:
++    return ApprovalResponse(
++        id=row.id,
++        schema_version=row.schema_version,
++        target=row.target,
++        gate=row.gate,
++        decision=row.decision,
++        actor=row.actor,
++        decided_at=row.decided_at,
++        note=row.note,
++        correlation_id=row.correlation_id,
++    )
++
++
++@router.post("/approvals", response_model=ApprovalResponse)
++async def create_approval(
++    req: ApprovalCreateRequest,
++    s: Session = Depends(get_session),  # noqa: B008
++) -> ApprovalResponse:
++    approval_id = f"approval-{new_ulid()}"
++    row = AgentApprovalRow(
++        id=approval_id,
++        schema_version=req.schema_version,
++        target=req.target,
++        gate=req.gate,
++        decision="pending",
++        actor=None,
++        decided_at=None,
++        note=None,
++        correlation_id=req.correlation_id,
++    )
++    AgentApprovalRepository(s).add(row)
++    ev = _emit(
++        s,
++        kind=KIND_APPROVAL_CREATED,
++        payload=payload_approval_created(
++            approval_id=approval_id, target=req.target, gate=req.gate
++        ),
++        correlation_id=req.correlation_id or approval_id,
++    )
++    s.commit()
++    await _publish(ev)
++    return _approval_to_response(row)
++
++
++@router.post("/approvals/{approval_id}/decide", response_model=ApprovalResponse)
++async def decide_approval(
++    approval_id: str,
++    req: ApprovalDecideRequest,
++    s: Session = Depends(get_session),  # noqa: B008
++) -> ApprovalResponse:
++    row = AgentApprovalRepository(s).decide(
++        approval_id, decision=req.decision, actor=req.actor, note=req.note
++    )
++    if row is None:
++        raise HTTPException(status_code=404, detail="approval_not_found")
++    ev = _emit(
++        s,
++        kind=KIND_APPROVAL_DECIDED,
++        payload=payload_approval_decided(
++            approval_id=approval_id,
++            target=row.target,
++            gate=row.gate,
++            decision=req.decision,
++            actor=req.actor,
++        ),
++        correlation_id=row.correlation_id or approval_id,
++    )
++    s.commit()
++    await _publish(ev)
++    return _approval_to_response(row)
++
++
++@router.get("/approvals", response_model=list[ApprovalResponse])
++def list_approvals(
++    target: str | None = Query(default=None),
++    gate: str | None = Query(default=None),
++    decision: str | None = Query(default=None),
++    limit: int = Query(default=DEFAULT_LIMIT, ge=1),
++    s: Session = Depends(get_session),  # noqa: B008
++) -> list[ApprovalResponse]:
++    rows = AgentApprovalRepository(s).list(
++        target=target, gate=gate, decision=decision, limit=min(limit, MAX_LIMIT)
++    )
++    return [_approval_to_response(r) for r in rows]
+diff --git a/backend/act/api/v1/schemas.py b/backend/act/api/v1/schemas.py
+index b7bec6c..2ebffd3 100644
+--- a/backend/act/api/v1/schemas.py
++++ b/backend/act/api/v1/schemas.py
+@@ -54,3 +54,110 @@ class AlertAckRequest(BaseModel):
+ class AlertAckResponse(BaseModel):
+     acked: bool
+     already_acked: bool
++
++
++# ---------------------------------------------------------------------------
++# Navigator agent resource — proposals, runs, approvals.
++# ---------------------------------------------------------------------------
++
++ProposalStatus = Literal[
++    "proposed", "approved", "declined", "expired", "superseded"
++]
++RunStatus = Literal[
++    "executing", "completed", "failed", "rolled_back", "aborted"
++]
++ApprovalGate = Literal[
++    "review", "merge", "architecture", "destructive", "budget", "deploy"
++]
++ApprovalDecision = Literal["pending", "approved", "declined"]
++
++
++class ProposalCreateRequest(BaseModel):
++    schema_version: int = 1
++    origin: str
++    proposal_origin_hash: str
++    repo: str
++    base_commit_sha: str
++    risk_tier: str
++    priority: int = 0
++    payload: dict[str, Any] = {}
++
++
++class ProposalStatusRequest(BaseModel):
++    status: ProposalStatus
++
++
++class ProposalResponse(BaseModel):
++    id: str
++    schema_version: int
++    status: ProposalStatus
++    origin: str
++    proposal_origin_hash: str
++    repo: str
++    base_commit_sha: str
++    risk_tier: str
++    priority: int
++    created_at: datetime
++    payload: dict[str, Any]
++
++
++class RunCreateRequest(BaseModel):
++    schema_version: int = 1
++    proposal_id: str
++    phase: str = "init"
++    base_commit_sha: str
++    branch: str
++    worktree_path: str | None = None
++    correlation_id: str | None = None
++    cost_usd: float = 0.0
++    payload: dict[str, Any] = {}
++
++
++class RunUpdateRequest(BaseModel):
++    status: RunStatus | None = None
++    phase: str | None = None
++    worktree_path: str | None = None
++    ended_at: datetime | None = None
++    cost_usd: float | None = None
++    payload: dict[str, Any] | None = None
++
++
++class RunResponse(BaseModel):
++    id: str
++    schema_version: int
++    proposal_id: str
++    status: RunStatus
++    phase: str
++    base_commit_sha: str
++    branch: str
++    worktree_path: str | None
++    correlation_id: str | None
++    started_at: datetime
++    ended_at: datetime | None
++    cost_usd: float
++    payload: dict[str, Any]
++
++
++class ApprovalCreateRequest(BaseModel):
++    schema_version: int = 1
++    target: str
++    gate: ApprovalGate
++    correlation_id: str | None = None
++
++
++class ApprovalDecideRequest(BaseModel):
++    decision: Literal["approved", "declined"]
++    actor: str | None = None
++    note: str | None = None
++
++
++class ApprovalResponse(BaseModel):
++    id: str
++    schema_version: int
++    target: str
++    gate: ApprovalGate
++    decision: ApprovalDecision
++    actor: str | None
++    decided_at: datetime | None
++    note: str | None
++    correlation_id: str | None
+diff --git a/backend/act/events/navigator.py b/backend/act/events/navigator.py
+new file mode 100644
+index 0000000..ba382c5
+--- /dev/null
++++ b/backend/act/events/navigator.py
+@@ -0,0 +1,76 @@
++"""Navigator agent-resource event kinds.
++
++Events are emitted via the existing EventIngestService (act.events.ingest).
++Kind format follows the ACT convention: "{source}.{resource}.{action}".
++"""
++from __future__ import annotations
++
++from typing import Any
++
++# Source identifier — every event from the Navigator agent resource uses this.
++NAVIGATOR_SOURCE = "navigator"
++
++# Proposal kinds
++KIND_PROPOSAL_CREATED = "agent.proposal.created"
++KIND_PROPOSAL_STATUS_CHANGED = "agent.proposal.status_changed"
++
++# Run kinds
++KIND_RUN_CREATED = "agent.run.created"
++KIND_RUN_UPDATED = "agent.run.updated"
++
++# Approval kinds
++KIND_APPROVAL_CREATED = "agent.approval.created"
++KIND_APPROVAL_DECIDED = "agent.approval.decided"
++
++
++def payload_proposal_created(
++    *, proposal_id: str, origin: str, repo: str, risk_tier: str, priority: int
++) -> dict[str, Any]:
++    return {
++        "proposal_id": proposal_id,
++        "origin": origin,
++        "repo": repo,
++        "risk_tier": risk_tier,
++        "priority": priority,
++    }
++
++
++def payload_proposal_status_changed(
++    *, proposal_id: str, status: str
++) -> dict[str, Any]:
++    return {"proposal_id": proposal_id, "status": status}
++
++
++def payload_run_created(
++    *, run_id: str, proposal_id: str, branch: str, base_commit_sha: str
++) -> dict[str, Any]:
++    return {
++        "run_id": run_id,
++        "proposal_id": proposal_id,
++        "branch": branch,
++        "base_commit_sha": base_commit_sha,
++    }
++
++
++def payload_run_updated(
++    *, run_id: str, status: str, phase: str
++) -> dict[str, Any]:
++    return {"run_id": run_id, "status": status, "phase": phase}
++
++
++def payload_approval_created(
++    *, approval_id: str, target: str, gate: str
++) -> dict[str, Any]:
++    return {"approval_id": approval_id, "target": target, "gate": gate}
++
++
++def payload_approval_decided(
++    *, approval_id: str, target: str, gate: str, decision: str, actor: str | None
++) -> dict[str, Any]:
++    return {
++        "approval_id": approval_id,
++        "target": target,
++        "gate": gate,
++        "decision": decision,
++        "actor": actor,
++    }
+diff --git a/backend/act/persistence/repositories.py b/backend/act/persistence/repositories.py
+index d99157e..8bfc1fb 100644
+--- a/backend/act/persistence/repositories.py
++++ b/backend/act/persistence/repositories.py
+@@ -8,6 +8,9 @@ from act.domain.event import Event
+ from act.domain.health import Health
+ from act.domain.probe import Probe
+ from act.persistence.models import (
++    AgentApprovalRow,
++    AgentProposalRow,
++    AgentRunRow,
+     AlertRow,
+     CursorRow,
+     EventRow,
+@@ -313,6 +316,135 @@ class VideoJobRepository:
+         row.updated_at = _now()
+ 
+ 
++# ---------------------------------------------------------------------------
++# Navigator agent resource — repositories for agent_proposals, agent_runs,
++# agent_approvals. Return raw rows; mapping to pydantic happens at the API edge.
++# ---------------------------------------------------------------------------
++
++
++class AgentProposalRepository:
++    def __init__(self, session: Session) -> None:
++        self.s = session
++
++    def add(self, row: AgentProposalRow) -> None:
++        self.s.add(row)
++
++    def get(self, proposal_id: str) -> AgentProposalRow | None:
++        return self.s.get(AgentProposalRow, proposal_id)
++
++    def list(
++        self, status: str | None = None, limit: int = 100
++    ) -> list[AgentProposalRow]:
++        stmt = select(AgentProposalRow)
++        if status is not None:
++            stmt = stmt.where(AgentProposalRow.status == status)
++        stmt = stmt.order_by(AgentProposalRow.created_at.desc()).limit(limit)
++        return list(self.s.scalars(stmt).all())
++
++    def set_status(self, proposal_id: str, status: str) -> AgentProposalRow | None:
++        row = self.s.get(AgentProposalRow, proposal_id)
++        if row is None:
++            return None
++        row.status = status
++        return row
++
++
++class AgentRunRepository:
++    def __init__(self, session: Session) -> None:
++        self.s = session
++
++    def add(self, row: AgentRunRow) -> None:
++        self.s.add(row)
++
++    def get(self, run_id: str) -> AgentRunRow | None:
++        return self.s.get(AgentRunRow, run_id)
++
++    def list_open(self, limit: int = 100) -> list[AgentRunRow]:
++        stmt = (
++            select(AgentRunRow)
++            .where(AgentRunRow.status == "executing")
++            .order_by(AgentRunRow.started_at.desc())
++            .limit(limit)
++        )
++        return list(self.s.scalars(stmt).all())
++
++    def list_for_proposal(self, proposal_id: str) -> list[AgentRunRow]:
++        stmt = (
++            select(AgentRunRow)
++            .where(AgentRunRow.proposal_id == proposal_id)
++            .order_by(AgentRunRow.started_at.desc())
++        )
++        return list(self.s.scalars(stmt).all())
++
++    def update(
++        self,
++        run_id: str,
++        *,
++        status: str | None = None,
++        phase: str | None = None,
++        worktree_path: str | None = None,
++        ended_at: datetime | None = None,
++        cost_usd: float | None = None,
++        payload: dict[str, object] | None = None,
++    ) -> AgentRunRow | None:
++        row = self.s.get(AgentRunRow, run_id)
++        if row is None:
++            return None
++        if status is not None:
++            row.status = status
++        if phase is not None:
++            row.phase = phase
++        if worktree_path is not None:
++            row.worktree_path = worktree_path
++        if ended_at is not None:
++            row.ended_at = ended_at
++        if cost_usd is not None:
++            row.cost_usd = cost_usd
++        if payload is not None:
++            row.payload = payload
++        return row
++
++
++class AgentApprovalRepository:
++    def __init__(self, session: Session) -> None:
++        self.s = session
++
++    def add(self, row: AgentApprovalRow) -> None:
++        self.s.add(row)
++
++    def get(self, approval_id: str) -> AgentApprovalRow | None:
++        return self.s.get(AgentApprovalRow, approval_id)
++
++    def list(
++        self,
++        target: str | None = None,
++        gate: str | None = None,
++        decision: str | None = None,
++        limit: int = 100,
++    ) -> list[AgentApprovalRow]:
++        stmt = select(AgentApprovalRow)
++        if target is not None:
++            stmt = stmt.where(AgentApprovalRow.target == target)
++        if gate is not None:
++            stmt = stmt.where(AgentApprovalRow.gate == gate)
++        if decision is not None:
++            stmt = stmt.where(AgentApprovalRow.decision == decision)
++        stmt = stmt.limit(limit)
++        return list(self.s.scalars(stmt).all())
++
++    def decide(
++        self, approval_id: str, decision: str, actor: str | None, note: str | None
++    ) -> AgentApprovalRow | None:
++        row = self.s.get(AgentApprovalRow, approval_id)
++        if row is None:
++            return None
++        row.decision = decision
++        row.actor = actor
++        row.note = note
++        row.decided_at = _now()
++        return row
++
++
+ def _to_event(row: EventRow) -> Event:
+     return Event(
+         id=row.id,
+-- 
+2.50.1 (Apple Git-155)
+
+
+From 098ea01721d30eaa90aae2dda1f03c6e68d9c4af Mon Sep 17 00:00:00 2001
+From: Manoj Kothapalli <31705961+manojkothapalli1004@users.noreply.github.com>
+Date: Sat, 6 Jun 2026 02:02:28 -0400
+Subject: [PATCH 3/4] test(agent): agent resource API tests
+
+In-memory SQLite TestClient (mirrors test_events.py). Covers proposal
+create/list/status-filter, run create/list-open/update, approval
+create/decide/list-by-decision, 404 paths, and that source="navigator"
+events are written on transitions (incl. error severity on failed runs).
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ backend/tests/api/v1/test_agent.py | 271 +++++++++++++++++++++++++++++
+ 1 file changed, 271 insertions(+)
+ create mode 100644 backend/tests/api/v1/test_agent.py
+
+diff --git a/backend/tests/api/v1/test_agent.py b/backend/tests/api/v1/test_agent.py
+new file mode 100644
+index 0000000..fab8e4d
+--- /dev/null
++++ b/backend/tests/api/v1/test_agent.py
+@@ -0,0 +1,271 @@
++"""API tests for the Navigator agent resource.
++
++Mirrors test_events.py: in-memory SQLite, TestClient, get_session override.
++Covers proposals, runs, approvals, and that a source="navigator" event is
++written into the same DB on a transition.
++"""
++from __future__ import annotations
++
++import pytest
++from fastapi.testclient import TestClient
++from sqlalchemy import create_engine, event, select
++from sqlalchemy.orm import sessionmaker
++from sqlalchemy.pool import StaticPool
++
++from act.api.v1.deps import get_session
++from act.main import app
++from act.persistence.db import Base
++from act.persistence.models import (  # noqa: F401
++    AgentApprovalRow,
++    AgentProposalRow,
++    AgentRunRow,
++    AlertRow,
++    CursorRow,
++    EventRow,
++    SnapshotRow,
++    SourceHealthRow,
++)
++
++
++@pytest.fixture
++def client():
++    engine = create_engine(
++        "sqlite:///:memory:",
++        future=True,
++        connect_args={"check_same_thread": False},
++        poolclass=StaticPool,
++    )
++
++    @event.listens_for(engine, "connect")
++    def _fk_on(dbapi_conn, _record):
++        cur = dbapi_conn.cursor()
++        cur.execute("PRAGMA foreign_keys=ON")
++        cur.close()
++
++    Base.metadata.create_all(engine)
++    SessionFactory = sessionmaker(bind=engine, expire_on_commit=False, autoflush=False)
++
++    def _override_session():
++        s = SessionFactory()
++        try:
++            yield s
++        finally:
++            s.close()
++
++    app.dependency_overrides[get_session] = _override_session
++    with TestClient(app) as c:
++        c._session_factory = SessionFactory  # type: ignore[attr-defined]
++        yield c
++    app.dependency_overrides.clear()
++    engine.dispose()
++
++
++def _make_proposal_body(**overrides) -> dict:
++    body = {
++        "origin": "navigator-planner",
++        "proposal_origin_hash": "deadbeef",
++        "repo": "calwbot/trader",
++        "base_commit_sha": "abc123",
++        "risk_tier": "low",
++        "priority": 5,
++        "payload": {"title": "tweak", "rationale": "because"},
++    }
++    body.update(overrides)
++    return body
++
++
++# ---- proposals ------------------------------------------------------------
++
++
++def test_create_and_list_proposal(client) -> None:
++    r = client.post("/api/v1/agent/proposals", json=_make_proposal_body())
++    assert r.status_code == 200, r.text
++    body = r.json()
++    assert body["id"].startswith("proposal-")
++    assert body["status"] == "proposed"
++    assert body["repo"] == "calwbot/trader"
++    assert body["payload"]["title"] == "tweak"
++
++    r2 = client.get("/api/v1/agent/proposals")
++    assert r2.status_code == 200
++    assert len(r2.json()) == 1
++    assert r2.json()[0]["id"] == body["id"]
++
++
++def test_list_proposals_filters_by_status(client) -> None:
++    p1 = client.post("/api/v1/agent/proposals", json=_make_proposal_body()).json()
++    client.post("/api/v1/agent/proposals", json=_make_proposal_body())
++
++    client.post(
++        f"/api/v1/agent/proposals/{p1['id']}/status", json={"status": "approved"}
++    )
++
++    r_all = client.get("/api/v1/agent/proposals")
++    assert len(r_all.json()) == 2
++    r_approved = client.get("/api/v1/agent/proposals?status=approved")
++    assert [p["id"] for p in r_approved.json()] == [p1["id"]]
++    r_proposed = client.get("/api/v1/agent/proposals?status=proposed")
++    assert len(r_proposed.json()) == 1
++
++
++def test_set_proposal_status(client) -> None:
++    p = client.post("/api/v1/agent/proposals", json=_make_proposal_body()).json()
++    r = client.post(
++        f"/api/v1/agent/proposals/{p['id']}/status", json={"status": "declined"}
++    )
++    assert r.status_code == 200
++    assert r.json()["status"] == "declined"
++
++
++def test_set_proposal_status_404(client) -> None:
++    r = client.post(
++        "/api/v1/agent/proposals/proposal-missing/status",
++        json={"status": "approved"},
++    )
++    assert r.status_code == 404
++
++
++# ---- runs -----------------------------------------------------------------
++
++
++def _make_run_body(proposal_id: str, **overrides) -> dict:
++    body = {
++        "proposal_id": proposal_id,
++        "phase": "init",
++        "base_commit_sha": "abc123",
++        "branch": "agent/run-1",
++        "worktree_path": "var/worktrees/run-1",
++        "correlation_id": "corr-1",
++        "payload": {"completed_tasks": []},
++    }
++    body.update(overrides)
++    return body
++
++
++def test_create_run_list_open_and_update(client) -> None:
++    p = client.post("/api/v1/agent/proposals", json=_make_proposal_body()).json()
++
++    r = client.post("/api/v1/agent/runs", json=_make_run_body(p["id"]))
++    assert r.status_code == 200, r.text
++    run = r.json()
++    assert run["id"].startswith("run-")
++    assert run["status"] == "executing"
++    assert run["proposal_id"] == p["id"]
++
++    r_open = client.get("/api/v1/agent/runs")
++    assert [x["id"] for x in r_open.json()] == [run["id"]]
++
++    r_upd = client.post(
++        f"/api/v1/agent/runs/{run['id']}",
++        json={"status": "completed", "phase": "done", "cost_usd": 1.25},
++    )
++    assert r_upd.status_code == 200
++    assert r_upd.json()["status"] == "completed"
++    assert r_upd.json()["phase"] == "done"
++    assert r_upd.json()["cost_usd"] == 1.25
++
++    # completed run no longer appears in open list
++    assert client.get("/api/v1/agent/runs").json() == []
++
++
++def test_update_run_404(client) -> None:
++    r = client.post("/api/v1/agent/runs/run-missing", json={"status": "aborted"})
++    assert r.status_code == 404
++
++
++# ---- approvals ------------------------------------------------------------
++
++
++def test_create_decide_and_list_approval(client) -> None:
++    r = client.post(
++        "/api/v1/agent/approvals",
++        json={"target": "run-xyz", "gate": "merge", "correlation_id": "corr-9"},
++    )
++    assert r.status_code == 200, r.text
++    appr = r.json()
++    assert appr["id"].startswith("approval-")
++    assert appr["decision"] == "pending"
++    assert appr["gate"] == "merge"
++
++    r_dec = client.post(
++        f"/api/v1/agent/approvals/{appr['id']}/decide",
++        json={"decision": "approved", "actor": "operator", "note": "lgtm"},
++    )
++    assert r_dec.status_code == 200
++    decided = r_dec.json()
++    assert decided["decision"] == "approved"
++    assert decided["actor"] == "operator"
++    assert decided["note"] == "lgtm"
++    assert decided["decided_at"] is not None
++
++    r_app = client.get("/api/v1/agent/approvals?decision=approved")
++    assert [a["id"] for a in r_app.json()] == [appr["id"]]
++    r_pend = client.get("/api/v1/agent/approvals?decision=pending")
++    assert r_pend.json() == []
++    r_tgt = client.get("/api/v1/agent/approvals?target=run-xyz&gate=merge")
++    assert len(r_tgt.json()) == 1
++
++
++def test_decide_approval_404(client) -> None:
++    r = client.post(
++        "/api/v1/agent/approvals/approval-missing/decide",
++        json={"decision": "approved"},
++    )
++    assert r.status_code == 404
++
++
++# ---- event emission -------------------------------------------------------
++
++
++def _navigator_events(client) -> list[EventRow]:
++    with client._session_factory() as s:
++        return list(
++            s.scalars(
++                select(EventRow).where(EventRow.source == "navigator")
++            ).all()
++        )
++
++
++def test_proposal_creation_writes_navigator_event(client) -> None:
++    p = client.post("/api/v1/agent/proposals", json=_make_proposal_body()).json()
++    events = _navigator_events(client)
++    kinds = {e.kind for e in events}
++    assert "agent.proposal.created" in kinds
++    created = next(e for e in events if e.kind == "agent.proposal.created")
++    assert created.source == "navigator"
++    assert created.severity == "info"
++    assert created.correlation_id == p["id"]
++    assert created.payload["proposal_id"] == p["id"]
++
++
++def test_status_transition_writes_navigator_event(client) -> None:
++    p = client.post("/api/v1/agent/proposals", json=_make_proposal_body()).json()
++    client.post(
++        f"/api/v1/agent/proposals/{p['id']}/status", json={"status": "approved"}
++    )
++    kinds = [e.kind for e in _navigator_events(client)]
++    assert "agent.proposal.status_changed" in kinds
++
++
++def test_failed_run_update_emits_error_severity(client) -> None:
++    p = client.post("/api/v1/agent/proposals", json=_make_proposal_body()).json()
++    run = client.post("/api/v1/agent/runs", json=_make_run_body(p["id"])).json()
++    client.post(f"/api/v1/agent/runs/{run['id']}", json={"status": "failed"})
++    events = _navigator_events(client)
++    updated = [e for e in events if e.kind == "agent.run.updated"]
++    assert updated
++    assert updated[-1].severity == "error"
++
++
++def test_approval_decision_writes_navigator_event(client) -> None:
++    appr = client.post(
++        "/api/v1/agent/approvals",
++        json={"target": "run-xyz", "gate": "review"},
++    ).json()
++    client.post(
++        f"/api/v1/agent/approvals/{appr['id']}/decide",
++        json={"decision": "declined"},
++    )
++    kinds = [e.kind for e in _navigator_events(client)]
++    assert "agent.approval.created" in kinds
++    assert "agent.approval.decided" in kinds
+-- 
+2.50.1 (Apple Git-155)
+
+
+From 87378d12353bb92ee44f5138329ca3f4917aa268 Mon Sep 17 00:00:00 2001
+From: Manoj Kothapalli <31705961+manojkothapalli1004@users.noreply.github.com>
+Date: Sat, 6 Jun 2026 02:07:00 -0400
+Subject: [PATCH 4/4] docs(agent): fix navigator event module docstring (no
+ EventIngestService)
+
+---
+ backend/act/events/navigator.py | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/backend/act/events/navigator.py b/backend/act/events/navigator.py
+index ba382c5..f097786 100644
+--- a/backend/act/events/navigator.py
++++ b/backend/act/events/navigator.py
+@@ -1,6 +1,7 @@
+ """Navigator agent-resource event kinds.
+ 
+-Events are emitted via the existing EventIngestService (act.events.ingest).
++The agent router writes each EventRow into the request session so the event and
++its state change commit in one transaction, then best-effort publishes to the bus.
+ Kind format follows the ACT convention: "{source}.{resource}.{action}".
+ """
+ from __future__ import annotations
+-- 
+2.50.1 (Apple Git-155)
+
