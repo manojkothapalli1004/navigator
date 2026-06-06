@@ -62,4 +62,9 @@ class Navigator:
             run.phase = RunPhase.finalizing
             run.ended_at = datetime.now(timezone.utc)
             self.act.update_run(run)
+            # Record a post-mortem lesson; the worktree (if any) is left on disk for inspection.
+            self.orc.apply_memory_update(
+                section="known_failures",
+                note=f"[{run.id}] aborted stale run on startup reconcile | worktree: {run.worktree_path}",
+                replace=False)
             log.warning("reconcile.aborted_stale_run", run_id=run.id, preserved_worktree=run.worktree_path)

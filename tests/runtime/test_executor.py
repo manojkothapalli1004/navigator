@@ -49,6 +49,24 @@ def test_merge_only_after_approval(tmp_path):
     assert d["act"].runs[run.id].status == RunStatus.completed
     assert d["orc"].updates  # outcome written
 
+def test_create_worktree_failure_marks_run_failed(tmp_path):
+    repo, sha = _seed(tmp_path); d = _deps(tmp_path, repo)
+    bad = _proposal(repo, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef")  # invalid base sha
+    run = execute_proposal(bad, **d)  # must NOT raise
+    assert run.status == RunStatus.failed
+    assert run.phase == RunPhase.finalizing
+    assert any(sec == "known_failures" for sec, _, _ in d["orc"].updates)
+
+def test_success_removes_worktree(tmp_path):
+    repo, sha = _seed(tmp_path); d = _deps(tmp_path, repo)
+    run = execute_proposal(_proposal(repo, sha), **d)
+    wt_path = run.worktree_path
+    assert Path(wt_path).exists()
+    approval = d["act"].list_approvals(target=run.id, gate=ApprovalGate.merge)[0]
+    d["act"].decide_approval(approval.id, ApprovalDecision.approved, actor="manoj")
+    merge_after_approval(run, **d)
+    assert not Path(wt_path).exists()  # worktree cleaned up on success
+
 def test_failed_verify_writes_failure_outcome_and_preserves(tmp_path, monkeypatch):
     repo, sha = _seed(tmp_path); d = _deps(tmp_path, repo)
     # force verify failure by making the verifier command fail

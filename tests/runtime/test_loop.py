@@ -55,3 +55,5 @@ def test_reconcile_aborts_and_preserves_stale_runs(tmp_path):
     nav.act.create_run(stale)
     nav.reconcile_on_startup()
     assert nav.act.runs[stale.id].status == RunStatus.aborted
+    # a known_failures lesson is recorded for the aborted run (post-mortem trail)
+    assert any(sec == "known_failures" and stale.id in note for sec, note, _ in nav.orc.updates)

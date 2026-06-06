@@ -13,7 +13,10 @@ class SingleFlightLock:
         except FileExistsError:
             raise RuntimeError(f"single-flight lock held: {self.path}")
         try:
-            os.write(fd, str(os.getpid()).encode()); os.close(fd)
+            try:
+                os.write(fd, str(os.getpid()).encode())
+            finally:
+                os.close(fd)  # always close, even if write raises (no fd leak)
             yield
         finally:
             try: self.path.unlink()
