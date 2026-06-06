@@ -28,3 +28,25 @@ def test_git_push_rejected(tmp_path):
 def test_cwd_outside_worktree_rejected(tmp_path):
     with pytest.raises(CommandRejected):
         _runner(tmp_path).run(["git","status"], cwd=Path("/etc"))
+
+def test_git_no_index_rejected(tmp_path):
+    # git diff --no-index ignores the worktree and reads arbitrary absolute paths
+    r = CommandRunner(allowlist=["git diff"], worktree_root=tmp_path)
+    with pytest.raises(CommandRejected):
+        r.run(["git","diff","--no-index","/etc/hosts","/dev/null"], cwd=tmp_path)
+
+def test_absolute_path_token_rejected(tmp_path):
+    r = CommandRunner(allowlist=["git diff"], worktree_root=tmp_path)
+    with pytest.raises(CommandRejected):
+        r.run(["git","diff","/etc/hosts"], cwd=tmp_path)
+
+def test_missing_binary_wrapped_as_command_rejected(tmp_path):
+    # passes allowlist/metachar/cwd checks, but the binary does not exist
+    r = CommandRunner(allowlist=["definitelynotarealbinary"], worktree_root=tmp_path)
+    with pytest.raises(CommandRejected):
+        r.run(["definitelynotarealbinary"], cwd=tmp_path)
+
+def test_timeout_wrapped_as_command_rejected(tmp_path):
+    r = CommandRunner(allowlist=["sleep"], worktree_root=tmp_path, timeout_s=0.2)
+    with pytest.raises(CommandRejected):
+        r.run(["sleep","5"], cwd=tmp_path)
