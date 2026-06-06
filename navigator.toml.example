@@ -1,0 +1,48 @@
+# Navigator v0 configuration reference
+#
+# v0 is configured via NAVIGATOR_* ENVIRONMENT VARIABLES, read by Settings.from_env().
+# This file documents every setting with its safe default and the env var that sets it.
+# (It is a reference, not a file the app loads — export the vars, or set them in the
+# launchd plist's EnvironmentVariables block, deploy/launchd/com.navigator.plist.example.)
+#
+# Default profile is intentionally safe: fake driver + dry_run (proposes, never mutates git,
+# contacts no live service).
+
+[driver]
+# NAVIGATOR_DRIVER — "fake" (deterministic, no LLM) is the only working driver in v0.
+# A real Claude Agent SDK driver is a v1 item.
+driver = "fake"
+
+[mode]
+# NAVIGATOR_MODE — "dry_run" proposes but never creates worktrees/branches or mutates git.
+# "execute" lets approval_poll run approved proposals. Keep "dry_run" unless you intend execution.
+mode = "dry_run"
+
+[services]
+# NAVIGATOR_ACT_BASE_URL — only used by HTTPACTClient, which is INERT in v0 (raises
+# NotImplementedError) until act-patch/ is applied. Leave unset for the FakeACTClient.
+act_base_url = ""   # unset
+# NAVIGATOR_ORC_BASE_URL — used by HTTPORCClient (REST). Leave unset for the FakeORCClient.
+orc_base_url = ""   # unset
+
+[runtime]
+# NAVIGATOR_WORKTREE_ROOT — where per-run git worktrees are created.
+worktree_root = "/tmp/navigator-worktrees"
+# NAVIGATOR_TICK_INTERVAL_S — periodic tick interval (seconds).
+tick_interval_s = 900
+
+# --- Safety limits (NOT env-wired in v0; fixed safe defaults in Settings) -------------------
+# These are documented for transparency. v0's Settings.from_env() does NOT read env overrides
+# for them — they always use these defaults. Wiring env overrides is a v1 follow-up
+# (see KNOWN_FOLLOWUPS.md).
+[safety]
+max_tool_failures = 5        # circuit breaker: total tool failures per run
+max_identical_failures = 3   # circuit breaker: identical repeated failures
+max_run_duration_s = 1800    # circuit breaker: wall-clock per run
+max_cost_usd = 2.0           # budget guard: pre-call ceiling
+max_proposals_per_tick = 3   # cap on proposals created per periodic tick
+max_failed_tests = 50        # circuit breaker: failed-test count
+
+# Command allowlist (DEFAULT_ALLOWLIST in config.py). argv-only, no shell. py_compile uses python3.
+[safety.allowed_commands]
+commands = ["git status", "git diff", "git log", "pytest", "python3 -m py_compile", "uv run pytest"]

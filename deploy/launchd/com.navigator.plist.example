@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Navigator launchd daemon template — V1 DEPLOYMENT ARTIFACT. DO NOT LOAD WITHOUT APPROVAL.
+
+  This is a TEMPLATE, not a working unit:
+    * v0 has NO daemon entrypoint. `python -m navigator` does not exist yet — the runtime loop
+      is the class navigator.runtime.loop.Navigator, driven by tests. Wiring a long-running
+      entrypoint (instantiate Navigator, reconcile_on_startup, then periodic_tick/approval_poll
+      on a timer) is a v1 task.
+    * Keep NAVIGATOR_MODE=dry_run until execution is explicitly approved.
+    * HTTPACTClient is inert until act-patch/ is applied; leave NAVIGATOR_ACT_BASE_URL unset
+      (the daemon uses FakeACTClient otherwise).
+
+  Paths are intentionally placeholders. No paths are hardcoded in the code — set them here.
+  Install (only after the entrypoint exists and you have approved execution):
+    cp com.navigator.plist.example ~/Library/LaunchAgents/com.navigator.plist
+    # edit absolute paths below, then:
+    launchctl load ~/Library/LaunchAgents/com.navigator.plist
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.navigator</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/ABSOLUTE/PATH/TO/navigator/.venv/bin/python3</string>
+    <string>-m</string>
+    <string>navigator</string>            <!-- v1: provide this entrypoint -->
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/ABSOLUTE/PATH/TO/navigator</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>NAVIGATOR_DRIVER</key>            <string>fake</string>
+    <key>NAVIGATOR_MODE</key>              <string>dry_run</string>
+    <key>NAVIGATOR_WORKTREE_ROOT</key>     <string>/tmp/navigator-worktrees</string>
+    <key>NAVIGATOR_TICK_INTERVAL_S</key>   <string>900</string>
+    <!-- NAVIGATOR_ORC_BASE_URL: set only when pointing at a live ORC over REST -->
+    <!-- NAVIGATOR_ACT_BASE_URL: leave unset until act-patch/ is applied (HTTPACTClient is inert) -->
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>/ABSOLUTE/PATH/TO/navigator/logs/navigator.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/ABSOLUTE/PATH/TO/navigator/logs/navigator.err.log</string>
+</dict>
+</plist>
