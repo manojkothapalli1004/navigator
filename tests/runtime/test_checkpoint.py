@@ -12,6 +12,13 @@ def _seed(tmp_path):
     sha = subprocess.run(["git","rev-parse","HEAD"], cwd=repo, capture_output=True, text=True).stdout.strip()
     return repo, sha
 
+def test_diff_artifact_raises_on_bad_sha(tmp_path):
+    import pytest
+    repo, sha = _seed(tmp_path)
+    h = create_worktree(repo=repo, base_commit_sha=sha, run_id="run-bad", worktree_root=tmp_path/"wt")
+    with pytest.raises(subprocess.CalledProcessError):
+        diff_artifact(h.path, base_commit_sha="deadbeefdeadbeefdeadbeefdeadbeefdeadbeef")
+
 def test_checkpoint_restore_roundtrip(tmp_path):
     repo, sha = _seed(tmp_path)
     h = create_worktree(repo=repo, base_commit_sha=sha, run_id="run-1", worktree_root=tmp_path/"wt")

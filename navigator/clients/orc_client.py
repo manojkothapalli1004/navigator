@@ -22,9 +22,9 @@ class HTTPORCClient:
         self.base_url = base_url.rstrip("/")
         self.client = client or httpx.Client()
     def get_canonical_memory(self) -> dict:
-        return self.client.get(f"{self.base_url}/api/memory").json()
+        r = self.client.get(f"{self.base_url}/api/memory"); r.raise_for_status(); return r.json()
     def get_digest(self) -> dict:
-        return self.client.get(f"{self.base_url}/api/memory/digest").json()
+        r = self.client.get(f"{self.base_url}/api/memory/digest"); r.raise_for_status(); return r.json()
     def apply_memory_update(self, section: str, note: str, replace: bool = False) -> None:
         self.client.post(f"{self.base_url}/api/memory/apply-update",
                          json={"section": section, "note": note, "replace": replace,

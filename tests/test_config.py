@@ -12,3 +12,9 @@ def test_defaults_are_fake_and_dry_run(monkeypatch):
 def test_env_overrides(monkeypatch):
     monkeypatch.setenv("NAVIGATOR_MODE", "execute")
     assert cfg.Settings.from_env().mode == "execute"
+
+def test_bad_tick_interval_gives_descriptive_error(monkeypatch):
+    import pytest
+    monkeypatch.setenv("NAVIGATOR_TICK_INTERVAL_S", "abc")
+    with pytest.raises(ValueError, match="NAVIGATOR_TICK_INTERVAL_S"):
+        cfg.Settings.from_env()

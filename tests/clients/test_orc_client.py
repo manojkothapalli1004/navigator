@@ -20,3 +20,12 @@ def test_http_orc_uses_rest_paths():
     orc.apply_memory_update(section="decisions", note="x", replace=False)
     assert seen["GET"].endswith("/api/memory")
     assert seen["POST"].endswith("/api/memory/apply-update")
+
+def test_http_orc_get_raises_on_error_status():
+    import pytest
+    transport = httpx.MockTransport(lambda req: httpx.Response(500, json={"error": "boom"}))
+    orc = HTTPORCClient(base_url="http://localhost:9", client=httpx.Client(transport=transport))
+    with pytest.raises(httpx.HTTPStatusError):
+        orc.get_canonical_memory()
+    with pytest.raises(httpx.HTTPStatusError):
+        orc.get_digest()

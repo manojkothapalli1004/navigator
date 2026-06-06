@@ -30,5 +30,13 @@ class Settings:
             act_base_url=os.getenv("NAVIGATOR_ACT_BASE_URL"),
             orc_base_url=os.getenv("NAVIGATOR_ORC_BASE_URL"),
             worktree_root=os.getenv("NAVIGATOR_WORKTREE_ROOT", "/tmp/navigator-worktrees"),
-            tick_interval_s=int(os.getenv("NAVIGATOR_TICK_INTERVAL_S", "900")),
+            tick_interval_s=_int_env("NAVIGATOR_TICK_INTERVAL_S", "900"),
         )
+
+
+def _int_env(name: str, default: str) -> int:
+    raw = os.getenv(name, default)
+    try:
+        return int(raw)
+    except ValueError as e:
+        raise ValueError(f"{name} must be an integer, got {raw!r}") from e

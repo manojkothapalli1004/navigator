@@ -28,7 +28,8 @@ class FakeACTClient:
     def create_proposal(self, p: Proposal) -> Proposal:
         self.proposals[p.id] = p; return p
     def list_proposals(self, status: ProposalStatus | None = None) -> list[Proposal]:
-        return [p for p in self.proposals.values() if status is None or p.status == status]
+        return [p.model_copy(deep=True) for p in self.proposals.values()
+                if status is None or p.status == status]
     def set_proposal_status(self, proposal_id: str, status: ProposalStatus) -> None:
         self.proposals[proposal_id].status = status
     def create_run(self, r: Run) -> Run:
@@ -37,7 +38,7 @@ class FakeACTClient:
         self.runs[r.id] = r
     def list_open_runs(self) -> list[Run]:
         from navigator.contracts.enums import RunStatus
-        return [r for r in self.runs.values() if r.status == RunStatus.executing]
+        return [r.model_copy(deep=True) for r in self.runs.values() if r.status == RunStatus.executing]
     def create_approval(self, target: str, gate: ApprovalGate) -> Approval:
         a = Approval(target=target, gate=gate); self.approvals[a.id] = a; return a
     def decide_approval(self, approval_id: str, decision: ApprovalDecision, actor: str) -> None:
@@ -45,7 +46,7 @@ class FakeACTClient:
         a.decision = decision; a.actor = actor; a.decided_at = datetime.now(timezone.utc)
     def list_approvals(self, target: str, gate: ApprovalGate,
                        decision: ApprovalDecision | None = None) -> list[Approval]:
-        return [a for a in self.approvals.values()
+        return [a.model_copy(deep=True) for a in self.approvals.values()
                 if a.target == target and a.gate == gate
                 and (decision is None or a.decision == decision)]
     def emit_event(self, event: Event) -> None:

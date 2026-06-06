@@ -9,6 +9,16 @@ def _proposal():
                     origin="periodic",
                     proposal_origin_hash=compute_origin_hash("trader","x",["a.py"],"periodic",None))
 
+def test_fake_act_list_returns_copies_not_live_refs():
+    # mutating a returned object must NOT corrupt the in-memory store
+    act = FakeACTClient()
+    p = _proposal(); act.create_proposal(p)
+    got = act.list_proposals(status=ProposalStatus.proposed)[0]
+    got.status = ProposalStatus.approved  # mutate the returned object
+    # store is unchanged: still proposed, not approved
+    assert act.list_proposals(status=ProposalStatus.proposed)[0].id == p.id
+    assert act.list_proposals(status=ProposalStatus.approved) == []
+
 def test_fake_act_proposal_and_approval_flow():
     act = FakeACTClient()
     p = _proposal(); act.create_proposal(p)
