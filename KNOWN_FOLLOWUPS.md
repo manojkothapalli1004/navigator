@@ -71,3 +71,7 @@ Verified non-breaking under v0's plan-as-written usage; harden when the surfaces
 - **Worktree leak on orchestration throw**: if `create_worktree` succeeds but the orchestrator
   throws before `remove_worktree`/`preserve_failed`, the dir + `nav/<run_id>` branch persist.
   v1 orchestration concern.
+- **Worktree not removed on the SUCCESS path either**: `merge_after_approval` completes the run
+  but never calls `remove_worktree`, so a merged run's worktree dir + `nav/<run_id>` branch
+  persist. Harmless in v0 (single process, `/tmp` worktree root), but the cleanup belongs in the
+  finalizing phase for v1. `remove_worktree` exists and is imported but currently unused.

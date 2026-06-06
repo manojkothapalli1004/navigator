@@ -62,7 +62,7 @@ tests + a `navigator` event source) to the Agent Control Tower (ACT) backend.
 ```bash
 cd ~/external-tools/agent-control-tower
 git checkout -b agent-resource
-git apply --check act-patch/0001-add-agent-resource.patch   # dry-run validate (path: this artifact)
+git apply --check /Users/pradeep/calwbot/navigator/act-patch/0001-add-agent-resource.patch   # dry-run validate
 git am < /Users/pradeep/calwbot/navigator/act-patch/0001-add-agent-resource.patch
 cd backend
 uv run alembic upgrade head
