@@ -38,7 +38,8 @@ class Navigator:
             p = Proposal(origin="periodic", proposal_origin_hash=h, title=item["title"],
                          rationale=item["rationale"], repo=self.repo, base_commit_sha=base_commit_sha,
                          intended_changes=item["intended_changes"], affected_files=item["affected_files"])
-            self.act.create_proposal(p); created.append(p)
+            # the backend may mint its own id — the stored proposal is the identity
+            created.append(self.act.create_proposal(p))
         return created  # dry_run stops here: no worktree/git mutation
 
     def approval_poll(self) -> list:
@@ -48,7 +49,8 @@ class Navigator:
         with self.lock.acquire():
             for p in self.act.list_proposals(status=ProposalStatus.approved):
                 # Correction 3: dedup guard — skip proposals that already have a run
-                if any(r.proposal_id == p.id for r in self.act.runs.values()):
+                # (any status: a completed run must also block re-execution)
+                if self.act.list_runs_for_proposal(p.id):
                     continue
                 run = execute_proposal(p, act=self.act, orc=self.orc, driver=self.driver,
                                        runner=self.runner, settings=self.settings)

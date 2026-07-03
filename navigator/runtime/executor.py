@@ -17,8 +17,8 @@ def _emit(act, run, kind, severity=Severity.info, **payload):
 
 def execute_proposal(proposal: Proposal, *, act, orc, driver, runner, settings) -> Run:
     # Ensure the proposal is registered in ACT so _repo_for can resolve it
-    if proposal.id not in act.proposals:
-        act.create_proposal(proposal)
+    if act.get_proposal(proposal.id) is None:
+        proposal = act.create_proposal(proposal)
     run = Run(proposal_id=proposal.id, base_commit_sha=proposal.base_commit_sha,
               branch="pending", correlation_id=new_id("corr"))
     run.branch = f"nav/{run.id}"
@@ -93,7 +93,9 @@ def _cleanup_worktree(run: Run, repo: str) -> None:
 
 def _repo_for(run, act) -> str:
     # worktree_path = <root>/<run_id>; repo is recorded on the proposal
-    prop = act.proposals[run.proposal_id]
+    prop = act.get_proposal(run.proposal_id)
+    if prop is None:
+        raise LookupError(f"proposal {run.proposal_id} not found in ACT")
     return prop.repo
 
 def _write_outcome(orc, run, *, status, summary, lessons, verification_notes=None,

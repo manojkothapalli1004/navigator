@@ -57,3 +57,48 @@ def test_reconcile_aborts_and_preserves_stale_runs(tmp_path):
     assert nav.act.runs[stale.id].status == RunStatus.aborted
     # a known_failures lesson is recorded for the aborted run (post-mortem trail)
     assert any(sec == "known_failures" and stale.id in note for sec, note, _ in nav.orc.updates)
+
+def test_approval_poll_dedup_works_through_protocol_and_counts_completed_runs(tmp_path):
+    # The dedup guard must use the ACTClient protocol (no Fake-only .runs attr)
+    # and must skip proposals whose run already COMPLETED, not just open ones.
+    from tests.support import ProtocolOnlyACT
+    from navigator.contracts.proposal import Proposal, compute_origin_hash
+    from navigator.contracts.run import Run
+    repo, sha = _seed(tmp_path)
+    inner = FakeACTClient()
+    s = Settings(mode="execute", worktree_root=str(tmp_path/"wt"))
+    nav = Navigator(act=ProtocolOnlyACT(inner), orc=FakeORCClient(), driver=FakeSubagentDriver(),
+                    runner=CommandRunner(allowlist=s.allowed_commands, worktree_root=tmp_path/"wt"),
+                    settings=s, repo=str(repo), lock_path=tmp_path/"nav.lock")
+    p = Proposal(title="t", rationale="r", repo=str(repo), base_commit_sha=sha,
+                 intended_changes="x", affected_files=["a.py"], origin="periodic",
+                 proposal_origin_hash=compute_origin_hash(str(repo),"x",["a.py"],"periodic",None))
+    inner.create_proposal(p)
+    inner.set_proposal_status(p.id, ProposalStatus.approved)
+    done = Run(proposal_id=p.id, base_commit_sha=sha, branch="nav/run-done",
+               status=RunStatus.completed)
+    inner.create_run(done)
+    runs = nav.approval_poll()
+    assert runs == []  # proposal already has a run (completed) — never re-execute
+
+def test_periodic_tick_returns_stored_proposal_identity(tmp_path):
+    # An HTTP ACT backend mints its own ids on create; periodic_tick must return
+    # the stored proposals (server identity), not the pre-create drafts.
+    from tests.support import ProtocolOnlyACT
+    repo, sha = _seed(tmp_path)
+    inner = FakeACTClient()
+
+    class RemintingACT(ProtocolOnlyACT):
+        def create_proposal(self, p):
+            stored = p.model_copy(deep=True)
+            stored.id = f"proposal-SERVER-{len(self._inner.proposals)}"
+            return self._inner.create_proposal(stored)
+
+    s = Settings(mode="dry_run", worktree_root=str(tmp_path/"wt"))
+    nav = Navigator(act=RemintingACT(inner), orc=FakeORCClient(), driver=FakeSubagentDriver(),
+                    runner=CommandRunner(allowlist=s.allowed_commands, worktree_root=tmp_path/"wt"),
+                    settings=s, repo=str(repo), lock_path=tmp_path/"nav.lock")
+    created = nav.periodic_tick(base_commit_sha=sha)
+    assert created  # driver proposed at least one
+    stored_ids = {q.id for q in inner.list_proposals()}
+    assert {c.id for c in created} <= stored_ids

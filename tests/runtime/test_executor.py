@@ -79,3 +79,20 @@ def test_failed_verify_writes_failure_outcome_and_preserves(tmp_path, monkeypatc
     assert run.status == RunStatus.failed
     o_updates = d["orc"].updates
     assert any(sec == "known_failures" for sec, _, _ in o_updates)
+
+def test_execute_and_merge_work_through_protocol_only_client(tmp_path):
+    # executor must not reach into Fake-only attributes (.proposals dict);
+    # the whole execute -> approve -> merge path must run on the protocol surface
+    from tests.support import ProtocolOnlyACT
+    repo, sha = _seed(tmp_path)
+    inner = FakeACTClient()
+    s = Settings(worktree_root=str(tmp_path/"wt"))
+    d = dict(act=ProtocolOnlyACT(inner), orc=FakeORCClient(), driver=FakeSubagentDriver(),
+             runner=CommandRunner(allowlist=s.allowed_commands, worktree_root=tmp_path/"wt"),
+             settings=s)
+    run = execute_proposal(_proposal(repo, sha), **d)
+    assert run.phase == RunPhase.awaiting_review
+    appr = inner.list_approvals(target=run.id, gate=ApprovalGate.merge)[0]
+    inner.decide_approval(appr.id, ApprovalDecision.approved, actor="manoj")
+    merge_after_approval(run, **d)
+    assert inner.runs[run.id].status == RunStatus.completed

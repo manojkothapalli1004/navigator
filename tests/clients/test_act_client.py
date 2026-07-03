@@ -34,3 +34,29 @@ def test_http_act_is_inert_until_patch():
     act = HTTPACTClient(base_url="http://localhost:9")
     with pytest.raises(NotImplementedError):
         act.create_proposal(_proposal())
+
+# ---- protocol additions for HTTP wiring ------------------------------------
+
+def test_fake_act_get_proposal_returns_copy_or_none():
+    act = FakeACTClient()
+    p = _proposal(); act.create_proposal(p)
+    got = act.get_proposal(p.id)
+    assert got is not None and got.id == p.id
+    got.status = ProposalStatus.approved  # mutating the copy must not touch the store
+    assert act.get_proposal(p.id).status == ProposalStatus.proposed
+    assert act.get_proposal("proposal-missing") is None
+
+def test_fake_act_list_runs_for_proposal_includes_completed():
+    from navigator.contracts.run import Run
+    from navigator.contracts.enums import RunStatus
+    act = FakeACTClient()
+    p = _proposal(); act.create_proposal(p)
+    r1 = Run(proposal_id=p.id, base_commit_sha="abc", branch="nav/r1")
+    r2 = Run(proposal_id="proposal-other", base_commit_sha="abc", branch="nav/r2")
+    act.create_run(r1); act.create_run(r2)
+    r1.status = RunStatus.completed; act.update_run(r1)
+    got = act.list_runs_for_proposal(p.id)
+    assert [r.id for r in got] == [r1.id]           # completed run still visible
+    assert got[0].status == RunStatus.completed
+    got[0].status = RunStatus.executing              # copy, not live ref
+    assert act.list_runs_for_proposal(p.id)[0].status == RunStatus.completed
