@@ -1,4 +1,11 @@
-# ACT agent-resource patch (UNAPPLIED artifact)
+# ACT agent-resource patch (APPLIED 2026-07-02)
+
+> **Status update (2026-07-02):** the operator applied this patch to the live ACT repo
+> (`git am` at BASE_SHA, merged fast-forward to `main`, 198 tests green). Two follow-up
+> commits on ACT `main` added HTTP-client support routes (proposal by id, runs filter,
+> event ingest, optional client-supplied ids; 206 tests). The live DB was already at the
+> patch's migration head. Navigator's `HTTPACTClient` is now implemented and verified
+> end-to-end. The text below is preserved as the original artifact documentation.
 
 This directory contains a single patch, `0001-add-agent-resource.patch`, that adds the
 **agent resource** (proposals / runs / approvals tables + REST API + Alembic migration +

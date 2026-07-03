@@ -24,11 +24,14 @@ live-integration claims.
 - ✅ Default profile: **`NAVIGATOR_DRIVER=fake`, `NAVIGATOR_MODE=dry_run`** (dry_run proposes
   but never mutates git).
 
+- ✅ **`HTTPACTClient` is live** (2026-07-03) — the operator applied
+  `act-patch/0001-add-agent-resource.patch` to ACT on 2026-07-02 (plus follow-up support
+  routes: proposal-by-id, `runs?proposal_id=&open_only=`, `POST /agent/events`, optional
+  client-supplied ids). Navigator-only fields round-trip through ACT's JSON `payload`
+  column. Verified end-to-end (execute → approve → merge) against a real ACT instance.
+
 ### Not in v0 (deferred to v1+)
 
-- ❌ **`HTTPACTClient` is inert** — every method raises `NotImplementedError`. It becomes usable
-  only after the operator applies `act-patch/0001-add-agent-resource.patch` to ACT (see
-  `act-patch/README.md`) and runs the migration.
 - ❌ No real Claude Agent SDK driver (interface + fake only). No daemon entrypoint yet — the
   runtime loop is a class (`navigator.runtime.loop.Navigator`), not a `python -m navigator` runner.
 - ❌ No curator, no ACT SSE/event push, no ACT-backed lease.
