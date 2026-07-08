@@ -30,10 +30,19 @@ live-integration claims.
   client-supplied ids). Navigator-only fields round-trip through ACT's JSON `payload`
   column. Verified end-to-end (execute → approve → merge) against a real ACT instance.
 
+### Landed since v0 (2026-07-08)
+
+- ✅ `ClaudeSDKDriver` (`runtime/drivers/claude_sdk_driver.py`): injectable `query_fn`, budget
+  checked before every call, strict-JSON parsing (bare object only), role permissions enforced
+  on outputs. The real claude-agent-sdk binding is still unwired — `NAVIGATOR_DRIVER=claude_sdk`
+  errors clearly until the sdk extra wiring lands.
+- ✅ Daemon entrypoint: `python -m navigator --once` (reconcile → periodic_tick → approval_poll,
+  JSON summary on stdout). Interval daemon still v1.
+
 ### Not in v0 (deferred to v1+)
 
-- ❌ No real Claude Agent SDK driver (interface + fake only). No daemon entrypoint yet — the
-  runtime loop is a class (`navigator.runtime.loop.Navigator`), not a `python -m navigator` runner.
+- ❌ No live claude-agent-sdk wiring for `ClaudeSDKDriver` (offline `query_fn` only); no
+  interval daemon (`--once` only).
 - ❌ No curator, no ACT SSE/event push, no ACT-backed lease.
 - ❌ No memory-trust tagging (v1.5+, once `tag_entry`/`verify_entry_result` are exposed over HTTP).
 
