@@ -21,6 +21,8 @@ class Settings:
     max_cost_usd: float = 2.0
     max_proposals_per_tick: int = 3
     max_failed_tests: int = 50
+    repo: str | None = None
+    lock_path: str = "/tmp/navigator.lock"
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -31,6 +33,14 @@ class Settings:
             orc_base_url=os.getenv("NAVIGATOR_ORC_BASE_URL"),
             worktree_root=os.getenv("NAVIGATOR_WORKTREE_ROOT", "/tmp/navigator-worktrees"),
             tick_interval_s=_int_env("NAVIGATOR_TICK_INTERVAL_S", "900"),
+            max_tool_failures=_int_env("NAVIGATOR_MAX_TOOL_FAILURES", "5"),
+            max_identical_failures=_int_env("NAVIGATOR_MAX_IDENTICAL_FAILURES", "3"),
+            max_run_duration_s=_int_env("NAVIGATOR_MAX_RUN_DURATION_S", "1800"),
+            max_cost_usd=_float_env("NAVIGATOR_MAX_COST_USD", "2.0"),
+            max_proposals_per_tick=_int_env("NAVIGATOR_MAX_PROPOSALS_PER_TICK", "3"),
+            max_failed_tests=_int_env("NAVIGATOR_MAX_FAILED_TESTS", "50"),
+            repo=os.getenv("NAVIGATOR_REPO"),
+            lock_path=os.getenv("NAVIGATOR_LOCK_PATH", "/tmp/navigator.lock"),
         )
 
 
@@ -40,3 +50,11 @@ def _int_env(name: str, default: str) -> int:
         return int(raw)
     except ValueError as e:
         raise ValueError(f"{name} must be an integer, got {raw!r}") from e
+
+
+def _float_env(name: str, default: str) -> float:
+    raw = os.getenv(name, default)
+    try:
+        return float(raw)
+    except ValueError as e:
+        raise ValueError(f"{name} must be a number, got {raw!r}") from e

@@ -18,3 +18,28 @@ def test_bad_tick_interval_gives_descriptive_error(monkeypatch):
     monkeypatch.setenv("NAVIGATOR_TICK_INTERVAL_S", "abc")
     with pytest.raises(ValueError, match="NAVIGATOR_TICK_INTERVAL_S"):
         cfg.Settings.from_env()
+
+def test_from_env_wires_safety_and_daemon_fields(monkeypatch):
+    monkeypatch.setenv("NAVIGATOR_MAX_COST_USD", "3.5")
+    monkeypatch.setenv("NAVIGATOR_MAX_TOOL_FAILURES", "7")
+    monkeypatch.setenv("NAVIGATOR_MAX_IDENTICAL_FAILURES", "2")
+    monkeypatch.setenv("NAVIGATOR_MAX_RUN_DURATION_S", "900")
+    monkeypatch.setenv("NAVIGATOR_MAX_PROPOSALS_PER_TICK", "1")
+    monkeypatch.setenv("NAVIGATOR_MAX_FAILED_TESTS", "10")
+    monkeypatch.setenv("NAVIGATOR_REPO", "/tmp/some-repo")
+    monkeypatch.setenv("NAVIGATOR_LOCK_PATH", "/tmp/nav.lock")
+    s = cfg.Settings.from_env()
+    assert s.max_cost_usd == 3.5
+    assert s.max_tool_failures == 7
+    assert s.max_identical_failures == 2
+    assert s.max_run_duration_s == 900
+    assert s.max_proposals_per_tick == 1
+    assert s.max_failed_tests == 10
+    assert s.repo == "/tmp/some-repo"
+    assert s.lock_path == "/tmp/nav.lock"
+
+def test_from_env_bad_float_is_descriptive(monkeypatch):
+    monkeypatch.setenv("NAVIGATOR_MAX_COST_USD", "not-a-number")
+    import pytest
+    with pytest.raises(ValueError, match="NAVIGATOR_MAX_COST_USD"):
+        cfg.Settings.from_env()
