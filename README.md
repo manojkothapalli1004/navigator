@@ -34,15 +34,17 @@ live-integration claims.
 
 - ✅ `ClaudeSDKDriver` (`runtime/drivers/claude_sdk_driver.py`): injectable `query_fn`, budget
   checked before every call, strict-JSON parsing (bare object only), role permissions enforced
-  on outputs. The real claude-agent-sdk binding is still unwired — `NAVIGATOR_DRIVER=claude_sdk`
-  errors clearly until the sdk extra wiring lands.
+  on outputs.
+- ✅ Live claude-agent-sdk wiring (`runtime/drivers/sdk_query.py`): `NAVIGATOR_DRIVER=claude_sdk`
+  + `uv sync --extra sdk`; model via `NAVIGATOR_SDK_MODEL`. Sessions run with `setting_sources=[]`
+  (no operator hooks/plugins/skills leak in), `allowed_tools=[]`, `max_turns=2`; markdown fences
+  stripped at the adapter so the driver parser stays strict. Smoke-tested live against haiku.
 - ✅ Daemon entrypoint: `python -m navigator --once` (reconcile → periodic_tick → approval_poll,
   JSON summary on stdout). Interval daemon still v1.
 
 ### Not in v0 (deferred to v1+)
 
-- ❌ No live claude-agent-sdk wiring for `ClaudeSDKDriver` (offline `query_fn` only); no
-  interval daemon (`--once` only).
+- ❌ No interval daemon (`--once` only).
 - ❌ No curator, no ACT SSE/event push, no ACT-backed lease.
 - ❌ No memory-trust tagging (v1.5+, once `tag_entry`/`verify_entry_result` are exposed over HTTP).
 

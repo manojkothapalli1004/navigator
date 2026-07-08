@@ -23,6 +23,7 @@ class Settings:
     max_failed_tests: int = 50
     repo: str | None = None
     lock_path: str = "/tmp/navigator.lock"
+    sdk_model: str | None = None
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -41,6 +42,7 @@ class Settings:
             max_failed_tests=_int_env("NAVIGATOR_MAX_FAILED_TESTS", "50"),
             repo=os.getenv("NAVIGATOR_REPO"),
             lock_path=os.getenv("NAVIGATOR_LOCK_PATH", "/tmp/navigator.lock"),
+            sdk_model=os.getenv("NAVIGATOR_SDK_MODEL"),
         )
 
 

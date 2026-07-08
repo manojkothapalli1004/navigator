@@ -5,21 +5,19 @@ import sys
 from navigator.config import Settings
 from navigator.clients.act_client import FakeACTClient, HTTPACTClient
 from navigator.clients.orc_client import FakeORCClient, HTTPORCClient
+from navigator.runtime.drivers.claude_sdk_driver import ClaudeSDKDriver
 from navigator.runtime.drivers.fake_driver import FakeSubagentDriver
+from navigator.runtime.drivers.sdk_query import make_sdk_query_fn
 from navigator.runtime.loop import Navigator
+from navigator.safety.budget_guard import BudgetGuard
 from navigator.safety.command_runner import CommandRunner
 
 def _make_driver(settings: Settings):
     if settings.driver == "fake":
         return FakeSubagentDriver()
     if settings.driver == "claude_sdk":
-        try:
-            import claude_agent_sdk  # noqa: F401
-        except ImportError as e:
-            raise ValueError(
-                "driver 'claude_sdk' needs the sdk extra: pip install 'navigator[sdk]' "
-                "(claude-agent-sdk not installed)") from e
-        raise ValueError("driver 'claude_sdk' wiring is not enabled yet; use NAVIGATOR_DRIVER=fake")
+        return ClaudeSDKDriver(query_fn=make_sdk_query_fn(model=settings.sdk_model),
+                               budget_guard=BudgetGuard(settings.max_cost_usd))
     raise ValueError(f"unknown NAVIGATOR_DRIVER {settings.driver!r}")
 
 def build_navigator(settings: Settings) -> Navigator:

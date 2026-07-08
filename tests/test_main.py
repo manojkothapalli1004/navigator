@@ -36,9 +36,22 @@ def test_build_navigator_rejects_unknown_driver(tmp_path):
     with pytest.raises(ValueError, match="bogus"):
         build_navigator(_settings(tmp_path, _seed_repo(tmp_path), driver="bogus"))
 
-def test_claude_sdk_driver_requires_sdk_extra(tmp_path):
+def test_claude_sdk_driver_requires_sdk_extra(tmp_path, monkeypatch):
+    import sys
+    monkeypatch.setitem(sys.modules, "claude_agent_sdk", None)  # simulate sdk extra not installed
     with pytest.raises(ValueError, match="claude-agent-sdk"):
         build_navigator(_settings(tmp_path, _seed_repo(tmp_path), driver="claude_sdk"))
+
+def test_build_navigator_wires_claude_sdk_driver(tmp_path, monkeypatch):
+    import sys, types
+    mod = types.ModuleType("claude_agent_sdk")
+    mod.query = None; mod.ClaudeAgentOptions = None; mod.ResultMessage = None
+    monkeypatch.setitem(sys.modules, "claude_agent_sdk", mod)
+    from navigator.runtime.drivers.claude_sdk_driver import ClaudeSDKDriver
+    s = _settings(tmp_path, _seed_repo(tmp_path), driver="claude_sdk", max_cost_usd=1.5)
+    nav = build_navigator(s)
+    assert isinstance(nav.driver, ClaudeSDKDriver)
+    assert nav.driver.budget_guard.max_cost_usd == 1.5
 
 def test_main_once_prints_summary_and_exits_zero(tmp_path, monkeypatch, capsys):
     repo = _seed_repo(tmp_path)

@@ -28,6 +28,7 @@ def test_from_env_wires_safety_and_daemon_fields(monkeypatch):
     monkeypatch.setenv("NAVIGATOR_MAX_FAILED_TESTS", "10")
     monkeypatch.setenv("NAVIGATOR_REPO", "/tmp/some-repo")
     monkeypatch.setenv("NAVIGATOR_LOCK_PATH", "/tmp/nav.lock")
+    monkeypatch.setenv("NAVIGATOR_SDK_MODEL", "claude-haiku-4-5-20251001")
     s = cfg.Settings.from_env()
     assert s.max_cost_usd == 3.5
     assert s.max_tool_failures == 7
@@ -37,6 +38,7 @@ def test_from_env_wires_safety_and_daemon_fields(monkeypatch):
     assert s.max_failed_tests == 10
     assert s.repo == "/tmp/some-repo"
     assert s.lock_path == "/tmp/nav.lock"
+    assert s.sdk_model == "claude-haiku-4-5-20251001"
 
 def test_from_env_bad_float_is_descriptive(monkeypatch):
     monkeypatch.setenv("NAVIGATOR_MAX_COST_USD", "not-a-number")
