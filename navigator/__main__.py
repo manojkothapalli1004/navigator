@@ -2,6 +2,7 @@ import argparse
 import json
 import subprocess
 import sys
+import time
 from navigator.config import Settings
 from navigator.clients.act_client import FakeACTClient, HTTPACTClient
 from navigator.clients.orc_client import FakeORCClient, HTTPORCClient
@@ -29,22 +30,42 @@ def build_navigator(settings: Settings) -> Navigator:
     return Navigator(act=act, orc=orc, driver=_make_driver(settings), runner=runner,
                      settings=settings, repo=settings.repo, lock_path=settings.lock_path)
 
+def _head_sha(repo: str) -> str:
+    return subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo,
+                          capture_output=True, text=True, check=True).stdout.strip()
+
+def _cycle(nav: Navigator, settings: Settings) -> dict:
+    created = nav.periodic_tick(base_commit_sha=_head_sha(settings.repo))
+    runs = nav.approval_poll()
+    return {"mode": settings.mode, "driver": settings.driver,
+            "proposals_created": len(created), "runs_executed": len(runs)}
+
+def run_daemon(nav: Navigator, settings: Settings, *, max_cycles: int | None = None) -> None:
+    nav.reconcile_on_startup()
+    cycle = 0
+    while True:
+        cycle += 1
+        summary = _cycle(nav, settings)
+        print(json.dumps({"cycle": cycle, **summary}), flush=True)
+        if max_cycles is not None and cycle >= max_cycles:
+            return
+        time.sleep(settings.tick_interval_s)
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="navigator")
-    parser.add_argument("--once", action="store_true", help="run a single perceive/plan/poll cycle")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--once", action="store_true", help="run a single perceive/plan/poll cycle")
+    group.add_argument("--max-cycles", type=int, default=None,
+                       help="daemon mode: stop after N cycles (default: run forever)")
     args = parser.parse_args(argv)
-    if not args.once:
-        parser.error("only --once is supported; the interval daemon arrives in v1")
 
     settings = Settings.from_env()
     nav = build_navigator(settings)
-    sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=settings.repo,
-                         capture_output=True, text=True, check=True).stdout.strip()
-    nav.reconcile_on_startup()
-    created = nav.periodic_tick(base_commit_sha=sha)
-    runs = nav.approval_poll()
-    print(json.dumps({"mode": settings.mode, "driver": settings.driver,
-                      "proposals_created": len(created), "runs_executed": len(runs)}))
+    if args.once:
+        nav.reconcile_on_startup()
+        print(json.dumps(_cycle(nav, settings)))
+    else:
+        run_daemon(nav, settings, max_cycles=args.max_cycles)
     return 0
 
 if __name__ == "__main__":

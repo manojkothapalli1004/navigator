@@ -66,6 +66,37 @@ def test_main_once_prints_summary_and_exits_zero(tmp_path, monkeypatch, capsys):
     assert summary["proposals_created"] == 1  # fake planner proposes exactly one
     assert summary["runs_executed"] == 0      # dry_run never executes
 
-def test_main_without_once_is_rejected():
+def test_negative_max_cycles_is_rejected():
     with pytest.raises(SystemExit):
-        main([])
+        main(["--max-cycles", "not-a-number"])
+
+def _daemon_env(tmp_path, monkeypatch):
+    repo = _seed_repo(tmp_path)
+    for k in ["NAVIGATOR_DRIVER","NAVIGATOR_MODE","NAVIGATOR_ACT_BASE_URL","NAVIGATOR_ORC_BASE_URL"]:
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("NAVIGATOR_REPO", str(repo))
+    monkeypatch.setenv("NAVIGATOR_LOCK_PATH", str(tmp_path/"nav.lock"))
+    monkeypatch.setenv("NAVIGATOR_WORKTREE_ROOT", str(tmp_path/"wt"))
+
+def test_daemon_runs_bounded_cycles_and_sleeps_interval(tmp_path, monkeypatch, capsys):
+    _daemon_env(tmp_path, monkeypatch)
+    monkeypatch.setenv("NAVIGATOR_TICK_INTERVAL_S", "123")
+    sleeps = []
+    import navigator.__main__ as m
+    monkeypatch.setattr(m.time, "sleep", sleeps.append)
+    assert main(["--max-cycles", "2"]) == 0
+    lines = [json.loads(l) for l in capsys.readouterr().out.strip().splitlines()]
+    assert [l["cycle"] for l in lines] == [1, 2]
+    assert all(l["mode"] == "dry_run" for l in lines)
+    assert sleeps == [123]  # sleeps between cycles, not after the last
+
+def test_daemon_is_default_when_once_absent(tmp_path, monkeypatch, capsys):
+    _daemon_env(tmp_path, monkeypatch)
+    import navigator.__main__ as m
+    monkeypatch.setattr(m.time, "sleep", lambda s: None)
+    assert main(["--max-cycles", "1"]) == 0
+    assert json.loads(capsys.readouterr().out.strip())["cycle"] == 1
+
+def test_once_and_max_cycles_are_mutually_exclusive():
+    with pytest.raises(SystemExit):
+        main(["--once", "--max-cycles", "2"])
