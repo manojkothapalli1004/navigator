@@ -5,8 +5,12 @@ from navigator.contracts.enums import Role
 from navigator.safety.budget_guard import BudgetGuard
 from navigator.safety.errors import DriverParseError
 
+_PROPOSAL_KEYS = {"title": str, "rationale": str, "intended_changes": str, "affected_files": list}
+
 _ROLE_OUTPUT_SPEC = {
-    Role.planner: 'Respond with ONLY a JSON object: {"proposals": [{...}], "summary": "..."}',
+    Role.planner: ('Respond with ONLY a JSON object: {"proposals": [{"title": "...", '
+                   '"rationale": "...", "intended_changes": "...", "affected_files": ["path", ...]}], '
+                   '"summary": "..."}'),
     Role.builder: 'Respond with ONLY a JSON object: {"file_writes": [[relpath, content], ...], "commands": [[argv...], ...], "summary": "..."}',
     Role.verifier: 'Respond with ONLY a JSON object: {"commands": [[argv...], ...], "summary": "..."}',
 }
@@ -60,6 +64,13 @@ class ClaudeSDKDriver:
             proposals = payload.get("proposals")
             if not isinstance(proposals, list) or not all(isinstance(p, dict) for p in proposals):
                 raise DriverParseError("planner response must contain a 'proposals' list of objects")
+            for p in proposals:
+                for key, typ in _PROPOSAL_KEYS.items():
+                    if not isinstance(p.get(key), typ):
+                        raise DriverParseError(
+                            f"proposal missing or mistyped {key!r} (expected {typ.__name__}): {p!r}"[:200])
+                if not all(isinstance(f, str) for f in p["affected_files"]):
+                    raise DriverParseError(f"affected_files must be a list of strings: {p['affected_files']!r}")
 
         file_writes = [self._parse_file_write(entry) for entry in payload.get("file_writes", [])]
         commands = [self._parse_command(entry) for entry in payload.get("commands", [])]

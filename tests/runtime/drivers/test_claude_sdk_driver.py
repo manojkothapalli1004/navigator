@@ -47,6 +47,26 @@ def test_prompt_contains_role_context_and_worktree():
     assert "trader" in prompts[0]
     assert "/tmp/w1" in prompts[0]
 
+def test_planner_proposal_missing_required_key_rejected():
+    # live haiku regression 2026-07-13: model invented its own keys → KeyError in loop
+    bad = {k: v for k, v in PROPOSAL.items() if k != "intended_changes"}
+    d = make_driver({"proposals": [bad], "summary": "s"})
+    with pytest.raises(DriverParseError, match="intended_changes"):
+        d.run_role(DriverRequest(role=Role.planner, context={}))
+
+def test_planner_proposal_wrong_types_rejected():
+    bad = dict(PROPOSAL, affected_files="not-a-list")
+    d = make_driver({"proposals": [bad], "summary": "s"})
+    with pytest.raises(DriverParseError, match="affected_files"):
+        d.run_role(DriverRequest(role=Role.planner, context={}))
+
+def test_planner_prompt_spells_out_proposal_schema():
+    prompts = []
+    d = make_driver({"proposals": [], "summary": ""}, prompts=prompts)
+    d.run_role(DriverRequest(role=Role.planner, context={}))
+    for key in ("title", "rationale", "intended_changes", "affected_files"):
+        assert key in prompts[0]
+
 def test_budget_checked_before_call():
     prompts = []
     d = make_driver({"proposals": [], "summary": ""}, max_cost_usd=0.1, est=0.25, prompts=prompts)

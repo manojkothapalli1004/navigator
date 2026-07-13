@@ -97,6 +97,24 @@ def test_daemon_is_default_when_once_absent(tmp_path, monkeypatch, capsys):
     assert main(["--max-cycles", "1"]) == 0
     assert json.loads(capsys.readouterr().out.strip())["cycle"] == 1
 
+def test_daemon_survives_a_failing_cycle(tmp_path, monkeypatch, capsys):
+    # live regression 2026-07-13: ORC restart mid-boot → ConnectError killed the daemon
+    _daemon_env(tmp_path, monkeypatch)
+    import navigator.__main__ as m
+    monkeypatch.setattr(m.time, "sleep", lambda s: None)
+    calls = {"n": 0}
+    real_cycle = m._cycle
+    def flaky_cycle(nav, settings):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise ConnectionError("dependency down")
+        return real_cycle(nav, settings)
+    monkeypatch.setattr(m, "_cycle", flaky_cycle)
+    assert main(["--max-cycles", "2"]) == 0
+    lines = [json.loads(l) for l in capsys.readouterr().out.strip().splitlines()]
+    assert "error" in lines[0] and "dependency down" in lines[0]["error"]
+    assert lines[1]["cycle"] == 2 and "error" not in lines[1]
+
 def test_once_and_max_cycles_are_mutually_exclusive():
     with pytest.raises(SystemExit):
         main(["--once", "--max-cycles", "2"])

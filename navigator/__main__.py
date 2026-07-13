@@ -45,7 +45,10 @@ def run_daemon(nav: Navigator, settings: Settings, *, max_cycles: int | None = N
     cycle = 0
     while True:
         cycle += 1
-        summary = _cycle(nav, settings)
+        try:
+            summary = _cycle(nav, settings)
+        except Exception as e:  # a dependency blip must not kill the daemon; retry next tick
+            summary = {"error": f"{type(e).__name__}: {e}"[:300]}
         print(json.dumps({"cycle": cycle, **summary}), flush=True)
         if max_cycles is not None and cycle >= max_cycles:
             return
