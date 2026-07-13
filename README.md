@@ -40,11 +40,14 @@ live-integration claims.
   (no operator hooks/plugins/skills leak in), `allowed_tools=[]`, `max_turns=2`; markdown fences
   stripped at the adapter so the driver parser stays strict. Smoke-tested live against haiku.
 - ✅ Daemon entrypoint: `python -m navigator --once` (reconcile → periodic_tick → approval_poll,
-  JSON summary on stdout). Interval daemon still v1.
+  JSON summary on stdout).
+- ✅ Interval daemon (2026-07-13): `python -m navigator` reconciles once then loops tick+poll
+  every `NAVIGATOR_TICK_INTERVAL_S`, one JSON summary line per cycle; `--max-cycles N` bounds it.
+  `SingleFlightLock` reclaims stale locks whose holder PID is dead or unverifiable; a live
+  holder still blocks.
 
 ### Not in v0 (deferred to v1+)
 
-- ❌ No interval daemon (`--once` only).
 - ❌ No curator, no ACT SSE/event push, no ACT-backed lease.
 - ❌ No memory-trust tagging (v1.5+, once `tag_entry`/`verify_entry_result` are exposed over HTTP).
 

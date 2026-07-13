@@ -31,8 +31,8 @@ Each fixed via TDD (failing test first). Suite 46 → 63 tests.
 - **Config**: safety-critical fields (`max_cost_usd`, `max_tool_failures`, …, `allowed_commands`)
   are still not env-wired — deliberate for v0's fixed safe defaults. Wire env overrides if v1
   needs per-deploy tuning.
-- **Lock**: no stale-lock TTL / PID-liveness recovery if the holding process dies. Acceptable
-  for v0 single-process use; add a recovery path in v1.
+- **Lock**: ~~no stale-lock recovery~~ RESOLVED 2026-07-13 — PID-liveness recovery landed
+  (dead/unparseable holder reclaimed; live holder, incl. other-user PIDs, still blocks).
 - **Command runner**: git subcommand flags like `git log --all/--format` remain allowed (they
   stay within the repo and don't read arbitrary files, so lower-risk than the now-closed
   `--no-index`). Consider exact-argv allowlisting for git as a v1 tightening.
