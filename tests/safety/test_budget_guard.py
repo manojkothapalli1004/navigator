@@ -14,3 +14,11 @@ def test_exact_cap_is_allowed():
     g = BudgetGuard(max_cost_usd=1.0)
     g.record_spend(0.7)
     g.check_before_call(estimated_usd=0.3)  # 1.0 == cap, strict > means allowed
+
+def test_reset_zeroes_spend_for_new_cycle():
+    from navigator.safety.budget_guard import BudgetGuard
+    g = BudgetGuard(2.0)
+    g.record_spend(2.0)
+    g.reset()
+    g.check_before_call(0.25)  # must not raise after reset
+    assert g.spent_usd == 0.0

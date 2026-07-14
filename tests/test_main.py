@@ -115,6 +115,28 @@ def test_daemon_survives_a_failing_cycle(tmp_path, monkeypatch, capsys):
     assert "error" in lines[0] and "dependency down" in lines[0]["error"]
     assert lines[1]["cycle"] == 2 and "error" not in lines[1]
 
+def test_daemon_resets_budget_each_cycle(tmp_path, monkeypatch):
+    # live regression 2026-07-14: process-lifetime budget exhausted after ~8 cycles,
+    # then every cycle failed BudgetExceeded. Budget must reset per tick.
+    from navigator.safety.budget_guard import BudgetGuard
+    import navigator.__main__ as m
+    monkeypatch.setattr(m.time, "sleep", lambda s: None)
+    guard = BudgetGuard(2.0)
+    class FakeDriver: pass
+    driver = FakeDriver(); driver.budget_guard = guard
+    class FakeNav:
+        def __init__(self): self.driver = driver
+        def reconcile_on_startup(self): pass
+    nav = FakeNav()
+    seen = []
+    def fake_cycle(n, s):
+        seen.append(n.driver.budget_guard.spent_usd)  # spend at cycle entry
+        n.driver.budget_guard.record_spend(2.0)       # exhaust within the cycle
+        return {}
+    monkeypatch.setattr(m, "_cycle", fake_cycle)
+    m.run_daemon(nav, Settings(), max_cycles=3)
+    assert seen == [0.0, 0.0, 0.0]  # reset before every cycle despite exhausting each
+
 def test_once_and_max_cycles_are_mutually_exclusive():
     with pytest.raises(SystemExit):
         main(["--once", "--max-cycles", "2"])

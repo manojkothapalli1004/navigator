@@ -40,11 +40,19 @@ def _cycle(nav: Navigator, settings: Settings) -> dict:
     return {"mode": settings.mode, "driver": settings.driver,
             "proposals_created": len(created), "runs_executed": len(runs)}
 
+def _reset_budget(nav: Navigator) -> None:
+    # The budget cap is per-cycle, not process-lifetime; a long-running daemon
+    # must zero accumulated spend each tick or it locks out after a few cycles.
+    guard = getattr(nav.driver, "budget_guard", None)
+    if guard is not None:
+        guard.reset()
+
 def run_daemon(nav: Navigator, settings: Settings, *, max_cycles: int | None = None) -> None:
     nav.reconcile_on_startup()
     cycle = 0
     while True:
         cycle += 1
+        _reset_budget(nav)
         try:
             summary = _cycle(nav, settings)
         except Exception as e:  # a dependency blip must not kill the daemon; retry next tick
