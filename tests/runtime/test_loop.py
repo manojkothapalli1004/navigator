@@ -18,7 +18,7 @@ def _seed(tmp_path):
     return repo, sha
 
 def _nav(tmp_path, repo, mode):
-    s = Settings(mode=mode, worktree_root=str(tmp_path/"wt"))
+    s = Settings(mode=mode, worktree_root=str(tmp_path/"wt"), outcome_path=str(tmp_path/"outcomes.jsonl"))
     return Navigator(act=FakeACTClient(), orc=FakeORCClient(), driver=FakeSubagentDriver(),
                      runner=CommandRunner(allowlist=s.allowed_commands, worktree_root=tmp_path/"wt"),
                      settings=s, repo=str(repo), lock_path=tmp_path/"nav.lock")
@@ -66,7 +66,7 @@ def test_approval_poll_dedup_works_through_protocol_and_counts_completed_runs(tm
     from navigator.contracts.run import Run
     repo, sha = _seed(tmp_path)
     inner = FakeACTClient()
-    s = Settings(mode="execute", worktree_root=str(tmp_path/"wt"))
+    s = Settings(mode="execute", worktree_root=str(tmp_path/"wt"), outcome_path=str(tmp_path/"outcomes.jsonl"))
     nav = Navigator(act=ProtocolOnlyACT(inner), orc=FakeORCClient(), driver=FakeSubagentDriver(),
                     runner=CommandRunner(allowlist=s.allowed_commands, worktree_root=tmp_path/"wt"),
                     settings=s, repo=str(repo), lock_path=tmp_path/"nav.lock")
@@ -94,7 +94,7 @@ def test_periodic_tick_returns_stored_proposal_identity(tmp_path):
             stored.id = f"proposal-SERVER-{len(self._inner.proposals)}"
             return self._inner.create_proposal(stored)
 
-    s = Settings(mode="dry_run", worktree_root=str(tmp_path/"wt"))
+    s = Settings(mode="dry_run", worktree_root=str(tmp_path/"wt"), outcome_path=str(tmp_path/"outcomes.jsonl"))
     nav = Navigator(act=RemintingACT(inner), orc=FakeORCClient(), driver=FakeSubagentDriver(),
                     runner=CommandRunner(allowlist=s.allowed_commands, worktree_root=tmp_path/"wt"),
                     settings=s, repo=str(repo), lock_path=tmp_path/"nav.lock")

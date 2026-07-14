@@ -16,7 +16,8 @@ def test_full_loop_propose_approve_execute_review_merge_outcome(tmp_path):
     subprocess.run(["git","config","user.name","t"], cwd=repo, check=True)
     subprocess.run(["git","commit","--allow-empty","-m","base"], cwd=repo, check=True, capture_output=True)
     sha = subprocess.run(["git","rev-parse","HEAD"], cwd=repo, capture_output=True, text=True).stdout.strip()
-    s = Settings(mode="execute", worktree_root=str(tmp_path/"wt"))
+    s = Settings(mode="execute", worktree_root=str(tmp_path/"wt"),
+                 outcome_path=str(tmp_path/"outcomes.jsonl"))
     nav = Navigator(act=FakeACTClient(), orc=FakeORCClient(), driver=FakeSubagentDriver(),
                     runner=CommandRunner(allowlist=s.allowed_commands, worktree_root=tmp_path/"wt"),
                     settings=s, repo=str(repo), lock_path=tmp_path/"nav.lock")

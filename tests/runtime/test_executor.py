@@ -25,7 +25,8 @@ def _proposal(repo, sha):
                     proposal_origin_hash=compute_origin_hash(str(repo),"x",["navigator_touch.py"],"periodic",None))
 
 def _deps(tmp_path, repo):
-    s = Settings(worktree_root=str(tmp_path/"wt"))
+    s = Settings(worktree_root=str(tmp_path/"wt"),
+                 outcome_path=str(tmp_path/"outcomes.jsonl"))  # hermetic: never touch the global /tmp path
     return dict(act=FakeACTClient(), orc=FakeORCClient(), driver=FakeSubagentDriver(),
                 runner=CommandRunner(allowlist=s.allowed_commands, worktree_root=tmp_path/"wt"),
                 settings=s)
@@ -106,7 +107,7 @@ def test_execute_and_merge_work_through_protocol_only_client(tmp_path):
     from tests.support import ProtocolOnlyACT
     repo, sha = _seed(tmp_path)
     inner = FakeACTClient()
-    s = Settings(worktree_root=str(tmp_path/"wt"))
+    s = Settings(worktree_root=str(tmp_path/"wt"), outcome_path=str(tmp_path/"outcomes.jsonl"))
     d = dict(act=ProtocolOnlyACT(inner), orc=FakeORCClient(), driver=FakeSubagentDriver(),
              runner=CommandRunner(allowlist=s.allowed_commands, worktree_root=tmp_path/"wt"),
              settings=s)
