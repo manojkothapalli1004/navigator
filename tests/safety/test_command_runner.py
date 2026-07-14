@@ -50,3 +50,30 @@ def test_timeout_wrapped_as_command_rejected(tmp_path):
     r = CommandRunner(allowlist=["sleep"], worktree_root=tmp_path, timeout_s=0.2)
     with pytest.raises(CommandRejected):
         r.run(["sleep","5"], cwd=tmp_path)
+
+# --- git flag allowlisting (v1 tightening) ---
+
+def _runner(tmp_path):
+    from navigator.safety.command_runner import CommandRunner
+    return CommandRunner(allowlist=["git status", "git diff", "git log"],
+                         worktree_root=tmp_path)
+
+def test_git_safe_flags_allowed(tmp_path):
+    import subprocess
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
+    r = _runner(tmp_path)
+    assert r.run(["git", "status", "--porcelain"], cwd=tmp_path).returncode == 0
+    assert r.run(["git", "diff", "--stat"], cwd=tmp_path).returncode == 0
+    assert r.run(["git", "log", "--oneline"], cwd=tmp_path).returncode in (0, 128)  # 128: empty repo
+
+def test_git_file_writing_flag_rejected(tmp_path):
+    import pytest
+    from navigator.safety.errors import CommandRejected
+    with pytest.raises(CommandRejected, match="--output"):
+        _runner(tmp_path).run(["git", "log", "--output=x"], cwd=tmp_path)
+
+def test_git_unknown_flag_rejected(tmp_path):
+    import pytest
+    from navigator.safety.errors import CommandRejected
+    with pytest.raises(CommandRejected, match="--all"):
+        _runner(tmp_path).run(["git", "log", "--all"], cwd=tmp_path)

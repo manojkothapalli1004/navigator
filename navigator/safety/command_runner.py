@@ -7,6 +7,13 @@ _METACHARS = set(";|&$`><\n*?!")
 # Flags that let an otherwise-allowlisted command escape the worktree boundary
 # (e.g. `git diff --no-index <abs> <abs>` reads arbitrary files regardless of cwd).
 _REJECTED_FLAGS = {"--no-index"}
+# Exact flag allowlist for LLM-issued git commands (trusted runtime git calls
+# bypass the runner). Any other dashed token in a git argv is rejected.
+_GIT_SAFE_FLAGS = {
+    "status": {"--porcelain", "-s", "--short", "-b"},
+    "diff": {"--stat", "--name-only", "--name-status", "--cached", "--staged"},
+    "log": {"--oneline", "--name-only", "--stat", "-1", "-5", "-10", "-20"},
+}
 
 @dataclass
 class CommandResult:
@@ -36,6 +43,11 @@ class CommandRunner:
                 raise CommandRejected(f"absolute path token not allowed: {token!r}")
         if not self._is_allowed(argv):
             raise CommandRejected(f"command not on allowlist: {' '.join(argv)}")
+        if argv[0] == "git" and len(argv) >= 2:
+            safe = _GIT_SAFE_FLAGS.get(argv[1], set())
+            for token in argv[2:]:
+                if token.startswith("-") and token not in safe:
+                    raise CommandRejected(f"git flag not on safe list: {token!r}")
         cwd = Path(cwd).resolve()
         if cwd != self.worktree_root and self.worktree_root not in cwd.parents:
             raise CommandRejected(f"cwd outside worktree: {cwd}")
