@@ -11,6 +11,7 @@ class Outcome(BaseModel):
     id: str = Field(default_factory=lambda: new_id("outcome"))
     schema_version: int = 1
     run_id: str
+    proposal_id: str | None = None
     status: str
     summary: str
     lessons: list[str] = Field(default_factory=list)

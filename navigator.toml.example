@@ -30,19 +30,24 @@ orc_base_url = ""   # unset
 worktree_root = "/tmp/navigator-worktrees"
 # NAVIGATOR_TICK_INTERVAL_S — periodic tick interval (seconds).
 tick_interval_s = 900
+# NAVIGATOR_OUTCOME_PATH — append-only JSONL trail of run outcomes (best-effort; a write
+# failure never fails a run). Lessons also go to ORC memory independently.
+outcome_path = "/tmp/navigator-outcomes.jsonl"
 
-# --- Safety limits (NOT env-wired in v0; fixed safe defaults in Settings) -------------------
-# These are documented for transparency. v0's Settings.from_env() does NOT read env overrides
-# for them — they always use these defaults. Wiring env overrides is a v1 follow-up
-# (see KNOWN_FOLLOWUPS.md).
+# --- Safety limits (env-wired as of 2026-07-14) ---------------------------------------------
+# Settings.from_env() reads NAVIGATOR_MAX_COST_USD (must be > 0) and NAVIGATOR_MAX_TOOL_FAILURES
+# (must be >= 1); non-numeric or out-of-range values raise a descriptive ValueError naming the
+# variable. The remaining limits below use fixed defaults.
 [safety]
-max_tool_failures = 5        # circuit breaker: total tool failures per run
+max_tool_failures = 5        # circuit breaker: total tool failures per run (NAVIGATOR_MAX_TOOL_FAILURES)
 max_identical_failures = 3   # circuit breaker: identical repeated failures
 max_run_duration_s = 1800    # circuit breaker: wall-clock per run
-max_cost_usd = 2.0           # budget guard: pre-call ceiling
+max_cost_usd = 2.0           # budget guard: pre-call ceiling (NAVIGATOR_MAX_COST_USD)
 max_proposals_per_tick = 3   # cap on proposals created per periodic tick
 max_failed_tests = 50        # circuit breaker: failed-test count
 
-# Command allowlist (DEFAULT_ALLOWLIST in config.py). argv-only, no shell. py_compile uses python3.
+# Command allowlist. NAVIGATOR_ALLOWED_COMMANDS overrides it (comma-separated); entries must be
+# bare command prefixes — no '/', shell metacharacters, or whitespace-injected operators.
+# argv-only, no shell. LLM-issued git commands are further limited to an exact safe-flag set.
 [safety.allowed_commands]
 commands = ["git status", "git diff", "git log", "pytest", "python3 -m py_compile", "uv run pytest"]

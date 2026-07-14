@@ -49,6 +49,26 @@ def test_merge_only_after_approval(tmp_path):
     assert d["act"].runs[run.id].status == RunStatus.completed
     assert d["orc"].updates  # outcome written
 
+def test_successful_run_appends_outcome_to_store(tmp_path):
+    from navigator.runtime.outcome_store import OutcomeStore
+    repo, sha = _seed(tmp_path); d = _deps(tmp_path, repo)
+    d["settings"].outcome_path = str(tmp_path / "outcomes.jsonl")
+    run = execute_proposal(_proposal(repo, sha), **d)
+    approval = d["act"].list_approvals(target=run.id, gate=ApprovalGate.merge)[0]
+    d["act"].decide_approval(approval.id, ApprovalDecision.approved, actor="m")
+    merge_after_approval(run, **d)
+    stored = OutcomeStore(tmp_path / "outcomes.jsonl").for_proposal(run.proposal_id)
+    assert [o.run_id for o in stored] == [run.id]
+    assert stored[0].status == "completed"
+
+def test_store_write_failure_does_not_fail_run(tmp_path):
+    repo, sha = _seed(tmp_path); d = _deps(tmp_path, repo)
+    # point the store at a path whose parent is a FILE → mkdir/open raises
+    clash = tmp_path / "afile"; clash.write_text("x")
+    d["settings"].outcome_path = str(clash / "sub" / "outcomes.jsonl")
+    run = execute_proposal(_proposal(repo, sha), **d)  # must NOT raise
+    assert run.phase == RunPhase.awaiting_review  # run proceeded normally
+
 def test_create_worktree_failure_marks_run_failed(tmp_path):
     repo, sha = _seed(tmp_path); d = _deps(tmp_path, repo)
     bad = _proposal(repo, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef")  # invalid base sha

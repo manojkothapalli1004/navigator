@@ -28,13 +28,15 @@ Each fixed via TDD (failing test first). Suite 46 → 63 tests.
 
 ## REMAINING (genuine v1 / intentional)
 
-- **Config**: safety-critical fields (`max_cost_usd`, `max_tool_failures`, …, `allowed_commands`)
-  are still not env-wired — deliberate for v0's fixed safe defaults. Wire env overrides if v1
-  needs per-deploy tuning.
+- **Config**: ~~safety fields not env-wired~~ RESOLVED 2026-07-14 — `NAVIGATOR_MAX_COST_USD`
+  (>0), `NAVIGATOR_MAX_TOOL_FAILURES` (>=1), and `NAVIGATOR_ALLOWED_COMMANDS` (comma-separated,
+  injection-guarded) are now read by `Settings.from_env()`. Remaining limits still use defaults.
 - **Lock**: ~~no stale-lock recovery~~ RESOLVED 2026-07-13 — PID-liveness recovery landed
   (dead/unparseable holder reclaimed; live holder, incl. other-user PIDs, still blocks).
-- **Command runner**: git subcommand flags like `git log --all/--format` remain allowed (they
-  stay within the repo and don't read arbitrary files, so lower-risk than the now-closed
-  `--no-index`). Consider exact-argv allowlisting for git as a v1 tightening.
-- **Outcome store**: `_write_outcome` returns an `Outcome` that's discarded — there is no Outcome
-  persistence in v0 (lessons go to ORC memory only). Add a store in v1 if needed.
+- **Command runner**: ~~broad git flags allowed~~ RESOLVED 2026-07-14 — LLM-issued git commands
+  are limited to an exact per-subcommand safe-flag set (`_GIT_SAFE_FLAGS`); file-writing flags
+  (`--output=`) and unknown flags (`--all`) are rejected. Trusted runtime git calls bypass the runner.
+- **Outcome store**: ~~Outcome discarded~~ RESOLVED 2026-07-14 — `OutcomeStore` (append-only
+  JSONL at `NAVIGATOR_OUTCOME_PATH`) persists each outcome; corrupt trailing lines are skipped on
+  read; a store-write failure never fails the run. `latest(n)`/`for_proposal(id)` read API added
+  (planner not yet wired to consult it — that is the next v1 step).

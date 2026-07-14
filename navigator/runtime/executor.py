@@ -9,6 +9,7 @@ from navigator.contracts.enums import RunPhase, RunStatus, ApprovalGate, Approva
 from navigator.runtime.worktree import (
     WorktreeHandle, create_worktree, preserve_failed, remove_worktree)
 from navigator.runtime.checkpoint import diff_artifact
+from navigator.runtime.outcome_store import OutcomeStore
 from navigator.runtime.phases import run_build_and_verify
 from navigator.ids import new_id
 
@@ -30,7 +31,7 @@ def execute_proposal(proposal: Proposal, *, act, orc, driver, runner, settings) 
         run.status = RunStatus.failed; run.phase = RunPhase.finalizing
         run.ended_at = datetime.now(timezone.utc); act.update_run(run)
         _write_outcome(orc, run, status="failed", summary=f"worktree creation failed: {e}",
-                       lessons=[f"create_worktree raised: {e}"])
+                       lessons=[f"create_worktree raised: {e}"], settings=settings)
         _emit(act, run, "run.failed", Severity.error, error=str(e)); return run
     run.worktree_path = str(handle.path)
     run.phase = RunPhase.building; act.update_run(run); _emit(act, run, "run.building")
@@ -41,7 +42,7 @@ def execute_proposal(proposal: Proposal, *, act, orc, driver, runner, settings) 
         run.status = RunStatus.failed; run.phase = RunPhase.finalizing
         run.ended_at = datetime.now(timezone.utc); act.update_run(run)
         _write_outcome(orc, run, status="failed", summary=f"exception: {e}",
-                       lessons=[f"build/verify raised: {e}"], preserved=handle.path)
+                       lessons=[f"build/verify raised: {e}"], preserved=handle.path, settings=settings)
         _emit(act, run, "run.failed", Severity.error, error=str(e)); return run
     # Correction 2: normal top-level import of Checkpoint (not dynamic __import__)
     run.checkpoints = [Checkpoint(sha=c, label="cp") for c in result.checkpoints]
@@ -52,7 +53,7 @@ def execute_proposal(proposal: Proposal, *, act, orc, driver, runner, settings) 
         _write_outcome(orc, run, status="failed", summary="verification failed",
                        lessons=[f"verify rc={result.verify_returncode}: {result.verify_output[:200]}"],
                        verification_notes=result.verify_output[:500], preserved=handle.path,
-                       checkpoints_made=len(result.checkpoints))
+                       checkpoints_made=len(result.checkpoints), settings=settings)
         _emit(act, run, "run.failed", Severity.error); return run
     run.phase = RunPhase.awaiting_review; act.update_run(run)
     act.create_approval(target=run.id, gate=ApprovalGate.merge)
@@ -75,7 +76,7 @@ def merge_after_approval(run: Run, *, act, orc, driver, runner, settings) -> Run
     run.phase = RunPhase.finalizing; run.status = RunStatus.completed
     run.ended_at = datetime.now(timezone.utc); act.update_run(run)
     _write_outcome(orc, run, status="completed", summary="merged after approval",
-                   lessons=["change merged"], section="decisions")
+                   lessons=["change merged"], section="decisions", settings=settings)
     _cleanup_worktree(run, repo)
     _emit(act, run, "run.completed")
     return run
@@ -99,13 +100,19 @@ def _repo_for(run, act) -> str:
     return prop.repo
 
 def _write_outcome(orc, run, *, status, summary, lessons, verification_notes=None,
-                   preserved=None, checkpoints_made=0, section=None):
-    out = Outcome(run_id=run.id, status=status, summary=summary, lessons=lessons,
-                  verification_notes=verification_notes, provenance=f"navigator {run.id}",
+                   preserved=None, checkpoints_made=0, section=None, settings=None):
+    out = Outcome(run_id=run.id, proposal_id=run.proposal_id, status=status, summary=summary,
+                  lessons=lessons, verification_notes=verification_notes,
+                  provenance=f"navigator {run.id}",
                   rollback=Rollback(checkpoints_made=checkpoints_made,
                                     worktree_preserved=preserved is not None,
                                     preserved_path=str(preserved) if preserved else None))
     target_section = section or ("known_failures" if status == "failed" else "status")
     note = f"[{run.id}] {summary} | lessons: {'; '.join(lessons)}"
     orc.apply_memory_update(section=target_section, note=note, replace=False)
+    if settings is not None and getattr(settings, "outcome_path", None):
+        try:
+            OutcomeStore(settings.outcome_path).append(out)
+        except OSError:
+            pass  # local trail is best-effort; a store failure must not fail the run
     return out
