@@ -34,10 +34,11 @@ class Settings:
             orc_base_url=os.getenv("NAVIGATOR_ORC_BASE_URL"),
             worktree_root=os.getenv("NAVIGATOR_WORKTREE_ROOT", "/tmp/navigator-worktrees"),
             tick_interval_s=_int_env("NAVIGATOR_TICK_INTERVAL_S", "900"),
-            max_tool_failures=_int_env("NAVIGATOR_MAX_TOOL_FAILURES", "5"),
+            allowed_commands=_allowlist_env("NAVIGATOR_ALLOWED_COMMANDS"),
+            max_tool_failures=_positive_int_env("NAVIGATOR_MAX_TOOL_FAILURES", "5"),
             max_identical_failures=_int_env("NAVIGATOR_MAX_IDENTICAL_FAILURES", "3"),
             max_run_duration_s=_int_env("NAVIGATOR_MAX_RUN_DURATION_S", "1800"),
-            max_cost_usd=_float_env("NAVIGATOR_MAX_COST_USD", "2.0"),
+            max_cost_usd=_positive_float_env("NAVIGATOR_MAX_COST_USD", "2.0"),
             max_proposals_per_tick=_int_env("NAVIGATOR_MAX_PROPOSALS_PER_TICK", "3"),
             max_failed_tests=_int_env("NAVIGATOR_MAX_FAILED_TESTS", "50"),
             repo=os.getenv("NAVIGATOR_REPO"),
@@ -60,3 +61,30 @@ def _float_env(name: str, default: str) -> float:
         return float(raw)
     except ValueError as e:
         raise ValueError(f"{name} must be a number, got {raw!r}") from e
+
+
+def _positive_int_env(name: str, default: str) -> int:
+    v = _int_env(name, default)
+    if v < 1:
+        raise ValueError(f"{name} must be >= 1, got {v}")
+    return v
+
+
+def _positive_float_env(name: str, default: str) -> float:
+    v = _float_env(name, default)
+    if v <= 0:
+        raise ValueError(f"{name} must be > 0, got {v}")
+    return v
+
+
+_ALLOWLIST_FORBIDDEN = set(";|&$`><\n*?!\\/")
+
+def _allowlist_env(name: str) -> list[str]:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return list(DEFAULT_ALLOWLIST)
+    entries = [e.strip() for e in raw.split(",") if e.strip()]
+    for e in entries:
+        if any(ch in _ALLOWLIST_FORBIDDEN for ch in e):
+            raise ValueError(f"{name} entry contains forbidden character: {e!r}")
+    return entries

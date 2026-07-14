@@ -45,3 +45,29 @@ def test_from_env_bad_float_is_descriptive(monkeypatch):
     import pytest
     with pytest.raises(ValueError, match="NAVIGATOR_MAX_COST_USD"):
         cfg.Settings.from_env()
+
+def test_nonpositive_cost_and_failures_rejected(monkeypatch):
+    import pytest
+    monkeypatch.setenv("NAVIGATOR_MAX_COST_USD", "0")
+    with pytest.raises(ValueError, match="NAVIGATOR_MAX_COST_USD"):
+        cfg.Settings.from_env()
+    monkeypatch.setenv("NAVIGATOR_MAX_COST_USD", "2.0")
+    monkeypatch.setenv("NAVIGATOR_MAX_TOOL_FAILURES", "0")
+    with pytest.raises(ValueError, match="NAVIGATOR_MAX_TOOL_FAILURES"):
+        cfg.Settings.from_env()
+
+def test_allowed_commands_env_wiring(monkeypatch):
+    monkeypatch.setenv("NAVIGATOR_ALLOWED_COMMANDS", "git status, uv run pytest ,ruff check")
+    s = cfg.Settings.from_env()
+    assert s.allowed_commands == ["git status", "uv run pytest", "ruff check"]
+
+def test_allowed_commands_unset_keeps_default(monkeypatch):
+    monkeypatch.delenv("NAVIGATOR_ALLOWED_COMMANDS", raising=False)
+    assert cfg.Settings.from_env().allowed_commands == cfg.DEFAULT_ALLOWLIST
+
+def test_allowed_commands_rejects_dangerous_entries(monkeypatch):
+    import pytest
+    for bad in ("git status;rm", "cat /etc/passwd", "python -c `x`", "a|b"):
+        monkeypatch.setenv("NAVIGATOR_ALLOWED_COMMANDS", bad)
+        with pytest.raises(ValueError, match="NAVIGATOR_ALLOWED_COMMANDS"):
+            cfg.Settings.from_env()
