@@ -69,6 +69,26 @@ def test_plain_fences_without_language_tag_stripped(monkeypatch):
     _stub_sdk(monkeypatch, captured, results=('```\n{"a": 1}\n```',))
     assert make_sdk_query_fn()("x") == '{"a": 1}'
 
+def test_fenced_json_embedded_in_prose_extracted(monkeypatch):
+    # observed live 2026-07-15: fable-5 planner cycle failed DriverParseError;
+    # models sometimes wrap the fenced block in prose despite the system prompt
+    captured = {}
+    wrapped = 'Here is the plan:\n```json\n{"commands": [], "summary": "ok"}\n```\nLet me know.'
+    _stub_sdk(monkeypatch, captured, results=(wrapped,))
+    assert make_sdk_query_fn()("x") == '{"commands": [], "summary": "ok"}'
+
+def test_bare_json_embedded_in_prose_extracted(monkeypatch):
+    captured = {}
+    wrapped = 'Sure!\n{"commands": [], "summary": "ok"}\nDone.'
+    _stub_sdk(monkeypatch, captured, results=(wrapped,))
+    assert make_sdk_query_fn()("x") == '{"commands": [], "summary": "ok"}'
+
+def test_truncated_json_passes_through_for_driver_error(monkeypatch):
+    # no closing brace: adapter must not invent structure; driver reports it
+    captured = {}
+    _stub_sdk(monkeypatch, captured, results=('{"commands": [',))
+    assert make_sdk_query_fn()("x") == '{"commands": ['
+
 def test_driver_end_to_end_with_stubbed_sdk(monkeypatch):
     captured = {}
     _stub_sdk(monkeypatch, captured, results=('{"commands": [["uv","run","pytest","-q"]], "summary": "verify"}',))

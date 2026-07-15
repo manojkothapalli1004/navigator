@@ -45,7 +45,9 @@ class ClaudeSDKDriver:
         try:
             payload = json.loads(raw)
         except (ValueError, TypeError) as e:
-            raise DriverParseError(f"response is not valid JSON: {raw[:120]!r}") from e
+            raise DriverParseError(
+                f"response is not valid JSON (len={len(raw)}): "
+                f"head={raw[:120]!r} tail={raw[-120:]!r}") from e
         if not isinstance(payload, dict):
             raise DriverParseError(f"response must be a JSON object, got {type(payload).__name__}")
 

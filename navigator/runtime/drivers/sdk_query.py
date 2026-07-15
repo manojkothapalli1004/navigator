@@ -1,4 +1,5 @@
 import asyncio
+import re
 from typing import Callable
 
 DEFAULT_SYSTEM_PROMPT = (
@@ -45,11 +46,15 @@ def make_sdk_query_fn(*, model: str | None = None,
 
 
 def _strip_fences(text: str) -> str:
-    # live models fence JSON despite instructions; the driver parser stays
+    # live models fence JSON and wrap it in prose despite instructions
+    # (observed 2026-07-15: fable-5 planner reply); the driver parser stays
     # strict, so bare JSON is this adapter's responsibility
     stripped = text.strip()
-    if stripped.startswith("```") and stripped.endswith("```"):
-        first_newline = stripped.find("\n")
-        if first_newline != -1:
-            return stripped[first_newline + 1:-3].strip()
+    match = re.search(r"```(?:\w+)?\n(.*?)```", stripped, re.DOTALL)
+    if match:
+        return match.group(1).strip()
+    if not stripped.startswith("{"):
+        start, end = stripped.find("{"), stripped.rfind("}")
+        if start != -1 and end > start:
+            return stripped[start:end + 1]
     return stripped

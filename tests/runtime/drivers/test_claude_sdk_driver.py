@@ -117,3 +117,11 @@ def test_role_permissions_enforced_on_output():
     d2 = make_driver({"commands": [], "file_writes": [["a.py", "x"]], "summary": ""})
     with pytest.raises(DriverParseError):
         d2.run_role(DriverRequest(role=Role.verifier, context={}, worktree_path="/tmp/w"))
+
+def test_parse_error_includes_head_and_tail_of_raw():
+    # a 120-char head alone hid the failure mode of a live 2026-07-15 planner
+    # cycle; the tail shows whether the response was truncated mid-JSON
+    raw = '{"proposals": [' + '{"title": "x"}, ' * 50 + '{"title": "cut off'
+    d = make_driver(raw)
+    with pytest.raises(DriverParseError, match="cut off"):
+        d.run_role(DriverRequest(role=Role.planner, context={}))
