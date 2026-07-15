@@ -76,7 +76,8 @@ class HTTPACTClient:
 
     def __init__(self, base_url: str, client: httpx.Client | None = None):
         self.base_url = f"{base_url.rstrip('/')}/api/v1/agent"
-        self.client = client or httpx.Client()
+        # local ACT can stall past httpx's 5s default (live ReadTimeout 2026-07-15)
+        self.client = client or httpx.Client(timeout=30.0)
 
     # ---- proposals ----------------------------------------------------------
 

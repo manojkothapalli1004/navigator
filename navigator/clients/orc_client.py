@@ -20,7 +20,8 @@ class FakeORCClient:
 class HTTPORCClient:
     def __init__(self, base_url: str, client: httpx.Client | None = None):
         self.base_url = base_url.rstrip("/")
-        self.client = client or httpx.Client()
+        # local ORC can stall past httpx's 5s default (live ReadTimeout 2026-07-15)
+        self.client = client or httpx.Client(timeout=30.0)
     def get_canonical_memory(self) -> dict:
         r = self.client.get(f"{self.base_url}/api/memory"); r.raise_for_status(); return r.json()
     def get_digest(self) -> dict:

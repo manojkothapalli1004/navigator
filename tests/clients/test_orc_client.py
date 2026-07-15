@@ -29,3 +29,10 @@ def test_http_orc_get_raises_on_error_status():
         orc.get_canonical_memory()
     with pytest.raises(httpx.HTTPStatusError):
         orc.get_digest()
+
+def test_default_client_timeout_is_generous():
+    # observed live 2026-07-15: cycle failed ReadTimeout against local ORC;
+    # httpx's 5s default is too tight for a slow local service on a 15m tick
+    from navigator.clients.orc_client import HTTPORCClient
+    c = HTTPORCClient("http://x")
+    assert c.client.timeout.read >= 30

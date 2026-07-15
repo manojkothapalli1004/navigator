@@ -263,3 +263,8 @@ def test_http_emit_event_maps_warning_to_act_warn():
                          correlation_id="corr-1", payload={"diff": "d"}))
     assert fake.events == [{"kind": "run.awaiting_review", "severity": "warn",
                             "correlation_id": "corr-1", "payload": {"diff": "d"}}]
+
+def test_default_client_timeout_is_generous():
+    from navigator.clients.act_client import HTTPACTClient
+    c = HTTPACTClient("http://x")
+    assert c.client.timeout.read >= 30
