@@ -17,7 +17,8 @@ def _make_driver(settings: Settings):
     if settings.driver == "fake":
         return FakeSubagentDriver()
     if settings.driver == "claude_sdk":
-        return ClaudeSDKDriver(query_fn=make_sdk_query_fn(model=settings.sdk_model),
+        return ClaudeSDKDriver(query_fn=make_sdk_query_fn(model=settings.sdk_model,
+                                                          timeout_s=settings.sdk_timeout_s),
                                budget_guard=BudgetGuard(settings.max_cost_usd))
     raise ValueError(f"unknown NAVIGATOR_DRIVER {settings.driver!r}")
 

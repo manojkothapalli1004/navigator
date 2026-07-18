@@ -40,6 +40,15 @@ def test_from_env_wires_safety_and_daemon_fields(monkeypatch):
     assert s.lock_path == "/tmp/nav.lock"
     assert s.sdk_model == "claude-haiku-4-5-20251001"
 
+def test_sdk_timeout_env_wiring(monkeypatch):
+    import pytest
+    assert cfg.Settings.from_env().sdk_timeout_s == 300.0
+    monkeypatch.setenv("NAVIGATOR_SDK_TIMEOUT_S", "120")
+    assert cfg.Settings.from_env().sdk_timeout_s == 120.0
+    monkeypatch.setenv("NAVIGATOR_SDK_TIMEOUT_S", "0")
+    with pytest.raises(ValueError, match="NAVIGATOR_SDK_TIMEOUT_S"):
+        cfg.Settings.from_env()
+
 def test_from_env_bad_float_is_descriptive(monkeypatch):
     monkeypatch.setenv("NAVIGATOR_MAX_COST_USD", "not-a-number")
     import pytest

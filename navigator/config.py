@@ -25,6 +25,7 @@ class Settings:
     lock_path: str = "/tmp/navigator.lock"
     outcome_path: str = "/tmp/navigator-outcomes.jsonl"
     sdk_model: str | None = None
+    sdk_timeout_s: float = 300.0
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -46,6 +47,7 @@ class Settings:
             lock_path=os.getenv("NAVIGATOR_LOCK_PATH", "/tmp/navigator.lock"),
             outcome_path=os.getenv("NAVIGATOR_OUTCOME_PATH", "/tmp/navigator-outcomes.jsonl"),
             sdk_model=os.getenv("NAVIGATOR_SDK_MODEL"),
+            sdk_timeout_s=_positive_float_env("NAVIGATOR_SDK_TIMEOUT_S", "300.0"),
         )
 
 

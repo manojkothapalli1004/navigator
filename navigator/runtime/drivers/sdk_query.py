@@ -7,7 +7,8 @@ DEFAULT_SYSTEM_PROMPT = (
     "no prose, no markdown fences.")
 
 def make_sdk_query_fn(*, model: str | None = None,
-                      system_prompt: str = DEFAULT_SYSTEM_PROMPT) -> Callable[[str], str]:
+                      system_prompt: str = DEFAULT_SYSTEM_PROMPT,
+                      timeout_s: float = 300.0) -> Callable[[str], str]:
     """Build a (prompt) -> str query_fn backed by claude-agent-sdk.
 
     Imported lazily so the package works without the sdk extra; the returned
@@ -37,7 +38,13 @@ def make_sdk_query_fn(*, model: str | None = None,
                 if isinstance(message, ResultMessage) and message.result is not None:
                     results.append(message.result)
 
-        asyncio.run(_collect())
+        # wall-clock guard: the CLI subprocess can stall during init under
+        # launchd (observed 2026-07-17 — daemon froze on cycle 1 for 19h);
+        # a stall must raise so the daemon loop retries next tick
+        try:
+            asyncio.run(asyncio.wait_for(_collect(), timeout=timeout_s))
+        except (asyncio.TimeoutError, TimeoutError) as e:
+            raise TimeoutError(f"claude-agent-sdk query timed out after {timeout_s}s") from e
         if not results:
             raise RuntimeError("claude-agent-sdk returned no result message")
         return _strip_fences(results[-1])

@@ -89,6 +89,30 @@ def test_truncated_json_passes_through_for_driver_error(monkeypatch):
     _stub_sdk(monkeypatch, captured, results=('{"commands": [',))
     assert make_sdk_query_fn()("x") == '{"commands": ['
 
+def test_hung_sdk_query_raises_instead_of_blocking_forever(monkeypatch):
+    # observed live 2026-07-17: the CLI subprocess stalled during init under
+    # launchd and asyncio.run blocked the daemon on cycle 1 for 19 hours; a
+    # stall must surface as an exception so the loop retries next tick
+    captured = {}
+    mod = types.ModuleType("claude_agent_sdk")
+    class ResultMessage:
+        def __init__(self, result=None):
+            self.result = result
+    class ClaudeAgentOptions:
+        def __init__(self, **kw):
+            captured["options"] = kw
+    async def query(*, prompt, options):
+        import asyncio
+        await asyncio.sleep(3600)
+        yield ResultMessage(result="never")
+    mod.query = query
+    mod.ClaudeAgentOptions = ClaudeAgentOptions
+    mod.ResultMessage = ResultMessage
+    monkeypatch.setitem(sys.modules, "claude_agent_sdk", mod)
+    fn = make_sdk_query_fn(timeout_s=0.1)
+    with pytest.raises(TimeoutError, match="timed out"):
+        fn("x")
+
 def test_driver_end_to_end_with_stubbed_sdk(monkeypatch):
     captured = {}
     _stub_sdk(monkeypatch, captured, results=('{"commands": [["uv","run","pytest","-q"]], "summary": "verify"}',))
