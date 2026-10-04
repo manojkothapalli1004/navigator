@@ -122,6 +122,16 @@ def _is_int(value) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
 
 
+def is_operator_message(msg: dict, chat_id: str) -> bool:
+    """Sent by the operator, in the operator's private chat."""
+    chat = msg.get("chat")
+    if (not isinstance(chat, dict) or chat.get("type") != "private"
+            or str(chat.get("id")) != str(chat_id)):
+        return False
+    sender = msg.get("from")
+    return isinstance(sender, dict) and str(sender.get("id")) == str(chat_id)
+
+
 class TelegramInbox:
     def __init__(self, token: str, chat_id: str, offset_path, inbox_path,
                  client: httpx.Client | None = None,
@@ -185,13 +195,7 @@ class TelegramInbox:
     # ---- filtering -------------------------------------------------------------
 
     def _authorized(self, msg: dict) -> bool:
-        """Sent by the operator, in the operator's private chat."""
-        chat = msg.get("chat")
-        if (not isinstance(chat, dict) or chat.get("type") != "private"
-                or str(chat.get("id")) != self.chat_id):
-            return False
-        sender = msg.get("from")
-        return isinstance(sender, dict) and str(sender.get("id")) == self.chat_id
+        return is_operator_message(msg, self.chat_id)
 
     @staticmethod
     def _ignored_reason(msg: dict, now: float) -> str | None:
