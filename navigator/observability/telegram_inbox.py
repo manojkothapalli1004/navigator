@@ -58,8 +58,8 @@ RUN_ID = re.compile(r"run-[0-9A-HJKMNP-TV-Z]{26}")
 _ACTIONS = {"/merge": "merge", "/reject": "reject"}
 # 'merge <name>': a proposal short name such as 'N5b' or 'S3a' (never a run id prefix)
 SHORT_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,31}")
-DEFAULT_OFFSET_PATH = "/Users/pradeep/calwbot/logs/navigator/telegram_offset"
-DEFAULT_INBOX_PATH = "/Users/pradeep/calwbot/logs/navigator/telegram_inbox.jsonl"
+DEFAULT_OFFSET_PATH = "/Users/Manoj/calwbot/logs/navigator/telegram_offset"
+DEFAULT_INBOX_PATH = "/Users/Manoj/calwbot/logs/navigator/telegram_inbox.jsonl"
 
 # a command older than this is not acted on (the daemon may have been down)
 MAX_MESSAGE_AGE_S = 3600
