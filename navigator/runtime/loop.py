@@ -54,6 +54,9 @@ class Navigator:
             "recent_outcomes": [{"proposal_id": o.proposal_id, "status": o.status,
                                  "summary": o.summary, "lessons": o.lessons} for o in outcomes],
             "act": {"open_proposals": [{"id": p.id, "title": p.title} for p in open_proposals]},
+            # self-learning: propose more of what the operator approves, less of what
+            # they decline or triage retired
+            "operator_decisions": self._recent_decisions(),
             "git": {"base_commit_sha": base_commit_sha, "dirty": bool(git_state.strip()),
                     "recent_commits": recent, "files": files},
         }
@@ -64,6 +67,13 @@ class Navigator:
         return snap
 
     _CONTEXT_CHARS = 6000
+
+    def _recent_decisions(self, n: int = 20) -> list[dict]:
+        decided = [p for p in self._mine(self.act.list_proposals())
+                   if p.status != ProposalStatus.proposed]
+        decided.sort(key=lambda p: p.created_at if p.created_at.tzinfo
+                     else p.created_at.replace(tzinfo=timezone.utc), reverse=True)
+        return [{"title": p.title[:120], "decision": p.status.value} for p in decided[:n]]
 
     def _read_context(self, rel: str) -> str | None:
         # read from the live checkout: research outputs are gitignored, so they never

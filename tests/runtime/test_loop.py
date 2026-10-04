@@ -36,7 +36,8 @@ def test_perceive_returns_three_distinct_sources(tmp_path):
     nav = _nav(tmp_path, repo, mode="dry_run")
     snap = nav.perceive(base_commit_sha=sha)
     # three non-conflated external sources (spec §8) + Navigator's own outcome trail
-    assert set(snap.keys()) == {"orc_memory", "act", "git", "recent_outcomes"}
+    assert set(snap.keys()) == {"orc_memory", "act", "git", "recent_outcomes",
+                                 "operator_decisions"}
 
 def test_approval_poll_executes_approved_proposal(tmp_path):
     repo, sha = _seed(tmp_path)
@@ -335,3 +336,22 @@ def test_reconcile_propagates_unrelated_lock_errors(tmp_path):
     nav.lock.acquire = boom
     with pytest.raises(RuntimeError, match="disk on fire"):
         nav.reconcile_on_startup()
+
+
+def test_planner_sees_operator_decisions_for_its_repo_only(tmp_path):
+    from navigator.contracts.proposal import Proposal
+    repo, sha = _seed(tmp_path)
+    nav = _nav(tmp_path, repo, mode="dry_run")
+    def mk(title, repo_path, status):
+        p = nav.act.create_proposal(Proposal(origin="periodic", proposal_origin_hash=title,
+                                             title=title, rationale="r", repo=repo_path,
+                                             base_commit_sha=sha, intended_changes="x"))
+        nav.act.set_proposal_status(p.id, status)
+    mk("liked", str(repo), ProposalStatus.approved)
+    mk("disliked", str(repo), ProposalStatus.declined)
+    mk("other repo", "/elsewhere", ProposalStatus.approved)
+    mk("still open", str(repo), ProposalStatus.proposed)
+    decisions = nav.perceive(base_commit_sha=sha)["operator_decisions"]
+    assert {"title": "liked", "decision": "approved"} in decisions
+    assert {"title": "disliked", "decision": "declined"} in decisions
+    assert all(d["title"] not in ("other repo", "still open") for d in decisions)

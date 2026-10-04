@@ -5,6 +5,7 @@ import subprocess
 import sys
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 
 import httpx
 import structlog
@@ -22,6 +23,8 @@ from navigator.runtime.drivers.fake_driver import FakeSubagentDriver
 from navigator.runtime.drivers.sdk_query import make_sdk_query_fn
 from navigator.runtime.executor import code_sha
 from navigator.runtime.loop import Navigator
+from navigator.runtime.outcome_store import OutcomeStore
+from navigator.runtime.triage import Triage
 from navigator.safety.budget_guard import BudgetGuard
 from navigator.safety.command_runner import CommandRunner
 
@@ -66,7 +69,18 @@ def build_navigator(settings: Settings):
     # opt-in (NAVIGATOR_TELEGRAM_COMMANDS=1): operator merge decisions from Telegram
     target.telegram_inbox = make_telegram_inbox()
     target.telegram_act = act
+    # one triage pass across every repo's proposals: the operator sees a top 3
+    target.triage = Triage(act, query_fn=_triage_query_fn(driver), notifier=notifier,
+                           path=os.getenv("NAVIGATOR_TRIAGE_PATH")
+                           or str(Path(settings.outcome_path).with_name("triage.json")),
+                           outcomes=lambda: OutcomeStore(settings.outcome_path).latest(10))
     return target
+
+def _triage_query_fn(driver):
+    """The planner's model ranks proposals; the fake driver has none (fallback order)."""
+    if not isinstance(driver, ClaudeSDKDriver):
+        return None
+    return driver.role_query_fns.get(Role.planner, driver.query_fn)
 
 def _head_sha(repo: str) -> str:
     return subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo,
@@ -108,8 +122,20 @@ def _telegram_step(nav, summary: dict) -> None:
         except Exception:
             pass
 
+def _triage_step(nav, summary: dict) -> None:
+    """Retire repeats and rank before planning, so freed backlog room is used this cycle.
+    A triage failure never breaks the cycle."""
+    triage = getattr(nav, "triage", None)
+    if triage is None:
+        return
+    try:
+        summary.update(triage.run())
+    except Exception as e:
+        summary["triage_error"] = f"{type(e).__name__}: {e}"[:300]
+
 def _cycle(nav: Navigator, settings: Settings) -> dict:
     summary: dict = {"mode": settings.mode, "driver": settings.driver}
+    _triage_step(nav, summary)
     # planning failures (LLM limits, timeouts) must not block approved work or merges
     try:
         summary["proposals_created"] = len(nav.periodic_tick())

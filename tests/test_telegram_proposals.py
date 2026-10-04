@@ -2,6 +2,7 @@
 approved and declined from Telegram; the bot hands every operator message to
 handle_operator_message, which keeps the inbox's authorization and freshness checks."""
 import itertools
+import json
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -38,6 +39,11 @@ def _prop(act, title, status=ProposalStatus.proposed, age_s=0):
     return p
 
 
+@pytest.fixture(autouse=True)
+def _triage_file(tmp_path, monkeypatch):
+    monkeypatch.setenv("NAVIGATOR_TRIAGE_PATH", str(tmp_path / "triage.json"))
+
+
 def _msg(text, chat=CHAT, sender=None, chat_type="private", date=None, **extra):
     m = {"chat": {"id": int(chat), "type": chat_type}, "from": {"id": int(sender or chat)},
          "date": int(NOW if date is None else date), "text": text}
@@ -55,6 +61,8 @@ def _status(act, pid):
     ("status", "status", ()),
     ("/Status", "status", ()),
     ("help", "help", ()),
+    ("more", "more", ()),
+    ("all", "all", ()),
     ("approve 1", "approve", ("1",)),
     ("/approve N1 N2", "approve", ("N1", "N2")),
     ("decline 4-33", "decline", ("4-33",)),
@@ -74,27 +82,45 @@ def test_parse_rejects(text):
 
 # ---- status --------------------------------------------------------------------------
 
-def test_status_numbers_proposed_oldest_first_and_skips_others():
+def test_status_shows_top3_in_triage_order_and_more_pages():
     act = FakeACTClient()
-    a = _prop(act, "N1: smarter retry")
+    plain = _prop(act, "Add device-token endpoint")
     _prop(act, "old thing", status=ProposalStatus.declined)
-    b = _prop(act, "N2: lessons")
-    assert [p.id for p in numbered_proposals(act)] == [a.id, b.id]
+    n = [_prop(act, f"N{i}: step {i}") for i in range(1, 5)]
+    # no ranking yet: milestones first, newest first
+    assert [p.id for p in numbered_proposals(act)] == [n[3].id, n[2].id, n[1].id, n[0].id,
+                                                       plain.id]
     rec = _Recorder()
     assert handle_operator_message(_msg("status"), act, rec, CHAT, now=NOW)
-    text = "\n".join(rec.sent)
-    assert "1. N1: smarter retry" in text and "2. N2: lessons" in text
-    assert "old thing" not in text
+    assert "top 1-3 of 5" in rec.sent[-1] and "1. [r] N4: step 4" in rec.sent[-1]
+    assert "old thing" not in rec.sent[-1] and "4." not in rec.sent[-1]
+    handle_operator_message(_msg("more"), act, rec, CHAT, now=NOW)
+    assert "top 4-5 of 5" in rec.sent[-1] and "5. [r] Add device-token" in rec.sent[-1]
+    handle_operator_message(_msg("status"), act, rec, CHAT, now=NOW)
+    assert "top 1-3" in rec.sent[-1]
 
 
-def test_status_splits_long_listings_under_telegram_limit():
+def test_numbers_follow_the_saved_ranking(tmp_path):
     act = FakeACTClient()
-    for i in range(80):
-        _prop(act, f"P{i}: " + "x" * 120)
+    a, b = _prop(act, "Add x"), _prop(act, "Add y")
+    (tmp_path / "triage.json").write_text(json.dumps(
+        {"ranked": [{"id": a.id, "title": a.title, "why": "first"}]}))
     rec = _Recorder()
     handle_operator_message(_msg("status"), act, rec, CHAT, now=NOW)
+    assert "1. [r] Add x" in rec.sent[-1] and "why: first" in rec.sent[-1]
+    handle_operator_message(_msg("approve 2"), act, rec, CHAT, now=NOW)
+    assert _status(act, b.id) == ProposalStatus.approved
+    assert _status(act, a.id) == ProposalStatus.proposed
+
+
+def test_all_splits_long_listings_under_telegram_limit():
+    act = FakeACTClient()
+    for i in range(80):
+        _prop(act, f"Idea {i}: " + "x" * 120)
+    rec = _Recorder()
+    handle_operator_message(_msg("all"), act, rec, CHAT, now=NOW)
     assert len(rec.sent) > 1 and all(len(t) <= 4000 for t in rec.sent)
-    assert "80. P79" in "\n".join(rec.sent)
+    assert "80. Idea 0" in "\n".join(rec.sent)
 
 
 # ---- approve / decline ---------------------------------------------------------------
@@ -103,7 +129,8 @@ def test_approve_by_number_and_short_name():
     act = FakeACTClient()
     a, b, c = _prop(act, "N1: a"), _prop(act, "N2: b"), _prop(act, "N3: c")
     rec = _Recorder()
-    handle_operator_message(_msg("approve 1 n3"), act, rec, CHAT, now=NOW)
+    # order: N3, N2, N1 -> '1' is N3
+    handle_operator_message(_msg("approve 1 n1"), act, rec, CHAT, now=NOW)
     assert _status(act, a.id) == ProposalStatus.approved
     assert _status(act, b.id) == ProposalStatus.proposed
     assert _status(act, c.id) == ProposalStatus.approved
@@ -112,7 +139,7 @@ def test_approve_by_number_and_short_name():
 
 def test_decline_range_resolves_against_one_snapshot():
     act = FakeACTClient()
-    props = [_prop(act, f"T{i}: t") for i in range(5)]
+    props = [_prop(act, f"T{i}: t") for i in range(5)][::-1]  # newest first
     handle_operator_message(_msg("decline 2-4"), act, _Recorder(), CHAT, now=NOW)
     assert [_status(act, p.id) for p in props] == [
         ProposalStatus.proposed, ProposalStatus.declined, ProposalStatus.declined,
