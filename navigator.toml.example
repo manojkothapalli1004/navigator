@@ -38,6 +38,8 @@ max_tool_failures = 5           # NAVIGATOR_MAX_TOOL_FAILURES (>= 1)
 max_identical_failures = 3      # NAVIGATOR_MAX_IDENTICAL_FAILURES
 max_run_duration_s = 1800       # NAVIGATOR_MAX_RUN_DURATION_S
 max_failed_tests = 50           # NAVIGATOR_MAX_FAILED_TESTS
+command_timeout_s = 60          # NAVIGATOR_COMMAND_TIMEOUT_S: per verifier command; a fresh
+                                # worktree's `uv run pytest` builds a venv first (~3 min)
 # NAVIGATOR_ALLOWED_COMMANDS: comma-separated bare command prefixes (no '/', no shell
 # metacharacters). argv-only, no shell; LLM-issued git commands are limited to a safe-flag set.
 allowed_commands = ["git status", "git diff", "git log", "pytest", "python3 -m py_compile", "uv run pytest"]

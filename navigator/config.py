@@ -23,6 +23,7 @@ class Settings:
     max_open_proposals: int = 10
     memory_chars_per_section: int = 3000
     proposal_ttl_days: int = 7
+    command_timeout_s: float = 60.0
     max_failed_tests: int = 50
     repo: str | None = None
     lock_path: str = "/tmp/navigator.lock"
@@ -48,6 +49,7 @@ class Settings:
             max_open_proposals=_positive_int_env("NAVIGATOR_MAX_OPEN_PROPOSALS", "10"),
             memory_chars_per_section=_positive_int_env("NAVIGATOR_MEMORY_CHARS_PER_SECTION", "3000"),
             proposal_ttl_days=_positive_int_env("NAVIGATOR_PROPOSAL_TTL_DAYS", "7"),
+            command_timeout_s=_positive_float_env("NAVIGATOR_COMMAND_TIMEOUT_S", "60"),
             max_failed_tests=_int_env("NAVIGATOR_MAX_FAILED_TESTS", "50"),
             repo=os.getenv("NAVIGATOR_REPO"),
             lock_path=os.getenv("NAVIGATOR_LOCK_PATH", "/tmp/navigator.lock"),

@@ -80,3 +80,14 @@ def test_allowed_commands_rejects_dangerous_entries(monkeypatch):
         monkeypatch.setenv("NAVIGATOR_ALLOWED_COMMANDS", bad)
         with pytest.raises(ValueError, match="NAVIGATOR_ALLOWED_COMMANDS"):
             cfg.Settings.from_env()
+
+def test_command_timeout_is_env_wired_and_reaches_the_runner(tmp_path, monkeypatch):
+    # a fresh worktree's `uv run pytest` builds a venv first: ~3 min live, past the 60s default
+    monkeypatch.setenv("NAVIGATOR_COMMAND_TIMEOUT_S", "600")
+    s = cfg.Settings.from_env()
+    assert s.command_timeout_s == 600
+    from navigator.__main__ import build_navigator
+    import subprocess
+    repo = tmp_path/"r"; repo.mkdir(); subprocess.run(["git", "init"], cwd=repo, capture_output=True)
+    s.repo = str(repo); s.lock_path = str(tmp_path/"l"); s.worktree_root = str(tmp_path/"wt")
+    assert build_navigator(s).runner.timeout_s == 600

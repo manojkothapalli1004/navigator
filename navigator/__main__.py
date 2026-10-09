@@ -36,7 +36,8 @@ def build_navigator(settings: Settings) -> Navigator:
     act = HTTPACTClient(settings.act_base_url) if settings.act_base_url else FakeACTClient()
     act = NotifyingACT(act, notifier)
     orc = HTTPORCClient(settings.orc_base_url) if settings.orc_base_url else FakeORCClient()
-    runner = CommandRunner(allowlist=settings.allowed_commands, worktree_root=settings.worktree_root)
+    runner = CommandRunner(allowlist=settings.allowed_commands, worktree_root=settings.worktree_root,
+                           timeout_s=settings.command_timeout_s)
     nav = Navigator(act=act, orc=orc, driver=_make_driver(settings), runner=runner,
                     settings=settings, repo=settings.repo, lock_path=settings.lock_path)
     nav.notifier = notifier
