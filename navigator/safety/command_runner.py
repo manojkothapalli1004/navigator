@@ -10,9 +10,9 @@ _REJECTED_FLAGS = {"--no-index"}
 # Exact flag allowlist for LLM-issued git commands (trusted runtime git calls
 # bypass the runner). Any other dashed token in a git argv is rejected.
 _GIT_SAFE_FLAGS = {
-    "status": {"--porcelain", "-s", "--short", "-b"},
-    "diff": {"--stat", "--name-only", "--name-status", "--cached", "--staged"},
-    "log": {"--oneline", "--name-only", "--stat", "-1", "-5", "-10", "-20"},
+    "status": {"--porcelain", "-s", "--short", "-b", "--"},
+    "diff": {"--stat", "--name-only", "--name-status", "--cached", "--staged", "--"},
+    "log": {"--oneline", "--name-only", "--stat", "-1", "-5", "-10", "-20", "--"},
 }
 
 @dataclass

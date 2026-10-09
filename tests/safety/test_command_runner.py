@@ -77,3 +77,12 @@ def test_git_unknown_flag_rejected(tmp_path):
     from navigator.safety.errors import CommandRejected
     with pytest.raises(CommandRejected, match="--all"):
         _runner(tmp_path).run(["git", "log", "--all"], cwd=tmp_path)
+
+def test_git_pathspec_separator_allowed(tmp_path):
+    # observed live 2026-10-09: the first execute-mode verifier issued
+    # `git diff -- <file>`; "--" only ends option parsing, so it is safe
+    import subprocess
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
+    r = _runner(tmp_path)
+    assert r.run(["git", "diff", "--stat", "--", "README.md"], cwd=tmp_path).returncode == 0
+    assert r.run(["git", "status", "--porcelain", "--", "README.md"], cwd=tmp_path).returncode == 0
