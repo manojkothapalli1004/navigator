@@ -66,6 +66,7 @@ def test_main_once_prints_summary_and_exits_zero(tmp_path, monkeypatch, capsys):
     assert summary["proposals_created"] == 1  # fake planner proposes exactly one
     assert summary["runs_executed"] == 0      # dry_run never executes
     assert summary["runs_finalized"] == 0     # merge gate is polled every cycle
+    assert summary["snapshot_chars"] > 0      # planner prompt size is visible per cycle
 
 def test_negative_max_cycles_is_rejected():
     with pytest.raises(SystemExit):
@@ -173,3 +174,12 @@ def test_daemon_health_alert_once_per_failure_streak_then_recovery(tmp_path, mon
     alerts = [t for t in sent if "failing" in t]
     assert len(alerts) == 1 and "Usage credits" in alerts[0]
     assert sum("recovered" in t for t in sent) == 1
+
+def test_structured_logs_go_to_stderr_keeping_stdout_json_only(tmp_path, monkeypatch, capsys):
+    import navigator.__main__ as m
+    from navigator.observability.logging import get_logger
+    m._configure_logging()
+    get_logger("t").info("tick.backlog_full", open=99)
+    captured = capsys.readouterr()
+    assert "tick.backlog_full" not in captured.out
+    assert "tick.backlog_full" in captured.err

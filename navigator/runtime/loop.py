@@ -1,3 +1,5 @@
+import json
+import re
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -6,6 +8,7 @@ from navigator.contracts.enums import (ProposalStatus, RunStatus, RunPhase, Appr
                                        ApprovalDecision)
 from navigator.runtime.executor import execute_proposal, merge_after_approval, decline_run
 from navigator.runtime.lock import SingleFlightLock
+from navigator.runtime.outcome_store import OutcomeStore
 from navigator.observability.logging import get_logger
 from navigator.observability.notify import NullNotifier
 
@@ -17,6 +20,7 @@ class Navigator:
         self.settings = settings; self.repo = repo
         self.lock = SingleFlightLock(lock_path)
         self.notifier = NullNotifier()
+        self.last_snapshot_chars = 0
 
     def perceive(self, base_commit_sha: str, open_proposals: list[Proposal] | None = None) -> dict:
         if open_proposals is None:
@@ -31,8 +35,12 @@ class Navigator:
         # sees the files a proposal names
         files = subprocess.run(["git","ls-files"], cwd=self.repo,
                                capture_output=True, text=True).stdout.splitlines()[:400]
+        outcomes = OutcomeStore(self.settings.outcome_path).latest(5)
         return {
-            "orc_memory": self.orc.get_canonical_memory(),
+            "orc_memory": _trim_memory(self.orc.get_canonical_memory(),
+                                       self.settings.memory_chars_per_section, Path(self.repo).name),
+            "recent_outcomes": [{"proposal_id": o.proposal_id, "status": o.status,
+                                 "summary": o.summary, "lessons": o.lessons} for o in outcomes],
             "act": {"open_proposals": [{"id": p.id, "title": p.title} for p in open_proposals]},
             "git": {"base_commit_sha": base_commit_sha, "dirty": bool(git_state.strip()),
                     "recent_commits": recent, "files": files},
@@ -44,6 +52,7 @@ class Navigator:
             log.info("tick.backlog_full", open=len(open_proposals))
             return []
         snap = self.perceive(base_commit_sha, open_proposals)
+        self.last_snapshot_chars = len(json.dumps(snap, default=str))
         from navigator.runtime.drivers.base import DriverRequest
         from navigator.contracts.enums import Role
         plan = self.driver.run_role(DriverRequest(role=Role.planner, context={"repo": self.repo, "snapshot": snap}))
@@ -126,6 +135,30 @@ class Navigator:
                 replace=False)
             log.warning("reconcile.aborted_stale_run", run_id=run.id, preserved_worktree=run.worktree_path)
 
+
+_ENTRY_SPLIT = re.compile(r"\n+(?=\[\d{4}-\d{2}-\d{2})")
+
+def _trim_memory(memory: dict, budget: int, focus: str) -> dict:
+    """Cap each ORC memory section at `budget` chars. Whole dated entries are kept,
+    entries mentioning `focus` (the target repo) first, then newest first."""
+    sections = memory.get("sections", memory)
+    trimmed = {}
+    for name, text in sections.items():
+        if not isinstance(text, str):
+            continue
+        if len(text) <= budget:
+            trimmed[name] = text
+            continue
+        entries = _ENTRY_SPLIT.split(text)
+        order = sorted(range(len(entries)),
+                       key=lambda i: (focus.lower() not in entries[i].lower(), -i))
+        keep, used = set(), 0
+        for i in order:
+            if used + len(entries[i]) + 2 <= budget:
+                keep.add(i); used += len(entries[i]) + 2
+        trimmed[name] = ("\n\n".join(entries[i] for i in sorted(keep))
+                         if keep else text[-budget:])
+    return trimmed
 
 def _norm_title(title: str) -> str:
     return " ".join(title.lower().strip(" .").split())

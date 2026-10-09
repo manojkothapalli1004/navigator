@@ -35,7 +35,8 @@ def test_perceive_returns_three_distinct_sources(tmp_path):
     repo, sha = _seed(tmp_path)
     nav = _nav(tmp_path, repo, mode="dry_run")
     snap = nav.perceive(base_commit_sha=sha)
-    assert set(snap.keys()) == {"orc_memory", "act", "git"}
+    # three non-conflated external sources (spec §8) + Navigator's own outcome trail
+    assert set(snap.keys()) == {"orc_memory", "act", "git", "recent_outcomes"}
 
 def test_approval_poll_executes_approved_proposal(tmp_path):
     repo, sha = _seed(tmp_path)
@@ -176,3 +177,41 @@ def test_reconcile_keeps_runs_parked_at_merge_gate(tmp_path):
     nav.reconcile_on_startup()
     assert nav.act.runs[parked.id].status == RunStatus.executing
     assert nav.act.runs[parked.id].phase == RunPhase.awaiting_review
+
+
+def _entry(day, text):
+    return f"[2026-07-{day:02d}T00:00:00Z · s]\n{text}"
+
+def test_planner_memory_is_trimmed_newest_and_repo_relevant_first(tmp_path):
+    # live 2026-10-09: ~79k chars of ORC memory (mostly benched trader history)
+    # went into every planner prompt; one cycle hit the 300s SDK timeout
+    repo, sha = _seed(tmp_path)
+    old_relevant = _entry(1, f"{repo.name} decision that still matters")
+    filler = [_entry(d, "trader experiment " + "x" * 900) for d in range(2, 20)]
+    newest = _entry(28, "newest status line")
+    memory = {"sections": {"status": "\n\n".join([old_relevant, *filler, newest]),
+                           "vision": "short vision"}}
+    planner = _ScriptedPlanner(["x"])
+    nav = _scripted_nav(tmp_path, repo, planner, memory_chars_per_section=3000)
+    nav.orc = FakeORCClient(memory=memory)
+    nav.periodic_tick(base_commit_sha=sha)
+    mem = planner.last_context["snapshot"]["orc_memory"]
+    assert len(mem["status"]) <= 3000
+    assert "newest status line" in mem["status"]
+    assert "decision that still matters" in mem["status"]
+    assert mem["vision"] == "short vision"
+
+
+def test_planner_sees_recent_outcomes(tmp_path):
+    from navigator.runtime.outcome_store import OutcomeStore
+    from navigator.contracts.outcome import Outcome
+    repo, sha = _seed(tmp_path)
+    planner = _ScriptedPlanner(["x"])
+    nav = _scripted_nav(tmp_path, repo, planner)
+    OutcomeStore(nav.settings.outcome_path).append(
+        Outcome(run_id="run-1", proposal_id="p-1", status="failed", summary="verification failed",
+                lessons=["git flag not on safe list"]))
+    nav.periodic_tick(base_commit_sha=sha)
+    outs = planner.last_context["snapshot"]["recent_outcomes"]
+    assert outs == [{"proposal_id": "p-1", "status": "failed", "summary": "verification failed",
+                     "lessons": ["git flag not on safe list"]}]

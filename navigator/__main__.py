@@ -7,6 +7,7 @@ import time
 from datetime import datetime, timezone
 
 import httpx
+import structlog
 from navigator.cli import COMMANDS, run_cli
 from navigator.config import Settings
 from navigator.observability.notify import NotifyingACT, make_notifier
@@ -51,7 +52,7 @@ def _cycle(nav: Navigator, settings: Settings) -> dict:
     finalized = nav.merge_poll()
     return {"mode": settings.mode, "driver": settings.driver,
             "proposals_created": len(created), "runs_executed": len(runs),
-            "runs_finalized": len(finalized)}
+            "runs_finalized": len(finalized), "snapshot_chars": nav.last_snapshot_chars}
 
 def _reset_budget(nav: Navigator) -> None:
     # The budget cap is per-cycle, not process-lifetime; a long-running daemon
@@ -109,7 +110,12 @@ def run_daemon(nav: Navigator, settings: Settings, *, max_cycles: int | None = N
             return
         time.sleep(settings.tick_interval_s)
 
+def _configure_logging() -> None:
+    # stdout carries one JSON summary per cycle; human logs must not interleave
+    structlog.configure(logger_factory=structlog.PrintLoggerFactory(file=sys.stderr))
+
 def main(argv: list[str] | None = None) -> int:
+    _configure_logging()
     argv = sys.argv[1:] if argv is None else argv
     if argv and argv[0] in COMMANDS:
         url = os.getenv("NAVIGATOR_ACT_BASE_URL") or "http://127.0.0.1:8090"
