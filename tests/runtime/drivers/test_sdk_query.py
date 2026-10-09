@@ -257,3 +257,9 @@ def test_error_result_without_text_reports_subtype_and_errors(monkeypatch):
     with pytest.raises(RuntimeError) as exc:
         make_sdk_query_fn()("x")
     assert "error_during_execution" in str(exc.value) and "529 overloaded" in str(exc.value)
+
+def test_usage_limit_errors_are_not_retried(monkeypatch):
+    calls = _stub_sdk_error_result(monkeypatch, "You've hit your session limit · resets 10:30pm")
+    with pytest.raises(RuntimeError, match="session limit"):
+        make_sdk_query_fn()("x")
+    assert calls["n"] == 1

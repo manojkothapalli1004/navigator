@@ -96,7 +96,8 @@ def _describe_error(message) -> str:
 
 
 # account/config failures: a retry just doubles the cost of a guaranteed error
-_NON_RETRYABLE = ("usage credits", "does not support this model")
+_NON_RETRYABLE = ("usage credits", "does not support this model", "session limit",
+                  "usage limit", "not logged in")
 
 def _is_retryable(e: Exception) -> bool:
     msg = str(e).lower()

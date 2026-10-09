@@ -183,3 +183,18 @@ def test_structured_logs_go_to_stderr_keeping_stdout_json_only(tmp_path, monkeyp
     captured = capsys.readouterr()
     assert "tick.backlog_full" not in captured.out
     assert "tick.backlog_full" in captured.err
+
+def test_planner_failure_does_not_block_execution_or_merges(tmp_path, monkeypatch):
+    # live 2026-10-09: the planner hit the account's session limit and the whole
+    # cycle aborted, so an approved proposal and merge decisions sat untouched
+    import navigator.__main__ as m
+    nav = build_navigator(_settings(tmp_path, _seed_repo(tmp_path)))
+    calls = []
+    def broken_tick(base_commit_sha):
+        raise RuntimeError("You've hit your session limit")
+    monkeypatch.setattr(nav, "periodic_tick", broken_tick)
+    monkeypatch.setattr(nav, "approval_poll", lambda: calls.append("exec") or [])
+    monkeypatch.setattr(nav, "merge_poll", lambda: calls.append("merge") or [])
+    summary = m._cycle(nav, nav.settings)
+    assert calls == ["exec", "merge"]
+    assert "session limit" in summary["planner_error"]

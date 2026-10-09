@@ -48,12 +48,17 @@ def _head_sha(repo: str) -> str:
                           capture_output=True, text=True, check=True).stdout.strip()
 
 def _cycle(nav: Navigator, settings: Settings) -> dict:
-    created = nav.periodic_tick(base_commit_sha=_head_sha(settings.repo))
-    runs = nav.approval_poll()
-    finalized = nav.merge_poll()
-    return {"mode": settings.mode, "driver": settings.driver,
-            "proposals_created": len(created), "runs_executed": len(runs),
-            "runs_finalized": len(finalized), "snapshot_chars": nav.last_snapshot_chars}
+    summary: dict = {"mode": settings.mode, "driver": settings.driver}
+    # planning failures (LLM limits, timeouts) must not block approved work or merges
+    try:
+        summary["proposals_created"] = len(nav.periodic_tick(base_commit_sha=_head_sha(settings.repo)))
+    except Exception as e:
+        summary["proposals_created"] = 0
+        summary["planner_error"] = f"{type(e).__name__}: {e}"[:300]
+    summary["runs_executed"] = len(nav.approval_poll())
+    summary["runs_finalized"] = len(nav.merge_poll())
+    summary["snapshot_chars"] = nav.last_snapshot_chars
+    return summary
 
 def _reset_budget(nav: Navigator) -> None:
     # The budget cap is per-cycle, not process-lifetime; a long-running daemon
@@ -95,12 +100,16 @@ def run_daemon(nav: Navigator, settings: Settings, *, max_cycles: int | None = N
         _reset_budget(nav)
         try:
             summary = _cycle(nav, settings)
+        except Exception as e:  # a dependency blip must not kill the daemon; retry next tick
+            summary = {"error": f"{type(e).__name__}: {e}"[:300]}
+        failure = summary.get("error") or summary.get("planner_error")
+        if not failure:
             if consecutive_failures >= _FAILURE_WARN_THRESHOLD:
                 nav.notifier.send(f"Navigator recovered after {consecutive_failures} failed cycles")
             consecutive_failures = 0
-        except Exception as e:  # a dependency blip must not kill the daemon; retry next tick
+        else:
             consecutive_failures += 1
-            summary = {"error": f"{type(e).__name__}: {e}"[:300]}
+            summary.setdefault("error", failure)
             if consecutive_failures >= _FAILURE_WARN_THRESHOLD:
                 summary["consecutive_failures"] = consecutive_failures
             if consecutive_failures == _FAILURE_WARN_THRESHOLD:
