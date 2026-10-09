@@ -100,6 +100,8 @@ class Navigator:
 
     def reconcile_on_startup(self) -> None:
         for run in self.act.list_open_runs():
+            if run.phase == RunPhase.awaiting_review:
+                continue  # parked at the merge gate by design; merge_poll owns it
             run.status = RunStatus.aborted
             run.phase = RunPhase.finalizing
             run.ended_at = datetime.now(timezone.utc)

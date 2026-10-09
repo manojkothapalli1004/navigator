@@ -162,3 +162,17 @@ def test_planner_sees_tracked_file_list(tmp_path):
     nav = _scripted_nav(tmp_path, repo, planner)
     nav.periodic_tick(base_commit_sha=sha)
     assert "real.py" in planner.last_context["snapshot"]["git"]["files"]
+
+def test_reconcile_keeps_runs_parked_at_merge_gate(tmp_path):
+    # a run awaiting the operator's merge decision is idle by design, not crashed;
+    # aborting it on every daemon restart would throw away verified work
+    from navigator.contracts.run import Run
+    from navigator.contracts.enums import RunPhase
+    repo, sha = _seed(tmp_path)
+    nav = _nav(tmp_path, repo, mode="execute")
+    parked = Run(proposal_id="p", base_commit_sha=sha, branch="nav/run-p",
+                 phase=RunPhase.awaiting_review, worktree_path=str(tmp_path/"wt/run-p"))
+    nav.act.create_run(parked)
+    nav.reconcile_on_startup()
+    assert nav.act.runs[parked.id].status == RunStatus.executing
+    assert nav.act.runs[parked.id].phase == RunPhase.awaiting_review

@@ -133,3 +133,16 @@ def test_execute_branches_from_current_head_not_stale_proposal_base(tmp_path):
                                capture_output=True, text=True).stdout.strip()
     assert head in (wt_parent, subprocess.run(["git","merge-base","HEAD",head], cwd=run.worktree_path,
                                                capture_output=True, text=True).stdout.strip())
+
+
+def test_heartbeat_renewed_on_every_phase_transition(tmp_path):
+    repo, sha = _seed(tmp_path); d = _deps(tmp_path, repo)
+    seen = []
+    real_update = d["act"].update_run
+    def recording(r):
+        seen.append((r.phase, r.heartbeat_at)); real_update(r)
+    d["act"].update_run = recording
+    run = execute_proposal(_proposal(repo, sha), **d)
+    beats = [hb for _, hb in seen]
+    assert len(seen) >= 2
+    assert beats == sorted(beats) and beats[-1] > run.started_at

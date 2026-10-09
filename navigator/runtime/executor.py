@@ -13,6 +13,11 @@ from navigator.runtime.outcome_store import OutcomeStore
 from navigator.runtime.phases import run_build_and_verify
 from navigator.ids import new_id
 
+def _save(act, run: Run) -> None:
+    # every persisted transition doubles as a liveness heartbeat for reconcile
+    run.heartbeat_at = datetime.now(timezone.utc)
+    act.update_run(run)
+
 def _emit(act, run, kind, severity=Severity.info, **payload):
     act.emit_event(Event(kind=kind, severity=severity, correlation_id=run.correlation_id, payload=payload))
 
@@ -35,12 +40,12 @@ def execute_proposal(proposal: Proposal, *, act, orc, driver, runner, settings) 
                                  run_id=run.id, worktree_root=Path(settings.worktree_root))
     except Exception as e:
         run.status = RunStatus.failed; run.phase = RunPhase.finalizing
-        run.ended_at = datetime.now(timezone.utc); act.update_run(run)
+        run.ended_at = datetime.now(timezone.utc); _save(act, run)
         _write_outcome(orc, run, status="failed", summary=f"worktree creation failed: {e}",
                        lessons=[f"create_worktree raised: {e}"], settings=settings)
         _emit(act, run, "run.failed", Severity.error, error=str(e)); return run
     run.worktree_path = str(handle.path)
-    run.phase = RunPhase.building; act.update_run(run); _emit(act, run, "run.building")
+    run.phase = RunPhase.building; _save(act, run); _emit(act, run, "run.building")
     try:
         result = run_build_and_verify(
             driver=driver, worktree=handle, run_id=run.id, runner=runner,
@@ -50,7 +55,7 @@ def execute_proposal(proposal: Proposal, *, act, orc, driver, runner, settings) 
     except Exception as e:
         preserve_failed(handle)
         run.status = RunStatus.failed; run.phase = RunPhase.finalizing
-        run.ended_at = datetime.now(timezone.utc); act.update_run(run)
+        run.ended_at = datetime.now(timezone.utc); _save(act, run)
         _write_outcome(orc, run, status="failed", summary=f"exception: {e}",
                        lessons=[f"build/verify raised: {e}"], preserved=handle.path, settings=settings)
         _emit(act, run, "run.failed", Severity.error, error=str(e)); return run
@@ -59,13 +64,13 @@ def execute_proposal(proposal: Proposal, *, act, orc, driver, runner, settings) 
     if result.verify_returncode != 0:
         preserve_failed(handle)
         run.status = RunStatus.failed; run.phase = RunPhase.finalizing
-        run.ended_at = datetime.now(timezone.utc); act.update_run(run)
+        run.ended_at = datetime.now(timezone.utc); _save(act, run)
         _write_outcome(orc, run, status="failed", summary="verification failed",
                        lessons=[f"verify rc={result.verify_returncode}: {result.verify_output[:200]}"],
                        verification_notes=result.verify_output[:500], preserved=handle.path,
                        checkpoints_made=len(result.checkpoints), settings=settings)
         _emit(act, run, "run.failed", Severity.error); return run
-    run.phase = RunPhase.awaiting_review; act.update_run(run)
+    run.phase = RunPhase.awaiting_review; _save(act, run)
     act.create_approval(target=run.id, gate=ApprovalGate.merge)
     # Correction 1: store diff in event payload, not as a transient Run attribute
     diff = diff_artifact(handle.path, head)
@@ -98,21 +103,21 @@ def merge_after_approval(run: Run, *, act, orc, driver, runner, settings) -> Run
         # stays parked at the gate; the next poll retries once the operator is done
         _emit(act, run, "run.merge_blocked", Severity.warning, reason=blocked)
         return run
-    run.phase = RunPhase.merging; act.update_run(run)
+    run.phase = RunPhase.merging; _save(act, run)
     merge = subprocess.run(["git", "merge", "--no-ff", "-m", f"navigator merge {run.id}", run.branch],
                            cwd=repo, capture_output=True, text=True)
     if merge.returncode != 0:
         subprocess.run(["git", "merge", "--abort"], cwd=repo, capture_output=True, text=True)
         detail = (merge.stdout + merge.stderr).strip()[:300]
         run.status = RunStatus.failed; run.phase = RunPhase.finalizing
-        run.ended_at = datetime.now(timezone.utc); act.update_run(run)
+        run.ended_at = datetime.now(timezone.utc); _save(act, run)
         _write_outcome(orc, run, status="failed", summary=f"merge failed and was aborted: {detail}",
                        lessons=["merge conflict with main — rebase or re-propose against current HEAD"],
                        preserved=run.worktree_path, settings=settings)
         _emit(act, run, "run.failed", Severity.error, error=detail)
         return run
     run.phase = RunPhase.finalizing; run.status = RunStatus.completed
-    run.ended_at = datetime.now(timezone.utc); act.update_run(run)
+    run.ended_at = datetime.now(timezone.utc); _save(act, run)
     _write_outcome(orc, run, status="completed", summary="merged after approval",
                    lessons=["change merged"], section="decisions", settings=settings)
     _cleanup_worktree(run, repo)
@@ -121,7 +126,7 @@ def merge_after_approval(run: Run, *, act, orc, driver, runner, settings) -> Run
 
 def decline_run(run: Run, *, act, orc, settings) -> Run:
     run.status = RunStatus.aborted; run.phase = RunPhase.finalizing
-    run.ended_at = datetime.now(timezone.utc); act.update_run(run)
+    run.ended_at = datetime.now(timezone.utc); _save(act, run)
     _write_outcome(orc, run, status="declined", summary="merge declined by operator",
                    lessons=["operator declined the change at the merge gate"],
                    preserved=run.worktree_path, section="decisions", settings=settings)
