@@ -1,5 +1,6 @@
 from datetime import datetime, timezone
 import subprocess
+import time
 from pathlib import Path
 from navigator.contracts.proposal import Proposal
 from navigator.contracts.run import Run, Checkpoint
@@ -12,6 +13,8 @@ from navigator.runtime.checkpoint import diff_artifact
 from navigator.runtime.outcome_store import OutcomeStore
 from navigator.runtime.phases import run_build_and_verify
 from navigator.ids import new_id
+from navigator.safety.approval_engine import require_gate
+from navigator.safety.circuit_breakers import CircuitBreakers
 
 def _save(act, run: Run) -> None:
     # every persisted transition doubles as a liveness heartbeat for reconcile
@@ -25,6 +28,15 @@ def execute_proposal(proposal: Proposal, *, act, orc, driver, runner, settings) 
     # Ensure the proposal is registered in ACT so _repo_for can resolve it
     if act.get_proposal(proposal.id) is None:
         proposal = act.create_proposal(proposal)
+    require_gate(act, ApprovalGate.review, proposal.id)
+    started = time.monotonic()
+    guard = getattr(driver, "budget_guard", None)
+    if guard is not None:
+        guard.reset()  # the cap is per run; planner spend earlier in the cycle doesn't count
+    breakers = CircuitBreakers(max_tool_failures=settings.max_tool_failures,
+                               max_identical_failures=settings.max_identical_failures,
+                               max_run_duration_s=settings.max_run_duration_s,
+                               max_failed_tests=settings.max_failed_tests)
     # branch from the repo's current HEAD, not the proposal's base: proposals sit
     # for weeks and an old base guarantees merge conflicts at the merge gate
     head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=proposal.repo,
@@ -51,7 +63,8 @@ def execute_proposal(proposal: Proposal, *, act, orc, driver, runner, settings) 
             driver=driver, worktree=handle, run_id=run.id, runner=runner,
             proposal={"title": proposal.title, "rationale": proposal.rationale,
                       "intended_changes": proposal.intended_changes,
-                      "affected_files": list(proposal.affected_files)})
+                      "affected_files": list(proposal.affected_files)},
+            breakers=breakers, started_monotonic=started)
     except Exception as e:
         preserve_failed(handle)
         run.status = RunStatus.failed; run.phase = RunPhase.finalizing

@@ -1,5 +1,9 @@
+import re
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from navigator.safety.circuit_breakers import CircuitBreakers
+from navigator.safety.errors import CommandRejected
 from navigator.runtime.drivers.base import DriverRequest, SubagentDriver
 from navigator.runtime.worktree import WorktreeHandle
 from navigator.runtime.checkpoint import checkpoint
@@ -40,15 +44,32 @@ def _read_affected(wt: Path, relpaths: list[str]) -> dict[str, str | None]:
         files[rel] = target.read_text()[:_MAX_FILE_CHARS] if target.is_file() else None
     return files
 
+def _check_scope(relpaths: list[str], allowed: list[str]) -> None:
+    # the operator approved a proposal naming these files; the builder may not widen it
+    if not allowed:
+        return
+    approved = {Path(a).as_posix() for a in allowed}
+    for rel in relpaths:
+        if Path(rel).as_posix() not in approved:
+            raise ValueError(f"builder wrote {rel!r} outside the approved affected_files")
+
+_FAILED_TESTS = re.compile(r"(\d+) failed")
+
 def run_build_and_verify(driver: SubagentDriver, worktree: WorktreeHandle,
                          run_id: str, runner: CommandRunner,
-                         proposal: dict | None = None) -> PhaseResult:
+                         proposal: dict | None = None,
+                         breakers: CircuitBreakers | None = None,
+                         started_monotonic: float | None = None) -> PhaseResult:
     res = PhaseResult()
     wt = Path(worktree.path)
     proposal = proposal or {}
+    started = time.monotonic() if started_monotonic is None else started_monotonic
     build_ctx = {"proposal": proposal,
                  "files": _read_affected(wt, proposal.get("affected_files", []))}
     build = driver.run_role(DriverRequest(role=Role.builder, context=build_ctx, worktree_path=str(wt)))
+    _check_scope([rel for rel, _ in build.file_writes], proposal.get("affected_files", []))
+    if breakers:
+        breakers.check_duration(started)
     for n, (relpath, content) in enumerate(build.file_writes, start=1):
         target = _resolve_write_target(wt, relpath)
         cp_before = checkpoint(wt, run_id=run_id, n=n, label=f"pre-write-{relpath}")
@@ -65,9 +86,24 @@ def run_build_and_verify(driver: SubagentDriver, worktree: WorktreeHandle,
         res.verify_output = "verifier produced no commands"
         return res
     for argv in verify.commands:
-        r = runner.run(argv, cwd=wt)
+        if breakers:
+            breakers.check_duration(started)
+        try:
+            r = runner.run(argv, cwd=wt)
+        except CommandRejected as e:
+            # a disallowed command is a verification result, not a crash
+            res.verify_returncode = 126
+            res.verify_output = f"verifier command rejected: {e}"
+            if breakers:
+                breakers.record_failure(f"rejected:{argv[0]}")
+            break
         res.verify_returncode = r.returncode
         res.verify_output = r.stdout + r.stderr
         if r.returncode != 0:
+            if breakers:
+                m = _FAILED_TESTS.search(res.verify_output)
+                if m:
+                    breakers.check_failed_tests(int(m.group(1)))
+                breakers.record_failure(" ".join(argv))
             break
     return res

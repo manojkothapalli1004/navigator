@@ -85,3 +85,53 @@ def test_builder_and_verifier_receive_proposal_and_file_contents(tmp_path):
     v = drv.requests[Role.verifier].context
     assert v["changed_files"] == ["a.py"]
     assert "pytest" in v["allowed_commands"]
+
+
+class _ScriptedRoles:
+    def __init__(self, writes, commands):
+        self.writes, self.commands = writes, commands
+    def run_role(self, request):
+        if request.role == Role.builder:
+            return DriverResult(role=Role.builder, file_writes=self.writes)
+        return DriverResult(role=Role.verifier, commands=self.commands)
+
+def _wt(tmp_path, run_id):
+    repo, sha = _seed(tmp_path)
+    h = create_worktree(repo=repo, base_commit_sha=sha, run_id=run_id, worktree_root=tmp_path/"wt")
+    return h, CommandRunner(allowlist=DEFAULT_ALLOWLIST, worktree_root=tmp_path/"wt")
+
+def test_rejected_verifier_command_is_a_verify_failure_not_a_crash(tmp_path):
+    # observed live 2026-10-09: a rejected verifier command raised out of the
+    # phase and the run died as an "exception" instead of a verification result
+    h, runner = _wt(tmp_path, "run-r")
+    drv = _ScriptedRoles([("a.py", "x = 1\n")], [["rm", "-rf", "a.py"]])
+    res = run_build_and_verify(driver=drv, worktree=h, run_id="run-r", runner=runner,
+                               proposal={"affected_files": ["a.py"]})
+    assert res.verify_returncode != 0
+    assert "rejected" in res.verify_output
+    assert (Path(h.path)/"a.py").exists()
+
+def test_builder_cannot_write_files_outside_the_approved_proposal(tmp_path):
+    # the operator approved a proposal naming specific files; the builder may not widen it
+    h, runner = _wt(tmp_path, "run-s")
+    drv = _ScriptedRoles([("a.py", "x = 1\n"), ("sneaky.py", "boom\n")], [["git", "status"]])
+    with pytest.raises(ValueError, match="sneaky.py"):
+        run_build_and_verify(driver=drv, worktree=h, run_id="run-s", runner=runner,
+                             proposal={"affected_files": ["a.py"]})
+    assert not (Path(h.path)/"sneaky.py").exists()
+
+def test_failed_test_count_trips_breaker(tmp_path):
+    from navigator.safety.circuit_breakers import CircuitBreakers
+    from navigator.safety.command_runner import CommandResult
+    from navigator.safety.errors import BreakerTripped
+    h, _ = _wt(tmp_path, "run-t")
+    class _Runner:
+        allowlist = ["pytest"]
+        def run(self, argv, cwd):
+            return CommandResult(1, "=== 7 failed, 3 passed in 0.1s ===", "")
+    drv = _ScriptedRoles([("a.py", "x = 1\n")], [["pytest"]])
+    cb = CircuitBreakers(max_tool_failures=99, max_identical_failures=99,
+                         max_run_duration_s=999, max_failed_tests=5)
+    with pytest.raises(BreakerTripped, match="max_failed_tests"):
+        run_build_and_verify(driver=drv, worktree=h, run_id="run-t", runner=_Runner(),
+                             proposal={"affected_files": ["a.py"]}, breakers=cb)

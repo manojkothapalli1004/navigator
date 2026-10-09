@@ -21,7 +21,7 @@ def _seed(tmp_path):
 def _proposal(repo, sha):
     return Proposal(title="t", rationale="r", repo=str(repo), base_commit_sha=sha,
                     intended_changes="x", affected_files=["navigator_touch.py"],
-                    risk_tier=RiskTier.low, origin="periodic",
+                    risk_tier=RiskTier.low, origin="periodic", status="approved",
                     proposal_origin_hash=compute_origin_hash(str(repo),"x",["navigator_touch.py"],"periodic",None))
 
 def _deps(tmp_path, repo):
@@ -146,3 +146,30 @@ def test_heartbeat_renewed_on_every_phase_transition(tmp_path):
     beats = [hb for _, hb in seen]
     assert len(seen) >= 2
     assert beats == sorted(beats) and beats[-1] > run.started_at
+
+
+def test_execute_refuses_proposal_without_review_approval(tmp_path):
+    import pytest
+    from navigator.contracts.enums import ProposalStatus
+    from navigator.safety.errors import GateNotApproved
+    repo, sha = _seed(tmp_path); d = _deps(tmp_path, repo)
+    p = _proposal(repo, sha); p.status = ProposalStatus.proposed
+    with pytest.raises(GateNotApproved):
+        execute_proposal(p, **d)
+    assert not (tmp_path/"wt").exists() or not any((tmp_path/"wt").iterdir())
+
+def test_run_duration_breaker_fails_run_and_preserves(tmp_path):
+    repo, sha = _seed(tmp_path); d = _deps(tmp_path, repo)
+    d["settings"].max_run_duration_s = 0
+    run = execute_proposal(_proposal(repo, sha), **d)
+    assert run.status == RunStatus.failed
+    assert any("max_run_duration" in note for _, note, _ in d["orc"].updates)
+    assert Path(run.worktree_path).exists()
+
+def test_budget_is_per_run_not_shared_with_planner_spend(tmp_path):
+    from navigator.safety.budget_guard import BudgetGuard
+    repo, sha = _seed(tmp_path); d = _deps(tmp_path, repo)
+    guard = BudgetGuard(1.0); guard.record_spend(1.0)  # planner exhausted this cycle's spend
+    d["driver"].budget_guard = guard
+    run = execute_proposal(_proposal(repo, sha), **d)
+    assert run.phase == RunPhase.awaiting_review
