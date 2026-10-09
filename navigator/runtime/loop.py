@@ -2,8 +2,9 @@ import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from navigator.contracts.proposal import Proposal, compute_origin_hash
-from navigator.contracts.enums import ProposalStatus, RunStatus, RunPhase
-from navigator.runtime.executor import execute_proposal
+from navigator.contracts.enums import (ProposalStatus, RunStatus, RunPhase, ApprovalGate,
+                                       ApprovalDecision)
+from navigator.runtime.executor import execute_proposal, merge_after_approval, decline_run
 from navigator.runtime.lock import SingleFlightLock
 from navigator.observability.logging import get_logger
 
@@ -76,6 +77,26 @@ class Navigator:
                 # Correction 3: proposal stays approved; the dedup guard above prevents re-execution
                 runs.append(run)
         return runs
+
+    def merge_poll(self) -> list:
+        """Act on operator decisions at the merge gate; returns runs that finished."""
+        if self.settings.mode != "execute":
+            return []
+        done = []
+        with self.lock.acquire():
+            for run in self.act.list_open_runs():
+                if run.phase != RunPhase.awaiting_review:
+                    continue
+                decisions = {a.decision for a in
+                             self.act.list_approvals(target=run.id, gate=ApprovalGate.merge)}
+                if ApprovalDecision.declined in decisions:
+                    done.append(decline_run(run, act=self.act, orc=self.orc, settings=self.settings))
+                elif ApprovalDecision.approved in decisions:
+                    run = merge_after_approval(run, act=self.act, orc=self.orc, driver=self.driver,
+                                               runner=self.runner, settings=self.settings)
+                    if run.status != RunStatus.executing:
+                        done.append(run)
+        return done
 
     def reconcile_on_startup(self) -> None:
         for run in self.act.list_open_runs():

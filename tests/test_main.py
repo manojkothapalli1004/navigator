@@ -65,6 +65,7 @@ def test_main_once_prints_summary_and_exits_zero(tmp_path, monkeypatch, capsys):
     assert summary["mode"] == "dry_run"
     assert summary["proposals_created"] == 1  # fake planner proposes exactly one
     assert summary["runs_executed"] == 0      # dry_run never executes
+    assert summary["runs_finalized"] == 0     # merge gate is polled every cycle
 
 def test_negative_max_cycles_is_rejected():
     with pytest.raises(SystemExit):

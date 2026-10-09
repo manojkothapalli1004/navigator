@@ -41,8 +41,10 @@ def _head_sha(repo: str) -> str:
 def _cycle(nav: Navigator, settings: Settings) -> dict:
     created = nav.periodic_tick(base_commit_sha=_head_sha(settings.repo))
     runs = nav.approval_poll()
+    finalized = nav.merge_poll()
     return {"mode": settings.mode, "driver": settings.driver,
-            "proposals_created": len(created), "runs_executed": len(runs)}
+            "proposals_created": len(created), "runs_executed": len(runs),
+            "runs_finalized": len(finalized)}
 
 def _reset_budget(nav: Navigator) -> None:
     # The budget cap is per-cycle, not process-lifetime; a long-running daemon

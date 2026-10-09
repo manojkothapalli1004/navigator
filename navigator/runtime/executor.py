@@ -24,7 +24,9 @@ def execute_proposal(proposal: Proposal, *, act, orc, driver, runner, settings) 
     # for weeks and an old base guarantees merge conflicts at the merge gate
     head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=proposal.repo,
                           capture_output=True, text=True).stdout.strip() or proposal.base_commit_sha
-    run = Run(proposal_id=proposal.id, base_commit_sha=head,
+    target = subprocess.run(["git", "symbolic-ref", "--short", "-q", "HEAD"], cwd=proposal.repo,
+                            capture_output=True, text=True).stdout.strip() or None
+    run = Run(proposal_id=proposal.id, base_commit_sha=head, target_branch=target,
               branch="pending", correlation_id=new_id("corr"))
     run.branch = f"nav/{run.id}"
     act.create_run(run)
@@ -74,19 +76,56 @@ def _merge_approved(act, run) -> bool:
     appr = act.list_approvals(target=run.id, gate=ApprovalGate.merge, decision=ApprovalDecision.approved)
     return len(appr) > 0
 
+def _merge_preflight(repo: str, run: Run) -> str | None:
+    """Reason the main checkout can't take the merge right now, else None. The main
+    checkout is the operator's — never merge over their edits or onto another branch."""
+    branch = subprocess.run(["git", "symbolic-ref", "--short", "-q", "HEAD"], cwd=repo,
+                            capture_output=True, text=True).stdout.strip()
+    if run.target_branch and branch != run.target_branch:
+        return f"checkout is on {branch or 'detached HEAD'!r}, run targets {run.target_branch!r}"
+    dirty = subprocess.run(["git", "status", "--porcelain", "--untracked-files=no"], cwd=repo,
+                           capture_output=True, text=True).stdout.strip()
+    if dirty:
+        return "main checkout has uncommitted changes to tracked files"
+    return None
+
 def merge_after_approval(run: Run, *, act, orc, driver, runner, settings) -> Run:
     if not _merge_approved(act, run):
         return run  # never auto-merge
-    run.phase = RunPhase.merging; act.update_run(run)
     repo = _repo_for(run, act)
-    subprocess.run(["git","merge","--no-ff","-m",f"navigator merge {run.id}", run.branch],
-                   cwd=repo, check=True, capture_output=True, text=True)
+    blocked = _merge_preflight(repo, run)
+    if blocked:
+        # stays parked at the gate; the next poll retries once the operator is done
+        _emit(act, run, "run.merge_blocked", Severity.warning, reason=blocked)
+        return run
+    run.phase = RunPhase.merging; act.update_run(run)
+    merge = subprocess.run(["git", "merge", "--no-ff", "-m", f"navigator merge {run.id}", run.branch],
+                           cwd=repo, capture_output=True, text=True)
+    if merge.returncode != 0:
+        subprocess.run(["git", "merge", "--abort"], cwd=repo, capture_output=True, text=True)
+        detail = (merge.stdout + merge.stderr).strip()[:300]
+        run.status = RunStatus.failed; run.phase = RunPhase.finalizing
+        run.ended_at = datetime.now(timezone.utc); act.update_run(run)
+        _write_outcome(orc, run, status="failed", summary=f"merge failed and was aborted: {detail}",
+                       lessons=["merge conflict with main — rebase or re-propose against current HEAD"],
+                       preserved=run.worktree_path, settings=settings)
+        _emit(act, run, "run.failed", Severity.error, error=detail)
+        return run
     run.phase = RunPhase.finalizing; run.status = RunStatus.completed
     run.ended_at = datetime.now(timezone.utc); act.update_run(run)
     _write_outcome(orc, run, status="completed", summary="merged after approval",
                    lessons=["change merged"], section="decisions", settings=settings)
     _cleanup_worktree(run, repo)
     _emit(act, run, "run.completed")
+    return run
+
+def decline_run(run: Run, *, act, orc, settings) -> Run:
+    run.status = RunStatus.aborted; run.phase = RunPhase.finalizing
+    run.ended_at = datetime.now(timezone.utc); act.update_run(run)
+    _write_outcome(orc, run, status="declined", summary="merge declined by operator",
+                   lessons=["operator declined the change at the merge gate"],
+                   preserved=run.worktree_path, section="decisions", settings=settings)
+    _emit(act, run, "run.declined")
     return run
 
 def _cleanup_worktree(run: Run, repo: str) -> None:

@@ -17,6 +17,7 @@ class Run(BaseModel):
     worktree_path: str | None = None
     base_commit_sha: str
     branch: str
+    target_branch: str | None = None
     completed_tasks: list[str] = Field(default_factory=list)
     checkpoints: list[Checkpoint] = Field(default_factory=list)
     cost_usd: float = 0.0
