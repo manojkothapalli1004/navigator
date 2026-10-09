@@ -215,3 +215,19 @@ def test_planner_sees_recent_outcomes(tmp_path):
     outs = planner.last_context["snapshot"]["recent_outcomes"]
     assert outs == [{"proposal_id": "p-1", "status": "failed", "summary": "verification failed",
                      "lessons": ["git flag not on safe list"]}]
+
+
+def test_stale_proposals_expire_so_backlog_cap_cannot_idle_forever(tmp_path):
+    from datetime import datetime, timedelta, timezone
+    repo, sha = _seed(tmp_path)
+    planner = _ScriptedPlanner(["fresh idea"])
+    nav = _scripted_nav(tmp_path, repo, planner, max_open_proposals=1, proposal_ttl_days=7)
+    from navigator.contracts.proposal import Proposal
+    old = Proposal(title="ancient", rationale="r", repo=str(repo), base_commit_sha=sha,
+                   intended_changes="c", affected_files=["a.py"], origin="periodic",
+                   proposal_origin_hash="h-old",
+                   created_at=datetime.now(timezone.utc) - timedelta(days=8))
+    nav.act.create_proposal(old)
+    created = nav.periodic_tick(base_commit_sha=sha)
+    assert nav.act.get_proposal(old.id).status == ProposalStatus.expired
+    assert [p.title for p in created] == ["fresh idea"]

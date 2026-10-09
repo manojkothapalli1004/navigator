@@ -1,7 +1,7 @@
 import json
 import re
 import subprocess
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from navigator.contracts.proposal import Proposal, compute_origin_hash
 from navigator.contracts.enums import (ProposalStatus, RunStatus, RunPhase, ApprovalGate,
@@ -46,8 +46,20 @@ class Navigator:
                     "recent_commits": recent, "files": files},
         }
 
+    def _expire_stale(self, proposals: list[Proposal]) -> list[Proposal]:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=self.settings.proposal_ttl_days)
+        live = []
+        for p in proposals:
+            created = p.created_at if p.created_at.tzinfo else p.created_at.replace(tzinfo=timezone.utc)
+            if created < cutoff:
+                self.act.set_proposal_status(p.id, ProposalStatus.expired)
+            else:
+                live.append(p)
+        return live
+
     def periodic_tick(self, base_commit_sha: str) -> list[Proposal]:
-        open_proposals = self.act.list_proposals(ProposalStatus.proposed)
+        # unreviewed proposals expire so the backlog cap can't idle the daemon forever
+        open_proposals = self._expire_stale(self.act.list_proposals(ProposalStatus.proposed))
         if len(open_proposals) >= self.settings.max_open_proposals:
             log.info("tick.backlog_full", open=len(open_proposals))
             return []

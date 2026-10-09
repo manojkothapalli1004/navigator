@@ -36,3 +36,42 @@ def test_full_loop_propose_approve_execute_review_merge_outcome(tmp_path):
     assert any(sec in ("status","decisions") for sec, _, _ in nav.orc.updates)
     # change is on main
     assert "navigator_touch.py" in subprocess.run(["git","ls-files"], cwd=repo, capture_output=True, text=True).stdout
+
+
+def test_operator_journey_through_daemon_cycles_and_cli_with_restart(tmp_path):
+    """propose -> CLI approve -> cycle builds -> restart -> CLI merge -> cycle merges"""
+    import io
+    from navigator.__main__ import _cycle
+    from navigator.cli import run_cli
+    from navigator.contracts.enums import RunPhase
+    repo = tmp_path/"repo"; repo.mkdir()
+    for args in (["init", "-b", "main"], ["config", "user.email", "t@t"],
+                 ["config", "user.name", "t"], ["commit", "--allow-empty", "-m", "base"]):
+        subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True)
+    s = Settings(mode="execute", repo=str(repo), worktree_root=str(tmp_path/"wt"),
+                 outcome_path=str(tmp_path/"outcomes.jsonl"), lock_path=str(tmp_path/"nav.lock"))
+    act, orc = FakeACTClient(), FakeORCClient()
+    def daemon():  # a fresh process each time: nothing survives but ACT/ORC/git
+        nav = Navigator(act=act, orc=orc, driver=FakeSubagentDriver(),
+                        runner=CommandRunner(allowlist=s.allowed_commands, worktree_root=tmp_path/"wt"),
+                        settings=s, repo=str(repo), lock_path=tmp_path/"nav.lock")
+        nav.reconcile_on_startup()
+        return nav
+    cli = lambda *a: run_cli(list(a), act=act, out=io.StringIO())
+
+    nav = daemon()
+    assert _cycle(nav, s)["proposals_created"] == 1
+    p = act.list_proposals(status=ProposalStatus.proposed)[0]
+    assert cli("approve", p.id) == 0
+    assert _cycle(nav, s)["runs_executed"] == 1
+    run = next(iter(act.runs.values()))
+    assert run.phase == RunPhase.awaiting_review
+
+    nav = daemon()  # restart while parked at the merge gate
+    assert act.runs[run.id].status == RunStatus.executing
+    assert cli("merge", run.id) == 0
+    assert _cycle(nav, s)["runs_finalized"] == 1
+    assert act.runs[run.id].status == RunStatus.completed
+    assert "navigator_touch.py" in subprocess.run(["git", "ls-files"], cwd=repo,
+                                                  capture_output=True, text=True).stdout
+    assert _cycle(nav, s)["runs_executed"] == 0  # completed proposal never re-runs
