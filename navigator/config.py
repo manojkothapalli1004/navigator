@@ -20,6 +20,7 @@ class Settings:
     max_run_duration_s: int = 1800
     max_cost_usd: float = 2.0
     max_proposals_per_tick: int = 3
+    max_open_proposals: int = 10
     max_failed_tests: int = 50
     repo: str | None = None
     lock_path: str = "/tmp/navigator.lock"
@@ -42,6 +43,7 @@ class Settings:
             max_run_duration_s=_int_env("NAVIGATOR_MAX_RUN_DURATION_S", "1800"),
             max_cost_usd=_positive_float_env("NAVIGATOR_MAX_COST_USD", "2.0"),
             max_proposals_per_tick=_int_env("NAVIGATOR_MAX_PROPOSALS_PER_TICK", "3"),
+            max_open_proposals=_positive_int_env("NAVIGATOR_MAX_OPEN_PROPOSALS", "10"),
             max_failed_tests=_int_env("NAVIGATOR_MAX_FAILED_TESTS", "50"),
             repo=os.getenv("NAVIGATOR_REPO"),
             lock_path=os.getenv("NAVIGATOR_LOCK_PATH", "/tmp/navigator.lock"),

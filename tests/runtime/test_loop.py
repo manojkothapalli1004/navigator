@@ -102,3 +102,53 @@ def test_periodic_tick_returns_stored_proposal_identity(tmp_path):
     assert created  # driver proposed at least one
     stored_ids = {q.id for q in inner.list_proposals()}
     assert {c.id for c in created} <= stored_ids
+
+
+class _ScriptedPlanner:
+    def __init__(self, titles):
+        self.titles = titles
+        self.calls = 0
+        self.last_context = None
+    def run_role(self, request):
+        from navigator.runtime.drivers.base import DriverResult
+        from navigator.contracts.enums import Role
+        self.calls += 1
+        self.last_context = request.context
+        return DriverResult(role=Role.planner, proposals=[{
+            "title": t, "rationale": "r", "intended_changes": f"change {i} {self.calls}",
+            "affected_files": ["a.py"]} for i, t in enumerate(self.titles)])
+
+def _scripted_nav(tmp_path, repo, planner, **settings_kw):
+    s = Settings(mode="dry_run", worktree_root=str(tmp_path/"wt"),
+                 outcome_path=str(tmp_path/"outcomes.jsonl"), **settings_kw)
+    return Navigator(act=FakeACTClient(), orc=FakeORCClient(), driver=planner,
+                     runner=CommandRunner(allowlist=s.allowed_commands, worktree_root=tmp_path/"wt"),
+                     settings=s, repo=str(repo), lock_path=tmp_path/"nav.lock")
+
+def test_reworded_duplicate_title_not_reproposed(tmp_path):
+    # observed live 2026-07→10: 100 open proposals, "Add timestamps to Navigator
+    # log lines" x10 — LLM rewords intended_changes so the exact hash never matches
+    repo, sha = _seed(tmp_path)
+    planner = _ScriptedPlanner(["Add timestamps to Navigator log lines"])
+    nav = _scripted_nav(tmp_path, repo, planner)
+    assert len(nav.periodic_tick(base_commit_sha=sha)) == 1
+    planner.titles = ["  add TIMESTAMPS to navigator log lines. "]
+    assert nav.periodic_tick(base_commit_sha=sha) == []
+
+def test_planner_skipped_when_open_backlog_full(tmp_path):
+    repo, sha = _seed(tmp_path)
+    planner = _ScriptedPlanner(["a", "b", "c"])
+    nav = _scripted_nav(tmp_path, repo, planner, max_open_proposals=3)
+    assert len(nav.periodic_tick(base_commit_sha=sha)) == 3
+    assert nav.periodic_tick(base_commit_sha=sha) == []
+    assert planner.calls == 1  # no LLM spend while nobody is reviewing
+
+def test_planner_sees_open_titles_and_recent_commits(tmp_path):
+    repo, sha = _seed(tmp_path)
+    planner = _ScriptedPlanner(["first idea"])
+    nav = _scripted_nav(tmp_path, repo, planner)
+    nav.periodic_tick(base_commit_sha=sha)
+    nav.periodic_tick(base_commit_sha=sha)
+    snap = planner.last_context["snapshot"]
+    assert [p["title"] for p in snap["act"]["open_proposals"]] == ["first idea"]
+    assert "base" in snap["git"]["recent_commits"][0]

@@ -15,26 +15,41 @@ class Navigator:
         self.settings = settings; self.repo = repo
         self.lock = SingleFlightLock(lock_path)
 
-    def perceive(self, base_commit_sha: str) -> dict:
+    def perceive(self, base_commit_sha: str, open_proposals: list[Proposal] | None = None) -> dict:
+        if open_proposals is None:
+            open_proposals = self.act.list_proposals(ProposalStatus.proposed)
         git_state = subprocess.run(["git","status","--porcelain"], cwd=self.repo,
                                    capture_output=True, text=True).stdout
+        # recent commits let the planner see what already shipped; without them it
+        # kept proposing finished work (outcome store, timestamps) for weeks
+        recent = subprocess.run(["git","log","--oneline","-15"], cwd=self.repo,
+                                capture_output=True, text=True).stdout.splitlines()
         return {
             "orc_memory": self.orc.get_canonical_memory(),
-            "act": {"open_proposals": [p.id for p in self.act.list_proposals(ProposalStatus.proposed)]},
-            "git": {"base_commit_sha": base_commit_sha, "dirty": bool(git_state.strip())},
+            "act": {"open_proposals": [{"id": p.id, "title": p.title} for p in open_proposals]},
+            "git": {"base_commit_sha": base_commit_sha, "dirty": bool(git_state.strip()),
+                    "recent_commits": recent},
         }
 
     def periodic_tick(self, base_commit_sha: str) -> list[Proposal]:
-        snap = self.perceive(base_commit_sha)
+        open_proposals = self.act.list_proposals(ProposalStatus.proposed)
+        if len(open_proposals) >= self.settings.max_open_proposals:
+            log.info("tick.backlog_full", open=len(open_proposals))
+            return []
+        snap = self.perceive(base_commit_sha, open_proposals)
         from navigator.runtime.drivers.base import DriverRequest
         from navigator.contracts.enums import Role
         plan = self.driver.run_role(DriverRequest(role=Role.planner, context={"repo": self.repo, "snapshot": snap}))
         created: list[Proposal] = []
-        existing_hashes = {p.proposal_origin_hash for p in self.act.list_proposals()}
-        for item in plan.proposals[: self.settings.max_proposals_per_tick]:
+        all_proposals = self.act.list_proposals()
+        existing_hashes = {p.proposal_origin_hash for p in all_proposals}
+        existing_titles = {_norm_title(p.title) for p in all_proposals}
+        room = self.settings.max_open_proposals - len(open_proposals)
+        for item in plan.proposals[: min(self.settings.max_proposals_per_tick, room)]:
             h = compute_origin_hash(self.repo, item["intended_changes"], item["affected_files"], "periodic", None)
-            if h in existing_hashes:
+            if h in existing_hashes or _norm_title(item["title"]) in existing_titles:
                 continue
+            existing_titles.add(_norm_title(item["title"]))
             p = Proposal(origin="periodic", proposal_origin_hash=h, title=item["title"],
                          rationale=item["rationale"], repo=self.repo, base_commit_sha=base_commit_sha,
                          intended_changes=item["intended_changes"], affected_files=item["affected_files"])
@@ -70,3 +85,7 @@ class Navigator:
                 note=f"[{run.id}] aborted stale run on startup reconcile | worktree: {run.worktree_path}",
                 replace=False)
             log.warning("reconcile.aborted_stale_run", run_id=run.id, preserved_worktree=run.worktree_path)
+
+
+def _norm_title(title: str) -> str:
+    return " ".join(title.lower().strip(" .").split())
