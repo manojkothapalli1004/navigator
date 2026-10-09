@@ -1,53 +1,49 @@
-# Navigator v0 configuration reference
+# Navigator configuration reference
 #
-# v0 is configured via NAVIGATOR_* ENVIRONMENT VARIABLES, read by Settings.from_env().
-# This file documents every setting with its safe default and the env var that sets it.
-# (It is a reference, not a file the app loads — export the vars, or set them in the
-# launchd plist's EnvironmentVariables block, deploy/launchd/com.navigator.plist.example.)
-#
-# Default profile is intentionally safe: fake driver + dry_run (proposes, never mutates git,
-# contacts no live service).
+# Navigator is configured by NAVIGATOR_* ENVIRONMENT VARIABLES read by Settings.from_env().
+# This file documents each one with its code default; it is not loaded by the app. Set the
+# vars in your shell or in the launchd plist's EnvironmentVariables block.
+# Code defaults are the safe profile: fake driver + dry_run (proposes, never mutates git).
 
 [driver]
-# NAVIGATOR_DRIVER — "fake" (deterministic, no LLM) is the only working driver in v0.
-# A real Claude Agent SDK driver is a v1 item.
-driver = "fake"
+driver = "fake"                 # NAVIGATOR_DRIVER: "fake" (deterministic) | "claude_sdk" (live)
+sdk_model = ""                  # NAVIGATOR_SDK_MODEL: e.g. "claude-opus-5-5" (live deployment)
+sdk_timeout_s = 300.0           # NAVIGATOR_SDK_TIMEOUT_S: wall-clock cap per SDK query
 
 [mode]
-# NAVIGATOR_MODE — "dry_run" proposes but never creates worktrees/branches or mutates git.
-# "execute" lets approval_poll run approved proposals. Keep "dry_run" unless you intend execution.
-mode = "dry_run"
+mode = "dry_run"                # NAVIGATOR_MODE: "dry_run" proposes only; "execute" runs approved
+                                # proposals and acts on merge decisions
 
 [services]
-# NAVIGATOR_ACT_BASE_URL — only used by HTTPACTClient, which is INERT in v0 (raises
-# NotImplementedError) until act-patch/ is applied. Leave unset for the FakeACTClient.
-act_base_url = ""   # unset
-# NAVIGATOR_ORC_BASE_URL — used by HTTPORCClient (REST). Leave unset for the FakeORCClient.
-orc_base_url = ""   # unset
+act_base_url = ""               # NAVIGATOR_ACT_BASE_URL: unset = in-memory FakeACTClient
+                                # (operator CLI defaults to http://127.0.0.1:8090)
+orc_base_url = ""               # NAVIGATOR_ORC_BASE_URL: unset = FakeORCClient
 
 [runtime]
-# NAVIGATOR_WORKTREE_ROOT — where per-run git worktrees are created.
-worktree_root = "/tmp/navigator-worktrees"
-# NAVIGATOR_TICK_INTERVAL_S — periodic tick interval (seconds).
-tick_interval_s = 900
-# NAVIGATOR_OUTCOME_PATH — append-only JSONL trail of run outcomes (best-effort; a write
-# failure never fails a run). Lessons also go to ORC memory independently.
-outcome_path = "/tmp/navigator-outcomes.jsonl"
+repo = ""                       # NAVIGATOR_REPO: target git repository (required)
+worktree_root = "/tmp/navigator-worktrees"     # NAVIGATOR_WORKTREE_ROOT
+lock_path = "/tmp/navigator.lock"              # NAVIGATOR_LOCK_PATH: single-flight lock
+outcome_path = "/tmp/navigator-outcomes.jsonl" # NAVIGATOR_OUTCOME_PATH: local outcome trail
+tick_interval_s = 900           # NAVIGATOR_TICK_INTERVAL_S
 
-# --- Safety limits (env-wired as of 2026-07-14) ---------------------------------------------
-# Settings.from_env() reads NAVIGATOR_MAX_COST_USD (must be > 0) and NAVIGATOR_MAX_TOOL_FAILURES
-# (must be >= 1); non-numeric or out-of-range values raise a descriptive ValueError naming the
-# variable. The remaining limits below use fixed defaults.
+[planner]
+max_proposals_per_tick = 3      # NAVIGATOR_MAX_PROPOSALS_PER_TICK
+max_open_proposals = 10         # NAVIGATOR_MAX_OPEN_PROPOSALS: planner pauses at this backlog
+proposal_ttl_days = 7           # NAVIGATOR_PROPOSAL_TTL_DAYS: unreviewed proposals expire
+memory_chars_per_section = 3000 # NAVIGATOR_MEMORY_CHARS_PER_SECTION: ORC memory budget
+
 [safety]
-max_tool_failures = 5        # circuit breaker: total tool failures per run (NAVIGATOR_MAX_TOOL_FAILURES)
-max_identical_failures = 3   # circuit breaker: identical repeated failures
-max_run_duration_s = 1800    # circuit breaker: wall-clock per run
-max_cost_usd = 2.0           # budget guard: pre-call ceiling (NAVIGATOR_MAX_COST_USD)
-max_proposals_per_tick = 3   # cap on proposals created per periodic tick
-max_failed_tests = 50        # circuit breaker: failed-test count
+max_cost_usd = 2.0              # NAVIGATOR_MAX_COST_USD: per-run budget (> 0)
+max_tool_failures = 5           # NAVIGATOR_MAX_TOOL_FAILURES (>= 1)
+max_identical_failures = 3      # NAVIGATOR_MAX_IDENTICAL_FAILURES
+max_run_duration_s = 1800       # NAVIGATOR_MAX_RUN_DURATION_S
+max_failed_tests = 50           # NAVIGATOR_MAX_FAILED_TESTS
+# NAVIGATOR_ALLOWED_COMMANDS: comma-separated bare command prefixes (no '/', no shell
+# metacharacters). argv-only, no shell; LLM-issued git commands are limited to a safe-flag set.
+allowed_commands = ["git status", "git diff", "git log", "pytest", "python3 -m py_compile", "uv run pytest"]
 
-# Command allowlist. NAVIGATOR_ALLOWED_COMMANDS overrides it (comma-separated); entries must be
-# bare command prefixes — no '/', shell metacharacters, or whitespace-injected operators.
-# argv-only, no shell. LLM-issued git commands are further limited to an exact safe-flag set.
-[safety.allowed_commands]
-commands = ["git status", "git diff", "git log", "pytest", "python3 -m py_compile", "uv run pytest"]
+[notify]
+# Telegram alerts (optional; sending is best-effort). Either set both direct vars:
+#   NAVIGATOR_TELEGRAM_BOT_TOKEN, NAVIGATOR_TELEGRAM_CHAT_ID
+# or point at an existing bot .env holding TELEGRAM_BOT_TOKEN and AUTHORIZED_CHAT_ID:
+notify_env_file = ""            # NAVIGATOR_NOTIFY_ENV_FILE

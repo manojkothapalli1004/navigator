@@ -26,7 +26,49 @@ Each fixed via TDD (failing test first). Suite 46 → 63 tests.
   per aborted stale run (post-mortem trail).
 - **Lock** (`runtime/lock.py`): fd is closed in a `finally` so it can't leak if `os.write` raises.
 
-## REMAINING (genuine v1 / intentional)
+## RESOLVED (completion pass, 2026-10-09)
+
+Found by the first live execute-mode run and a spec-vs-code audit. Each fixed test-first.
+
+- **Outage masking** (`drivers/sdk_query.py`): failed SDK sessions surfaced only as
+  `error result: success`; 216 cycles (2026-08-25 → 10-09) failed on "Usage credits are
+  required" for Fable. The real `ResultMessage.result` text is now raised; billing and
+  model-support errors are not retried. Model → `claude-opus-5-5`; SDK ≥ 0.2.165 (lock-pinned).
+- **Proposal spam** (`runtime/loop.py`): planner saw only proposal ids → 142 open duplicates.
+  It now sees open titles, recent commits and the tracked file list; normalized-title dedup;
+  `NAVIGATOR_MAX_OPEN_PROPOSALS` backpressure; unreviewed proposals expire after
+  `NAVIGATOR_PROPOSAL_TTL_DAYS`.
+- **Blind builder** (`runtime/phases.py`): builder/verifier got `context={}`. They now receive
+  the proposal, affected file contents, and the command allowlist. Runs branch from current
+  HEAD, not the proposal's stale base.
+- **Merge gate never polled** (`runtime/loop.py` `merge_poll`): approved runs are merged,
+  declined runs aborted (worktree kept). Merge preflight protects the operator's checkout;
+  conflicts are aborted cleanly.
+- **Restart discarded parked runs**: reconcile now keeps runs at `awaiting_review`; every run
+  transition renews `heartbeat_at`.
+- **Safety not wired** (`safety/approval_engine.py`, phases, executor): review gate enforced at
+  execution; circuit breakers (duration, failed tests, tool failures) and per-run budget active;
+  builder writes limited to approved `affected_files`; rejected verifier commands are
+  verification failures; `--` allowed in git argv.
+- **No operator surface** (`cli.py`): `status/approve/decline/diff/merge/reject/retry`.
+- **Silent failures** (`observability/notify.py`): Telegram messages on review-ready, failed,
+  merged, declined, merge-blocked runs, and on daemon failure streaks + recovery.
+- **Prompt bloat**: ORC memory trimmed per section (~85k → ~23k chars live); recent outcomes
+  included; `snapshot_chars` reported per cycle; structured logs moved to stderr.
+
+## REMAINING (v1+, intentional)
+
+- **Curator** (spec §11) — not built.
+- **ACT push** — polling only; SSE/webhook needs an ACT change.
+- **ACT-backed lease** — single host, local lock is sufficient for now.
+- **Gates beyond review+merge** — schema-only (`GateNotImplemented`).
+- **Memory-trust tagging** — needs ORC to expose tagging over HTTP (v1.5+).
+- **General shell** — never without a real OS sandbox.
+- **Verifier environment** — verifier commands run inside the run's worktree, which has no
+  virtualenv; `uv run pytest` builds one per run (slow first time). Revisit if runs time out.
+
+## History (pre-2026-10)
+
 
 - **Config**: ~~safety fields not env-wired~~ RESOLVED 2026-07-14 — `NAVIGATOR_MAX_COST_USD`
   (>0), `NAVIGATOR_MAX_TOOL_FAILURES` (>=1), and `NAVIGATOR_ALLOWED_COMMANDS` (comma-separated,
