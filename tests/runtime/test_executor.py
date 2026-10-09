@@ -70,10 +70,12 @@ def test_store_write_failure_does_not_fail_run(tmp_path):
     run = execute_proposal(_proposal(repo, sha), **d)  # must NOT raise
     assert run.phase == RunPhase.awaiting_review  # run proceeded normally
 
-def test_create_worktree_failure_marks_run_failed(tmp_path):
+def test_create_worktree_failure_marks_run_failed(tmp_path, monkeypatch):
     repo, sha = _seed(tmp_path); d = _deps(tmp_path, repo)
-    bad = _proposal(repo, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef")  # invalid base sha
-    run = execute_proposal(bad, **d)  # must NOT raise
+    def boom(**kw):
+        raise RuntimeError("git worktree add failed")
+    monkeypatch.setattr("navigator.runtime.executor.create_worktree", boom)
+    run = execute_proposal(_proposal(repo, sha), **d)  # must NOT raise
     assert run.status == RunStatus.failed
     assert run.phase == RunPhase.finalizing
     assert any(sec == "known_failures" for sec, _, _ in d["orc"].updates)
@@ -117,3 +119,17 @@ def test_execute_and_merge_work_through_protocol_only_client(tmp_path):
     inner.decide_approval(appr.id, ApprovalDecision.approved, actor="manoj")
     merge_after_approval(run, **d)
     assert inner.runs[run.id].status == RunStatus.completed
+
+
+def test_execute_branches_from_current_head_not_stale_proposal_base(tmp_path):
+    # proposals sit for weeks; executing on their old base guarantees merge
+    # conflicts with everything committed since
+    repo, stale = _seed(tmp_path); d = _deps(tmp_path, repo)
+    subprocess.run(["git","commit","--allow-empty","-m","later"], cwd=repo, check=True, capture_output=True)
+    head = subprocess.run(["git","rev-parse","HEAD"], cwd=repo, capture_output=True, text=True).stdout.strip()
+    run = execute_proposal(_proposal(repo, stale), **d)
+    assert run.base_commit_sha == head
+    wt_parent = subprocess.run(["git","rev-parse","HEAD~1"], cwd=run.worktree_path,
+                               capture_output=True, text=True).stdout.strip()
+    assert head in (wt_parent, subprocess.run(["git","merge-base","HEAD",head], cwd=run.worktree_path,
+                                               capture_output=True, text=True).stdout.strip())

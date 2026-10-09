@@ -53,3 +53,35 @@ def test_build_and_verify_writes_and_runs(tmp_path):
     assert (Path(h.path)/"navigator_touch.py").exists()
     assert result.verify_returncode == 0
     assert len(result.checkpoints) >= 1
+
+
+class _RecordingDriver:
+    def __init__(self):
+        self.requests = {}
+    def run_role(self, request):
+        self.requests[request.role] = request
+        if request.role == Role.builder:
+            return DriverResult(role=Role.builder, file_writes=[("a.py", "x = 2\n")])
+        return DriverResult(role=Role.verifier, commands=[["python3", "-m", "py_compile", "a.py"]])
+
+def test_builder_and_verifier_receive_proposal_and_file_contents(tmp_path):
+    # observed 2026-10-09: both roles got context={} — a real LLM with tools
+    # disabled would have to invent whole files blind
+    repo, _ = _seed(tmp_path)
+    (repo/"a.py").write_text("x = 1\n")
+    subprocess.run(["git","add","a.py"], cwd=repo, check=True)
+    subprocess.run(["git","commit","-m","a"], cwd=repo, check=True, capture_output=True)
+    sha = subprocess.run(["git","rev-parse","HEAD"], cwd=repo, capture_output=True, text=True).stdout.strip()
+    h = create_worktree(repo=repo, base_commit_sha=sha, run_id="run-c", worktree_root=tmp_path/"wt")
+    runner = CommandRunner(allowlist=DEFAULT_ALLOWLIST, worktree_root=tmp_path/"wt")
+    drv = _RecordingDriver()
+    proposal = {"title": "bump x", "rationale": "r", "intended_changes": "set x to 2",
+                "affected_files": ["a.py", "new_file.py"]}
+    res = run_build_and_verify(driver=drv, worktree=h, run_id="run-c", runner=runner, proposal=proposal)
+    assert res.verify_returncode == 0
+    b = drv.requests[Role.builder].context
+    assert b["proposal"]["intended_changes"] == "set x to 2"
+    assert b["files"] == {"a.py": "x = 1\n", "new_file.py": None}
+    v = drv.requests[Role.verifier].context
+    assert v["changed_files"] == ["a.py"]
+    assert "pytest" in v["allowed_commands"]

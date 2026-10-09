@@ -26,12 +26,29 @@ def _resolve_write_target(wt: Path, relpath: str) -> Path:
         raise ValueError(f"write outside worktree (or is the worktree root): {target}")
     return target
 
+_MAX_FILE_CHARS = 60_000
+
+def _read_affected(wt: Path, relpaths: list[str]) -> dict[str, str | None]:
+    # tools are disabled for subagents, so the builder only sees what we hand it;
+    # None marks a file the proposal expects to create
+    files: dict[str, str | None] = {}
+    for rel in relpaths:
+        try:
+            target = _resolve_write_target(wt, rel)
+        except ValueError:
+            continue
+        files[rel] = target.read_text()[:_MAX_FILE_CHARS] if target.is_file() else None
+    return files
+
 def run_build_and_verify(driver: SubagentDriver, worktree: WorktreeHandle,
-                         run_id: str, runner: CommandRunner) -> PhaseResult:
+                         run_id: str, runner: CommandRunner,
+                         proposal: dict | None = None) -> PhaseResult:
     res = PhaseResult()
     wt = Path(worktree.path)
-    # builder
-    build = driver.run_role(DriverRequest(role=Role.builder, context={}, worktree_path=str(wt)))
+    proposal = proposal or {}
+    build_ctx = {"proposal": proposal,
+                 "files": _read_affected(wt, proposal.get("affected_files", []))}
+    build = driver.run_role(DriverRequest(role=Role.builder, context=build_ctx, worktree_path=str(wt)))
     for n, (relpath, content) in enumerate(build.file_writes, start=1):
         target = _resolve_write_target(wt, relpath)
         cp_before = checkpoint(wt, run_id=run_id, n=n, label=f"pre-write-{relpath}")
@@ -40,7 +57,9 @@ def run_build_and_verify(driver: SubagentDriver, worktree: WorktreeHandle,
         res.file_writes.append(relpath)
     checkpoint(wt, run_id=run_id, n=len(build.file_writes) + 1, label="post-build")
     # verifier — a verify phase with no commands is a failure, not a silent pass
-    verify = driver.run_role(DriverRequest(role=Role.verifier, context={}, worktree_path=str(wt)))
+    verify_ctx = {"proposal": proposal, "changed_files": list(res.file_writes),
+                  "allowed_commands": list(runner.allowlist)}
+    verify = driver.run_role(DriverRequest(role=Role.verifier, context=verify_ctx, worktree_path=str(wt)))
     if not verify.commands:
         res.verify_returncode = 1
         res.verify_output = "verifier produced no commands"

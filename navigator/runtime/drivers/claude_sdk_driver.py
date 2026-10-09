@@ -11,8 +11,13 @@ _ROLE_OUTPUT_SPEC = {
     Role.planner: ('Respond with ONLY a JSON object: {"proposals": [{"title": "...", '
                    '"rationale": "...", "intended_changes": "...", "affected_files": ["path", ...]}], '
                    '"summary": "..."}'),
-    Role.builder: 'Respond with ONLY a JSON object: {"file_writes": [[relpath, content], ...], "commands": [[argv...], ...], "summary": "..."}',
-    Role.verifier: 'Respond with ONLY a JSON object: {"commands": [[argv...], ...], "summary": "..."}',
+    Role.builder: ('Implement context.proposal by editing context.files (null = new file). '
+                   'Respond with ONLY a JSON object: {"file_writes": [[relpath, FULL new file content], ...], '
+                   '"commands": [], "summary": "..."}. Each content replaces the whole file — '
+                   'never elide unchanged code. Only write paths listed in context.files.'),
+    Role.verifier: ('Choose commands that prove context.proposal works, each starting with an entry '
+                    'of context.allowed_commands. Respond with ONLY a JSON object: '
+                    '{"commands": [[argv...], ...], "summary": "..."}'),
 }
 
 class ClaudeSDKDriver:

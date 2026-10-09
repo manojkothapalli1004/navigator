@@ -24,11 +24,15 @@ class Navigator:
         # kept proposing finished work (outcome store, timestamps) for weeks
         recent = subprocess.run(["git","log","--oneline","-15"], cwd=self.repo,
                                 capture_output=True, text=True).stdout.splitlines()
+        # real paths keep proposals' affected_files accurate — the builder only
+        # sees the files a proposal names
+        files = subprocess.run(["git","ls-files"], cwd=self.repo,
+                               capture_output=True, text=True).stdout.splitlines()[:400]
         return {
             "orc_memory": self.orc.get_canonical_memory(),
             "act": {"open_proposals": [{"id": p.id, "title": p.title} for p in open_proposals]},
             "git": {"base_commit_sha": base_commit_sha, "dirty": bool(git_state.strip()),
-                    "recent_commits": recent},
+                    "recent_commits": recent, "files": files},
         }
 
     def periodic_tick(self, base_commit_sha: str) -> list[Proposal]:

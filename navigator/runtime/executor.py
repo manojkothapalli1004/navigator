@@ -20,12 +20,16 @@ def execute_proposal(proposal: Proposal, *, act, orc, driver, runner, settings) 
     # Ensure the proposal is registered in ACT so _repo_for can resolve it
     if act.get_proposal(proposal.id) is None:
         proposal = act.create_proposal(proposal)
-    run = Run(proposal_id=proposal.id, base_commit_sha=proposal.base_commit_sha,
+    # branch from the repo's current HEAD, not the proposal's base: proposals sit
+    # for weeks and an old base guarantees merge conflicts at the merge gate
+    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=proposal.repo,
+                          capture_output=True, text=True).stdout.strip() or proposal.base_commit_sha
+    run = Run(proposal_id=proposal.id, base_commit_sha=head,
               branch="pending", correlation_id=new_id("corr"))
     run.branch = f"nav/{run.id}"
     act.create_run(run)
     try:
-        handle = create_worktree(repo=Path(proposal.repo), base_commit_sha=proposal.base_commit_sha,
+        handle = create_worktree(repo=Path(proposal.repo), base_commit_sha=head,
                                  run_id=run.id, worktree_root=Path(settings.worktree_root))
     except Exception as e:
         run.status = RunStatus.failed; run.phase = RunPhase.finalizing
@@ -36,7 +40,11 @@ def execute_proposal(proposal: Proposal, *, act, orc, driver, runner, settings) 
     run.worktree_path = str(handle.path)
     run.phase = RunPhase.building; act.update_run(run); _emit(act, run, "run.building")
     try:
-        result = run_build_and_verify(driver=driver, worktree=handle, run_id=run.id, runner=runner)
+        result = run_build_and_verify(
+            driver=driver, worktree=handle, run_id=run.id, runner=runner,
+            proposal={"title": proposal.title, "rationale": proposal.rationale,
+                      "intended_changes": proposal.intended_changes,
+                      "affected_files": list(proposal.affected_files)})
     except Exception as e:
         preserve_failed(handle)
         run.status = RunStatus.failed; run.phase = RunPhase.finalizing
@@ -58,7 +66,7 @@ def execute_proposal(proposal: Proposal, *, act, orc, driver, runner, settings) 
     run.phase = RunPhase.awaiting_review; act.update_run(run)
     act.create_approval(target=run.id, gate=ApprovalGate.merge)
     # Correction 1: store diff in event payload, not as a transient Run attribute
-    diff = diff_artifact(handle.path, proposal.base_commit_sha)
+    diff = diff_artifact(handle.path, head)
     _emit(act, run, "run.awaiting_review", diff=diff)
     return run
 

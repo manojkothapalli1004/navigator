@@ -152,3 +152,13 @@ def test_planner_sees_open_titles_and_recent_commits(tmp_path):
     snap = planner.last_context["snapshot"]
     assert [p["title"] for p in snap["act"]["open_proposals"]] == ["first idea"]
     assert "base" in snap["git"]["recent_commits"][0]
+
+def test_planner_sees_tracked_file_list(tmp_path):
+    repo, sha = _seed(tmp_path)
+    (repo/"real.py").write_text("")
+    subprocess.run(["git","add","real.py"], cwd=repo, check=True)
+    subprocess.run(["git","commit","-m","f"], cwd=repo, check=True, capture_output=True)
+    planner = _ScriptedPlanner(["x"])
+    nav = _scripted_nav(tmp_path, repo, planner)
+    nav.periodic_tick(base_commit_sha=sha)
+    assert "real.py" in planner.last_context["snapshot"]["git"]["files"]
