@@ -34,15 +34,23 @@ def make_sdk_query_fn(*, model: str | None = None,
                                      max_turns=4, allowed_tools=[],
                                      setting_sources=[])
         results: list[str] = []
+        error: list[str] = []
 
         async def _collect() -> None:
-            async for message in query(prompt=prompt, options=options):
-                # the SDK's own exception for an is_error result only says
-                # "error result: success"; the real reason is in .result
-                if isinstance(message, ResultMessage) and getattr(message, "is_error", False):
-                    raise RuntimeError(f"claude-agent-sdk error result: {message.result}")
-                if isinstance(message, ResultMessage) and message.result is not None:
-                    results.append(message.result)
+            # the SDK's own exception for an is_error result only says "error result:
+            # success"; record the real reason and let the stream finish (raising
+            # mid-iteration leaves the generator half-closed)
+            try:
+                async for message in query(prompt=prompt, options=options):
+                    if not isinstance(message, ResultMessage):
+                        continue
+                    if getattr(message, "is_error", False):
+                        error.append(_describe_error(message))
+                    elif message.result is not None:
+                        results.append(message.result)
+            except Exception:
+                if not error:
+                    raise
 
         # wall-clock guard: the CLI subprocess can stall during init under
         # launchd (observed 2026-07-17 — daemon froze on cycle 1 for 19h);
@@ -51,6 +59,8 @@ def make_sdk_query_fn(*, model: str | None = None,
             asyncio.run(asyncio.wait_for(_collect(), timeout=timeout_s))
         except (asyncio.TimeoutError, TimeoutError) as e:
             raise TimeoutError(f"claude-agent-sdk query timed out after {timeout_s}s") from e
+        if error:
+            raise RuntimeError(f"claude-agent-sdk error result: {error[-1]}")
         if not results:
             raise RuntimeError("claude-agent-sdk returned no result message")
         return _strip_fences(results[-1])
@@ -76,6 +86,13 @@ def make_sdk_query_fn(*, model: str | None = None,
         return retry
 
     return query_fn
+
+
+def _describe_error(message) -> str:
+    if message.result:
+        return str(message.result)
+    errors = getattr(message, "errors", None) or []
+    return f"{getattr(message, 'subtype', 'unknown')}: {'; '.join(map(str, errors)) or 'no detail'}"
 
 
 # account/config failures: a retry just doubles the cost of a guaranteed error

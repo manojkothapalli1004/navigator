@@ -237,3 +237,23 @@ def test_transient_error_result_still_retried_once(monkeypatch):
     with pytest.raises(RuntimeError, match="maximum number of turns"):
         make_sdk_query_fn()("x")
     assert calls["n"] == 2
+
+
+def test_error_result_without_text_reports_subtype_and_errors(monkeypatch):
+    # observed live 2026-10-09 under launchd: is_error with result=None logged as
+    # "error result: None" — the reason lives in subtype/errors
+    mod = types.ModuleType("claude_agent_sdk")
+    class ResultMessage:
+        def __init__(self):
+            self.result = None; self.is_error = True
+            self.subtype = "error_during_execution"; self.errors = ["API Error: 529 overloaded"]
+    class ClaudeAgentOptions:
+        def __init__(self, **kw): pass
+    async def query(*, prompt, options):
+        yield ResultMessage()
+        raise Exception("Claude Code returned an error result: success")
+    mod.query, mod.ClaudeAgentOptions, mod.ResultMessage = query, ClaudeAgentOptions, ResultMessage
+    monkeypatch.setitem(sys.modules, "claude_agent_sdk", mod)
+    with pytest.raises(RuntimeError) as exc:
+        make_sdk_query_fn()("x")
+    assert "error_during_execution" in str(exc.value) and "529 overloaded" in str(exc.value)
