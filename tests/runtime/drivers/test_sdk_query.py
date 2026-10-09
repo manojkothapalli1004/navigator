@@ -30,8 +30,10 @@ def test_query_fn_returns_result_text_with_locked_down_options(monkeypatch):
     fn = make_sdk_query_fn()
     assert fn("hello") == '{"commands": [], "summary": "ok"}'
     assert captured["prompt"] == "hello"
-    # 2, not 1: the CLI occasionally burns a turn before the reply; observed live 2026-07-08
-    assert captured["options"]["max_turns"] == 2
+    # headroom over 1: the CLI occasionally burns turns before the reply
+    # (observed live 2026-07-08 at 1, 2026-07-18 at 2); tools are disabled so
+    # unused turns cost nothing
+    assert captured["options"]["max_turns"] == 4
     assert captured["options"]["allowed_tools"] == []
     assert "JSON" in captured["options"]["system_prompt"]
     # no filesystem settings: without this the session inherits the operator's
@@ -50,11 +52,77 @@ def test_missing_sdk_raises_clear_error(monkeypatch):
     with pytest.raises(ValueError, match="claude-agent-sdk"):
         make_sdk_query_fn()
 
-def test_no_result_message_raises(monkeypatch):
+def test_no_result_message_retried_once_then_raises(monkeypatch):
     captured = {}
     _stub_sdk(monkeypatch, captured, results=())
+    calls = _count_queries(monkeypatch)
     with pytest.raises(RuntimeError, match="no result"):
         make_sdk_query_fn()("x")
+    assert calls["n"] == 2  # bounded: exactly one retry, then surface
+
+
+def _stub_sdk_sequence(monkeypatch, captured, attempts):
+    """Stub whose query behaves per-call: each entry of `attempts` is either an
+    Exception to raise or a tuple of result strings to yield."""
+    mod = types.ModuleType("claude_agent_sdk")
+    class ResultMessage:
+        def __init__(self, result=None):
+            self.result = result
+    class ClaudeAgentOptions:
+        def __init__(self, **kw):
+            captured["options"] = kw
+    calls = {"n": 0}
+    async def query(*, prompt, options):
+        step = attempts[min(calls["n"], len(attempts) - 1)]
+        calls["n"] += 1
+        if isinstance(step, Exception):
+            raise step
+        for r in step:
+            yield ResultMessage(result=r)
+    mod.query = query
+    mod.ClaudeAgentOptions = ClaudeAgentOptions
+    mod.ResultMessage = ResultMessage
+    monkeypatch.setitem(sys.modules, "claude_agent_sdk", mod)
+    return calls
+
+def _count_queries(monkeypatch):
+    import claude_agent_sdk as mod
+    calls = {"n": 0}
+    real = mod.query
+    def counting(*, prompt, options):
+        calls["n"] += 1
+        return real(prompt=prompt, options=options)
+    monkeypatch.setattr(mod, "query", counting)
+    return calls
+
+def test_max_turns_error_result_retried_once(monkeypatch):
+    # observed live 2026-07-18: fable-5 burned every turn without a result and
+    # the SDK raised "Claude Code returned an error result: Reached maximum
+    # number of turns (2)" — one bounded retry recovers the cycle
+    captured = {}
+    good = '{"commands": [], "summary": "ok"}'
+    calls = _stub_sdk_sequence(monkeypatch, captured, [
+        Exception("Claude Code returned an error result: Reached maximum number of turns (4)"),
+        (good,)])
+    assert make_sdk_query_fn()("x") == good
+    assert calls["n"] == 2
+
+def test_non_retryable_exception_propagates_without_retry(monkeypatch):
+    captured = {}
+    calls = _stub_sdk_sequence(monkeypatch, captured, [ValueError("bad options")])
+    with pytest.raises(ValueError, match="bad options"):
+        make_sdk_query_fn()("x")
+    assert calls["n"] == 1
+
+def test_truncated_json_retried_once_then_recovers(monkeypatch):
+    # observed live 2026-07-18: fable-5 reply cut mid-generation (no closing
+    # brace) → DriverParseError; a fresh query usually completes
+    captured = {}
+    good = '{"commands": [], "summary": "ok"}'
+    calls = _stub_sdk_sequence(monkeypatch, captured, [
+        ('{"proposals": [{"title": "truncat',), (good,)])
+    assert make_sdk_query_fn()("x") == good
+    assert calls["n"] == 2
 
 def test_markdown_fences_stripped_at_adapter_boundary(monkeypatch):
     # live models fence JSON despite instructions; the adapter must hand the
@@ -84,10 +152,13 @@ def test_bare_json_embedded_in_prose_extracted(monkeypatch):
     assert make_sdk_query_fn()("x") == '{"commands": [], "summary": "ok"}'
 
 def test_truncated_json_passes_through_for_driver_error(monkeypatch):
-    # no closing brace: adapter must not invent structure; driver reports it
+    # no closing brace on BOTH attempts: adapter must not invent structure;
+    # the driver's strict parser reports it with head/tail detail
     captured = {}
     _stub_sdk(monkeypatch, captured, results=('{"commands": [',))
+    calls = _count_queries(monkeypatch)
     assert make_sdk_query_fn()("x") == '{"commands": ['
+    assert calls["n"] == 2  # retried once, still truncated, surfaced as-is
 
 def test_hung_sdk_query_raises_instead_of_blocking_forever(monkeypatch):
     # observed live 2026-07-17: the CLI subprocess stalled during init under
@@ -121,3 +192,48 @@ def test_driver_end_to_end_with_stubbed_sdk(monkeypatch):
     assert result.commands == [["uv", "run", "pytest", "-q"]]
     assert d.budget_guard.spent_usd == 0.25
     assert "verifier" in captured["prompt"]
+
+
+def _stub_sdk_error_result(monkeypatch, text):
+    """Mimics the real CLI: an is_error ResultMessage carrying the actual
+    reason, then the SDK's generic 'error result: success' exception."""
+    mod = types.ModuleType("claude_agent_sdk")
+    class ResultMessage:
+        def __init__(self, result=None, is_error=False):
+            self.result = result
+            self.is_error = is_error
+    class ClaudeAgentOptions:
+        def __init__(self, **kw):
+            pass
+    calls = {"n": 0}
+    async def query(*, prompt, options):
+        calls["n"] += 1
+        yield ResultMessage(result=text, is_error=True)
+        raise Exception("Claude Code returned an error result: success")
+    mod.query = query
+    mod.ClaudeAgentOptions = ClaudeAgentOptions
+    mod.ResultMessage = ResultMessage
+    monkeypatch.setitem(sys.modules, "claude_agent_sdk", mod)
+    return calls
+
+def test_error_result_surfaces_real_reason_not_generic_success(monkeypatch):
+    # observed live 2026-08-25 → 2026-10-09: 216 cycles logged only
+    # "error result: success"; the real reason was in ResultMessage.result
+    _stub_sdk_error_result(monkeypatch, "Usage credits are required for this model.")
+    with pytest.raises(RuntimeError, match="Usage credits are required"):
+        make_sdk_query_fn()("x")
+
+def test_billing_and_model_support_errors_not_retried(monkeypatch):
+    for text in ("Usage credits are required for this model.",
+                 "API Error: 400 Claude Code 2.1.165 does not support this model; "
+                 "version 2.1.280 or newer is required."):
+        calls = _stub_sdk_error_result(monkeypatch, text)
+        with pytest.raises(RuntimeError):
+            make_sdk_query_fn()("x")
+        assert calls["n"] == 1
+
+def test_transient_error_result_still_retried_once(monkeypatch):
+    calls = _stub_sdk_error_result(monkeypatch, "Reached maximum number of turns (4)")
+    with pytest.raises(RuntimeError, match="maximum number of turns"):
+        make_sdk_query_fn()("x")
+    assert calls["n"] == 2

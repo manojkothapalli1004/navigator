@@ -3,6 +3,9 @@ import json
 import subprocess
 import sys
 import time
+from datetime import datetime, timezone
+
+import httpx
 from navigator.config import Settings
 from navigator.clients.act_client import FakeACTClient, HTTPACTClient
 from navigator.clients.orc_client import FakeORCClient, HTTPORCClient
@@ -48,17 +51,46 @@ def _reset_budget(nav: Navigator) -> None:
     if guard is not None:
         guard.reset()
 
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+# ACT restarts take ~1 min to accept connections; Navigator racing it at boot
+# crash-looped 4x on 2026-07-17. Wait bounded, then proceed — the cycle loop's
+# own error handling covers a dependency that stays down.
+_RECONCILE_ATTEMPTS = 18
+_RECONCILE_DELAY_S = 10.0
+
+def _reconcile_with_readiness(nav: Navigator) -> None:
+    for attempt in range(1, _RECONCILE_ATTEMPTS + 1):
+        try:
+            nav.reconcile_on_startup()
+            return
+        except (httpx.ConnectError, ConnectionError) as e:
+            print(json.dumps({"ts": _now_iso(), "startup": "waiting_for_dependencies",
+                              "attempt": attempt, "error": f"{type(e).__name__}: {e}"[:200]}),
+                  flush=True)
+            if attempt == _RECONCILE_ATTEMPTS:
+                return
+            time.sleep(_RECONCILE_DELAY_S)
+
+_FAILURE_WARN_THRESHOLD = 4
+
 def run_daemon(nav: Navigator, settings: Settings, *, max_cycles: int | None = None) -> None:
-    nav.reconcile_on_startup()
+    _reconcile_with_readiness(nav)
     cycle = 0
+    consecutive_failures = 0
     while True:
         cycle += 1
         _reset_budget(nav)
         try:
             summary = _cycle(nav, settings)
+            consecutive_failures = 0
         except Exception as e:  # a dependency blip must not kill the daemon; retry next tick
+            consecutive_failures += 1
             summary = {"error": f"{type(e).__name__}: {e}"[:300]}
-        print(json.dumps({"cycle": cycle, **summary}), flush=True)
+            if consecutive_failures >= _FAILURE_WARN_THRESHOLD:
+                summary["consecutive_failures"] = consecutive_failures
+        print(json.dumps({"ts": _now_iso(), "cycle": cycle, **summary}), flush=True)
         if max_cycles is not None and cycle >= max_cycles:
             return
         time.sleep(settings.tick_interval_s)
