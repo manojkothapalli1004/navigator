@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 import httpx
 from navigator.cli import COMMANDS, run_cli
 from navigator.config import Settings
+from navigator.observability.notify import NotifyingACT, make_notifier
 from navigator.clients.act_client import FakeACTClient, HTTPACTClient
 from navigator.clients.orc_client import FakeORCClient, HTTPORCClient
 from navigator.runtime.drivers.claude_sdk_driver import ClaudeSDKDriver
@@ -30,11 +31,15 @@ def _make_driver(settings: Settings):
 def build_navigator(settings: Settings) -> Navigator:
     if not settings.repo:
         raise ValueError("NAVIGATOR_REPO must point at the target git repository")
+    notifier = make_notifier()
     act = HTTPACTClient(settings.act_base_url) if settings.act_base_url else FakeACTClient()
+    act = NotifyingACT(act, notifier)
     orc = HTTPORCClient(settings.orc_base_url) if settings.orc_base_url else FakeORCClient()
     runner = CommandRunner(allowlist=settings.allowed_commands, worktree_root=settings.worktree_root)
-    return Navigator(act=act, orc=orc, driver=_make_driver(settings), runner=runner,
-                     settings=settings, repo=settings.repo, lock_path=settings.lock_path)
+    nav = Navigator(act=act, orc=orc, driver=_make_driver(settings), runner=runner,
+                    settings=settings, repo=settings.repo, lock_path=settings.lock_path)
+    nav.notifier = notifier
+    return nav
 
 def _head_sha(repo: str) -> str:
     return subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo,
@@ -88,12 +93,17 @@ def run_daemon(nav: Navigator, settings: Settings, *, max_cycles: int | None = N
         _reset_budget(nav)
         try:
             summary = _cycle(nav, settings)
+            if consecutive_failures >= _FAILURE_WARN_THRESHOLD:
+                nav.notifier.send(f"Navigator recovered after {consecutive_failures} failed cycles")
             consecutive_failures = 0
         except Exception as e:  # a dependency blip must not kill the daemon; retry next tick
             consecutive_failures += 1
             summary = {"error": f"{type(e).__name__}: {e}"[:300]}
             if consecutive_failures >= _FAILURE_WARN_THRESHOLD:
                 summary["consecutive_failures"] = consecutive_failures
+            if consecutive_failures == _FAILURE_WARN_THRESHOLD:
+                nav.notifier.send(f"Navigator cycles failing: {consecutive_failures} in a row. "
+                                  f"Latest: {summary['error']}")
         print(json.dumps({"ts": _now_iso(), "cycle": cycle, **summary}), flush=True)
         if max_cycles is not None and cycle >= max_cycles:
             return

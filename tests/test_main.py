@@ -20,13 +20,13 @@ def _settings(tmp_path, repo, **kw):
 
 def test_build_navigator_defaults_to_fake_clients(tmp_path):
     nav = build_navigator(_settings(tmp_path, _seed_repo(tmp_path)))
-    assert isinstance(nav.act, FakeACTClient)
+    assert isinstance(nav.act.inner, FakeACTClient)  # wrapped to announce run events
     assert isinstance(nav.driver, FakeSubagentDriver)
 
 def test_build_navigator_uses_http_act_when_url_set(tmp_path):
     s = _settings(tmp_path, _seed_repo(tmp_path), act_base_url="http://127.0.0.1:9")
     nav = build_navigator(s)
-    assert isinstance(nav.act, HTTPACTClient)
+    assert isinstance(nav.act.inner, HTTPACTClient)
 
 def test_build_navigator_requires_repo(tmp_path):
     with pytest.raises(ValueError, match="NAVIGATOR_REPO"):
@@ -153,3 +153,23 @@ def test_operator_commands_dispatch_to_cli_against_act(monkeypatch, capsys):
     assert main(["status"]) == 0
     assert seen["url"] == "http://127.0.0.1:8090"  # local ACT default for operator use
     assert "proposed (0)" in capsys.readouterr().out
+
+def test_daemon_health_alert_once_per_failure_streak_then_recovery(tmp_path, monkeypatch, capsys):
+    # 2026-08-25 → 10-09: 216 consecutive failed cycles went unnoticed for six weeks
+    import navigator.__main__ as m
+    monkeypatch.setattr(m.time, "sleep", lambda s: None)
+    sent = []
+    class _Rec:
+        def send(self, text): sent.append(text)
+    nav = build_navigator(_settings(tmp_path, _seed_repo(tmp_path)))
+    nav.notifier = _Rec()
+    outcomes = iter([False] * 6 + [True, False])
+    def fake_cycle(n, s):
+        if not next(outcomes):
+            raise RuntimeError("Usage credits are required")
+        return {"ok": 1}
+    monkeypatch.setattr(m, "_cycle", fake_cycle)
+    m.run_daemon(nav, Settings(), max_cycles=8)
+    alerts = [t for t in sent if "failing" in t]
+    assert len(alerts) == 1 and "Usage credits" in alerts[0]
+    assert sum("recovered" in t for t in sent) == 1

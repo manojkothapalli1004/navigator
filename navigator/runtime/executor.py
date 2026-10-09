@@ -22,6 +22,7 @@ def _save(act, run: Run) -> None:
     act.update_run(run)
 
 def _emit(act, run, kind, severity=Severity.info, **payload):
+    payload = {"run_id": run.id, "proposal_id": run.proposal_id, **payload}
     act.emit_event(Event(kind=kind, severity=severity, correlation_id=run.correlation_id, payload=payload))
 
 def execute_proposal(proposal: Proposal, *, act, orc, driver, runner, settings) -> Run:
@@ -87,7 +88,7 @@ def execute_proposal(proposal: Proposal, *, act, orc, driver, runner, settings) 
     act.create_approval(target=run.id, gate=ApprovalGate.merge)
     # Correction 1: store diff in event payload, not as a transient Run attribute
     diff = diff_artifact(handle.path, head)
-    _emit(act, run, "run.awaiting_review", diff=diff)
+    _emit(act, run, "run.awaiting_review", diff=diff, title=proposal.title)
     return run
 
 def _merge_approved(act, run) -> bool:

@@ -7,6 +7,7 @@ from navigator.contracts.enums import (ProposalStatus, RunStatus, RunPhase, Appr
 from navigator.runtime.executor import execute_proposal, merge_after_approval, decline_run
 from navigator.runtime.lock import SingleFlightLock
 from navigator.observability.logging import get_logger
+from navigator.observability.notify import NullNotifier
 
 log = get_logger("navigator.loop")
 
@@ -15,6 +16,7 @@ class Navigator:
         self.act = act; self.orc = orc; self.driver = driver; self.runner = runner
         self.settings = settings; self.repo = repo
         self.lock = SingleFlightLock(lock_path)
+        self.notifier = NullNotifier()
 
     def perceive(self, base_commit_sha: str, open_proposals: list[Proposal] | None = None) -> dict:
         if open_proposals is None:
