@@ -141,3 +141,15 @@ def test_daemon_resets_budget_each_cycle(tmp_path, monkeypatch):
 def test_once_and_max_cycles_are_mutually_exclusive():
     with pytest.raises(SystemExit):
         main(["--once", "--max-cycles", "2"])
+
+def test_operator_commands_dispatch_to_cli_against_act(monkeypatch, capsys):
+    import navigator.__main__ as m
+    seen = {}
+    class _ACT(FakeACTClient):
+        def __init__(self, url):
+            super().__init__(); seen["url"] = url
+    monkeypatch.setattr(m, "HTTPACTClient", _ACT)
+    monkeypatch.delenv("NAVIGATOR_ACT_BASE_URL", raising=False)
+    assert main(["status"]) == 0
+    assert seen["url"] == "http://127.0.0.1:8090"  # local ACT default for operator use
+    assert "proposed (0)" in capsys.readouterr().out

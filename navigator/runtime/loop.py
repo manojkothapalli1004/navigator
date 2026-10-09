@@ -70,13 +70,24 @@ class Navigator:
             for p in self.act.list_proposals(status=ProposalStatus.approved):
                 # Correction 3: dedup guard — skip proposals that already have a run
                 # (any status: a completed run must also block re-execution)
-                if self.act.list_runs_for_proposal(p.id):
+                if not self._may_run(p.id):
                     continue
                 run = execute_proposal(p, act=self.act, orc=self.orc, driver=self.driver,
                                        runner=self.runner, settings=self.settings)
                 # Correction 3: proposal stays approved; the dedup guard above prevents re-execution
                 runs.append(run)
         return runs
+
+    def _may_run(self, proposal_id: str) -> bool:
+        # one run per proposal; each operator `retry` grant buys exactly one more
+        runs = self.act.list_runs_for_proposal(proposal_id)
+        if not runs:
+            return True
+        if any(r.status in (RunStatus.executing, RunStatus.completed) for r in runs):
+            return False
+        grants = self.act.list_approvals(target=proposal_id, gate=ApprovalGate.review,
+                                         decision=ApprovalDecision.approved)
+        return len(runs) <= len(grants)
 
     def merge_poll(self) -> list:
         """Act on operator decisions at the merge gate; returns runs that finished."""

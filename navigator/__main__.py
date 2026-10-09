@@ -1,11 +1,13 @@
 import argparse
 import json
+import os
 import subprocess
 import sys
 import time
 from datetime import datetime, timezone
 
 import httpx
+from navigator.cli import COMMANDS, run_cli
 from navigator.config import Settings
 from navigator.clients.act_client import FakeACTClient, HTTPACTClient
 from navigator.clients.orc_client import FakeORCClient, HTTPORCClient
@@ -98,6 +100,10 @@ def run_daemon(nav: Navigator, settings: Settings, *, max_cycles: int | None = N
         time.sleep(settings.tick_interval_s)
 
 def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    if argv and argv[0] in COMMANDS:
+        url = os.getenv("NAVIGATOR_ACT_BASE_URL") or "http://127.0.0.1:8090"
+        return run_cli(argv, act=HTTPACTClient(url), out=sys.stdout)
     parser = argparse.ArgumentParser(prog="navigator")
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--once", action="store_true", help="run a single perceive/plan/poll cycle")
