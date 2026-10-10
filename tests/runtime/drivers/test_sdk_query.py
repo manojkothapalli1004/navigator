@@ -1,3 +1,4 @@
+import json
 import sys
 import types
 import pytest
@@ -35,6 +36,13 @@ def test_query_fn_returns_result_text_with_locked_down_options(monkeypatch):
     # unused turns cost nothing
     assert captured["options"]["max_turns"] == 4
     assert captured["options"]["allowed_tools"] == []
+    # allowed_tools=[] only withholds auto-approval; the model still SEES the default
+    # toolset, tries tools, and burns turns (live error_max_turns 2026-10-10).
+    # tools=[] is what removes them (--tools "")
+    assert captured["options"]["tools"] == []
+    # claude.ai connectors (Docs incl. delete, Uber Eats, job boards) were still
+    # offered to subagents; they are disabled outright
+    assert json.loads(captured["options"]["settings"]) == {"disableClaudeAiConnectors": True}
     assert "JSON" in captured["options"]["system_prompt"]
     # no filesystem settings: without this the session inherits the operator's
     # hooks/plugins/skills (observed live 2026-07-08: claude-mem hooks fired,

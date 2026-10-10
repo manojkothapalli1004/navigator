@@ -31,8 +31,8 @@ def make_sdk_query_fn(*, model: str | None = None,
         # the subagent session — with them loaded, skill reminders push the
         # model into tool calls until max_turns errors (observed same day).
         options = ClaudeAgentOptions(system_prompt=system_prompt, model=model,
-                                     max_turns=4, allowed_tools=[],
-                                     setting_sources=[])
+                                     max_turns=4, tools=[], allowed_tools=[],
+                                     setting_sources=[], settings=_LOCKED_SETTINGS)
         results: list[str] = []
         error: list[str] = []
 
@@ -86,6 +86,11 @@ def make_sdk_query_fn(*, model: str | None = None,
         return retry
 
     return query_fn
+
+
+# subagents only return JSON: tools=[] drops the built-in toolset (allowed_tools=[]
+# alone leaves it visible), and this drops the account's claude.ai connectors
+_LOCKED_SETTINGS = json.dumps({"disableClaudeAiConnectors": True})
 
 
 def _describe_error(message) -> str:
