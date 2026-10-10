@@ -8,6 +8,8 @@
 [driver]
 driver = "fake"                 # NAVIGATOR_DRIVER: "fake" (deterministic) | "claude_sdk" (live)
 sdk_model = ""                  # NAVIGATOR_SDK_MODEL: e.g. "claude-opus-5-5" (live deployment)
+# Optional per-role model overrides (unset = use NAVIGATOR_SDK_MODEL):
+#   NAVIGATOR_SDK_MODEL_PLANNER, NAVIGATOR_SDK_MODEL_BUILDER, NAVIGATOR_SDK_MODEL_VERIFIER
 sdk_timeout_s = 300.0           # NAVIGATOR_SDK_TIMEOUT_S: wall-clock cap per SDK query
 
 [mode]
