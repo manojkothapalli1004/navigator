@@ -16,6 +16,7 @@ class PhaseResult:
     checkpoints: list[str] = field(default_factory=list)
     verify_returncode: int = 0
     verify_output: str = ""
+    verify_log: list[dict] = field(default_factory=list)
 
 def _resolve_write_target(wt: Path, relpath: str) -> Path:
     """Resolve a builder write target, rejecting escapes and the worktree root itself.
@@ -54,6 +55,16 @@ def _check_scope(relpaths: list[str], allowed: list[str]) -> None:
             raise ValueError(f"builder wrote {rel!r} outside the approved affected_files")
 
 _FAILED_TESTS = re.compile(r"(\d+) failed")
+_TEST_RUNNERS = ("uv run pytest", "pytest")
+
+def _requires_tests(wt: Path, changed: list[str]) -> bool:
+    # a python change in a repo that has a test suite must be checked by that suite;
+    # live 2026-10-10 a verifier "passed" a .py change in 48s with no tests run
+    return any(c.endswith(".py") for c in changed) and (wt / "tests").is_dir()
+
+def _runs_tests(commands: list[list[str]]) -> bool:
+    return any(" ".join(c) == r or " ".join(c).startswith(r + " ")
+               for c in commands for r in _TEST_RUNNERS)
 
 def run_build_and_verify(driver: SubagentDriver, worktree: WorktreeHandle,
                          run_id: str, runner: CommandRunner,
@@ -85,6 +96,11 @@ def run_build_and_verify(driver: SubagentDriver, worktree: WorktreeHandle,
         res.verify_returncode = 1
         res.verify_output = "verifier produced no commands"
         return res
+    if _requires_tests(wt, res.file_writes) and not _runs_tests(verify.commands):
+        res.verify_returncode = 1
+        res.verify_output = ("verifier did not run the test suite for a python change: "
+                             + "; ".join(" ".join(c) for c in verify.commands))
+        return res
     for argv in verify.commands:
         if breakers:
             breakers.check_duration(started)
@@ -94,11 +110,15 @@ def run_build_and_verify(driver: SubagentDriver, worktree: WorktreeHandle,
             # a disallowed command is a verification result, not a crash
             res.verify_returncode = 126
             res.verify_output = f"verifier command rejected: {e}"
+            res.verify_log.append({"argv": " ".join(argv), "returncode": 126,
+                                   "output_tail": res.verify_output[-1500:]})
             if breakers:
                 breakers.record_failure(f"rejected:{argv[0]}")
             break
         res.verify_returncode = r.returncode
         res.verify_output = r.stdout + r.stderr
+        res.verify_log.append({"argv": " ".join(argv), "returncode": r.returncode,
+                               "output_tail": res.verify_output[-1500:]})
         if r.returncode != 0:
             if breakers:
                 m = _FAILED_TESTS.search(res.verify_output)

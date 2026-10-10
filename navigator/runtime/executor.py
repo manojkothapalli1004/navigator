@@ -75,6 +75,9 @@ def execute_proposal(proposal: Proposal, *, act, orc, driver, runner, settings) 
         _emit(act, run, "run.failed", Severity.error, error=str(e)); return run
     # Correction 2: normal top-level import of Checkpoint (not dynamic __import__)
     run.checkpoints = [Checkpoint(sha=c, label="cp") for c in result.checkpoints]
+    run.verification = result.verify_log
+    if guard is not None:
+        run.cost_usd = round(guard.spent_usd, 4)  # driver's per-call estimate
     if result.verify_returncode != 0:
         preserve_failed(handle)
         run.status = RunStatus.failed; run.phase = RunPhase.finalizing
@@ -88,7 +91,8 @@ def execute_proposal(proposal: Proposal, *, act, orc, driver, runner, settings) 
     act.create_approval(target=run.id, gate=ApprovalGate.merge)
     # Correction 1: store diff in event payload, not as a transient Run attribute
     diff = diff_artifact(handle.path, head)
-    _emit(act, run, "run.awaiting_review", diff=diff, title=proposal.title)
+    _emit(act, run, "run.awaiting_review", diff=diff, title=proposal.title,
+          verification=run.verification)
     return run
 
 def _merge_approved(act, run) -> bool:

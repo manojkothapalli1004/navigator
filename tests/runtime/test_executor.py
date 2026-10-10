@@ -173,3 +173,20 @@ def test_budget_is_per_run_not_shared_with_planner_spend(tmp_path):
     d["driver"].budget_guard = guard
     run = execute_proposal(_proposal(repo, sha), **d)
     assert run.phase == RunPhase.awaiting_review
+
+
+def test_run_records_verification_evidence_and_cost(tmp_path):
+    from navigator.safety.budget_guard import BudgetGuard
+    repo, sha = _seed(tmp_path); d = _deps(tmp_path, repo)
+    guard = BudgetGuard(5.0)
+    d["driver"].budget_guard = guard
+    real = d["driver"].run_role
+    def costed(req):
+        guard.record_spend(0.25); return real(req)
+    d["driver"].run_role = costed
+    run = execute_proposal(_proposal(repo, sha), **d)
+    stored = d["act"].runs[run.id]
+    assert stored.verification and stored.verification[0]["argv"].startswith("python3 -m py_compile")
+    assert stored.cost_usd == 0.5  # builder + verifier
+    ev = [e for e in d["act"].events if e.kind == "run.awaiting_review"][0]
+    assert ev.payload["verification"] == stored.verification

@@ -135,3 +135,37 @@ def test_failed_test_count_trips_breaker(tmp_path):
     with pytest.raises(BreakerTripped, match="max_failed_tests"):
         run_build_and_verify(driver=drv, worktree=h, run_id="run-t", runner=_Runner(),
                              proposal={"affected_files": ["a.py"]}, breakers=cb)
+
+
+def test_python_change_without_a_test_command_fails_verification(tmp_path):
+    # live 2026-10-10: the verifier passed a .py change in ~48s without running tests
+    h, runner = _wt(tmp_path, "run-n")
+    (Path(h.path)/"tests").mkdir()  # the repo has a test suite
+    drv = _ScriptedRoles([("a.py", "x = 1\n")], [["python3", "-m", "py_compile", "a.py"]])
+    res = run_build_and_verify(driver=drv, worktree=h, run_id="run-n", runner=runner,
+                               proposal={"affected_files": ["a.py"]})
+    assert res.verify_returncode != 0
+    assert "did not run the test suite" in res.verify_output
+
+def test_docs_only_change_may_verify_without_tests(tmp_path):
+    h, runner = _wt(tmp_path, "run-d")
+    drv = _ScriptedRoles([("README.md", "hi\n")], [["git", "status"]])
+    res = run_build_and_verify(driver=drv, worktree=h, run_id="run-d", runner=runner,
+                               proposal={"affected_files": ["README.md"]})
+    assert res.verify_returncode == 0
+
+def test_verification_evidence_is_recorded(tmp_path):
+    h, runner = _wt(tmp_path, "run-e")
+    drv = _ScriptedRoles([("README.md", "hi\n")], [["git", "status"], ["git", "log", "--oneline"]])
+    res = run_build_and_verify(driver=drv, worktree=h, run_id="run-e", runner=runner,
+                               proposal={"affected_files": ["README.md"]})
+    assert [c["argv"] for c in res.verify_log] == ["git status", "git log --oneline"]
+    assert all("returncode" in c and "output_tail" in c for c in res.verify_log)
+
+
+def test_python_change_in_repo_without_tests_may_use_py_compile(tmp_path):
+    h, runner = _wt(tmp_path, "run-p")
+    drv = _ScriptedRoles([("a.py", "x = 1\n")], [["python3", "-m", "py_compile", "a.py"]])
+    res = run_build_and_verify(driver=drv, worktree=h, run_id="run-p", runner=runner,
+                               proposal={"affected_files": ["a.py"]})
+    assert res.verify_returncode == 0

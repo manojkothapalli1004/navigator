@@ -20,6 +20,7 @@ class Run(BaseModel):
     target_branch: str | None = None
     completed_tasks: list[str] = Field(default_factory=list)
     checkpoints: list[Checkpoint] = Field(default_factory=list)
+    verification: list[dict] = Field(default_factory=list)
     cost_usd: float = 0.0
     correlation_id: str | None = None
     started_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
