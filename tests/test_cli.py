@@ -50,6 +50,8 @@ def test_approve_then_merge_through_cli(tmp_path):
     run = nav.approval_poll()[0]
     code, out = _cli(nav, "diff", run.id)
     assert code == 0 and "navigator_touch.py" in out
+    # the reviewer sees what verification actually ran before the diff
+    assert "verification:" in out and "python3 -m py_compile" in out and "rc=0" in out
     assert _cli(nav, "merge", run.id)[0] == 0
     nav.merge_poll()
     assert nav.act.runs[run.id].status == RunStatus.completed

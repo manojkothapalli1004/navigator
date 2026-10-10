@@ -55,7 +55,9 @@ def test_notifying_act_announces_run_events_and_dedups_merge_blocked():
     act = NotifyingACT(FakeACTClient(), rec)
     act.emit_event(_ev("run.building", run_id="run-1"))
     act.emit_event(_ev("run.awaiting_review", run_id="run-1", title="Fix x",
-                       diff="diff --git a/a.py b/a.py\n+x\n"))
+                       diff="diff --git a/a.py b/a.py\n+x\n",
+                       verification=[{"argv": "uv run pytest -q", "returncode": 0,
+                                      "output_tail": "212 passed in 41.2s"}]))
     act.emit_event(_ev("run.merge_blocked", run_id="run-1", reason="dirty"))
     act.emit_event(_ev("run.merge_blocked", run_id="run-1", reason="dirty"))
     act.emit_event(_ev("run.failed", Severity.error, run_id="run-2", error="boom"))
@@ -64,6 +66,7 @@ def test_notifying_act_announces_run_events_and_dedups_merge_blocked():
     review = rec.sent[0]
     assert "run-1" in review and "Fix x" in review and "a.py" in review
     assert "python -m navigator merge run-1" in review
+    assert "uv run pytest -q" in review and "212 passed" in review
     assert "dirty" in rec.sent[1]
     assert "run-2" in rec.sent[2] and "boom" in rec.sent[2]
 

@@ -65,6 +65,16 @@ def _diff_summary(diff: str) -> str:
     return f"{', '.join(files) or 'no files'} (+{adds}/-{dels})"
 
 
+def format_verification(log: list[dict]) -> str:
+    if not log:
+        return "verification: (none recorded)"
+    lines = ["verification:"]
+    for c in log:
+        tail = (c.get("output_tail") or "").strip().splitlines()
+        lines.append(f"  $ {c.get('argv')}  rc={c.get('returncode')}  {tail[-1] if tail else ''}")
+    return "\n".join(lines)
+
+
 class NotifyingACT:
     """ACT client wrapper that turns run events into operator messages."""
 
@@ -87,6 +97,7 @@ class NotifyingACT:
         if kind == "run.awaiting_review":
             return (f"Navigator: {run_id} is ready for review\n{p.get('title', '')}\n"
                     f"{_diff_summary(p.get('diff', ''))}\n"
+                    f"{format_verification(p.get('verification') or [])}\n"
                     f"review: python -m navigator diff {run_id}\n"
                     f"merge:  python -m navigator merge {run_id}\n"
                     f"reject: python -m navigator reject {run_id}")

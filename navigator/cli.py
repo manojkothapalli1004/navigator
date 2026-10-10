@@ -4,6 +4,7 @@ Every decision here is recorded in ACT; the daemon acts on it next cycle.
 """
 import subprocess
 from typing import TextIO
+from navigator.observability.notify import format_verification
 from navigator.contracts.enums import (ApprovalDecision, ApprovalGate, ProposalStatus,
                                        RunPhase, RunStatus)
 
@@ -76,6 +77,8 @@ def _diff(act, run_id, out) -> int:
     if run is None or prop is None:
         print(f"no open run: {run_id}", file=out)
         return 1
+    print(f"{run.id}  {prop.title}  (cost est. ${run.cost_usd:.2f})", file=out)
+    print(format_verification(run.verification), file=out)
     d = subprocess.run(["git", "diff", f"{run.base_commit_sha}..{run.branch}"], cwd=prop.repo,
                        capture_output=True, text=True)
     out.write(d.stdout or d.stderr)
