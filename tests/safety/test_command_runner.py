@@ -86,3 +86,20 @@ def test_git_pathspec_separator_allowed(tmp_path):
     r = _runner(tmp_path)
     assert r.run(["git", "diff", "--stat", "--", "README.md"], cwd=tmp_path).returncode == 0
     assert r.run(["git", "status", "--porcelain", "--", "README.md"], cwd=tmp_path).returncode == 0
+
+
+def test_commands_do_not_inherit_navigator_configuration(tmp_path, monkeypatch):
+    # live 2026-10-10: verifier pytest inherited NAVIGATOR_DRIVER=claude_sdk from the
+    # daemon, so env-reading tests in the target repo built a live SDK driver
+    monkeypatch.setenv("NAVIGATOR_DRIVER", "claude_sdk")
+    monkeypatch.setenv("NAVIGATOR_NOTIFY_ENV_FILE", "/secret/.env")
+    seen = {}
+    real_run = subprocess.run
+    def spy(argv, **kw):
+        seen["env"] = kw.get("env"); return real_run(argv, **kw)
+    monkeypatch.setattr("navigator.safety.command_runner.subprocess.run", spy)
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
+    _runner(tmp_path).run(["git", "status"], cwd=tmp_path)
+    assert seen["env"] is not None
+    assert not any(k.startswith("NAVIGATOR_") for k in seen["env"])
+    assert "PATH" in seen["env"]

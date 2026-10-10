@@ -140,3 +140,13 @@ def test_role_specific_query_fns_route_by_role():
     drv.run_role(DriverRequest(role=Role.planner, context={}))
     drv.run_role(DriverRequest(role=Role.verifier, context={}))
     assert calls == ["planner", "default"]
+
+
+def test_verifier_command_given_as_a_string_is_split_into_argv():
+    # live 2026-10-10: a Sonnet verifier returned "uv run pytest tests/x.py -q" as one
+    # string; the run died as a parse exception instead of verifying
+    drv = ClaudeSDKDriver(query_fn=lambda p: json.dumps(
+        {"commands": ["uv run pytest tests/x.py -q", ["git", "status"]], "summary": "s"}),
+        budget_guard=BudgetGuard(10))
+    res = drv.run_role(DriverRequest(role=Role.verifier, context={}))
+    assert res.commands == [["uv", "run", "pytest", "tests/x.py", "-q"], ["git", "status"]]

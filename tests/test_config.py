@@ -84,6 +84,8 @@ def test_allowed_commands_rejects_dangerous_entries(monkeypatch):
 def test_command_timeout_is_env_wired_and_reaches_the_runner(tmp_path, monkeypatch):
     # a fresh worktree's `uv run pytest` builds a venv first: ~3 min live, past the 60s default
     monkeypatch.setenv("NAVIGATOR_COMMAND_TIMEOUT_S", "600")
+    for k in ("NAVIGATOR_DRIVER", "NAVIGATOR_ACT_BASE_URL", "NAVIGATOR_ORC_BASE_URL"):
+        monkeypatch.delenv(k, raising=False)  # hermetic: the daemon's env must not leak in
     s = cfg.Settings.from_env()
     assert s.command_timeout_s == 600
     from navigator.__main__ import build_navigator

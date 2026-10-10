@@ -1,4 +1,5 @@
 import json
+import shlex
 from typing import Callable
 from navigator.runtime.drivers.base import ROLE_PERMISSIONS, DriverRequest, DriverResult
 from navigator.contracts.enums import Role
@@ -96,6 +97,13 @@ class ClaudeSDKDriver:
 
     @staticmethod
     def _parse_command(entry) -> list[str]:
+        # models sometimes send a command as one string; split it (no shell involved —
+        # the command runner still applies every metacharacter/allowlist check)
+        if isinstance(entry, str) and entry.strip():
+            try:
+                entry = shlex.split(entry)
+            except ValueError as e:
+                raise DriverParseError(f"unparseable command string {entry!r}: {e}") from e
         if not isinstance(entry, list) or not entry or not all(isinstance(x, str) for x in entry):
             raise DriverParseError(f"commands entries must be non-empty argv string lists, got {entry!r}")
         return list(entry)

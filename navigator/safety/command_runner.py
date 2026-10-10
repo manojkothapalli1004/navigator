@@ -1,3 +1,4 @@
+import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,6 +15,11 @@ _GIT_SAFE_FLAGS = {
     "diff": {"--stat", "--name-only", "--name-status", "--cached", "--staged", "--"},
     "log": {"--oneline", "--name-only", "--stat", "-1", "-5", "-10", "-20", "--"},
 }
+
+def _clean_env() -> dict[str, str]:
+    # commands run the target repo's tooling; they must not see Navigator's own
+    # configuration (live 2026-10-10: NAVIGATOR_DRIVER leaked into a verifier pytest)
+    return {k: v for k, v in os.environ.items() if not k.startswith("NAVIGATOR_")}
 
 @dataclass
 class CommandResult:
@@ -53,7 +59,7 @@ class CommandRunner:
             raise CommandRejected(f"cwd outside worktree: {cwd}")
         try:
             proc = subprocess.run(argv, cwd=cwd, capture_output=True, text=True,
-                                  shell=False, timeout=self.timeout_s)
+                                  shell=False, timeout=self.timeout_s, env=_clean_env())
         except subprocess.TimeoutExpired as e:
             raise CommandRejected(f"command timed out after {self.timeout_s}s: {' '.join(argv)}") from e
         except OSError as e:
