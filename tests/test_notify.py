@@ -76,3 +76,10 @@ def test_notifying_act_delegates_everything_else():
     act = NotifyingACT(inner, NullNotifier())
     assert act.list_proposals() == []
     assert act.inner is inner
+
+
+def test_verification_summary_prefers_the_test_result_line():
+    from navigator.observability.notify import format_verification
+    log = [{"argv": "uv run pytest -q", "returncode": 0,
+            "output_tail": "16 passed in 0.80s\nCreating virtual environment\nInstalled 19 packages"}]
+    assert "16 passed" in format_verification(log)

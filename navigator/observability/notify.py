@@ -65,13 +65,18 @@ def _diff_summary(diff: str) -> str:
     return f"{', '.join(files) or 'no files'} (+{adds}/-{dels})"
 
 
+_RESULT_LINE = re.compile(r"\d+ (passed|failed|error)")
+
+
 def format_verification(log: list[dict]) -> str:
     if not log:
         return "verification: (none recorded)"
     lines = ["verification:"]
     for c in log:
         tail = (c.get("output_tail") or "").strip().splitlines()
-        lines.append(f"  $ {c.get('argv')}  rc={c.get('returncode')}  {tail[-1] if tail else ''}")
+        # pytest's result line beats trailing stderr noise (uv's venv setup)
+        result = next((l for l in reversed(tail) if _RESULT_LINE.search(l)), tail[-1] if tail else "")
+        lines.append(f"  $ {c.get('argv')}  rc={c.get('returncode')}  {result.strip()}")
     return "\n".join(lines)
 
 
