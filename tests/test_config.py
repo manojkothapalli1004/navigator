@@ -91,3 +91,10 @@ def test_command_timeout_is_env_wired_and_reaches_the_runner(tmp_path, monkeypat
     repo = tmp_path/"r"; repo.mkdir(); subprocess.run(["git", "init"], cwd=repo, capture_output=True)
     s.repo = str(repo); s.lock_path = str(tmp_path/"l"); s.worktree_root = str(tmp_path/"wt")
     assert build_navigator(s).runner.timeout_s == 600
+
+def test_per_role_sdk_models_from_env(monkeypatch):
+    monkeypatch.setenv("NAVIGATOR_SDK_MODEL_PLANNER", "claude-sonnet-5-5")
+    monkeypatch.setenv("NAVIGATOR_SDK_MODEL_VERIFIER", "claude-sonnet-5-5")
+    monkeypatch.delenv("NAVIGATOR_SDK_MODEL_BUILDER", raising=False)
+    assert cfg.Settings.from_env().sdk_role_models == {"planner": "claude-sonnet-5-5",
+                                                        "verifier": "claude-sonnet-5-5"}

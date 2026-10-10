@@ -29,6 +29,7 @@ class Settings:
     lock_path: str = "/tmp/navigator.lock"
     outcome_path: str = "/tmp/navigator-outcomes.jsonl"
     sdk_model: str | None = None
+    sdk_role_models: dict[str, str] = field(default_factory=dict)
     sdk_timeout_s: float = 300.0
 
     @classmethod
@@ -55,6 +56,9 @@ class Settings:
             lock_path=os.getenv("NAVIGATOR_LOCK_PATH", "/tmp/navigator.lock"),
             outcome_path=os.getenv("NAVIGATOR_OUTCOME_PATH", "/tmp/navigator-outcomes.jsonl"),
             sdk_model=os.getenv("NAVIGATOR_SDK_MODEL"),
+            sdk_role_models={role: os.environ[f"NAVIGATOR_SDK_MODEL_{role.upper()}"]
+                             for role in ("planner", "builder", "verifier")
+                             if os.getenv(f"NAVIGATOR_SDK_MODEL_{role.upper()}")},
             sdk_timeout_s=_positive_float_env("NAVIGATOR_SDK_TIMEOUT_S", "300.0"),
         )
 

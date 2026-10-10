@@ -125,3 +125,18 @@ def test_parse_error_includes_head_and_tail_of_raw():
     d = make_driver(raw)
     with pytest.raises(DriverParseError, match="cut off"):
         d.run_role(DriverRequest(role=Role.planner, context={}))
+
+
+def test_role_specific_query_fns_route_by_role():
+    calls = []
+    def make(name, reply):
+        def fn(prompt):
+            calls.append(name); return reply
+        return fn
+    drv = ClaudeSDKDriver(
+        query_fn=make("default", '{"commands": [["git", "status"]], "summary": "s"}'),
+        role_query_fns={Role.planner: make("planner", '{"proposals": [], "summary": "s"}')},
+        budget_guard=BudgetGuard(10))
+    drv.run_role(DriverRequest(role=Role.planner, context={}))
+    drv.run_role(DriverRequest(role=Role.verifier, context={}))
+    assert calls == ["planner", "default"]

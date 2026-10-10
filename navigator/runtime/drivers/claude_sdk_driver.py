@@ -28,14 +28,17 @@ class ClaudeSDKDriver:
     imported here.
     """
     def __init__(self, *, query_fn: Callable[[str], str], budget_guard: BudgetGuard,
+                 role_query_fns: dict[Role, Callable[[str], str]] | None = None,
                  estimated_cost_per_call_usd: float = 0.25):
         self.query_fn = query_fn
+        self.role_query_fns = role_query_fns or {}
         self.budget_guard = budget_guard
         self.estimated_cost_per_call_usd = estimated_cost_per_call_usd
 
     def run_role(self, request: DriverRequest) -> DriverResult:
         self.budget_guard.check_before_call(self.estimated_cost_per_call_usd)
-        raw = self.query_fn(self._build_prompt(request))
+        query_fn = self.role_query_fns.get(request.role, self.query_fn)
+        raw = query_fn(self._build_prompt(request))
         self.budget_guard.record_spend(self.estimated_cost_per_call_usd)
         return self._parse(request.role, raw)
 

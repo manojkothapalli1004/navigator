@@ -198,3 +198,17 @@ def test_planner_failure_does_not_block_execution_or_merges(tmp_path, monkeypatc
     summary = m._cycle(nav, nav.settings)
     assert calls == ["exec", "merge"]
     assert "session limit" in summary["planner_error"]
+
+def test_per_role_sdk_models_are_wired(tmp_path, monkeypatch):
+    # operator 2026-10-10: use cheaper models where Opus isn't needed
+    import navigator.__main__ as m
+    from navigator.contracts.enums import Role
+    built = []
+    monkeypatch.setattr(m, "make_sdk_query_fn", lambda model, timeout_s: built.append(model) or (lambda p: model))
+    s = _settings(tmp_path, _seed_repo(tmp_path), driver="claude_sdk", sdk_model="claude-opus-5-5",
+                  sdk_role_models={"planner": "claude-sonnet-5-5", "verifier": "claude-sonnet-5-5"})
+    drv = build_navigator(s).driver
+    assert drv.query_fn("x") == "claude-opus-5-5"
+    assert drv.role_query_fns[Role.planner]("x") == "claude-sonnet-5-5"
+    assert drv.role_query_fns[Role.verifier]("x") == "claude-sonnet-5-5"
+    assert Role.builder not in drv.role_query_fns
