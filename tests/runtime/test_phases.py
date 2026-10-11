@@ -272,3 +272,23 @@ def test_navigator_runs_the_full_suite_itself_when_repo_has_tests(tmp_path):
     assert ["uv", "run", "pytest", "-q"] in calls
     assert res.verify_returncode != 0
     assert res.verify_log[-1]["argv"] == "uv run pytest -q"
+
+
+def test_builder_gets_read_only_context_of_other_repo_files(tmp_path):
+    # live 2026-10-11: a waker builder wrote tests creating Users without the
+    # required phone_number because it never saw app/models.py
+    repo, _ = _seed(tmp_path)
+    (repo/"models.py").write_text("class User:\n    phone_number: str\n")
+    (repo/"big.py").write_text("x = 1\n" * 20000)
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "m"], cwd=repo, check=True, capture_output=True)
+    sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True).stdout.strip()
+    h = create_worktree(repo=repo, base_commit_sha=sha, run_id="run-ctx", worktree_root=tmp_path/"wt")
+    drv = _RecordingDriver()
+    run_build_and_verify(driver=drv, worktree=h, run_id="run-ctx",
+                         runner=CommandRunner(allowlist=DEFAULT_ALLOWLIST, worktree_root=tmp_path/"wt"),
+                         proposal={"affected_files": ["a.py"]})
+    ctx = drv.requests[Role.builder].context
+    assert "phone_number" in ctx["related_files"]["models.py"]
+    assert "big.py" not in ctx["related_files"]          # over budget: left out, not truncated
+    assert "a.py" not in ctx["related_files"]            # writable files stay in context.files

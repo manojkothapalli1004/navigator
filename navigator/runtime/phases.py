@@ -72,6 +72,26 @@ def _runs_tests(commands: list[list[str]]) -> bool:
     return any(c and (c[0] == "pytest" or (c[:2] == ["uv", "run"] and "pytest" in c))
                for c in commands)
 
+_RELATED_BUDGET = 60_000
+
+def _related_files(wt: Path, tracked: list[str], skip: set[str]) -> dict[str, str]:
+    """Read-only contents of other python files, smallest first, whole files only,
+    within a budget. Builders that only saw the files they edit wrote code against
+    guessed models and fixtures (live 2026-10-11)."""
+    sized = []
+    for rel in tracked:
+        if rel.endswith(".py") and rel not in skip:
+            p = wt / rel
+            if p.is_file():
+                sized.append((p.stat().st_size, rel))
+    out, used = {}, 0
+    for size, rel in sorted(sized):
+        if used + size > _RELATED_BUDGET:
+            break
+        out[rel] = (wt / rel).read_text(errors="replace")
+        used += size
+    return out
+
 def _normalize_affected(wt: Path, paths: list[str], workdir: str) -> list[str]:
     """Map workdir-relative paths onto repo-relative ones. Planners sometimes name
     files relative to the repo's workdir (e.g. "app/x.py" for backend/app/x.py)."""
@@ -100,9 +120,10 @@ def run_build_and_verify(driver: SubagentDriver, worktree: WorktreeHandle,
     proposal["affected_files"] = _normalize_affected(wt, proposal.get("affected_files", []), workdir)
     started = time.monotonic() if started_monotonic is None else started_monotonic
     tracked = subprocess.run(["git", "ls-files"], cwd=wt, capture_output=True, text=True).stdout.split()
-    build_ctx = {"proposal": proposal,
-                 "files": _read_affected(wt, proposal.get("affected_files", [])),
-                 "test_files": [f for f in tracked if _is_test_file(f)][:200]}
+    files = _read_affected(wt, proposal.get("affected_files", []))
+    build_ctx = {"proposal": proposal, "files": files,
+                 "test_files": [f for f in tracked if _is_test_file(f)][:200],
+                 "related_files": _related_files(wt, tracked, set(files))}
     build = driver.run_role(DriverRequest(role=Role.builder, context=build_ctx, worktree_path=str(wt)))
     _check_scope([rel for rel, _ in build.file_writes], proposal.get("affected_files", []))
     if breakers:

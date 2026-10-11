@@ -21,7 +21,8 @@ _ROLE_OUTPUT_SPEC = {
                    'If the repo has tests, add or update tests that exercise the new or changed '
                    'behaviour (a passing suite that never runs the new path proves nothing). '
                    'You MAY add new test files not in context.files; follow the layout and '
-                   'naming of context.test_files.'),
+                   'naming of context.test_files. context.related_files are READ-ONLY: use them '
+                   'to get models, fixtures and APIs right; never write them.'),
     Role.verifier: ('Choose commands that prove context.proposal works, each starting with an entry '
                     'of context.allowed_commands. Commands run inside context.workdir; use paths '
                     'relative to it (context.changed_files already are). Respond with ONLY a JSON '
