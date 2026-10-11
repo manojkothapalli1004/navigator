@@ -107,6 +107,13 @@ def run_build_and_verify(driver: SubagentDriver, worktree: WorktreeHandle,
         res.verify_returncode = 1
         res.verify_output = "verifier produced no commands"
         return res
+    code_changed = [f for f in res.file_writes if f.endswith(".py") and not _is_test_file(f)]
+    if (_requires_tests(run_dir, res.file_writes) and code_changed
+            and not any(_is_test_file(f) for f in res.file_writes)):
+        res.verify_returncode = 1
+        res.verify_output = ("builder changed code but made no test changes: "
+                             + ", ".join(code_changed))
+        return res
     if _requires_tests(run_dir, res.file_writes) and not _runs_tests(verify.commands):
         res.verify_returncode = 1
         res.verify_output = ("verifier did not run the test suite for a python change: "

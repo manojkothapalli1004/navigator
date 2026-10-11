@@ -141,7 +141,8 @@ def test_python_change_without_a_test_command_fails_verification(tmp_path):
     # live 2026-10-10: the verifier passed a .py change in ~48s without running tests
     h, runner = _wt(tmp_path, "run-n")
     (Path(h.path)/"tests").mkdir()  # the repo has a test suite
-    drv = _ScriptedRoles([("a.py", "x = 1\n")], [["python3", "-m", "py_compile", "a.py"]])
+    drv = _ScriptedRoles([("a.py", "x = 1\n"), ("tests/test_a.py", "def test_a(): pass\n")],
+                         [["python3", "-m", "py_compile", "a.py"]])
     res = run_build_and_verify(driver=drv, worktree=h, run_id="run-n", runner=runner,
                                proposal={"affected_files": ["a.py"]})
     assert res.verify_returncode != 0
@@ -209,3 +210,15 @@ def test_builder_may_add_test_files_beyond_the_approved_list(tmp_path):
         _check_scope(["a.py", "b.py"], ["a.py"])
     with pytest.raises(ValueError, match="conftest_evil"):
         _check_scope(["tests_helpers/conftest_evil.py"], ["a.py"])
+
+
+def test_code_change_without_any_test_change_fails_in_repo_with_tests(tmp_path):
+    # live 2026-10-11: told to add tests, a builder still shipped trade-entry logic
+    # with none; the rule is now enforced, not just requested
+    h, _ = _wt(tmp_path, "run-q")
+    (Path(h.path)/"tests").mkdir()
+    runner = CommandRunner(allowlist=["uv run pytest", "git status"], worktree_root=tmp_path/"wt")
+    no_tests = _ScriptedRoles([("a.py", "x = 1\n")], [["git", "status"], ["uv", "run", "pytest"]])
+    res = run_build_and_verify(driver=no_tests, worktree=h, run_id="run-q", runner=runner,
+                               proposal={"affected_files": ["a.py"]})
+    assert res.verify_returncode != 0 and "no test changes" in res.verify_output
