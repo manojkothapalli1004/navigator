@@ -50,10 +50,15 @@ class CommandRunner:
         if not self._is_allowed(argv):
             raise CommandRejected(f"command not on allowlist: {' '.join(argv)}")
         if argv[0] == "git" and len(argv) >= 2:
-            safe = _GIT_SAFE_FLAGS.get(argv[1], set())
+            subcommand = argv[1]
+            safe = _GIT_SAFE_FLAGS.get(subcommand, set())
             for token in argv[2:]:
                 if token.startswith("-") and token not in safe:
-                    raise CommandRejected(f"git flag not on safe list: {token!r}")
+                    allowed = ", ".join(sorted(safe)) if safe else "none"
+                    raise CommandRejected(
+                        f"git flag not on safe list for 'git {subcommand}': {token!r} "
+                        f"(allowed: {allowed})"
+                    )
         cwd = Path(cwd).resolve()
         if cwd != self.worktree_root and self.worktree_root not in cwd.parents:
             raise CommandRejected(f"cwd outside worktree: {cwd}")
