@@ -72,6 +72,21 @@ def _runs_tests(commands: list[list[str]]) -> bool:
     return any(c and (c[0] == "pytest" or (c[:2] == ["uv", "run"] and "pytest" in c))
                for c in commands)
 
+def _normalize_affected(wt: Path, paths: list[str], workdir: str) -> list[str]:
+    """Map workdir-relative paths onto repo-relative ones. Planners sometimes name
+    files relative to the repo's workdir (e.g. "app/x.py" for backend/app/x.py)."""
+    if workdir in (".", ""):
+        return list(paths)
+    out = []
+    for p in paths:
+        if p.startswith(workdir.rstrip("/") + "/") or (wt / p).exists():
+            out.append(p)
+        elif (wt / workdir / p).exists() or _is_test_file(p) or (wt / workdir / Path(p).parts[0]).is_dir():
+            out.append(f"{workdir.rstrip('/')}/{p}")
+        else:
+            out.append(p)
+    return out
+
 def run_build_and_verify(driver: SubagentDriver, worktree: WorktreeHandle,
                          run_id: str, runner: CommandRunner,
                          proposal: dict | None = None,
@@ -81,7 +96,8 @@ def run_build_and_verify(driver: SubagentDriver, worktree: WorktreeHandle,
     res = PhaseResult()
     wt = Path(worktree.path)
     run_dir = _resolve_write_target(wt, workdir) if workdir not in (".", "") else wt
-    proposal = proposal or {}
+    proposal = dict(proposal or {})
+    proposal["affected_files"] = _normalize_affected(wt, proposal.get("affected_files", []), workdir)
     started = time.monotonic() if started_monotonic is None else started_monotonic
     tracked = subprocess.run(["git", "ls-files"], cwd=wt, capture_output=True, text=True).stdout.split()
     build_ctx = {"proposal": proposal,

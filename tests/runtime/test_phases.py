@@ -236,3 +236,16 @@ def test_builder_sees_existing_test_file_names(tmp_path):
                          runner=CommandRunner(allowlist=DEFAULT_ALLOWLIST, worktree_root=tmp_path/"wt"),
                          proposal={"affected_files": ["a.py"]})
     assert drv.requests[Role.builder].context["test_files"] == ["tests/test_x.py"]
+
+
+def test_workdir_relative_affected_paths_are_mapped_to_repo_paths(tmp_path):
+    # live 2026-10-11: waker proposals named "app/routes/pings.py" (relative to the
+    # backend/ workdir); built as-is the builder would create a stray root-level copy
+    from navigator.runtime.phases import _normalize_affected
+    wt = tmp_path/"wt"; (wt/"backend"/"app"/"routes").mkdir(parents=True)
+    (wt/"backend"/"app"/"routes"/"pings.py").write_text("")
+    (wt/"README.md").write_text("")
+    got = _normalize_affected(wt, ["app/routes/pings.py", "README.md", "backend/tests/test_new.py",
+                                   "tests/test_new2.py"], "backend")
+    assert got == ["backend/app/routes/pings.py", "README.md", "backend/tests/test_new.py",
+                   "backend/tests/test_new2.py"]
