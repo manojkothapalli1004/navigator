@@ -91,8 +91,12 @@ def run_build_and_verify(driver: SubagentDriver, worktree: WorktreeHandle,
         res.file_writes.append(relpath)
     checkpoint(wt, run_id=run_id, n=len(build.file_writes) + 1, label="post-build")
     # verifier — a verify phase with no commands is a failure, not a silent pass
-    verify_ctx = {"proposal": proposal, "changed_files": list(res.file_writes),
-                  "allowed_commands": list(runner.allowlist)}
+    # commands run in the workdir, so hand the verifier paths relative to it
+    rel_changed = [str(Path(f).relative_to(workdir)) if workdir not in (".", "")
+                   and Path(f).is_relative_to(workdir) else f for f in res.file_writes]
+    verify_ctx = {"proposal": proposal, "changed_files": rel_changed,
+                  "allowed_commands": list(runner.allowlist),
+                  "workdir": workdir or "."}
     verify = driver.run_role(DriverRequest(role=Role.verifier, context=verify_ctx, worktree_path=str(wt)))
     if not verify.commands:
         res.verify_returncode = 1

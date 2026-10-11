@@ -177,3 +177,24 @@ def test_test_runner_with_uv_flags_counts_as_running_the_suite(tmp_path):
     assert _runs_tests([["uv", "run", "--extra", "dev", "pytest", "-q"]])
     assert _runs_tests([["uv", "run", "pytest"]]) and _runs_tests([["pytest", "-x"]])
     assert not _runs_tests([["python3", "-m", "py_compile", "a.py"], ["git", "status"]])
+
+
+def test_verifier_gets_paths_relative_to_its_workdir(tmp_path):
+    # live 2026-10-11 (waker): verifier ran `py_compile backend/app/push.py` from inside
+    # backend/ because it was handed repo-relative paths -> "No such file"
+    repo, _ = _seed(tmp_path)
+    (repo/"backend"/"app").mkdir(parents=True); (repo/"backend"/"app"/"x.py").write_text("")
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "b"], cwd=repo, check=True, capture_output=True)
+    sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True).stdout.strip()
+    h = create_worktree(repo=repo, base_commit_sha=sha, run_id="run-w", worktree_root=tmp_path/"wt")
+    runner = CommandRunner(allowlist=DEFAULT_ALLOWLIST, worktree_root=tmp_path/"wt")
+    drv = _RecordingDriver()
+    drv.run_role = (lambda req, real=drv.run_role: real(req) if req.role != Role.builder
+                    else (drv.requests.__setitem__(req.role, req) or
+                          DriverResult(role=Role.builder, file_writes=[("backend/app/x.py", "y = 1\n")])))
+    run_build_and_verify(driver=drv, worktree=h, run_id="run-w", runner=runner,
+                         proposal={"affected_files": ["backend/app/x.py"]}, workdir="backend")
+    v = drv.requests[Role.verifier].context
+    assert v["workdir"] == "backend"
+    assert v["changed_files"] == ["app/x.py"]

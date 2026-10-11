@@ -17,8 +17,9 @@ _ROLE_OUTPUT_SPEC = {
                    '"commands": [], "summary": "..."}. Each content replaces the whole file — '
                    'never elide unchanged code. Only write paths listed in context.files.'),
     Role.verifier: ('Choose commands that prove context.proposal works, each starting with an entry '
-                    'of context.allowed_commands. Respond with ONLY a JSON object: '
-                    '{"commands": [[argv...], ...], "summary": "..."}'),
+                    'of context.allowed_commands. Commands run inside context.workdir; use paths '
+                    'relative to it (context.changed_files already are). Respond with ONLY a JSON '
+                    'object: {"commands": [[argv...], ...], "summary": "..."}'),
 }
 
 class ClaudeSDKDriver:
