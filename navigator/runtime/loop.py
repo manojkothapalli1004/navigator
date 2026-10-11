@@ -16,10 +16,11 @@ log = get_logger("navigator.loop")
 
 class Navigator:
     def __init__(self, *, act, orc, driver, runner, settings, repo: str, lock_path,
-                 workdir: str = "."):
+                 workdir: str = ".", squash: bool = False):
         self.act = act; self.orc = orc; self.driver = driver; self.runner = runner
         self.settings = settings; self.repo = repo
         self.workdir = workdir  # where verifier commands run inside the repo
+        self.squash = squash    # public repos: single squash commit, no tool identities
         self.lock = SingleFlightLock(lock_path)
         self.notifier = NullNotifier()
         self.last_snapshot_chars = 0
@@ -141,7 +142,8 @@ class Navigator:
                     done.append(decline_run(run, act=self.act, orc=self.orc, settings=self.settings))
                 elif ApprovalDecision.approved in decisions:
                     run = merge_after_approval(run, act=self.act, orc=self.orc, driver=self.driver,
-                                               runner=self.runner, settings=self.settings)
+                                               runner=self.runner, settings=self.settings,
+                                               squash=self.squash)
                     if run.status != RunStatus.executing:
                         done.append(run)
         return done

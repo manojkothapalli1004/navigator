@@ -50,7 +50,8 @@ def build_navigator(settings: Settings):
                                worktree_root=settings.worktree_root,
                                timeout_s=settings.command_timeout_s)
         nav = Navigator(act=act, orc=orc, driver=driver, runner=runner, settings=settings,
-                        repo=rc.path, lock_path=settings.lock_path, workdir=rc.workdir)
+                        repo=rc.path, lock_path=settings.lock_path, workdir=rc.workdir,
+                        squash=rc.squash)
         nav.notifier = notifier
         navs.append(nav)
     if len(navs) == 1:

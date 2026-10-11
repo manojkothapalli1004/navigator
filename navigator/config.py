@@ -12,6 +12,7 @@ class RepoConfig:
     path: str
     workdir: str = "."                      # where verifier commands run (e.g. "backend")
     allowed_commands: list[str] | None = None  # None = Settings.allowed_commands
+    squash: bool = False                    # public repo: one squash commit per merge
 
 
 @dataclass
@@ -125,6 +126,7 @@ def _repos_env() -> list[RepoConfig]:
             raise ValueError(f"NAVIGATOR_REPOS_FILE workdir must stay inside the repo: {workdir!r}")
         cmds = entry.get("allowed_commands")
         repos.append(RepoConfig(path=entry["path"], workdir=workdir,
+                                squash=bool(entry.get("squash", False)),
                                 allowed_commands=_check_allowlist("NAVIGATOR_REPOS_FILE", cmds)
                                 if cmds is not None else None))
     return repos

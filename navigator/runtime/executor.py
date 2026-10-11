@@ -114,7 +114,26 @@ def _merge_preflight(repo: str, run: Run) -> str | None:
         return "main checkout has uncommitted changes to tracked files"
     return None
 
-def merge_after_approval(run: Run, *, act, orc, driver, runner, settings) -> Run:
+def _git_merge(repo: str, run: Run, squash: bool, title: str):
+    if not squash:
+        return subprocess.run(["git", "merge", "--no-ff", "-m", f"navigator merge {run.id}", run.branch],
+                              cwd=repo, capture_output=True, text=True)
+    # public repos: one commit under the repo's own identity; the run branch's
+    # navigator@local checkpoints never enter history
+    merge = subprocess.run(["git", "merge", "--squash", run.branch], cwd=repo,
+                           capture_output=True, text=True)
+    if merge.returncode != 0:
+        return merge
+    return subprocess.run(["git", "commit", "-q", "-m", title], cwd=repo,
+                          capture_output=True, text=True)
+
+def _abort_merge(repo: str, squash: bool) -> None:
+    # a squash leaves no MERGE_HEAD, so --abort can't undo it; reset --merge restores
+    # the index and conflicted files while keeping unrelated local changes
+    cmd = ["git", "reset", "--merge"] if squash else ["git", "merge", "--abort"]
+    subprocess.run(cmd, cwd=repo, capture_output=True, text=True)
+
+def merge_after_approval(run: Run, *, act, orc, driver, runner, settings, squash: bool = False) -> Run:
     if not _merge_approved(act, run):
         return run  # never auto-merge
     repo = _repo_for(run, act)
@@ -124,10 +143,10 @@ def merge_after_approval(run: Run, *, act, orc, driver, runner, settings) -> Run
         _emit(act, run, "run.merge_blocked", Severity.warning, reason=blocked)
         return run
     run.phase = RunPhase.merging; _save(act, run)
-    merge = subprocess.run(["git", "merge", "--no-ff", "-m", f"navigator merge {run.id}", run.branch],
-                           cwd=repo, capture_output=True, text=True)
+    prop = act.get_proposal(run.proposal_id)
+    merge = _git_merge(repo, run, squash, prop.title if prop else run.id)
     if merge.returncode != 0:
-        subprocess.run(["git", "merge", "--abort"], cwd=repo, capture_output=True, text=True)
+        _abort_merge(repo, squash)
         detail = (merge.stdout + merge.stderr).strip()[:300]
         run.status = RunStatus.failed; run.phase = RunPhase.finalizing
         run.ended_at = datetime.now(timezone.utc); _save(act, run)
@@ -141,6 +160,8 @@ def merge_after_approval(run: Run, *, act, orc, driver, runner, settings) -> Run
     _write_outcome(orc, run, status="completed", summary="merged after approval",
                    lessons=["change merged"], section="decisions", settings=settings)
     _cleanup_worktree(run, repo)
+    if squash:
+        subprocess.run(["git", "branch", "-D", run.branch], cwd=repo, capture_output=True, text=True)
     _emit(act, run, "run.completed")
     return run
 

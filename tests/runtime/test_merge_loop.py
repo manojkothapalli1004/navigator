@@ -95,3 +95,37 @@ def test_merge_conflict_aborts_cleanly_and_fails_run(tmp_path):
     assert _git(repo, "status", "--porcelain").strip() == ""  # merge aborted, tree clean
     assert (repo/"navigator_touch.py").read_text() == "conflicting = True\n"
     assert Path(run.worktree_path).exists()
+
+
+def _setup_squash(tmp_path):
+    nav, repo, run = _setup(tmp_path)
+    nav.squash = True
+    _git(repo, "config", "user.name", "Owner"); _git(repo, "config", "user.email", "owner@users.noreply.github.com")
+    return nav, repo, run
+
+
+def test_public_repo_merge_is_one_commit_under_the_repo_identity(tmp_path):
+    # trader/orchestrator are public: navigator@local checkpoint commits and tool
+    # identities must never become part of their history
+    nav, repo, run = _setup_squash(tmp_path)
+    before = _git(repo, "rev-parse", "HEAD").strip()
+    _decide(nav, run, ApprovalDecision.approved)
+    assert [r.id for r in nav.merge_poll()] == [run.id]
+    new = _git(repo, "rev-list", f"{before}..HEAD").split()
+    assert len(new) == 1
+    assert _git(repo, "log", "-1", "--format=%an <%ae>").strip() == "Owner <owner@users.noreply.github.com>"
+    assert "navigator" not in _git(repo, "log", "--format=%an %ae %B", "-1").lower()
+    assert "navigator-checkpoint" not in _git(repo, "log", "--format=%s")
+    assert run.branch not in _git(repo, "branch", "--list")
+    assert "navigator_touch.py" in _git(repo, "ls-files")
+
+
+def test_public_repo_squash_conflict_leaves_checkout_clean(tmp_path):
+    nav, repo, run = _setup_squash(tmp_path)
+    (repo/"navigator_touch.py").write_text("conflicting = True\n")
+    _git(repo, "add", "navigator_touch.py"); _git(repo, "commit", "-m", "conflict")
+    _decide(nav, run, ApprovalDecision.approved)
+    nav.merge_poll()
+    assert nav.act.runs[run.id].status == RunStatus.failed
+    assert _git(repo, "status", "--porcelain").strip() == ""
+    assert (repo/"navigator_touch.py").read_text() == "conflicting = True\n"
