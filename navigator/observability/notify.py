@@ -66,6 +66,7 @@ def _diff_summary(diff: str) -> str:
 
 
 _RESULT_LINE = re.compile(r"\d+ (passed|failed|error)")
+_PROGRESS_DONE = re.compile(r"\[\s*100%\]")
 
 
 def format_verification(log: list[dict]) -> str:
@@ -75,7 +76,11 @@ def format_verification(log: list[dict]) -> str:
     for c in log:
         tail = (c.get("output_tail") or "").strip().splitlines()
         # pytest's result line beats trailing stderr noise (uv's venv setup)
-        result = next((l for l in reversed(tail) if _RESULT_LINE.search(l)), tail[-1] if tail else "")
+        result = next((l for l in reversed(tail) if _RESULT_LINE.search(l)), None)
+        if result is None and any(_PROGRESS_DONE.search(l) for l in tail):
+            result = "tests passed (100%)" if c.get("returncode") == 0 else "tests failed"
+        if result is None:
+            result = tail[-1] if tail else ""
         lines.append(f"  $ {c.get('argv')}  rc={c.get('returncode')}  {result.strip()}")
     return "\n".join(lines)
 

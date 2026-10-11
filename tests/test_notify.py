@@ -83,3 +83,12 @@ def test_verification_summary_prefers_the_test_result_line():
     log = [{"argv": "uv run pytest -q", "returncode": 0,
             "output_tail": "16 passed in 0.80s\nCreating virtual environment\nInstalled 19 packages"}]
     assert "16 passed" in format_verification(log)
+
+
+def test_verification_summary_understands_quiet_progress_only_output():
+    # this repo's pytest config prints no "N passed" line, only the progress bar
+    from navigator.observability.notify import format_verification
+    log = [{"argv": "uv run pytest -q", "returncode": 0,
+            "output_tail": "........   [100%]\nCreating virtual environment at: .venv\nInstalled 19 packages in 98ms\n"}]
+    out = format_verification(log)
+    assert "tests passed (100%)" in out and "Installed" not in out
