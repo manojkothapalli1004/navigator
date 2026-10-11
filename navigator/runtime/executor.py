@@ -85,8 +85,8 @@ def execute_proposal(proposal: Proposal, *, act, orc, driver, runner, settings,
         run.status = RunStatus.failed; run.phase = RunPhase.finalizing
         run.ended_at = datetime.now(timezone.utc); _save(act, run)
         _write_outcome(orc, run, status="failed", summary="verification failed",
-                       lessons=[f"verify rc={result.verify_returncode}: {result.verify_output[:200]}"],
-                       verification_notes=result.verify_output[:500], preserved=handle.path,
+                       lessons=[f"verify rc={result.verify_returncode}: {result.verify_output[-300:]}"],
+                       verification_notes=result.verify_output[-1500:], preserved=handle.path,
                        checkpoints_made=len(result.checkpoints), settings=settings)
         _emit(act, run, "run.failed", Severity.error); return run
     run.phase = RunPhase.awaiting_review; _save(act, run)

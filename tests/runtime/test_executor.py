@@ -191,3 +191,19 @@ def test_run_records_verification_evidence_and_cost(tmp_path):
     assert stored.model_calls == 2  # what the operator sees; the $ figure is only a budget cap
     ev = [e for e in d["act"].events if e.kind == "run.awaiting_review"][0]
     assert ev.payload["verification"] == stored.verification
+
+
+def test_failure_notes_keep_the_end_of_test_output(tmp_path, monkeypatch):
+    # pytest prints its header first and the failures last; keeping the head (as
+    # before) recorded "test session starts" and dropped the actual failures
+    repo, sha = _seed(tmp_path); d = _deps(tmp_path, repo)
+    from navigator.runtime import phases
+    real = phases.run_build_and_verify
+    def failing(*a, **k):
+        r = real(*a, **k); r.verify_returncode = 1
+        r.verify_output = "=== test session starts ===\n" + "x" * 2000 + "\nFAILED tests/t.py::test_x - boom"
+        return r
+    monkeypatch.setattr("navigator.runtime.executor.run_build_and_verify", failing)
+    execute_proposal(_proposal(repo, sha), **d)
+    note = [n for sec, n, _ in d["orc"].updates if sec == "known_failures"][-1]
+    assert "FAILED tests/t.py::test_x - boom" in note
