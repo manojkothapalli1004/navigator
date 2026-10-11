@@ -129,3 +129,14 @@ def test_public_repo_squash_conflict_leaves_checkout_clean(tmp_path):
     assert nav.act.runs[run.id].status == RunStatus.failed
     assert _git(repo, "status", "--porcelain").strip() == ""
     assert (repo/"navigator_touch.py").read_text() == "conflicting = True\n"
+
+
+def test_merge_commit_message_says_what_changed(tmp_path):
+    # live 2026-10-11: waker re-proposed an already-merged cooldown because its merge
+    # commit only said "navigator merge run-…" and the planner reads commit subjects
+    nav, repo, run = _setup(tmp_path)
+    title = nav.act.get_proposal(run.proposal_id).title
+    _decide(nav, run, ApprovalDecision.approved)
+    nav.merge_poll()
+    subject = _git(repo, "log", "-1", "--format=%s").strip()
+    assert title in subject and run.id in subject

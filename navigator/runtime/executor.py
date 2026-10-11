@@ -116,7 +116,7 @@ def _merge_preflight(repo: str, run: Run) -> str | None:
 
 def _git_merge(repo: str, run: Run, squash: bool, title: str):
     if not squash:
-        return subprocess.run(["git", "merge", "--no-ff", "-m", f"navigator merge {run.id}", run.branch],
+        return subprocess.run(["git", "merge", "--no-ff", "-m", f"{title} (navigator {run.id})", run.branch],
                               cwd=repo, capture_output=True, text=True)
     # public repos: one commit under the repo's own identity; the run branch's
     # navigator@local checkpoints never enter history
