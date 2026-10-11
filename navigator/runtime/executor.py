@@ -78,6 +78,7 @@ def execute_proposal(proposal: Proposal, *, act, orc, driver, runner, settings) 
     run.verification = result.verify_log
     if guard is not None:
         run.cost_usd = round(guard.spent_usd, 4)  # driver's per-call estimate
+        run.model_calls = guard.calls
     if result.verify_returncode != 0:
         preserve_failed(handle)
         run.status = RunStatus.failed; run.phase = RunPhase.finalizing

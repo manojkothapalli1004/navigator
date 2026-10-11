@@ -188,5 +188,6 @@ def test_run_records_verification_evidence_and_cost(tmp_path):
     stored = d["act"].runs[run.id]
     assert stored.verification and stored.verification[0]["argv"].startswith("python3 -m py_compile")
     assert stored.cost_usd == 0.5  # builder + verifier
+    assert stored.model_calls == 2  # what the operator sees; the $ figure is only a budget cap
     ev = [e for e in d["act"].events if e.kind == "run.awaiting_review"][0]
     assert ev.payload["verification"] == stored.verification

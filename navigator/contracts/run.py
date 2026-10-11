@@ -21,7 +21,8 @@ class Run(BaseModel):
     completed_tasks: list[str] = Field(default_factory=list)
     checkpoints: list[Checkpoint] = Field(default_factory=list)
     verification: list[dict] = Field(default_factory=list)
-    cost_usd: float = 0.0
+    cost_usd: float = 0.0  # budget-cap estimate, not a bill (runs on the subscription)
+    model_calls: int = 0
     correlation_id: str | None = None
     started_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     ended_at: datetime | None = None

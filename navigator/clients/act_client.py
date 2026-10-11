@@ -161,7 +161,7 @@ class HTTPACTClient:
     @staticmethod
     def _run_payload(r: Run) -> dict:
         return {"completed_tasks": r.completed_tasks, "target_branch": r.target_branch,
-                "verification": r.verification,
+                "verification": r.verification, "model_calls": r.model_calls,
                 "checkpoints": [c.model_dump() for c in r.checkpoints],
                 "heartbeat_at": r.heartbeat_at.isoformat()}
 
@@ -175,6 +175,7 @@ class HTTPACTClient:
             worktree_path=d.get("worktree_path"), base_commit_sha=d["base_commit_sha"],
             branch=d["branch"], target_branch=pl.get("target_branch"),
             verification=pl.get("verification") or [],
+            model_calls=pl.get("model_calls") or 0,
             completed_tasks=pl.get("completed_tasks") or [],
             checkpoints=pl.get("checkpoints") or [], cost_usd=d.get("cost_usd", 0.0),
             correlation_id=d.get("correlation_id"), started_at=d["started_at"],

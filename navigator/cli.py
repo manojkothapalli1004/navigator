@@ -77,7 +77,7 @@ def _diff(act, run_id, out) -> int:
     if run is None or prop is None:
         print(f"no open run: {run_id}", file=out)
         return 1
-    print(f"{run.id}  {prop.title}  (cost est. ${run.cost_usd:.2f})", file=out)
+    print(f"{run.id}  {prop.title}  (model calls: {run.model_calls})", file=out)
     print(format_verification(run.verification), file=out)
     d = subprocess.run(["git", "diff", f"{run.base_commit_sha}..{run.branch}"], cwd=prop.repo,
                        capture_output=True, text=True)
