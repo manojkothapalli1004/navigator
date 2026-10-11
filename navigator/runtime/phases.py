@@ -163,4 +163,28 @@ def run_build_and_verify(driver: SubagentDriver, worktree: WorktreeHandle,
                     breakers.check_failed_tests(int(m.group(1)))
                 breakers.record_failure(" ".join(argv))
             break
+    if res.verify_returncode == 0 and _requires_tests(run_dir, res.file_writes):
+        _run_full_suite(runner, run_dir, res, breakers)
     return res
+
+
+def _run_full_suite(runner, run_dir: Path, res: PhaseResult, breakers) -> None:
+    # the verifier picks its own commands and may skip suites its change breaks
+    # (live 2026-10-11); Navigator always runs the repo's whole suite itself
+    entry = next((a for a in runner.allowlist if "pytest" in a.split()), None)
+    if entry is None:
+        res.verify_returncode = 1
+        res.verify_output = "repo has tests but no pytest command is allowlisted"
+        return
+    argv = entry.split() + ["-q"]
+    try:
+        r = runner.run(argv, cwd=run_dir)
+        rc, out = r.returncode, r.stdout + r.stderr
+    except CommandRejected as e:
+        rc, out = 126, f"full-suite command rejected: {e}"
+    res.verify_log.append({"argv": " ".join(argv), "returncode": rc, "output_tail": out[-1500:]})
+    res.verify_returncode, res.verify_output = rc, out
+    if rc != 0 and breakers:
+        m = _FAILED_TESTS.search(out)
+        if m:
+            breakers.check_failed_tests(int(m.group(1)))

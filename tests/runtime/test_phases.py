@@ -249,3 +249,26 @@ def test_workdir_relative_affected_paths_are_mapped_to_repo_paths(tmp_path):
                                    "tests/test_new2.py"], "backend")
     assert got == ["backend/app/routes/pings.py", "README.md", "backend/tests/test_new.py",
                    "backend/tests/test_new2.py"]
+
+
+def test_navigator_runs_the_full_suite_itself_when_repo_has_tests(tmp_path):
+    # live 2026-10-11: a waker verifier ran only 3 chosen test files, skipped the
+    # allowlist suite its change broke, and "passed"; 13 tests failed on merge
+    h, _ = _wt(tmp_path, "run-fs")
+    (Path(h.path)/"tests").mkdir()
+    calls = []
+    from navigator.safety.command_runner import CommandResult
+    class _Runner:
+        allowlist = ["git status", "uv run pytest"]
+        def run(self, argv, cwd):
+            calls.append(argv)
+            full = argv[:3] == ["uv", "run", "pytest"] and not any(
+                a.startswith("tests/") or a == "-k" for a in argv[3:])
+            return CommandResult(1 if full else 0, "13 failed" if full else "3 passed", "")
+    drv = _ScriptedRoles([("a.py", "x = 1\n"), ("tests/test_a.py", "def test_a(): pass\n")],
+                         [["uv", "run", "pytest", "tests/test_a.py"]])
+    res = run_build_and_verify(driver=drv, worktree=h, run_id="run-fs", runner=_Runner(),
+                               proposal={"affected_files": ["a.py"]})
+    assert ["uv", "run", "pytest", "-q"] in calls
+    assert res.verify_returncode != 0
+    assert res.verify_log[-1]["argv"] == "uv run pytest -q"
