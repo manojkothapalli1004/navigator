@@ -45,13 +45,18 @@ def _read_affected(wt: Path, relpaths: list[str]) -> dict[str, str | None]:
         files[rel] = target.read_text()[:_MAX_FILE_CHARS] if target.is_file() else None
     return files
 
+def _is_test_file(rel: str) -> bool:
+    # tests may be added beyond the approved list: they can't change runtime behaviour
+    p = Path(rel)
+    return p.suffix == ".py" and ("tests" in p.parts[:-1] or p.name.startswith("test_"))
+
 def _check_scope(relpaths: list[str], allowed: list[str]) -> None:
     # the operator approved a proposal naming these files; the builder may not widen it
     if not allowed:
         return
     approved = {Path(a).as_posix() for a in allowed}
     for rel in relpaths:
-        if Path(rel).as_posix() not in approved:
+        if Path(rel).as_posix() not in approved and not _is_test_file(rel):
             raise ValueError(f"builder wrote {rel!r} outside the approved affected_files")
 
 _FAILED_TESTS = re.compile(r"(\d+) failed")

@@ -158,3 +158,14 @@ def test_planner_prompt_tells_the_model_to_follow_the_repo_brief():
                           budget_guard=BudgetGuard(10))
     drv.run_role(DriverRequest(role=Role.planner, context={"snapshot": {"repo_brief": "x"}}))
     assert "repo_brief" in seen["p"] and "context_files" in seen["p"]
+
+
+def test_builder_is_told_to_test_the_behaviour_it_changes():
+    # live 2026-10-11: a trader regime-gate run changed entry logic and added no tests;
+    # the suite still passed because nothing exercised the new path
+    seen = {}
+    drv = ClaudeSDKDriver(query_fn=lambda p: seen.setdefault("p", p) and
+                          '{"file_writes": [], "commands": [], "summary": "s"}',
+                          budget_guard=BudgetGuard(10))
+    drv.run_role(DriverRequest(role=Role.builder, context={}))
+    assert "tests" in seen["p"] and "new or changed behaviour" in seen["p"]

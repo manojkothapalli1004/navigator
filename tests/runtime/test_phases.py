@@ -198,3 +198,14 @@ def test_verifier_gets_paths_relative_to_its_workdir(tmp_path):
     v = drv.requests[Role.verifier].context
     assert v["workdir"] == "backend"
     assert v["changed_files"] == ["app/x.py"]
+
+
+def test_builder_may_add_test_files_beyond_the_approved_list(tmp_path):
+    # tests can't change runtime behaviour; requiring them in affected_files meant a
+    # trader gate change shipped with no tests. Non-test files stay out of scope.
+    from navigator.runtime.phases import _check_scope
+    _check_scope(["a.py", "tests/test_a.py", "pkg/tests/test_b.py", "test_root.py"], ["a.py"])
+    with pytest.raises(ValueError, match="b.py"):
+        _check_scope(["a.py", "b.py"], ["a.py"])
+    with pytest.raises(ValueError, match="conftest_evil"):
+        _check_scope(["tests_helpers/conftest_evil.py"], ["a.py"])
