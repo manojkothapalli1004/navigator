@@ -88,6 +88,33 @@ def test_git_pathspec_separator_allowed(tmp_path):
     assert r.run(["git", "status", "--porcelain", "--", "README.md"], cwd=tmp_path).returncode == 0
 
 
+def test_git_diff_bare_pathspec_separator_still_passes(tmp_path):
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
+    r = _runner(tmp_path)
+    assert r.run(["git", "diff", "--", "README.md"], cwd=tmp_path).returncode == 0
+
+
+def test_git_flag_rejection_names_subcommand(tmp_path):
+    # outcome proposal-01M4HDFFTAEVBQ0M7WE6EAH55X only said "git flag not on safe
+    # list: '--'" -- the subcommand must be named so the lesson is actionable
+    r = CommandRunner(allowlist=["git show"], worktree_root=tmp_path)
+    with pytest.raises(CommandRejected) as exc:
+        r.run(["git", "show", "--", "README.md"], cwd=tmp_path)
+    msg = str(exc.value)
+    assert "'git show'" in msg
+    assert "'--'" in msg
+    assert "allowed: none" in msg
+
+
+def test_git_flag_rejection_lists_allowed_flags(tmp_path):
+    with pytest.raises(CommandRejected) as exc:
+        _runner(tmp_path).run(["git", "diff", "--all"], cwd=tmp_path)
+    msg = str(exc.value)
+    assert "'git diff'" in msg
+    assert "'--all'" in msg
+    assert "allowed: --, --cached, --name-only, --name-status, --staged, --stat" in msg
+
+
 def test_commands_do_not_inherit_navigator_configuration(tmp_path, monkeypatch):
     # live 2026-10-10: verifier pytest inherited NAVIGATOR_DRIVER=claude_sdk from the
     # daemon, so env-reading tests in the target repo built a live SDK driver
