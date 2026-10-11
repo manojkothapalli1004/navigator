@@ -128,8 +128,16 @@ def _strip_fences(text: str) -> str:
     match = re.search(r"```(?:\w+)?\n(.*?)```", stripped, re.DOTALL)
     if match:
         return match.group(1).strip()
-    if not stripped.startswith("{"):
-        start, end = stripped.find("{"), stripped.rfind("}")
-        if start != -1 and end > start:
-            return stripped[start:end + 1]
-    return stripped
+    start = stripped.find("{")
+    if start == -1:
+        return stripped
+    try:
+        # first complete JSON object; drops prose before AND after it
+        _, end = json.JSONDecoder().raw_decode(stripped, start)
+        return stripped[start:end]
+    except ValueError:
+        if start > 0:
+            last = stripped.rfind("}")
+            if last > start:
+                return stripped[start:last + 1]
+        return stripped[start:]

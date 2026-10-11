@@ -271,3 +271,11 @@ def test_usage_limit_errors_are_not_retried(monkeypatch):
     with pytest.raises(RuntimeError, match="session limit"):
         make_sdk_query_fn()("x")
     assert calls["n"] == 1
+
+def test_trailing_prose_after_json_is_dropped(monkeypatch):
+    # live 2026-10-11: Sonnet verifiers replied '{"commands": ...} <explanation>' and
+    # 3 waker runs died on "response is not valid JSON"
+    captured = {}
+    _stub_sdk(monkeypatch, captured, results=(
+        '{"commands": [["git", "status"]], "summary": "s"}\nNote: "uv run --extra dev pytest" matches.',))
+    assert make_sdk_query_fn()("x") == '{"commands": [["git", "status"]], "summary": "s"}'
