@@ -169,3 +169,6 @@ def test_builder_is_told_to_test_the_behaviour_it_changes():
                           budget_guard=BudgetGuard(10))
     drv.run_role(DriverRequest(role=Role.builder, context={}))
     assert "tests" in seen["p"] and "new or changed behaviour" in seen["p"]
+    # test files may be ADDED even though they aren't in context.files
+    assert "must be listed in context.files" not in seen["p"]
+    assert "context.test_files" in seen["p"]

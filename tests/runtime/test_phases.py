@@ -222,3 +222,17 @@ def test_code_change_without_any_test_change_fails_in_repo_with_tests(tmp_path):
     res = run_build_and_verify(driver=no_tests, worktree=h, run_id="run-q", runner=runner,
                                proposal={"affected_files": ["a.py"]})
     assert res.verify_returncode != 0 and "no test changes" in res.verify_output
+
+
+def test_builder_sees_existing_test_file_names(tmp_path):
+    repo, _ = _seed(tmp_path)
+    (repo/"tests").mkdir(); (repo/"tests"/"test_x.py").write_text("")
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "t"], cwd=repo, check=True, capture_output=True)
+    sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True).stdout.strip()
+    h = create_worktree(repo=repo, base_commit_sha=sha, run_id="run-tf", worktree_root=tmp_path/"wt")
+    drv = _RecordingDriver()
+    run_build_and_verify(driver=drv, worktree=h, run_id="run-tf",
+                         runner=CommandRunner(allowlist=DEFAULT_ALLOWLIST, worktree_root=tmp_path/"wt"),
+                         proposal={"affected_files": ["a.py"]})
+    assert drv.requests[Role.builder].context["test_files"] == ["tests/test_x.py"]

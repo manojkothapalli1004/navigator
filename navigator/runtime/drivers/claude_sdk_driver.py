@@ -17,10 +17,11 @@ _ROLE_OUTPUT_SPEC = {
     Role.builder: ('Implement context.proposal by editing context.files (null = new file). '
                    'Respond with ONLY a JSON object: {"file_writes": [[relpath, FULL new file content], ...], '
                    '"commands": [], "summary": "..."}. Each content replaces the whole file — '
-                   'never elide unchanged code. Only write paths listed in context.files. '
+                   'never elide unchanged code. Only write paths listed in context.files, plus test files. '
                    'If the repo has tests, add or update tests that exercise the new or changed '
-                   'behaviour (a passing suite that never runs the new path proves nothing); '
-                   'test files you write must be listed in context.files.'),
+                   'behaviour (a passing suite that never runs the new path proves nothing). '
+                   'You MAY add new test files not in context.files; follow the layout and '
+                   'naming of context.test_files.'),
     Role.verifier: ('Choose commands that prove context.proposal works, each starting with an entry '
                     'of context.allowed_commands. Commands run inside context.workdir; use paths '
                     'relative to it (context.changed_files already are). Respond with ONLY a JSON '

@@ -1,4 +1,5 @@
 import re
+import subprocess
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -82,8 +83,10 @@ def run_build_and_verify(driver: SubagentDriver, worktree: WorktreeHandle,
     run_dir = _resolve_write_target(wt, workdir) if workdir not in (".", "") else wt
     proposal = proposal or {}
     started = time.monotonic() if started_monotonic is None else started_monotonic
+    tracked = subprocess.run(["git", "ls-files"], cwd=wt, capture_output=True, text=True).stdout.split()
     build_ctx = {"proposal": proposal,
-                 "files": _read_affected(wt, proposal.get("affected_files", []))}
+                 "files": _read_affected(wt, proposal.get("affected_files", [])),
+                 "test_files": [f for f in tracked if _is_test_file(f)][:200]}
     build = driver.run_role(DriverRequest(role=Role.builder, context=build_ctx, worktree_path=str(wt)))
     _check_scope([rel for rel, _ in build.file_writes], proposal.get("affected_files", []))
     if breakers:
