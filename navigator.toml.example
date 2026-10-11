@@ -22,7 +22,13 @@ act_base_url = ""               # NAVIGATOR_ACT_BASE_URL: unset = in-memory Fake
 orc_base_url = ""               # NAVIGATOR_ORC_BASE_URL: unset = FakeORCClient
 
 [runtime]
-repo = ""                       # NAVIGATOR_REPO: target git repository (required)
+repo = ""                       # NAVIGATOR_REPO: target git repository (single-repo mode)
+# NAVIGATOR_REPOS_FILE: JSON list of repos for multi-repo mode (overrides NAVIGATOR_REPO), e.g.
+#   [{"path": "/abs/navigator"},
+#    {"path": "/abs/waker", "workdir": "backend",
+#     "allowed_commands": ["git status", "git diff", "git log", "uv run --extra dev pytest"]}]
+# workdir = where verifier commands run; allowed_commands defaults to the global allowlist.
+repos_file = ""
 worktree_root = "/tmp/navigator-worktrees"     # NAVIGATOR_WORKTREE_ROOT
 lock_path = "/tmp/navigator.lock"              # NAVIGATOR_LOCK_PATH: single-flight lock
 outcome_path = "/tmp/navigator-outcomes.jsonl" # NAVIGATOR_OUTCOME_PATH: local outcome trail

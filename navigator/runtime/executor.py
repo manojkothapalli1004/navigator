@@ -25,7 +25,8 @@ def _emit(act, run, kind, severity=Severity.info, **payload):
     payload = {"run_id": run.id, "proposal_id": run.proposal_id, **payload}
     act.emit_event(Event(kind=kind, severity=severity, correlation_id=run.correlation_id, payload=payload))
 
-def execute_proposal(proposal: Proposal, *, act, orc, driver, runner, settings) -> Run:
+def execute_proposal(proposal: Proposal, *, act, orc, driver, runner, settings,
+                     workdir: str = ".") -> Run:
     # Ensure the proposal is registered in ACT so _repo_for can resolve it
     if act.get_proposal(proposal.id) is None:
         proposal = act.create_proposal(proposal)
@@ -65,7 +66,7 @@ def execute_proposal(proposal: Proposal, *, act, orc, driver, runner, settings) 
             proposal={"title": proposal.title, "rationale": proposal.rationale,
                       "intended_changes": proposal.intended_changes,
                       "affected_files": list(proposal.affected_files)},
-            breakers=breakers, started_monotonic=started)
+            breakers=breakers, started_monotonic=started, workdir=workdir)
     except Exception as e:
         preserve_failed(handle)
         run.status = RunStatus.failed; run.phase = RunPhase.finalizing

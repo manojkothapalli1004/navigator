@@ -9,7 +9,8 @@ from datetime import datetime, timezone
 import httpx
 import structlog
 from navigator.cli import COMMANDS, run_cli
-from navigator.config import Settings
+from navigator.config import RepoConfig, Settings
+from navigator.runtime.fleet import Fleet
 from navigator.contracts.enums import Role
 from navigator.observability.notify import NotifyingACT, make_notifier
 from navigator.clients.act_client import FakeACTClient, HTTPACTClient
@@ -34,19 +35,29 @@ def _make_driver(settings: Settings):
                                budget_guard=BudgetGuard(settings.max_cost_usd))
     raise ValueError(f"unknown NAVIGATOR_DRIVER {settings.driver!r}")
 
-def build_navigator(settings: Settings) -> Navigator:
-    if not settings.repo:
+def build_navigator(settings: Settings):
+    repos = settings.repos or ([RepoConfig(path=settings.repo)] if settings.repo else [])
+    if not repos:
         raise ValueError("NAVIGATOR_REPO must point at the target git repository")
     notifier = make_notifier()
     act = HTTPACTClient(settings.act_base_url) if settings.act_base_url else FakeACTClient()
     act = NotifyingACT(act, notifier)
     orc = HTTPORCClient(settings.orc_base_url) if settings.orc_base_url else FakeORCClient()
-    runner = CommandRunner(allowlist=settings.allowed_commands, worktree_root=settings.worktree_root,
-                           timeout_s=settings.command_timeout_s)
-    nav = Navigator(act=act, orc=orc, driver=_make_driver(settings), runner=runner,
-                    settings=settings, repo=settings.repo, lock_path=settings.lock_path)
-    nav.notifier = notifier
-    return nav
+    driver = _make_driver(settings)
+    navs = []
+    for rc in repos:
+        runner = CommandRunner(allowlist=rc.allowed_commands or settings.allowed_commands,
+                               worktree_root=settings.worktree_root,
+                               timeout_s=settings.command_timeout_s)
+        nav = Navigator(act=act, orc=orc, driver=driver, runner=runner, settings=settings,
+                        repo=rc.path, lock_path=settings.lock_path, workdir=rc.workdir)
+        nav.notifier = notifier
+        navs.append(nav)
+    if len(navs) == 1:
+        return navs[0]
+    fleet = Fleet(navs)
+    fleet.notifier = notifier
+    return fleet
 
 def _head_sha(repo: str) -> str:
     return subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo,
@@ -56,7 +67,7 @@ def _cycle(nav: Navigator, settings: Settings) -> dict:
     summary: dict = {"mode": settings.mode, "driver": settings.driver}
     # planning failures (LLM limits, timeouts) must not block approved work or merges
     try:
-        summary["proposals_created"] = len(nav.periodic_tick(base_commit_sha=_head_sha(settings.repo)))
+        summary["proposals_created"] = len(nav.periodic_tick())
     except Exception as e:
         summary["proposals_created"] = 0
         summary["planner_error"] = f"{type(e).__name__}: {e}"[:300]

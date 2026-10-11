@@ -47,7 +47,7 @@ READ_OUTSIDE_SETTINGS: set[str] = {
 }
 
 # navigator.toml.example keys that are not Settings fields.
-TOML_NON_SETTINGS_KEYS: set[str] = {"notify_env_file"}
+TOML_NON_SETTINGS_KEYS: set[str] = {"notify_env_file", "repos_file"}
 
 
 def _settings_env_keys(monkeypatch: pytest.MonkeyPatch) -> set[str]:

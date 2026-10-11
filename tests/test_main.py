@@ -7,7 +7,7 @@ from navigator.clients.act_client import FakeACTClient, HTTPACTClient
 from navigator.runtime.drivers.fake_driver import FakeSubagentDriver
 
 def _seed_repo(tmp_path):
-    repo = tmp_path/"repo"; repo.mkdir()
+    repo = tmp_path/"repo"; repo.mkdir(parents=True)
     subprocess.run(["git","init"], cwd=repo, check=True, capture_output=True)
     subprocess.run(["git","config","user.email","t@t"], cwd=repo, check=True)
     subprocess.run(["git","config","user.name","t"], cwd=repo, check=True)
@@ -190,7 +190,7 @@ def test_planner_failure_does_not_block_execution_or_merges(tmp_path, monkeypatc
     import navigator.__main__ as m
     nav = build_navigator(_settings(tmp_path, _seed_repo(tmp_path)))
     calls = []
-    def broken_tick(base_commit_sha):
+    def broken_tick(base_commit_sha=None):
         raise RuntimeError("You've hit your session limit")
     monkeypatch.setattr(nav, "periodic_tick", broken_tick)
     monkeypatch.setattr(nav, "approval_poll", lambda: calls.append("exec") or [])
@@ -212,3 +212,18 @@ def test_per_role_sdk_models_are_wired(tmp_path, monkeypatch):
     assert drv.role_query_fns[Role.planner]("x") == "claude-sonnet-5-5"
     assert drv.role_query_fns[Role.verifier]("x") == "claude-sonnet-5-5"
     assert Role.builder not in drv.role_query_fns
+
+def test_repos_file_builds_a_fleet_with_per_repo_runners(tmp_path):
+    from navigator.config import RepoConfig
+    from navigator.runtime.fleet import Fleet
+    a, b = _seed_repo(tmp_path/"a"), _seed_repo(tmp_path/"b")
+    s = _settings(tmp_path, a, repos=[RepoConfig(path=str(a)),
+                                      RepoConfig(path=str(b), workdir="backend",
+                                                 allowed_commands=["git status", "uv run --extra dev pytest"])])
+    fleet = build_navigator(s)
+    assert isinstance(fleet, Fleet)
+    na, nb = fleet.navigators
+    assert (na.repo, nb.repo) == (str(a), str(b))
+    assert nb.workdir == "backend" and nb.runner.allowlist == ["git status", "uv run --extra dev pytest"]
+    assert na.runner.allowlist == s.allowed_commands
+    assert na.act is nb.act and na.driver is nb.driver  # one ACT, one model driver

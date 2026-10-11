@@ -100,3 +100,22 @@ def test_per_role_sdk_models_from_env(monkeypatch):
     monkeypatch.delenv("NAVIGATOR_SDK_MODEL_BUILDER", raising=False)
     assert cfg.Settings.from_env().sdk_role_models == {"planner": "claude-sonnet-5-5",
                                                         "verifier": "claude-sonnet-5-5"}
+
+def test_repos_file_configures_multiple_repos(tmp_path, monkeypatch):
+    import json
+    f = tmp_path/"repos.json"
+    f.write_text(json.dumps([
+        {"path": "/r/navigator"},
+        {"path": "/r/waker", "workdir": "backend",
+         "allowed_commands": ["git status", "git diff", "uv run --extra dev pytest"]}]))
+    monkeypatch.setenv("NAVIGATOR_REPOS_FILE", str(f))
+    s = cfg.Settings.from_env()
+    assert [r.path for r in s.repos] == ["/r/navigator", "/r/waker"]
+    assert s.repos[1].workdir == "backend"
+    assert s.repos[1].allowed_commands == ["git status", "git diff", "uv run --extra dev pytest"]
+    assert s.repos[0].workdir == "." and s.repos[0].allowed_commands is None
+
+def test_single_repo_env_still_works_without_repos_file(monkeypatch):
+    monkeypatch.delenv("NAVIGATOR_REPOS_FILE", raising=False)
+    monkeypatch.setenv("NAVIGATOR_REPO", "/r/one")
+    assert [r.path for r in cfg.Settings.from_env().repos] == ["/r/one"]

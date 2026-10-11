@@ -1,3 +1,4 @@
+import json
 import os
 from dataclasses import dataclass, field
 
@@ -5,6 +6,13 @@ DEFAULT_ALLOWLIST = [
     "git status", "git diff", "git log",
     "pytest", "python3 -m py_compile", "uv run pytest",
 ]
+
+@dataclass
+class RepoConfig:
+    path: str
+    workdir: str = "."                      # where verifier commands run (e.g. "backend")
+    allowed_commands: list[str] | None = None  # None = Settings.allowed_commands
+
 
 @dataclass
 class Settings:
@@ -26,6 +34,7 @@ class Settings:
     command_timeout_s: float = 60.0
     max_failed_tests: int = 50
     repo: str | None = None
+    repos: list[RepoConfig] = field(default_factory=list)
     lock_path: str = "/tmp/navigator.lock"
     outcome_path: str = "/tmp/navigator-outcomes.jsonl"
     sdk_model: str | None = None
@@ -53,6 +62,7 @@ class Settings:
             command_timeout_s=_positive_float_env("NAVIGATOR_COMMAND_TIMEOUT_S", "60"),
             max_failed_tests=_int_env("NAVIGATOR_MAX_FAILED_TESTS", "50"),
             repo=os.getenv("NAVIGATOR_REPO"),
+            repos=_repos_env(),
             lock_path=os.getenv("NAVIGATOR_LOCK_PATH", "/tmp/navigator.lock"),
             outcome_path=os.getenv("NAVIGATOR_OUTCOME_PATH", "/tmp/navigator-outcomes.jsonl"),
             sdk_model=os.getenv("NAVIGATOR_SDK_MODEL"),
@@ -94,6 +104,30 @@ def _positive_float_env(name: str, default: str) -> float:
 
 
 _ALLOWLIST_FORBIDDEN = set(";|&$`><\n*?!\\/")
+
+
+def _check_allowlist(name: str, entries: list[str]) -> list[str]:
+    for e in entries:
+        if any(ch in _ALLOWLIST_FORBIDDEN for ch in e):
+            raise ValueError(f"{name} entry contains forbidden character: {e!r}")
+    return entries
+
+
+def _repos_env() -> list[RepoConfig]:
+    path = os.getenv("NAVIGATOR_REPOS_FILE")
+    if not path:
+        single = os.getenv("NAVIGATOR_REPO")
+        return [RepoConfig(path=single)] if single else []
+    repos = []
+    for entry in json.loads(open(path).read()):
+        workdir = entry.get("workdir", ".")
+        if workdir.startswith("/") or ".." in workdir.split("/"):
+            raise ValueError(f"NAVIGATOR_REPOS_FILE workdir must stay inside the repo: {workdir!r}")
+        cmds = entry.get("allowed_commands")
+        repos.append(RepoConfig(path=entry["path"], workdir=workdir,
+                                allowed_commands=_check_allowlist("NAVIGATOR_REPOS_FILE", cmds)
+                                if cmds is not None else None))
+    return repos
 
 def _allowlist_env(name: str) -> list[str]:
     raw = os.getenv(name)

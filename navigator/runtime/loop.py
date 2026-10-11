@@ -15,9 +15,11 @@ from navigator.observability.notify import NullNotifier
 log = get_logger("navigator.loop")
 
 class Navigator:
-    def __init__(self, *, act, orc, driver, runner, settings, repo: str, lock_path):
+    def __init__(self, *, act, orc, driver, runner, settings, repo: str, lock_path,
+                 workdir: str = "."):
         self.act = act; self.orc = orc; self.driver = driver; self.runner = runner
         self.settings = settings; self.repo = repo
+        self.workdir = workdir  # where verifier commands run inside the repo
         self.lock = SingleFlightLock(lock_path)
         self.notifier = NullNotifier()
         self.last_snapshot_chars = 0
@@ -57,9 +59,17 @@ class Navigator:
                 live.append(p)
         return live
 
-    def periodic_tick(self, base_commit_sha: str) -> list[Proposal]:
+    def _mine(self, proposals: list[Proposal]) -> list[Proposal]:
+        # several Navigators (one per repo) share one ACT; each owns only its repo's work
+        return [p for p in proposals if p.repo == self.repo]
+
+    def periodic_tick(self, base_commit_sha: str | None = None) -> list[Proposal]:
+        if base_commit_sha is None:
+            base_commit_sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=self.repo,
+                                             capture_output=True, text=True).stdout.strip()
         # unreviewed proposals expire so the backlog cap can't idle the daemon forever
-        open_proposals = self._expire_stale(self.act.list_proposals(ProposalStatus.proposed))
+        open_proposals = self._expire_stale(
+            self._mine(self.act.list_proposals(ProposalStatus.proposed)))
         if len(open_proposals) >= self.settings.max_open_proposals:
             log.info("tick.backlog_full", open=len(open_proposals))
             return []
@@ -69,7 +79,7 @@ class Navigator:
         from navigator.contracts.enums import Role
         plan = self.driver.run_role(DriverRequest(role=Role.planner, context={"repo": self.repo, "snapshot": snap}))
         created: list[Proposal] = []
-        all_proposals = self.act.list_proposals()
+        all_proposals = self._mine(self.act.list_proposals())
         existing_hashes = {p.proposal_origin_hash for p in all_proposals}
         existing_titles = {_norm_title(p.title) for p in all_proposals}
         room = self.settings.max_open_proposals - len(open_proposals)
@@ -90,13 +100,14 @@ class Navigator:
             return []
         runs = []
         with self.lock.acquire():
-            for p in self.act.list_proposals(status=ProposalStatus.approved):
+            for p in self._mine(self.act.list_proposals(status=ProposalStatus.approved)):
                 # Correction 3: dedup guard — skip proposals that already have a run
                 # (any status: a completed run must also block re-execution)
                 if not self._may_run(p.id):
                     continue
                 run = execute_proposal(p, act=self.act, orc=self.orc, driver=self.driver,
-                                       runner=self.runner, settings=self.settings)
+                                       runner=self.runner, settings=self.settings,
+                                       workdir=self.workdir)
                 # Correction 3: proposal stays approved; the dedup guard above prevents re-execution
                 runs.append(run)
         return runs
@@ -120,6 +131,9 @@ class Navigator:
         with self.lock.acquire():
             for run in self.act.list_open_runs():
                 if run.phase != RunPhase.awaiting_review:
+                    continue
+                prop = self.act.get_proposal(run.proposal_id)
+                if prop is None or prop.repo != self.repo:
                     continue
                 decisions = {a.decision for a in
                              self.act.list_approvals(target=run.id, gate=ApprovalGate.merge)}

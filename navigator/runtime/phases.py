@@ -70,9 +70,11 @@ def run_build_and_verify(driver: SubagentDriver, worktree: WorktreeHandle,
                          run_id: str, runner: CommandRunner,
                          proposal: dict | None = None,
                          breakers: CircuitBreakers | None = None,
-                         started_monotonic: float | None = None) -> PhaseResult:
+                         started_monotonic: float | None = None,
+                         workdir: str = ".") -> PhaseResult:
     res = PhaseResult()
     wt = Path(worktree.path)
+    run_dir = _resolve_write_target(wt, workdir) if workdir not in (".", "") else wt
     proposal = proposal or {}
     started = time.monotonic() if started_monotonic is None else started_monotonic
     build_ctx = {"proposal": proposal,
@@ -96,7 +98,7 @@ def run_build_and_verify(driver: SubagentDriver, worktree: WorktreeHandle,
         res.verify_returncode = 1
         res.verify_output = "verifier produced no commands"
         return res
-    if _requires_tests(wt, res.file_writes) and not _runs_tests(verify.commands):
+    if _requires_tests(run_dir, res.file_writes) and not _runs_tests(verify.commands):
         res.verify_returncode = 1
         res.verify_output = ("verifier did not run the test suite for a python change: "
                              + "; ".join(" ".join(c) for c in verify.commands))
@@ -105,7 +107,7 @@ def run_build_and_verify(driver: SubagentDriver, worktree: WorktreeHandle,
         if breakers:
             breakers.check_duration(started)
         try:
-            r = runner.run(argv, cwd=wt)
+            r = runner.run(argv, cwd=run_dir)
         except CommandRejected as e:
             # a disallowed command is a verification result, not a crash
             res.verify_returncode = 126
