@@ -9,7 +9,9 @@ from navigator.safety.errors import DriverParseError
 _PROPOSAL_KEYS = {"title": str, "rationale": str, "intended_changes": str, "affected_files": list}
 
 _ROLE_OUTPUT_SPEC = {
-    Role.planner: ('Respond with ONLY a JSON object: {"proposals": [{"title": "...", '
+    Role.planner: ('If context.snapshot.repo_brief is present it overrides general planning: follow '
+                   'it exactly, using context.snapshot.context_files as evidence. '
+                   'Respond with ONLY a JSON object: {"proposals": [{"title": "...", '
                    '"rationale": "...", "intended_changes": "...", "affected_files": ["path", ...]}], '
                    '"summary": "..."}'),
     Role.builder: ('Implement context.proposal by editing context.files (null = new file). '

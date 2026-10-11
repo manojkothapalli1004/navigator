@@ -16,11 +16,19 @@ log = get_logger("navigator.loop")
 
 class Navigator:
     def __init__(self, *, act, orc, driver, runner, settings, repo: str, lock_path,
-                 workdir: str = ".", squash: bool = False):
+                 workdir: str = ".", squash: bool = False, brief: str | None = None,
+                 context_files: list[str] | None = None,
+                 min_plan_interval_hours: float | None = None,
+                 max_proposals_per_tick: int | None = None):
         self.act = act; self.orc = orc; self.driver = driver; self.runner = runner
         self.settings = settings; self.repo = repo
         self.workdir = workdir  # where verifier commands run inside the repo
         self.squash = squash    # public repos: single squash commit, no tool identities
+        # per-repo planner shaping (e.g. trader research loop: one experiment a day)
+        self.brief = brief
+        self.context_files = context_files or []
+        self.min_plan_interval_hours = min_plan_interval_hours
+        self.max_proposals_per_tick = max_proposals_per_tick
         self.lock = SingleFlightLock(lock_path)
         self.notifier = NullNotifier()
         self.last_snapshot_chars = 0
@@ -39,7 +47,7 @@ class Navigator:
         files = subprocess.run(["git","ls-files"], cwd=self.repo,
                                capture_output=True, text=True).stdout.splitlines()[:400]
         outcomes = OutcomeStore(self.settings.outcome_path).latest(5)
-        return {
+        snap = {
             "orc_memory": _trim_memory(self.orc.get_canonical_memory(),
                                        self.settings.memory_chars_per_section, Path(self.repo).name),
             "recent_outcomes": [{"proposal_id": o.proposal_id, "status": o.status,
@@ -48,6 +56,32 @@ class Navigator:
             "git": {"base_commit_sha": base_commit_sha, "dirty": bool(git_state.strip()),
                     "recent_commits": recent, "files": files},
         }
+        if self.brief:
+            snap["repo_brief"] = self.brief
+        if self.context_files:
+            snap["context_files"] = {rel: self._read_context(rel) for rel in self.context_files}
+        return snap
+
+    _CONTEXT_CHARS = 6000
+
+    def _read_context(self, rel: str) -> str | None:
+        # read from the live checkout: research outputs are gitignored, so they never
+        # exist in a run worktree; tail-capped so one file can't bloat the prompt
+        root = Path(self.repo).resolve()
+        target = (root / rel).resolve()
+        if root not in target.parents or not target.is_file():
+            return None
+        return target.read_text(errors="replace")[-self._CONTEXT_CHARS:]
+
+    def _planned_recently(self) -> bool:
+        if not self.min_plan_interval_hours:
+            return False
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=self.min_plan_interval_hours)
+        for p in self._mine(self.act.list_proposals()):
+            created = p.created_at if p.created_at.tzinfo else p.created_at.replace(tzinfo=timezone.utc)
+            if created >= cutoff:
+                return True
+        return False
 
     def _expire_stale(self, proposals: list[Proposal]) -> list[Proposal]:
         cutoff = datetime.now(timezone.utc) - timedelta(days=self.settings.proposal_ttl_days)
@@ -74,6 +108,8 @@ class Navigator:
         if len(open_proposals) >= self.settings.max_open_proposals:
             log.info("tick.backlog_full", open=len(open_proposals))
             return []
+        if self._planned_recently():
+            return []
         snap = self.perceive(base_commit_sha, open_proposals)
         self.last_snapshot_chars = len(json.dumps(snap, default=str))
         from navigator.runtime.drivers.base import DriverRequest
@@ -84,7 +120,8 @@ class Navigator:
         existing_hashes = {p.proposal_origin_hash for p in all_proposals}
         existing_titles = {_norm_title(p.title) for p in all_proposals}
         room = self.settings.max_open_proposals - len(open_proposals)
-        for item in plan.proposals[: min(self.settings.max_proposals_per_tick, room)]:
+        per_tick = self.max_proposals_per_tick or self.settings.max_proposals_per_tick
+        for item in plan.proposals[: min(per_tick, room)]:
             h = compute_origin_hash(self.repo, item["intended_changes"], item["affected_files"], "periodic", None)
             if h in existing_hashes or _norm_title(item["title"]) in existing_titles:
                 continue

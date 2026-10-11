@@ -150,3 +150,11 @@ def test_verifier_command_given_as_a_string_is_split_into_argv():
         budget_guard=BudgetGuard(10))
     res = drv.run_role(DriverRequest(role=Role.verifier, context={}))
     assert res.commands == [["uv", "run", "pytest", "tests/x.py", "-q"], ["git", "status"]]
+
+
+def test_planner_prompt_tells_the_model_to_follow_the_repo_brief():
+    seen = {}
+    drv = ClaudeSDKDriver(query_fn=lambda p: seen.setdefault("p", p) and '{"proposals": [], "summary": "s"}',
+                          budget_guard=BudgetGuard(10))
+    drv.run_role(DriverRequest(role=Role.planner, context={"snapshot": {"repo_brief": "x"}}))
+    assert "repo_brief" in seen["p"] and "context_files" in seen["p"]

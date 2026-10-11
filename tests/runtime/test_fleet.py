@@ -93,3 +93,54 @@ def test_verifier_runs_in_repo_workdir(tmp_path):
     nav.act.set_proposal_status(p.id, ProposalStatus.approved)
     run = nav.approval_poll()[0]
     assert seen["cwd"] == Path(run.worktree_path).resolve()/"backend"
+
+
+class _RecordingPlanner(FakeSubagentDriver):
+    def __init__(self):
+        self.contexts = []
+    def run_role(self, request):
+        from navigator.contracts.enums import Role
+        if request.role == Role.planner:
+            self.contexts.append(request.context)
+        return super().run_role(request)
+
+
+def _research_nav(tmp_path, **kw):
+    repo = _repo(tmp_path, "trader")
+    (repo/"research_manager").mkdir()
+    (repo/"research_manager"/"morning_brief.md").write_text("## Brief\norb@ETH 12 trades, net -0.40\n")
+    s = Settings(mode="dry_run", worktree_root=str(tmp_path/"wt"), outcome_path=str(tmp_path/"o.jsonl"))
+    planner = _RecordingPlanner()
+    nav = Navigator(act=FakeACTClient(), orc=FakeORCClient(), driver=planner,
+                    runner=CommandRunner(allowlist=s.allowed_commands, worktree_root=tmp_path/"wt"),
+                    settings=s, repo=str(repo), lock_path=tmp_path/"l",
+                    brief="Propose at most ONE paper-only experiment with a kill rule.",
+                    context_files=["research_manager/morning_brief.md", "research_manager/missing.json"],
+                    **kw)
+    return nav, planner
+
+
+def test_repo_brief_and_context_files_reach_the_planner(tmp_path):
+    nav, planner = _research_nav(tmp_path)
+    nav.periodic_tick()
+    snap = planner.contexts[0]["snapshot"]
+    assert snap["repo_brief"] == "Propose at most ONE paper-only experiment with a kill rule."
+    assert "orb@ETH 12 trades" in snap["context_files"]["research_manager/morning_brief.md"]
+    assert snap["context_files"]["research_manager/missing.json"] is None
+
+
+def test_repo_plans_at_most_once_per_interval(tmp_path):
+    # trader research loop: one experiment proposal per day, not one per tick
+    nav, planner = _research_nav(tmp_path, min_plan_interval_hours=24, max_proposals_per_tick=1)
+    assert len(nav.periodic_tick()) == 1
+    assert nav.periodic_tick() == []
+    assert len(planner.contexts) == 1  # no model call while inside the interval
+
+
+def test_repo_scoped_max_proposals_per_tick(tmp_path):
+    nav, _ = _research_nav(tmp_path, max_proposals_per_tick=1)
+    nav.driver = type("P", (), {"run_role": lambda self, r: __import__(
+        "navigator.runtime.drivers.base", fromlist=["DriverResult"]).DriverResult(
+        role=r.role, proposals=[{"title": f"t{i}", "rationale": "r", "intended_changes": f"c{i}",
+                                 "affected_files": ["a.py"]} for i in range(3)])})()
+    assert len(nav.periodic_tick()) == 1

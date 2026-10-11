@@ -51,7 +51,9 @@ def build_navigator(settings: Settings):
                                timeout_s=settings.command_timeout_s)
         nav = Navigator(act=act, orc=orc, driver=driver, runner=runner, settings=settings,
                         repo=rc.path, lock_path=settings.lock_path, workdir=rc.workdir,
-                        squash=rc.squash)
+                        squash=rc.squash, brief=rc.brief, context_files=rc.context_files,
+                        min_plan_interval_hours=rc.min_plan_interval_hours,
+                        max_proposals_per_tick=rc.max_proposals_per_tick)
         nav.notifier = notifier
         navs.append(nav)
     if len(navs) == 1:

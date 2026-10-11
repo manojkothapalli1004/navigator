@@ -13,6 +13,10 @@ class RepoConfig:
     workdir: str = "."                      # where verifier commands run (e.g. "backend")
     allowed_commands: list[str] | None = None  # None = Settings.allowed_commands
     squash: bool = False                    # public repo: one squash commit per merge
+    brief: str | None = None                # repo-specific planner instructions
+    context_files: list[str] | None = None  # extra files (from the live checkout) shown to the planner
+    min_plan_interval_hours: float | None = None
+    max_proposals_per_tick: int | None = None
 
 
 @dataclass
@@ -127,6 +131,10 @@ def _repos_env() -> list[RepoConfig]:
         cmds = entry.get("allowed_commands")
         repos.append(RepoConfig(path=entry["path"], workdir=workdir,
                                 squash=bool(entry.get("squash", False)),
+                                brief=entry.get("brief"),
+                                context_files=entry.get("context_files"),
+                                min_plan_interval_hours=entry.get("min_plan_interval_hours"),
+                                max_proposals_per_tick=entry.get("max_proposals_per_tick"),
                                 allowed_commands=_check_allowlist("NAVIGATOR_REPOS_FILE", cmds)
                                 if cmds is not None else None))
     return repos

@@ -119,3 +119,14 @@ def test_single_repo_env_still_works_without_repos_file(monkeypatch):
     monkeypatch.delenv("NAVIGATOR_REPOS_FILE", raising=False)
     monkeypatch.setenv("NAVIGATOR_REPO", "/r/one")
     assert [r.path for r in cfg.Settings.from_env().repos] == ["/r/one"]
+
+def test_repos_file_research_loop_fields(tmp_path, monkeypatch):
+    import json
+    f = tmp_path/"repos.json"
+    f.write_text(json.dumps([{"path": "/r/trader", "brief": "one experiment",
+                              "context_files": ["research_manager/morning_brief.md"],
+                              "min_plan_interval_hours": 24, "max_proposals_per_tick": 1}]))
+    monkeypatch.setenv("NAVIGATOR_REPOS_FILE", str(f))
+    r = cfg.Settings.from_env().repos[0]
+    assert (r.brief, r.context_files, r.min_plan_interval_hours, r.max_proposals_per_tick) == \
+        ("one experiment", ["research_manager/morning_brief.md"], 24, 1)
