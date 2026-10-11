@@ -55,7 +55,6 @@ def _check_scope(relpaths: list[str], allowed: list[str]) -> None:
             raise ValueError(f"builder wrote {rel!r} outside the approved affected_files")
 
 _FAILED_TESTS = re.compile(r"(\d+) failed")
-_TEST_RUNNERS = ("uv run pytest", "pytest")
 
 def _requires_tests(wt: Path, changed: list[str]) -> bool:
     # a python change in a repo that has a test suite must be checked by that suite;
@@ -63,8 +62,9 @@ def _requires_tests(wt: Path, changed: list[str]) -> bool:
     return any(c.endswith(".py") for c in changed) and (wt / "tests").is_dir()
 
 def _runs_tests(commands: list[list[str]]) -> bool:
-    return any(" ".join(c) == r or " ".join(c).startswith(r + " ")
-               for c in commands for r in _TEST_RUNNERS)
+    # pytest as the program, or launched through uv (`uv run [--flags] pytest ...`)
+    return any(c and (c[0] == "pytest" or (c[:2] == ["uv", "run"] and "pytest" in c))
+               for c in commands)
 
 def run_build_and_verify(driver: SubagentDriver, worktree: WorktreeHandle,
                          run_id: str, runner: CommandRunner,

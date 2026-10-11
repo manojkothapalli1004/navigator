@@ -169,3 +169,11 @@ def test_python_change_in_repo_without_tests_may_use_py_compile(tmp_path):
     res = run_build_and_verify(driver=drv, worktree=h, run_id="run-p", runner=runner,
                                proposal={"affected_files": ["a.py"]})
     assert res.verify_returncode == 0
+
+
+def test_test_runner_with_uv_flags_counts_as_running_the_suite(tmp_path):
+    # waker's suite runs as `uv run --extra dev pytest` (pytest is a dev extra)
+    from navigator.runtime.phases import _runs_tests
+    assert _runs_tests([["uv", "run", "--extra", "dev", "pytest", "-q"]])
+    assert _runs_tests([["uv", "run", "pytest"]]) and _runs_tests([["pytest", "-x"]])
+    assert not _runs_tests([["python3", "-m", "py_compile", "a.py"], ["git", "status"]])
