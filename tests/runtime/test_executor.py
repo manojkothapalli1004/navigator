@@ -207,3 +207,23 @@ def test_failure_notes_keep_the_end_of_test_output(tmp_path, monkeypatch):
     execute_proposal(_proposal(repo, sha), **d)
     note = [n for sec, n, _ in d["orc"].updates if sec == "known_failures"][-1]
     assert "FAILED tests/t.py::test_x - boom" in note
+
+
+def test_retry_shows_the_builder_why_the_previous_attempt_failed(tmp_path, monkeypatch):
+    # live 2026-10-11: security-fix runs failed on existing tests they hadn't updated;
+    # a blind retry would repeat the mistake because the builder never saw the failure
+    from navigator.runtime.outcome_store import OutcomeStore
+    from navigator.contracts.outcome import Outcome
+    repo, sha = _seed(tmp_path); d = _deps(tmp_path, repo)
+    p = _proposal(repo, sha)
+    OutcomeStore(d["settings"].outcome_path).append(Outcome(
+        run_id="run-old", proposal_id=p.id, status="failed", summary="verification failed",
+        lessons=["x"], verification_notes="FAILED tests/test_pings.py::test_ack - assert 422 == 200"))
+    seen = {}
+    from navigator.runtime import phases
+    real = phases.run_build_and_verify
+    def spy(*a, **k):
+        seen["proposal"] = k["proposal"]; return real(*a, **k)
+    monkeypatch.setattr("navigator.runtime.executor.run_build_and_verify", spy)
+    execute_proposal(p, **d)
+    assert "assert 422 == 200" in seen["proposal"]["previous_attempt_failure"]

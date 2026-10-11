@@ -15,14 +15,19 @@ _ROLE_OUTPUT_SPEC = {
                    '"rationale": "...", "intended_changes": "...", "affected_files": ["path", ...]}], '
                    '"summary": "..."}'),
     Role.builder: ('Implement context.proposal by editing context.files (null = new file). '
+                   'If context.proposal.previous_attempt_failure is present, a previous attempt '
+                   'failed with that output: fix its cause (e.g. update existing tests that call '
+                   'changed APIs). '
                    'Respond with ONLY a JSON object: {"file_writes": [[relpath, FULL new file content], ...], '
                    '"commands": [], "summary": "..."}. Each content replaces the whole file — '
                    'never elide unchanged code. Only write paths listed in context.files, plus test files. '
                    'If the repo has tests, add or update tests that exercise the new or changed '
                    'behaviour (a passing suite that never runs the new path proves nothing). '
                    'You MAY add new test files not in context.files; follow the layout and '
-                   'naming of context.test_files. context.related_files are READ-ONLY: use them '
-                   'to get models, fixtures and APIs right; never write them.'),
+                   'naming of context.test_files. context.related_files are for reference: use them '
+                   'to get models, fixtures and APIs right. Never write non-test related files; '
+                   'DO update existing test files among them when your change alters an API '
+                   'they call.'),
     Role.verifier: ('Choose commands that prove context.proposal works, each starting with an entry '
                     'of context.allowed_commands. Commands run inside context.workdir; use paths '
                     'relative to it (context.changed_files already are). Respond with ONLY a JSON '

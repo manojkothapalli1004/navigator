@@ -65,7 +65,8 @@ def execute_proposal(proposal: Proposal, *, act, orc, driver, runner, settings,
             driver=driver, worktree=handle, run_id=run.id, runner=runner,
             proposal={"title": proposal.title, "rationale": proposal.rationale,
                       "intended_changes": proposal.intended_changes,
-                      "affected_files": list(proposal.affected_files)},
+                      "affected_files": list(proposal.affected_files),
+                      **_previous_failure(settings, proposal.id)},
             breakers=breakers, started_monotonic=started, workdir=workdir)
     except Exception as e:
         preserve_failed(handle)
@@ -132,6 +133,19 @@ def _abort_merge(repo: str, squash: bool) -> None:
     # the index and conflicted files while keeping unrelated local changes
     cmd = ["git", "reset", "--merge"] if squash else ["git", "merge", "--abort"]
     subprocess.run(cmd, cwd=repo, capture_output=True, text=True)
+
+def _previous_failure(settings, proposal_id: str) -> dict:
+    # a retry must see why the last attempt failed, or it repeats the same mistake
+    try:
+        failed = [o for o in OutcomeStore(settings.outcome_path).for_proposal(proposal_id)
+                  if o.status == "failed"]
+    except OSError:
+        return {}
+    if not failed:
+        return {}
+    last = failed[-1]
+    detail = (last.verification_notes or "; ".join(last.lessons) or last.summary)[-2000:]
+    return {"previous_attempt_failure": f"{last.summary}: {detail}"}
 
 def merge_after_approval(run: Run, *, act, orc, driver, runner, settings, squash: bool = False) -> Run:
     if not _merge_approved(act, run):
