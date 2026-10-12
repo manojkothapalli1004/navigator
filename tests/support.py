@@ -38,6 +38,9 @@ class ProtocolOnlyACT:
     def list_open_runs(self) -> list[Run]:
         return self._inner.list_open_runs()
 
+    def list_all_runs(self) -> list[Run]:
+        return self._inner.list_all_runs()
+
     def list_runs_for_proposal(self, proposal_id: str) -> list[Run]:
         return self._inner.list_runs_for_proposal(proposal_id)
 
