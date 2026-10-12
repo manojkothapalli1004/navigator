@@ -119,13 +119,20 @@ class Navigator:
         all_proposals = self._mine(self.act.list_proposals())
         existing_hashes = {p.proposal_origin_hash for p in all_proposals}
         existing_titles = {_norm_title(p.title) for p in all_proposals}
+        # reworded duplicates slip past exact-title dedup (live 2026-10-12: 3-4 variants
+        # of the same idea); compare content words against every prior title, any status
+        seen_titles: list[str] = [p.title for p in all_proposals]
         room = self.settings.max_open_proposals - len(open_proposals)
         per_tick = self.max_proposals_per_tick or self.settings.max_proposals_per_tick
         for item in plan.proposals[: min(per_tick, room)]:
             h = compute_origin_hash(self.repo, item["intended_changes"], item["affected_files"], "periodic", None)
             if h in existing_hashes or _norm_title(item["title"]) in existing_titles:
                 continue
+            if _near_duplicate(item["title"], seen_titles):
+                log.info("tick.near_duplicate_skipped", title=item["title"])
+                continue
             existing_titles.add(_norm_title(item["title"]))
+            seen_titles.append(item["title"])
             p = Proposal(origin="periodic", proposal_origin_hash=h, title=item["title"],
                          rationale=item["rationale"], repo=self.repo, base_commit_sha=base_commit_sha,
                          intended_changes=item["intended_changes"], affected_files=item["affected_files"])
@@ -227,3 +234,23 @@ def _trim_memory(memory: dict, budget: int, focus: str) -> dict:
 
 def _norm_title(title: str) -> str:
     return " ".join(title.lower().strip(" .").split())
+
+_STOPWORDS = frozenset("a an the and or for to of in on with add so that every all across".split())
+_NON_ALNUM = re.compile(r"[^a-z0-9]+")
+_NEAR_DUP_THRESHOLD = 0.6
+
+def _content_words(title: str) -> set[str]:
+    return {w for w in _NON_ALNUM.split(title.lower()) if w and w not in _STOPWORDS}
+
+def _near_duplicate(title: str, titles) -> bool:
+    """True if `title` shares >= 0.6 Jaccard similarity of content words with any of `titles`."""
+    words = _content_words(title)
+    if not words:
+        return False
+    for other in titles:
+        other_words = _content_words(other)
+        if not other_words:
+            continue
+        if len(words & other_words) / len(words | other_words) >= _NEAR_DUP_THRESHOLD:
+            return True
+    return False

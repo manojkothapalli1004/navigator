@@ -231,3 +231,49 @@ def test_stale_proposals_expire_so_backlog_cap_cannot_idle_forever(tmp_path):
     created = nav.periodic_tick(base_commit_sha=sha)
     assert nav.act.get_proposal(old.id).status == ProposalStatus.expired
     assert [p.title for p in created] == ["fresh idea"]
+
+
+# --- near-duplicate suppression (live 2026-10-12: 3-4 reworded variants per idea) ---
+
+def test_near_duplicate_detects_reworded_titles():
+    from navigator.runtime.loop import _near_duplicate
+    assert _near_duplicate(
+        "Add edge-case regression tests for scheduler service and schedule storage",
+        ["Add edge-case regression tests for the scheduler service and schedule storage"])
+    assert _near_duplicate(
+        "Add a CI-style guard test that every ping route enforces allowlist and kill-switch ordering",
+        ["Add a CI-style guard test that every ping route enforces the allowlist and kill switch ordering"])
+
+def test_near_duplicate_rejects_distinct_titles():
+    from navigator.runtime.loop import _near_duplicate
+    assert not _near_duplicate(
+        "Add device-token registration endpoint with per-user ownership tests",
+        ["Add ping history endpoint with allowlist-state snapshot tests"])
+    assert not _near_duplicate("anything", [])
+    assert not _near_duplicate("a", ["a"])  # stopword-only titles carry no content
+
+def test_periodic_tick_creates_one_of_two_near_duplicates_in_a_batch(tmp_path):
+    repo, sha = _seed(tmp_path)
+    planner = _ScriptedPlanner([
+        "Add edge-case regression tests for scheduler service and schedule storage",
+        "Add edge-case regression tests for the scheduler service and schedule storage",
+    ])
+    nav = _scripted_nav(tmp_path, repo, planner)
+    created = nav.periodic_tick(base_commit_sha=sha)
+    assert len(created) == 1
+    assert len(nav.act.list_proposals()) == 1
+
+def test_periodic_tick_skips_near_duplicate_of_existing_any_status(tmp_path):
+    repo, sha = _seed(tmp_path)
+    planner = _ScriptedPlanner([
+        "Add a CI-style guard test that every ping route enforces allowlist and kill-switch ordering"])
+    nav = _scripted_nav(tmp_path, repo, planner)
+    first = nav.periodic_tick(base_commit_sha=sha)
+    assert len(first) == 1
+    nav.act.set_proposal_status(first[0].id, ProposalStatus.declined)
+    planner.titles = [
+        "Add a CI-style guard test that every ping route enforces the allowlist and kill switch ordering",
+        "Add ping history endpoint with allowlist-state snapshot tests",
+    ]
+    created = nav.periodic_tick(base_commit_sha=sha)
+    assert [p.title for p in created] == ["Add ping history endpoint with allowlist-state snapshot tests"]
