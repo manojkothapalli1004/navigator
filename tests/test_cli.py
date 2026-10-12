@@ -184,6 +184,59 @@ def test_cleanup_apply_removes_finished_runs_only(tmp_path):
     assert code == 0 and runs["done"].id not in out
 
 
+class _FailingProposalACT:
+    """FakeACT wrapper: get_proposal raises for one proposal id, and the run that
+    hits it is listed first so later runs prove the loop keeps going."""
+
+    def __init__(self, inner, bad_proposal_id, bad_run_id):
+        self.inner = inner
+        self.bad_proposal_id = bad_proposal_id
+        self.bad_run_id = bad_run_id
+
+    def get_proposal(self, proposal_id):
+        if proposal_id == self.bad_proposal_id:
+            raise RuntimeError("ACT 503")
+        return self.inner.get_proposal(proposal_id)
+
+    def list_all_runs(self):
+        runs = self.inner.list_all_runs()
+        return sorted(runs, key=lambda r: r.id != self.bad_run_id)
+
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
+
+
+def test_cleanup_continues_past_a_run_whose_lookup_errors(tmp_path):
+    repo, act, runs = _cleanup_world(tmp_path)
+    sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True,
+                         text=True).stdout.strip()
+    bad_p = act.create_proposal(Proposal(title="t2", rationale="r", repo=str(repo),
+                                         base_commit_sha=sha, intended_changes="x",
+                                         affected_files=["b.py"], origin="periodic",
+                                         proposal_origin_hash="h2"))
+    rid = new_id("run")
+    h = create_worktree(repo=repo, base_commit_sha=sha, run_id=rid, worktree_root=tmp_path/"wt")
+    bad = act.create_run(Run(id=rid, proposal_id=bad_p.id, base_commit_sha=sha,
+                             branch=h.branch, worktree_path=str(h.path),
+                             status=RunStatus.completed, ended_at=datetime.now(timezone.utc)))
+    failing = _FailingProposalACT(act, bad_p.id, bad.id)
+    assert failing.list_all_runs()[0].id == bad.id  # errored run is processed first
+
+    code, out = _cleanup_cli(failing, tmp_path, "--apply")
+    assert code == 1, out
+    assert f"error {bad.id}: RuntimeError" in out
+    # the other eligible runs are still cleaned
+    for name in ("done", "old_fail"):
+        assert not Path(runs[name].worktree_path).exists()
+        assert not _branch_exists(repo, runs[name].branch)
+    # NEGATIVE: the errored run's worktree and branch are untouched
+    assert Path(bad.worktree_path).exists()
+    assert _branch_exists(repo, bad.branch)
+    for name in ("live", "recent_fail"):
+        assert Path(runs[name].worktree_path).exists()
+        assert _branch_exists(repo, runs[name].branch)
+
+
 def test_cleanup_ignores_worktrees_outside_root(tmp_path):
     repo, act, runs = _cleanup_world(tmp_path)
     out = io.StringIO()
