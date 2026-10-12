@@ -143,7 +143,9 @@ def _previous_failure(settings, proposal_id: str) -> dict:
         return {}
     if not failed:
         return {}
-    last = failed[-1]
+    # infra errors (limits, timeouts) carry no test output; prefer a real test failure
+    with_tests = [o for o in failed if o.verification_notes and "FAILED" in o.verification_notes]
+    last = with_tests[-1] if with_tests else failed[-1]
     detail = (last.verification_notes or "; ".join(last.lessons) or last.summary)[-2000:]
     return {"previous_attempt_failure": f"{last.summary}: {detail}"}
 

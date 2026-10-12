@@ -227,3 +227,18 @@ def test_retry_shows_the_builder_why_the_previous_attempt_failed(tmp_path, monke
     monkeypatch.setattr("navigator.runtime.executor.run_build_and_verify", spy)
     execute_proposal(p, **d)
     assert "assert 422 == 200" in seen["proposal"]["previous_attempt_failure"]
+
+
+def test_retry_prefers_the_last_failure_with_test_output_over_infra_errors(tmp_path, monkeypatch):
+    # live 2026-10-11: the latest failure was a session-limit error, so the retry got
+    # no test output and repeated the real mistake
+    from navigator.runtime.outcome_store import OutcomeStore
+    from navigator.contracts.outcome import Outcome
+    repo, sha = _seed(tmp_path); d = _deps(tmp_path, repo)
+    p = _proposal(repo, sha); store = OutcomeStore(d["settings"].outcome_path)
+    store.append(Outcome(run_id="r1", proposal_id=p.id, status="failed", summary="verification failed",
+                         lessons=["x"], verification_notes="FAILED tests/test_flow.py::test_dispatch - 503"))
+    store.append(Outcome(run_id="r2", proposal_id=p.id, status="failed",
+                         summary="exception: You've hit your session limit", lessons=["limit"]))
+    from navigator.runtime.executor import _previous_failure
+    assert "FAILED tests/test_flow.py::test_dispatch" in _previous_failure(d["settings"], p.id)["previous_attempt_failure"]
