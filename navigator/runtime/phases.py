@@ -60,6 +60,27 @@ def _check_scope(relpaths: list[str], allowed: list[str]) -> None:
         if Path(rel).as_posix() not in approved and not _is_test_file(rel):
             raise ValueError(f"builder wrote {rel!r} outside the approved affected_files")
 
+# live 2026-10-12: a run added 11 tests that skip when a guessed API is missing; the
+# suite passed while verifying nothing. xfail is deliberately not counted.
+_SKIP_MARKERS = ("pytest.skip(", "pytest.importorskip(", "@pytest.mark.skip", "skipif")
+
+def _count_skips(text: str) -> int:
+    return sum(text.count(m) for m in _SKIP_MARKERS)
+
+def _added_skips(wt: Path, writes: list[tuple[str, str]]) -> list[str]:
+    """'<file>: <n>' for each written test file whose skip count grew versus the
+    file on disk before the write (empty for new files). Must run before writing."""
+    out = []
+    for rel, content in writes:
+        if not _is_test_file(rel):
+            continue
+        target = _resolve_write_target(wt, rel)
+        original = target.read_text(errors="replace") if target.is_file() else ""
+        n = _count_skips(content) - _count_skips(original)
+        if n > 0:
+            out.append(f"{rel}: {n}")
+    return out
+
 _FAILED_TESTS = re.compile(r"(\d+) failed")
 
 def _requires_tests(wt: Path, changed: list[str]) -> bool:
@@ -142,6 +163,8 @@ def run_build_and_verify(driver: SubagentDriver, worktree: WorktreeHandle,
     _check_scope([rel for rel, _ in build.file_writes], proposal.get("affected_files", []))
     if breakers:
         breakers.check_duration(started)
+    # compare against the originals before they are overwritten
+    added_skips = _added_skips(wt, build.file_writes)
     for n, (relpath, content) in enumerate(build.file_writes, start=1):
         target = _resolve_write_target(wt, relpath)
         cp_before = checkpoint(wt, run_id=run_id, n=n, label=f"pre-write-{relpath}")
@@ -149,6 +172,11 @@ def run_build_and_verify(driver: SubagentDriver, worktree: WorktreeHandle,
         target.write_text(content)
         res.file_writes.append(relpath)
     checkpoint(wt, run_id=run_id, n=len(build.file_writes) + 1, label="post-build")
+    if added_skips:
+        # a skipped test verifies nothing; don't let the suite "pass" on them
+        res.verify_returncode = 1
+        res.verify_output = "builder added test skips: " + "; ".join(added_skips)
+        return res
     # verifier — a verify phase with no commands is a failure, not a silent pass
     # commands run in the workdir, so hand the verifier paths relative to it
     rel_changed = [str(Path(f).relative_to(workdir)) if workdir not in (".", "")
