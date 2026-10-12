@@ -1,20 +1,27 @@
 import asyncio
 import json
 import re
+import time
 from typing import Callable
 
 DEFAULT_SYSTEM_PROMPT = (
-    "You are a Navigator subagent. Reply with ONLY the requested JSON object — "
+    "You are a Navigator subagent. Reply with ONLY the requested JSON object \u2014 "
     "no prose, no markdown fences.")
 
 def make_sdk_query_fn(*, model: str | None = None,
                       system_prompt: str = DEFAULT_SYSTEM_PROMPT,
-                      timeout_s: float = 300.0) -> Callable[[str], str]:
+                      timeout_s: float = 300.0,
+                      logger=None) -> Callable[[str], str]:
     """Build a (prompt) -> str query_fn backed by claude-agent-sdk.
 
     Imported lazily so the package works without the sdk extra; the returned
     fn is what ClaudeSDKDriver consumes. Tools are disabled and turns capped
-    at 1: subagent roles only emit JSON — Navigator's own runner executes.
+    at 1: subagent roles only emit JSON \u2014 Navigator's own runner executes.
+
+    Each SDK query emits exactly one metrics event on `logger`
+    ('sdk_query.completed' or 'sdk_query.failed'); logging failures never
+    affect results. Pass a logger to observe metrics without touching global
+    logging configuration.
     """
     try:
         from claude_agent_sdk import ClaudeAgentOptions, ResultMessage, query
@@ -23,12 +30,26 @@ def make_sdk_query_fn(*, model: str | None = None,
             "driver 'claude_sdk' needs the sdk extra: uv sync --extra sdk "
             "(claude-agent-sdk not installed)") from e
 
-    def _query_once(prompt: str) -> str:
+    if logger is None:
+        from navigator.observability.logging import get_logger
+        logger = get_logger("navigator.sdk")
+
+    def _emit(ok: bool, fields: dict) -> None:
+        # metrics are best-effort: a broken logger must never change a result
+        try:
+            if ok:
+                logger.info("sdk_query.completed", **fields)
+            else:
+                logger.warning("sdk_query.failed", **fields)
+        except Exception:
+            pass
+
+    def _run_query(prompt: str, meta: dict) -> str:
         # max_turns=4 not 1: the CLI occasionally burns turns before the
         # final reply (observed live 2026-07-08, and again 2026-07-18 at 2).
         # Tools are disabled, so unused headroom costs nothing.
         # setting_sources=[] keeps the operator's hooks/plugins/skills out of
-        # the subagent session — with them loaded, skill reminders push the
+        # the subagent session \u2014 with them loaded, skill reminders push the
         # model into tool calls until max_turns errors (observed same day).
         options = ClaudeAgentOptions(system_prompt=system_prompt, model=model,
                                      max_turns=4, tools=[], allowed_tools=[],
@@ -44,6 +65,11 @@ def make_sdk_query_fn(*, model: str | None = None,
                 async for message in query(prompt=prompt, options=options):
                     if not isinstance(message, ResultMessage):
                         continue
+                    try:
+                        meta["num_turns"] = getattr(message, "num_turns", None)
+                        meta["subtype"] = getattr(message, "subtype", None)
+                    except Exception:
+                        pass
                     if getattr(message, "is_error", False):
                         error.append(_describe_error(message))
                     elif message.result is not None:
@@ -53,7 +79,7 @@ def make_sdk_query_fn(*, model: str | None = None,
                     raise
 
         # wall-clock guard: the CLI subprocess can stall during init under
-        # launchd (observed 2026-07-17 — daemon froze on cycle 1 for 19h);
+        # launchd (observed 2026-07-17 \u2014 daemon froze on cycle 1 for 19h);
         # a stall must raise so the daemon loop retries next tick
         try:
             asyncio.run(asyncio.wait_for(_collect(), timeout=timeout_s))
@@ -65,9 +91,34 @@ def make_sdk_query_fn(*, model: str | None = None,
             raise RuntimeError("claude-agent-sdk returned no result message")
         return _strip_fences(results[-1])
 
+    def _query_once(prompt: str) -> str:
+        meta: dict = {"num_turns": None, "subtype": None}
+        start = time.monotonic()
+
+        def _fields(reply_chars: int) -> dict:
+            return {"model": model, "elapsed_s": round(time.monotonic() - start, 3),
+                    "num_turns": meta.get("num_turns"), "subtype": meta.get("subtype"),
+                    "reply_chars": reply_chars}
+
+        try:
+            text = _run_query(prompt, meta)
+        except TimeoutError as e:
+            fields = _fields(0)
+            fields["timeout_s"] = timeout_s
+            fields["error"] = str(e)[:300]
+            _emit(False, fields)
+            raise
+        except Exception as e:
+            fields = _fields(0)
+            fields["error"] = str(e)[:300]
+            _emit(False, fields)
+            raise
+        _emit(True, _fields(len(text)))
+        return text
+
     def query_fn(prompt: str) -> str:
         # one bounded retry for model-side flakes (max-turns error results,
-        # missing result message, truncated/non-JSON output — all observed
+        # missing result message, truncated/non-JSON output \u2014 all observed
         # live on fable-5 through 2026-07-18). Wall-clock timeouts are NOT
         # retried: doubling a 300s wait starves the tick cadence.
         try:
@@ -82,7 +133,7 @@ def make_sdk_query_fn(*, model: str | None = None,
             return text
         retry = _query_once(prompt)
         # still bad after the retry: hand it to the driver's strict parser so
-        # the failure surfaces with head/tail detail — never invent structure
+        # the failure surfaces with head/tail detail \u2014 never invent structure
         return retry
 
     return query_fn
