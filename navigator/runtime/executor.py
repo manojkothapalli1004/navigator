@@ -25,6 +25,30 @@ def _emit(act, run, kind, severity=Severity.info, **payload):
     payload = {"run_id": run.id, "proposal_id": run.proposal_id, **payload}
     act.emit_event(Event(kind=kind, severity=severity, correlation_id=run.correlation_id, payload=payload))
 
+_CODE_SHA_UNSET = object()
+_code_sha_cache = _CODE_SHA_UNSET
+
+def _compute_code_sha() -> str | None:
+    # trusted runtime git call (never the LLM command runner), run in the
+    # navigator package's own directory so it reports Navigator's code, not the target repo
+    try:
+        proc = subprocess.run(["git", "rev-parse", "HEAD"], cwd=Path(__file__).resolve().parent,
+                              capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    sha = (proc.stdout or "").strip()
+    return sha if proc.returncode == 0 and sha else None
+
+def code_sha() -> str | None:
+    """Navigator's own git HEAD, computed once per process; None if git fails."""
+    global _code_sha_cache
+    if _code_sha_cache is _CODE_SHA_UNSET:
+        try:
+            _code_sha_cache = _compute_code_sha()
+        except Exception:
+            _code_sha_cache = None
+    return _code_sha_cache
+
 def execute_proposal(proposal: Proposal, *, act, orc, driver, runner, settings,
                      workdir: str = ".") -> Run:
     # Ensure the proposal is registered in ACT so _repo_for can resolve it
@@ -215,7 +239,8 @@ def _write_outcome(orc, run, *, status, summary, lessons, verification_notes=Non
                   provenance=f"navigator {run.id}",
                   rollback=Rollback(checkpoints_made=checkpoints_made,
                                     worktree_preserved=preserved is not None,
-                                    preserved_path=str(preserved) if preserved else None))
+                                    preserved_path=str(preserved) if preserved else None),
+                  code_sha=code_sha())
     target_section = section or ("known_failures" if status == "failed" else "status")
     note = f"[{run.id}] {summary} | lessons: {'; '.join(lessons)}"
     orc.apply_memory_update(section=target_section, note=note, replace=False)
