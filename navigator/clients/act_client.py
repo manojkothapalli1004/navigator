@@ -15,6 +15,7 @@ class ACTClient(Protocol):
     def create_run(self, r: Run) -> Run: ...
     def update_run(self, r: Run) -> None: ...
     def list_open_runs(self) -> list[Run]: ...
+    def list_all_runs(self) -> list[Run]: ...
     def list_runs_for_proposal(self, proposal_id: str) -> list[Run]: ...
     def create_approval(self, target: str, gate: ApprovalGate) -> Approval: ...
     def decide_approval(self, approval_id: str, decision: ApprovalDecision, actor: str) -> None: ...
@@ -45,6 +46,8 @@ class FakeACTClient:
     def list_open_runs(self) -> list[Run]:
         from navigator.contracts.enums import RunStatus
         return [r.model_copy(deep=True) for r in self.runs.values() if r.status == RunStatus.executing]
+    def list_all_runs(self) -> list[Run]:
+        return [r.model_copy(deep=True) for r in self.runs.values()]
     def list_runs_for_proposal(self, proposal_id: str) -> list[Run]:
         return [r.model_copy(deep=True) for r in self.runs.values() if r.proposal_id == proposal_id]
     def create_approval(self, target: str, gate: ApprovalGate) -> Approval:
@@ -149,6 +152,12 @@ class HTTPACTClient:
 
     def list_open_runs(self) -> list[Run]:
         r = self.client.get(f"{self.base_url}/runs", params={"limit": _LIST_LIMIT})
+        r.raise_for_status()
+        return [self._run_from(d) for d in r.json()]
+
+    def list_all_runs(self) -> list[Run]:
+        r = self.client.get(f"{self.base_url}/runs", params={
+            "open_only": "false", "limit": _LIST_LIMIT})
         r.raise_for_status()
         return [self._run_from(d) for d in r.json()]
 
