@@ -159,6 +159,47 @@ def _protected_branches(repo) -> set[str]:
     return protected
 
 
+def _cleanup_run(act, run, *, root: Path, apply: bool, prefix: str, out,
+                 touched: list[str], protected_by_repo: dict[str, set[str]]) -> int:
+    """Clean one run; returns the number of git command failures."""
+    failures = 0
+    prop = act.get_proposal(run.proposal_id)
+    if prop is None or not prop.repo or not Path(prop.repo).is_dir():
+        print(f"skip {run.id}: repo unknown or missing", file=out)
+        return 0
+    repo = prop.repo
+
+    def _mark_touched():
+        if repo not in touched:
+            touched.append(repo)
+
+    wt = Path(run.worktree_path) if run.worktree_path else root / run.id
+    wt = wt.expanduser().resolve()
+    if wt.exists() and root in wt.parents:
+        _mark_touched()
+        print(f"{prefix}remove worktree {wt} ({run.id})", file=out)
+        if apply:
+            r = _git(repo, "worktree", "remove", "--force", str(wt))
+            if r.returncode != 0:
+                failures += 1
+                print(f"  failed: {(r.stderr or r.stdout).strip()}", file=out)
+
+    branch = f"nav/{run.id}"
+    if repo not in protected_by_repo:
+        protected_by_repo[repo] = _protected_branches(repo)
+    if (branch.startswith(_BRANCH_PREFIX) and branch not in protected_by_repo[repo]
+            and _git(repo, "rev-parse", "--verify", "--quiet",
+                     f"refs/heads/{branch}").returncode == 0):
+        _mark_touched()
+        print(f"{prefix}delete branch {branch} in {repo} ({run.id})", file=out)
+        if apply:
+            r = _git(repo, "branch", "-D", branch)
+            if r.returncode != 0:
+                failures += 1
+                print(f"  failed: {(r.stderr or r.stdout).strip()}", file=out)
+    return failures
+
+
 def _cleanup(act, *, apply: bool, out, worktree_root: str | None = None,
              now: datetime | None = None) -> int:
     root_s = _resolve_worktree_root(worktree_root)
@@ -171,44 +212,17 @@ def _cleanup(act, *, apply: bool, out, worktree_root: str | None = None,
     touched: list[str] = []
     protected_by_repo: dict[str, set[str]] = {}
     failures = 0
+    errors = 0
 
     for run in act.list_all_runs():
         if run.status == RunStatus.executing or not _eligible(run, now):
             continue
-        prop = act.get_proposal(run.proposal_id)
-        if prop is None or not prop.repo or not Path(prop.repo).is_dir():
-            print(f"skip {run.id}: repo unknown or missing", file=out)
-            continue
-        repo = prop.repo
-        acted = False
-
-        wt = Path(run.worktree_path) if run.worktree_path else root / run.id
-        wt = wt.expanduser().resolve()
-        if wt.exists() and root in wt.parents:
-            acted = True
-            print(f"{prefix}remove worktree {wt} ({run.id})", file=out)
-            if apply:
-                r = _git(repo, "worktree", "remove", "--force", str(wt))
-                if r.returncode != 0:
-                    failures += 1
-                    print(f"  failed: {(r.stderr or r.stdout).strip()}", file=out)
-
-        branch = f"nav/{run.id}"
-        if repo not in protected_by_repo:
-            protected_by_repo[repo] = _protected_branches(repo)
-        if (branch.startswith(_BRANCH_PREFIX) and branch not in protected_by_repo[repo]
-                and _git(repo, "rev-parse", "--verify", "--quiet",
-                         f"refs/heads/{branch}").returncode == 0):
-            acted = True
-            print(f"{prefix}delete branch {branch} in {repo} ({run.id})", file=out)
-            if apply:
-                r = _git(repo, "branch", "-D", branch)
-                if r.returncode != 0:
-                    failures += 1
-                    print(f"  failed: {(r.stderr or r.stdout).strip()}", file=out)
-
-        if acted and repo not in touched:
-            touched.append(repo)
+        try:
+            failures += _cleanup_run(act, run, root=root, apply=apply, prefix=prefix, out=out,
+                                     touched=touched, protected_by_repo=protected_by_repo)
+        except Exception as e:
+            errors += 1
+            print(f"error {run.id}: {type(e).__name__}", file=out)
 
     for repo in touched:
         print(f"{prefix}prune worktrees in {repo}", file=out)
@@ -219,7 +233,9 @@ def _cleanup(act, *, apply: bool, out, worktree_root: str | None = None,
                 print(f"  failed: {(r.stderr or r.stdout).strip()}", file=out)
     if not touched:
         print("nothing to clean up", file=out)
-    return 1 if failures else 0
+    if errors:
+        print(f"cleanup finished with {errors} errored run(s)", file=out)
+    return 1 if (failures or errors) else 0
 
 
 _HANDLERS = {
