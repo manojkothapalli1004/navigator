@@ -292,3 +292,23 @@ def test_builder_gets_read_only_context_of_other_repo_files(tmp_path):
     assert "phone_number" in ctx["related_files"]["models.py"]
     assert "big.py" not in ctx["related_files"]          # over budget: left out, not truncated
     assert "a.py" not in ctx["related_files"]            # writable files stay in context.files
+
+
+def test_previous_failure_test_files_are_given_to_the_builder_in_full(tmp_path):
+    # live 2026-10-11: a retry still couldn't update tests/test_pings.py — too big
+    # for the reference budget, and builders write whole files
+    repo, _ = _seed(tmp_path)
+    (repo/"backend"/"tests").mkdir(parents=True)
+    (repo/"backend"/"tests"/"test_pings.py").write_text("def test_ack(): pass\n" + "# pad\n" * 30000)
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "t"], cwd=repo, check=True, capture_output=True)
+    sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True).stdout.strip()
+    h = create_worktree(repo=repo, base_commit_sha=sha, run_id="run-pf", worktree_root=tmp_path/"wt")
+    drv = _RecordingDriver()
+    run_build_and_verify(driver=drv, worktree=h, run_id="run-pf", workdir="backend",
+                         runner=CommandRunner(allowlist=DEFAULT_ALLOWLIST, worktree_root=tmp_path/"wt"),
+                         proposal={"affected_files": ["a.py"],
+                                   "previous_attempt_failure": "verification failed: "
+                                   "FAILED tests/test_pings.py::test_ack - assert 422 == 200"})
+    files = drv.requests[Role.builder].context["files"]
+    assert files["backend/tests/test_pings.py"].startswith("def test_ack")

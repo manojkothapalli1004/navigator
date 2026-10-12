@@ -72,6 +72,19 @@ def _runs_tests(commands: list[list[str]]) -> bool:
     return any(c and (c[0] == "pytest" or (c[:2] == ["uv", "run"] and "pytest" in c))
                for c in commands)
 
+_FAILED_FILE = re.compile(r"FAILED\s+(\S+?\.py)::")
+
+def _failing_test_files(failure: str, wt: Path, workdir: str) -> list[str]:
+    """Test files named in a previous attempt's pytest failures. They go to the
+    builder in full so a retry can update them (live 2026-10-11)."""
+    out = []
+    for rel in dict.fromkeys(_FAILED_FILE.findall(failure or "")):
+        for cand in (f"{workdir.rstrip('/')}/{rel}" if workdir not in (".", "") else rel, rel):
+            if (wt / cand).is_file() and _is_test_file(cand):
+                out.append(cand)
+                break
+    return out
+
 _RELATED_BUDGET = 60_000
 
 def _related_files(wt: Path, tracked: list[str], skip: set[str]) -> dict[str, str]:
@@ -120,7 +133,8 @@ def run_build_and_verify(driver: SubagentDriver, worktree: WorktreeHandle,
     proposal["affected_files"] = _normalize_affected(wt, proposal.get("affected_files", []), workdir)
     started = time.monotonic() if started_monotonic is None else started_monotonic
     tracked = subprocess.run(["git", "ls-files"], cwd=wt, capture_output=True, text=True).stdout.split()
-    files = _read_affected(wt, proposal.get("affected_files", []))
+    failing = _failing_test_files(proposal.get("previous_attempt_failure", ""), wt, workdir)
+    files = _read_affected(wt, list(dict.fromkeys(proposal.get("affected_files", []) + failing)))
     build_ctx = {"proposal": proposal, "files": files,
                  "test_files": [f for f in tracked if _is_test_file(f)][:200],
                  "related_files": _related_files(wt, tracked, set(files))}
