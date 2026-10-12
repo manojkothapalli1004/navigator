@@ -242,3 +242,59 @@ def test_retry_prefers_the_last_failure_with_test_output_over_infra_errors(tmp_p
                          summary="exception: You've hit your session limit", lessons=["limit"]))
     from navigator.runtime.executor import _previous_failure
     assert "FAILED tests/test_flow.py::test_dispatch" in _previous_failure(d["settings"], p.id)["previous_attempt_failure"]
+
+
+def test_failure_outcome_records_navigator_code_sha(tmp_path, monkeypatch):
+    import pytest
+    from navigator.runtime import executor
+    from navigator.runtime.outcome_store import OutcomeStore
+    pkg = Path(executor.__file__).resolve().parent
+    expected = subprocess.run(["git", "rev-parse", "HEAD"], cwd=pkg, capture_output=True, text=True)
+    if expected.returncode != 0 or not expected.stdout.strip():
+        pytest.skip("navigator package is not in a git checkout")
+    monkeypatch.setattr(executor, "_code_sha_cache", executor._CODE_SHA_UNSET)
+    repo, sha = _seed(tmp_path); d = _deps(tmp_path, repo)
+    def boom(**kw):
+        raise RuntimeError("git worktree add failed")
+    monkeypatch.setattr("navigator.runtime.executor.create_worktree", boom)
+    run = execute_proposal(_proposal(repo, sha), **d)
+    stored = OutcomeStore(d["settings"].outcome_path).for_proposal(run.proposal_id)
+    assert stored and stored[-1].status == "failed"
+    assert stored[-1].code_sha and stored[-1].code_sha == expected.stdout.strip()
+
+
+def test_code_sha_is_computed_once_and_cached(monkeypatch):
+    from navigator.runtime import executor
+    monkeypatch.setattr(executor, "_code_sha_cache", executor._CODE_SHA_UNSET)
+    calls = []
+    def fake_run(*a, **k):
+        calls.append(a)
+        return subprocess.CompletedProcess(a, 0, stdout="cafe1234\n", stderr="")
+    monkeypatch.setattr(executor.subprocess, "run", fake_run)
+    assert executor.code_sha() == "cafe1234"
+    assert executor.code_sha() == "cafe1234"
+    assert len(calls) == 1
+
+
+def test_code_sha_is_none_when_git_unavailable(tmp_path, monkeypatch):
+    from navigator.runtime import executor
+    from navigator.runtime.outcome_store import OutcomeStore
+    from navigator.contracts.run import Run
+    monkeypatch.setattr(executor, "_code_sha_cache", executor._CODE_SHA_UNSET)
+    def no_git(*a, **k):
+        raise FileNotFoundError("git not found")
+    monkeypatch.setattr(executor.subprocess, "run", no_git)
+    run = Run(proposal_id="p", base_commit_sha="s", branch="nav/x")
+    s = Settings(worktree_root=str(tmp_path/"wt"), outcome_path=str(tmp_path/"o.jsonl"))
+    out = executor._write_outcome(FakeORCClient(), run, status="failed", summary="x",
+                                  lessons=["y"], settings=s)  # must not raise
+    assert out.code_sha is None
+    assert OutcomeStore(tmp_path/"o.jsonl").latest(1)[0].code_sha is None
+
+
+def test_code_sha_is_none_when_git_fails(monkeypatch):
+    from navigator.runtime import executor
+    monkeypatch.setattr(executor, "_code_sha_cache", executor._CODE_SHA_UNSET)
+    monkeypatch.setattr(executor.subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(
+        a, 128, stdout="", stderr="fatal: not a git repository"))
+    assert executor.code_sha() is None

@@ -19,3 +19,6 @@ class Outcome(BaseModel):
     verification_notes: str | None = None
     provenance: str | None = None
     rollback: Rollback = Field(default_factory=Rollback)
+    # git HEAD of the navigator code that produced this outcome; None when unknown
+    # (old JSONL lines, or git unavailable)
+    code_sha: str | None = None

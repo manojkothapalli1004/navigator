@@ -18,6 +18,7 @@ from navigator.clients.orc_client import FakeORCClient, HTTPORCClient
 from navigator.runtime.drivers.claude_sdk_driver import ClaudeSDKDriver
 from navigator.runtime.drivers.fake_driver import FakeSubagentDriver
 from navigator.runtime.drivers.sdk_query import make_sdk_query_fn
+from navigator.runtime.executor import code_sha
 from navigator.runtime.loop import Navigator
 from navigator.safety.budget_guard import BudgetGuard
 from navigator.safety.command_runner import CommandRunner
@@ -111,6 +112,8 @@ def _reconcile_with_readiness(nav: Navigator) -> None:
 _FAILURE_WARN_THRESHOLD = 4
 
 def run_daemon(nav: Navigator, settings: Settings, *, max_cycles: int | None = None) -> None:
+    # which navigator code is running: lets outcomes/cycles be tied to a commit
+    print(json.dumps({"ts": _now_iso(), "startup": "navigator", "code_sha": code_sha()}), flush=True)
     _reconcile_with_readiness(nav)
     cycle = 0
     consecutive_failures = 0

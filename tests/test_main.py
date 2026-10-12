@@ -18,6 +18,10 @@ def _settings(tmp_path, repo, **kw):
     return Settings(repo=str(repo), lock_path=str(tmp_path/"nav.lock"),
                     worktree_root=str(tmp_path/"wt"), **kw)
 
+def _cycle_lines(out: str) -> list[dict]:
+    # daemon stdout: one startup line, then one JSON summary per cycle
+    return [l for l in (json.loads(x) for x in out.strip().splitlines()) if "cycle" in l]
+
 def test_build_navigator_defaults_to_fake_clients(tmp_path):
     nav = build_navigator(_settings(tmp_path, _seed_repo(tmp_path)))
     assert isinstance(nav.act.inner, FakeACTClient)  # wrapped to announce run events
@@ -87,7 +91,7 @@ def test_daemon_runs_bounded_cycles_and_sleeps_interval(tmp_path, monkeypatch, c
     import navigator.__main__ as m
     monkeypatch.setattr(m.time, "sleep", sleeps.append)
     assert main(["--max-cycles", "2"]) == 0
-    lines = [json.loads(l) for l in capsys.readouterr().out.strip().splitlines()]
+    lines = _cycle_lines(capsys.readouterr().out)
     assert [l["cycle"] for l in lines] == [1, 2]
     assert all(l["mode"] == "dry_run" for l in lines)
     assert sleeps == [123]  # sleeps between cycles, not after the last
@@ -97,7 +101,8 @@ def test_daemon_is_default_when_once_absent(tmp_path, monkeypatch, capsys):
     import navigator.__main__ as m
     monkeypatch.setattr(m.time, "sleep", lambda s: None)
     assert main(["--max-cycles", "1"]) == 0
-    assert json.loads(capsys.readouterr().out.strip())["cycle"] == 1
+    lines = _cycle_lines(capsys.readouterr().out)
+    assert [l["cycle"] for l in lines] == [1]
 
 def test_daemon_survives_a_failing_cycle(tmp_path, monkeypatch, capsys):
     # live regression 2026-07-13: ORC restart mid-boot → ConnectError killed the daemon
@@ -113,9 +118,35 @@ def test_daemon_survives_a_failing_cycle(tmp_path, monkeypatch, capsys):
         return real_cycle(nav, settings)
     monkeypatch.setattr(m, "_cycle", flaky_cycle)
     assert main(["--max-cycles", "2"]) == 0
-    lines = [json.loads(l) for l in capsys.readouterr().out.strip().splitlines()]
+    lines = _cycle_lines(capsys.readouterr().out)
     assert "error" in lines[0] and "dependency down" in lines[0]["error"]
     assert lines[1]["cycle"] == 2 and "error" not in lines[1]
+
+def test_daemon_prints_startup_line_with_code_sha_before_first_cycle(monkeypatch, capsys):
+    import navigator.__main__ as m
+    monkeypatch.setattr(m.time, "sleep", lambda s: None)
+    monkeypatch.setattr(m, "code_sha", lambda: "abc123")
+    class FakeNav:
+        driver = None
+        def reconcile_on_startup(self): pass
+    monkeypatch.setattr(m, "_cycle", lambda n, s: {"ok": 1})
+    m.run_daemon(FakeNav(), Settings(), max_cycles=1)
+    lines = [json.loads(l) for l in capsys.readouterr().out.strip().splitlines()]
+    assert lines[0]["startup"] == "navigator"
+    assert lines[0]["code_sha"] == "abc123" and "ts" in lines[0]
+    assert lines[1]["cycle"] == 1
+
+def test_daemon_startup_line_tolerates_unknown_code_sha(monkeypatch, capsys):
+    import navigator.__main__ as m
+    monkeypatch.setattr(m.time, "sleep", lambda s: None)
+    monkeypatch.setattr(m, "code_sha", lambda: None)
+    class FakeNav:
+        driver = None
+        def reconcile_on_startup(self): pass
+    monkeypatch.setattr(m, "_cycle", lambda n, s: {"ok": 1})
+    m.run_daemon(FakeNav(), Settings(), max_cycles=1)
+    first = json.loads(capsys.readouterr().out.strip().splitlines()[0])
+    assert first["startup"] == "navigator" and "code_sha" in first and first["code_sha"] is None
 
 def test_daemon_resets_budget_each_cycle(tmp_path, monkeypatch):
     # live regression 2026-07-14: process-lifetime budget exhausted after ~8 cycles,
