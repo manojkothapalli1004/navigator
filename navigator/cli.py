@@ -1,24 +1,42 @@
 """Operator commands: `python -m navigator <command> [id]`.
 
 Every decision here is recorded in ACT; the daemon acts on it next cycle.
+`cleanup [--apply]` is the exception: it removes finished runs' worktrees and
+nav/run-* branches directly (dry run unless --apply).
 """
+import os
 import subprocess
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import TextIO
 from navigator.observability.notify import format_verification
 from navigator.contracts.enums import (ApprovalDecision, ApprovalGate, ProposalStatus,
                                        RunPhase, RunStatus)
 
-COMMANDS = ("status", "approve", "decline", "diff", "merge", "reject", "retry")
+COMMANDS = ("status", "approve", "decline", "diff", "merge", "reject", "retry", "cleanup")
 ACTOR = "operator"
 
+# run statuses whose worktree/branch can go regardless of age
+_FINISHED_STATUSES = {"completed", "declined", "aborted"}
+# failed runs are kept this long for inspection
+_FAILED_GRACE = timedelta(days=7)
+_BRANCH_PREFIX = "nav/run-"
+_ALWAYS_PROTECTED = {"main", "master"}
 
-def run_cli(argv: list[str], *, act, out: TextIO) -> int:
+
+def run_cli(argv: list[str], *, act, out: TextIO, worktree_root: str | None = None) -> int:
     if not argv or argv[0] not in COMMANDS:
-        print(f"usage: navigator {{{'|'.join(COMMANDS)}}} [id]", file=out)
+        print(f"usage: navigator {{{'|'.join(COMMANDS)}}} [id]  "
+              f"(cleanup takes no id: navigator cleanup [--apply])", file=out)
         return 2
     cmd, args = argv[0], argv[1:]
     if cmd == "status":
         return _status(act, out)
+    if cmd == "cleanup":
+        if args not in ([], ["--apply"]):
+            print("usage: navigator cleanup [--apply]", file=out)
+            return 2
+        return _cleanup(act, apply=bool(args), out=out, worktree_root=worktree_root)
     if len(args) != 1:
         print(f"navigator {cmd} needs exactly one id", file=out)
         return 2
@@ -100,6 +118,108 @@ def _retry(act, pid, out) -> int:
     act.decide_approval(grant.id, ApprovalDecision.approved, actor=ACTOR)
     print(f"{pid}: one retry granted (runs on the daemon's next execute cycle)", file=out)
     return 0
+
+
+# ---- cleanup -----------------------------------------------------------------
+
+def _git(repo, *args) -> subprocess.CompletedProcess:
+    return subprocess.run(["git", *args], cwd=repo, capture_output=True, text=True)
+
+
+def _resolve_worktree_root(worktree_root: str | None) -> str | None:
+    if worktree_root:
+        return worktree_root
+    env = os.environ.get("NAVIGATOR_WORKTREE_ROOT")
+    if env:
+        return env
+    try:
+        from navigator.config import Settings
+        return Settings().worktree_root or None
+    except Exception:
+        return None
+
+
+def _eligible(run, now: datetime) -> bool:
+    status = run.status.value
+    if status in _FINISHED_STATUSES:
+        return True
+    if status == "failed" and run.ended_at is not None:
+        ended = run.ended_at
+        if ended.tzinfo is None:
+            ended = ended.replace(tzinfo=timezone.utc)
+        return now - ended > _FAILED_GRACE
+    return False
+
+
+def _protected_branches(repo) -> set[str]:
+    protected = set(_ALWAYS_PROTECTED)
+    cur = _git(repo, "symbolic-ref", "--quiet", "--short", "HEAD")
+    if cur.returncode == 0 and cur.stdout.strip():
+        protected.add(cur.stdout.strip())
+    return protected
+
+
+def _cleanup(act, *, apply: bool, out, worktree_root: str | None = None,
+             now: datetime | None = None) -> int:
+    root_s = _resolve_worktree_root(worktree_root)
+    if not root_s:
+        print("cleanup needs NAVIGATOR_WORKTREE_ROOT to be set", file=out)
+        return 1
+    root = Path(root_s).expanduser().resolve()
+    now = now or datetime.now(timezone.utc)
+    prefix = "" if apply else "would "
+    touched: list[str] = []
+    protected_by_repo: dict[str, set[str]] = {}
+    failures = 0
+
+    for run in act.list_all_runs():
+        if run.status == RunStatus.executing or not _eligible(run, now):
+            continue
+        prop = act.get_proposal(run.proposal_id)
+        if prop is None or not prop.repo or not Path(prop.repo).is_dir():
+            print(f"skip {run.id}: repo unknown or missing", file=out)
+            continue
+        repo = prop.repo
+        acted = False
+
+        wt = Path(run.worktree_path) if run.worktree_path else root / run.id
+        wt = wt.expanduser().resolve()
+        if wt.exists() and root in wt.parents:
+            acted = True
+            print(f"{prefix}remove worktree {wt} ({run.id})", file=out)
+            if apply:
+                r = _git(repo, "worktree", "remove", "--force", str(wt))
+                if r.returncode != 0:
+                    failures += 1
+                    print(f"  failed: {(r.stderr or r.stdout).strip()}", file=out)
+
+        branch = f"nav/{run.id}"
+        if repo not in protected_by_repo:
+            protected_by_repo[repo] = _protected_branches(repo)
+        if (branch.startswith(_BRANCH_PREFIX) and branch not in protected_by_repo[repo]
+                and _git(repo, "rev-parse", "--verify", "--quiet",
+                         f"refs/heads/{branch}").returncode == 0):
+            acted = True
+            print(f"{prefix}delete branch {branch} in {repo} ({run.id})", file=out)
+            if apply:
+                r = _git(repo, "branch", "-D", branch)
+                if r.returncode != 0:
+                    failures += 1
+                    print(f"  failed: {(r.stderr or r.stdout).strip()}", file=out)
+
+        if acted and repo not in touched:
+            touched.append(repo)
+
+    for repo in touched:
+        print(f"{prefix}prune worktrees in {repo}", file=out)
+        if apply:
+            r = _git(repo, "worktree", "prune")
+            if r.returncode != 0:
+                failures += 1
+                print(f"  failed: {(r.stderr or r.stdout).strip()}", file=out)
+    if not touched:
+        print("nothing to clean up", file=out)
+    return 1 if failures else 0
 
 
 _HANDLERS = {
