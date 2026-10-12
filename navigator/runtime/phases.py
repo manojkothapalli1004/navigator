@@ -23,7 +23,7 @@ def _resolve_write_target(wt: Path, relpath: str) -> Path:
     """Resolve a builder write target, rejecting escapes and the worktree root itself.
 
     A valid target must be a path strictly inside the worktree (so relpath="." / ""
-    — which resolve to the worktree root — and "../x" / absolute paths are rejected
+    \u2014 which resolve to the worktree root \u2014 and "../x" / absolute paths are rejected
     with a clean ValueError rather than a later IsADirectoryError or an escape).
     """
     wt = Path(wt).resolve()
@@ -107,18 +107,69 @@ def _failing_test_files(failure: str, wt: Path, workdir: str) -> list[str]:
     return out
 
 _RELATED_BUDGET = 60_000
+_NAMED_BUDGET = 60_000
+_TRUNCATED_MARKER = "\n# [truncated by navigator]"
 
-def _related_files(wt: Path, tracked: list[str], skip: set[str]) -> dict[str, str]:
-    """Read-only contents of other python files, smallest first, whole files only,
-    within a budget. Builders that only saw the files they edit wrote code against
-    guessed models and fixtures (live 2026-10-11)."""
-    sized = []
+def _mention_position(rel: str, text: str, workdir: str) -> int | None:
+    """Index of the first literal mention of `rel` (repo-relative, or relative to
+    workdir) in `text`, bounded so 'x.py' does not match inside 'services/x.py'."""
+    if not text:
+        return None
+    cands = [rel]
+    if workdir not in (".", ""):
+        prefix = workdir.rstrip("/") + "/"
+        if rel.startswith(prefix) and len(rel) > len(prefix):
+            cands.append(rel[len(prefix):])
+    best = None
+    for c in cands:
+        m = re.search(r"(?<![\w./-])" + re.escape(c) + r"(?![\w/])", text)
+        if m and (best is None or m.start() < best):
+            best = m.start()
+    return best
+
+def _related_files(wt: Path, tracked: list[str], skip: set[str],
+                   mention_text: str = "", workdir: str = ".") -> dict[str, str]:
+    """Read-only contents of other python files. Builders that only saw the files
+    they edit wrote code against guessed models and fixtures (live 2026-10-11).
+
+    Two separate allowances:
+    (A) files the proposal names literally in mention_text, in order of first
+        mention, up to _NAMED_BUDGET chars; the file that overflows is truncated
+        (with a marker) and no further named files are added (live 2026-10-12:
+        test-only proposals never showed the builder the modules they named);
+    (B) the remaining python files, smallest first, whole files only, up to
+        _RELATED_BUDGET.
+    """
+    candidates = []
     for rel in tracked:
         if rel.endswith(".py") and rel not in skip:
             p = wt / rel
             if p.is_file():
-                sized.append((p.stat().st_size, rel))
-    out, used = {}, 0
+                candidates.append(rel)
+    out: dict[str, str] = {}
+    # (A) named allowance
+    named = []
+    for rel in candidates:
+        pos = _mention_position(rel, mention_text or "", workdir or ".")
+        if pos is not None:
+            named.append((pos, rel))
+    remaining = _NAMED_BUDGET
+    for _, rel in sorted(named):
+        if remaining <= 0:
+            break
+        text = (wt / rel).read_text(errors="replace")
+        if len(text) <= remaining:
+            out[rel] = text
+            remaining -= len(text)
+        else:
+            out[rel] = text[:remaining] + _TRUNCATED_MARKER
+            break
+    # (B) general allowance, separate budget
+    sized = []
+    for rel in candidates:
+        if rel not in out:
+            sized.append(((wt / rel).stat().st_size, rel))
+    used = 0
     for size, rel in sorted(sized):
         if used + size > _RELATED_BUDGET:
             break
@@ -156,9 +207,12 @@ def run_build_and_verify(driver: SubagentDriver, worktree: WorktreeHandle,
     tracked = subprocess.run(["git", "ls-files"], cwd=wt, capture_output=True, text=True).stdout.split()
     failing = _failing_test_files(proposal.get("previous_attempt_failure", ""), wt, workdir)
     files = _read_affected(wt, list(dict.fromkeys(proposal.get("affected_files", []) + failing)))
+    mention_text = f"{proposal.get('intended_changes') or ''} {proposal.get('rationale') or ''}"
     build_ctx = {"proposal": proposal, "files": files,
                  "test_files": [f for f in tracked if _is_test_file(f)][:200],
-                 "related_files": _related_files(wt, tracked, set(files))}
+                 "related_files": _related_files(wt, tracked, set(files),
+                                                 mention_text=mention_text,
+                                                 workdir=workdir or ".")}
     build = driver.run_role(DriverRequest(role=Role.builder, context=build_ctx, worktree_path=str(wt)))
     _check_scope([rel for rel, _ in build.file_writes], proposal.get("affected_files", []))
     if breakers:
@@ -177,7 +231,7 @@ def run_build_and_verify(driver: SubagentDriver, worktree: WorktreeHandle,
         res.verify_returncode = 1
         res.verify_output = "builder added test skips: " + "; ".join(added_skips)
         return res
-    # verifier — a verify phase with no commands is a failure, not a silent pass
+    # verifier \u2014 a verify phase with no commands is a failure, not a silent pass
     # commands run in the workdir, so hand the verifier paths relative to it
     rel_changed = [str(Path(f).relative_to(workdir)) if workdir not in (".", "")
                    and Path(f).is_relative_to(workdir) else f for f in res.file_writes]
