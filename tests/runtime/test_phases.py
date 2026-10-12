@@ -312,3 +312,66 @@ def test_previous_failure_test_files_are_given_to_the_builder_in_full(tmp_path):
                                    "FAILED tests/test_pings.py::test_ack - assert 422 == 200"})
     files = drv.requests[Role.builder].context["files"]
     assert files["backend/tests/test_pings.py"].startswith("def test_ack")
+
+
+# live 2026-10-12: a run added 11 tests that bail out when a guessed API is missing;
+# the suite passed while verifying nothing. Markers are built by concatenation so
+# this file does not itself look like it adds skips.
+_SKIP_CALL = "pytest." + "skip("
+
+class _RecordingRunner:
+    allowlist = ["git status"]
+    def __init__(self):
+        self.calls = []
+    def run(self, argv, cwd):
+        from navigator.safety.command_runner import CommandResult
+        self.calls.append(argv)
+        return CommandResult(0, "", "")
+
+def test_new_test_file_with_a_skip_fails_verification_without_running_commands(tmp_path):
+    h, _ = _wt(tmp_path, "run-sk1")
+    runner = _RecordingRunner()
+    drv = _ScriptedRoles([("test_new.py", "import pytest\n\ndef test_x():\n    " + _SKIP_CALL + "'no api')\n")],
+                         [["git", "status"]])
+    res = run_build_and_verify(driver=drv, worktree=h, run_id="run-sk1", runner=runner,
+                               proposal={"affected_files": []})
+    assert res.verify_returncode == 1
+    assert res.verify_output == "builder added test skips: test_new.py: 1"
+    assert runner.calls == []
+
+def test_existing_skip_left_unchanged_passes(tmp_path):
+    h, _ = _wt(tmp_path, "run-sk2")
+    original = "import pytest\n\ndef test_a():\n    " + _SKIP_CALL + "'old')\n"
+    (Path(h.path)/"test_old.py").write_text(original)
+    runner = _RecordingRunner()
+    drv = _ScriptedRoles([("test_old.py", original + "\ndef test_b():\n    assert 1\n")],
+                         [["git", "status"]])
+    res = run_build_and_verify(driver=drv, worktree=h, run_id="run-sk2", runner=runner,
+                               proposal={"affected_files": []})
+    assert res.verify_returncode == 0
+    assert runner.calls == [["git", "status"]]
+
+def test_added_xfail_is_not_counted(tmp_path):
+    h, _ = _wt(tmp_path, "run-sk3")
+    runner = _RecordingRunner()
+    drv = _ScriptedRoles([("test_x.py", "import pytest\n\n@pytest.mark.xfail\ndef test_x():\n    assert 0\n")],
+                         [["git", "status"]])
+    res = run_build_and_verify(driver=drv, worktree=h, run_id="run-sk3", runner=runner,
+                               proposal={"affected_files": []})
+    assert res.verify_returncode == 0
+
+def test_skip_text_in_a_non_test_file_is_not_counted(tmp_path):
+    h, _ = _wt(tmp_path, "run-sk4")
+    runner = _RecordingRunner()
+    drv = _ScriptedRoles([("helper.py", "import pytest\n\ndef bail():\n    " + _SKIP_CALL + "'x')\n")],
+                         [["git", "status"]])
+    res = run_build_and_verify(driver=drv, worktree=h, run_id="run-sk4", runner=runner,
+                               proposal={"affected_files": ["helper.py"]})
+    assert res.verify_returncode == 0
+
+def test_skip_counting_covers_all_markers(tmp_path):
+    from navigator.runtime.phases import _added_skips
+    content = ("pytest." + "importorskip('x')\n" + "@pytest.mark." + "skip\n"
+               + "@pytest.mark." + "skip" + "if(True, reason='r')\n")
+    got = _added_skips(tmp_path, [("tests/test_m.py", content), ("lib.py", content)])
+    assert len(got) == 1 and got[0].startswith("tests/test_m.py: ")
