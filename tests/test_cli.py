@@ -1,12 +1,18 @@
 import io
 import subprocess
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from navigator.cli import run_cli
 from navigator.runtime.loop import Navigator
+from navigator.runtime.worktree import create_worktree
 from navigator.clients.act_client import FakeACTClient
 from navigator.clients.orc_client import FakeORCClient
 from navigator.runtime.drivers.fake_driver import FakeSubagentDriver
 from navigator.safety.command_runner import CommandRunner
 from navigator.config import Settings
+from navigator.contracts.proposal import Proposal
+from navigator.contracts.run import Run
+from navigator.ids import new_id
 from navigator.contracts.enums import (ProposalStatus, ApprovalGate, ApprovalDecision,
                                        RunStatus, RunPhase)
 
@@ -97,3 +103,108 @@ def test_retry_refused_while_a_run_is_open_or_completed(tmp_path):
     _cli(nav, "approve", p.id)
     nav.approval_poll()
     assert _cli(nav, "retry", p.id)[0] != 0
+
+
+# ---- cleanup -------------------------------------------------------------------
+
+def _cleanup_world(tmp_path):
+    repo = tmp_path/"repo"; repo.mkdir()
+    for args in (["init", "-b", "main"], ["config", "user.email", "t@t"],
+                 ["config", "user.name", "t"], ["commit", "--allow-empty", "-m", "base"]):
+        subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True)
+    sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True,
+                         text=True).stdout.strip()
+    act = FakeACTClient()
+    p = act.create_proposal(Proposal(title="t", rationale="r", repo=str(repo),
+                                     base_commit_sha=sha, intended_changes="x",
+                                     affected_files=["a.py"], origin="periodic",
+                                     proposal_origin_hash="h"))
+    now = datetime.now(timezone.utc)
+    runs = {}
+    for name, status, ended in (("done", RunStatus.completed, now),
+                                ("live", RunStatus.executing, None),
+                                ("recent_fail", RunStatus.failed, now - timedelta(days=1)),
+                                ("old_fail", RunStatus.failed, now - timedelta(days=10))):
+        rid = new_id("run")
+        h = create_worktree(repo=repo, base_commit_sha=sha, run_id=rid,
+                            worktree_root=tmp_path/"wt")
+        r = Run(id=rid, proposal_id=p.id, base_commit_sha=sha, branch=h.branch,
+                worktree_path=str(h.path), status=status, ended_at=ended)
+        act.create_run(r)
+        runs[name] = r
+    return repo, act, runs
+
+
+def _cleanup_cli(act, tmp_path, *argv):
+    out = io.StringIO()
+    code = run_cli(["cleanup", *argv], act=act, out=out, worktree_root=str(tmp_path/"wt"))
+    return code, out.getvalue()
+
+
+def _branch_exists(repo, branch):
+    return subprocess.run(["git", "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"],
+                          cwd=repo, capture_output=True).returncode == 0
+
+
+def test_cleanup_dry_run_lists_actions_and_changes_nothing(tmp_path):
+    repo, act, runs = _cleanup_world(tmp_path)
+    code, out = _cleanup_cli(act, tmp_path)
+    assert code == 0
+    lines = [l for l in out.splitlines() if l.strip()]
+    assert lines and all(l.startswith("would ") for l in lines)
+    for name in ("done", "old_fail"):
+        assert f"would remove worktree" in out and runs[name].id in out
+        assert f"would delete branch nav/{runs[name].id}" in out
+    assert "would prune worktrees" in out
+    for name in ("live", "recent_fail"):
+        assert runs[name].id not in out
+    for r in runs.values():
+        assert Path(r.worktree_path).exists()
+        assert _branch_exists(repo, r.branch)
+
+
+def test_cleanup_apply_removes_finished_runs_only(tmp_path):
+    repo, act, runs = _cleanup_world(tmp_path)
+    code, out = _cleanup_cli(act, tmp_path, "--apply")
+    assert code == 0, out
+    assert "would" not in out
+    for name in ("done", "old_fail"):
+        assert not Path(runs[name].worktree_path).exists()
+        assert not _branch_exists(repo, runs[name].branch)
+    # NEGATIVE: executing run and a failed run ended 1 day ago are untouched
+    for name in ("live", "recent_fail"):
+        assert Path(runs[name].worktree_path).exists()
+        assert _branch_exists(repo, runs[name].branch)
+    assert _branch_exists(repo, "main")
+    listing = subprocess.run(["git", "worktree", "list", "--porcelain"], cwd=repo,
+                             capture_output=True, text=True).stdout
+    assert runs["done"].id not in listing and runs["live"].id in listing
+    # a second run has nothing left to do for the finished runs
+    code, out = _cleanup_cli(act, tmp_path)
+    assert code == 0 and runs["done"].id not in out
+
+
+def test_cleanup_ignores_worktrees_outside_root(tmp_path):
+    repo, act, runs = _cleanup_world(tmp_path)
+    out = io.StringIO()
+    code = run_cli(["cleanup"], act=act, out=out, worktree_root=str(tmp_path/"elsewhere"))
+    assert code == 0
+    assert "remove worktree" not in out.getvalue()
+
+
+def test_cleanup_reads_worktree_root_from_env(tmp_path, monkeypatch):
+    repo, act, runs = _cleanup_world(tmp_path)
+    monkeypatch.setenv("NAVIGATOR_WORKTREE_ROOT", str(tmp_path/"wt"))
+    out = io.StringIO()
+    assert run_cli(["cleanup"], act=act, out=out) == 0
+    assert runs["done"].id in out.getvalue()
+    assert Path(runs["done"].worktree_path).exists()
+
+
+def test_cleanup_takes_no_id(tmp_path):
+    act = FakeACTClient()
+    out = io.StringIO()
+    assert run_cli(["cleanup", "run-x"], act=act, out=out,
+                   worktree_root=str(tmp_path/"wt")) == 2
+    assert run_cli(["cleanup", "--apply", "extra"], act=act, out=io.StringIO(),
+                   worktree_root=str(tmp_path/"wt")) == 2
