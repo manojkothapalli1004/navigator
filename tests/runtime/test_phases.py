@@ -1,8 +1,9 @@
 import subprocess
+from collections import Counter
 from pathlib import Path
 import pytest
 from navigator.runtime.worktree import create_worktree
-from navigator.runtime.phases import run_build_and_verify, _resolve_write_target
+from navigator.runtime.phases import run_build_and_verify, _resolve_write_target, _added_skips, _skip_sites
 from navigator.runtime.drivers.base import DriverRequest, DriverResult
 from navigator.runtime.drivers.fake_driver import FakeSubagentDriver
 from navigator.safety.command_runner import CommandRunner
@@ -252,7 +253,7 @@ def test_workdir_relative_affected_paths_are_mapped_to_repo_paths(tmp_path):
 
 
 def test_navigator_runs_the_full_suite_itself_when_repo_has_tests(tmp_path):
-    # live 2026-10-11: a waker verifier ran only 3 chosen test files, skipped the
+    # live 2026-10-11: a waker verifier ran only 3 chosen test files, ignored the
     # allowlist suite its change broke, and "passed"; 13 tests failed on merge
     h, _ = _wt(tmp_path, "run-fs")
     (Path(h.path)/"tests").mkdir()
@@ -315,9 +316,16 @@ def test_previous_failure_test_files_are_given_to_the_builder_in_full(tmp_path):
 
 
 # live 2026-10-12: a run added 11 tests that bail out when a guessed API is missing;
-# the suite passed while verifying nothing. Markers are built by concatenation so
-# this file does not itself look like it adds skips.
-_SKIP_CALL = "pytest." + "skip("
+# the suite passed while verifying nothing. Every sample source below is assembled
+# from fragments at runtime so this file holds no literal snippets of its own.
+SK = "sk" + "ip"
+SKIF = SK + "if"
+IOS = "importor" + SK
+STEST = SK + "Test"
+SKIF_U = SK + "If"
+SKUN = SK + "Unless"
+PM = "pytest" + "mark"
+_SKIP_CALL = "pytest." + SK + "("
 
 class _RecordingRunner:
     allowlist = ["git status"]
@@ -370,8 +378,109 @@ def test_skip_text_in_a_non_test_file_is_not_counted(tmp_path):
     assert res.verify_returncode == 0
 
 def test_skip_counting_covers_all_markers(tmp_path):
-    from navigator.runtime.phases import _added_skips
-    content = ("pytest." + "importorskip('x')\n" + "@pytest.mark." + "skip\n"
-               + "@pytest.mark." + "skip" + "if(True, reason='r')\n")
+    content = (f"import pytest\nm = pytest.{IOS}('x')\n\n@pytest.mark.{SK}\ndef test_a():\n    pass\n\n"
+               f"@pytest.mark.{SKIF}(True, reason='r')\ndef test_b():\n    pass\n")
     got = _added_skips(tmp_path, [("tests/test_m.py", content), ("lib.py", content)])
-    assert len(got) == 1 and got[0].startswith("tests/test_m.py: ")
+    assert got == ["tests/test_m.py: 3"]
+
+
+# G1c: ast-based site detection
+
+def _grown(tmp_path, rel, new, old=None):
+    if old is not None:
+        p = tmp_path / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(old)
+    return _added_skips(tmp_path, [(rel, new)])
+
+
+def test_module_level_mark_assignment_trips(tmp_path):
+    bare = f"import pytest\n{PM} = pytest.mark.{SK}\n\ndef test_a():\n    assert 1\n"
+    called = f"import pytest\n{PM} = pytest.mark.{SK}(reason='r')\n"
+    listed = f"import pytest\n{PM} = [pytest.mark.{SKIF}(True, reason='r')]\n"
+    assert _skip_sites(bare) == Counter({SK: 1})
+    assert _skip_sites(called) == Counter({SK: 1})
+    assert _skip_sites(listed) == Counter({SKIF: 1})
+    assert _grown(tmp_path, "tests/test_m.py", bare) == ["tests/test_m.py: 1"]
+
+
+def test_unittest_decorators_trip(tmp_path):
+    src = ("import unittest\n\nclass T(unittest.TestCase):\n"
+           f"    @unittest.{SK}('r')\n    def test_a(self):\n        pass\n"
+           f"    @unittest.{SKIF_U}(True, 'r')\n    def test_b(self):\n        pass\n"
+           f"    @unittest.{SKUN}(False, 'r')\n    def test_c(self):\n        pass\n")
+    assert _skip_sites(src) == Counter({SK: 1, SKIF_U: 1, SKUN: 1})
+    assert _grown(tmp_path, "tests/test_u.py", src) == ["tests/test_u.py: 3"]
+
+
+def test_self_method_call_trips(tmp_path):
+    src = ("import unittest\n\nclass T(unittest.TestCase):\n"
+           f"    def test_a(self):\n        self.{STEST}('r')\n")
+    assert _skip_sites(src) == Counter({STEST: 1})
+    assert _grown(tmp_path, "tests/test_s.py", src) == ["tests/test_s.py: 1"]
+
+
+def test_call_with_space_before_paren_trips(tmp_path):
+    src = f"import pytest\n\ndef test_a():\n    pytest.{SK} ('r')\n"
+    assert _skip_sites(src) == Counter({SK: 1})
+    assert _grown(tmp_path, "tests/test_sp.py", src) == ["tests/test_sp.py: 1"]
+
+
+def test_imported_name_call_trips(tmp_path):
+    src = f"from pytest import {SK}\n\ndef test_a():\n    {SK}('r')\n"
+    assert _skip_sites(src) == Counter({SK: 1})
+    assert _grown(tmp_path, "tests/test_i.py", src) == ["tests/test_i.py: 1"]
+
+
+def test_aliased_module_call_trips(tmp_path):
+    src = f"import pytest as pt\n\ndef test_a():\n    pt.{SK}('r')\n"
+    assert _skip_sites(src) == Counter({SK: 1})
+    assert _grown(tmp_path, "tests/test_al.py", src) == ["tests/test_al.py: 1"]
+
+
+def test_conftest_new_site_trips(tmp_path):
+    src = f"import pytest\n\ndef pytest_runtest_setup(item):\n    pytest.{SK}('r')\n"
+    assert _grown(tmp_path, "conftest.py", src) == ["conftest.py: 1"]
+    assert _grown(tmp_path, "pkg/conftest.py", src) == ["pkg/conftest.py: 1"]
+
+
+def test_conditional_marker_counts_once(tmp_path):
+    src = f"import pytest\n\n@pytest.mark.{SKIF}(True, reason='r')\ndef test_a():\n    pass\n"
+    assert _skip_sites(src) == Counter({SKIF: 1})
+    assert _grown(tmp_path, "tests/test_once.py", src) == ["tests/test_once.py: 1"]
+
+
+def test_unchanged_existing_site_passes(tmp_path):
+    old = f"import pytest\n\n@pytest.mark.{SK}\ndef test_a():\n    pass\n"
+    new = old + "\ndef test_b():\n    assert 1\n"
+    assert _grown(tmp_path, "tests/test_o.py", new, old=old) == []
+
+
+def test_converting_marker_kind_trips(tmp_path):
+    old = f"import pytest\n\n@pytest.mark.{SK}\ndef test_a():\n    pass\n"
+    new = f"import pytest\n\n@pytest.mark.{SKIF}(True, reason='r')\ndef test_a():\n    pass\n"
+    assert _grown(tmp_path, "tests/test_c.py", new, old=old) == ["tests/test_c.py: 1"]
+
+
+def test_xfail_marker_passes(tmp_path):
+    src = "import pytest\n\n@pytest.mark.xfail\ndef test_a():\n    assert 0\n"
+    assert _skip_sites(src) == Counter()
+    assert _grown(tmp_path, "tests/test_xf.py", src) == []
+
+
+def test_names_in_strings_and_comments_do_not_trip(tmp_path):
+    src = (f"# pytest.mark.{SKIF}(True)\nX = 'pytest.{SK}(r) {SKIF}( {STEST}('\n\n"
+           "def test_a():\n    assert X\n")
+    assert _skip_sites(src) == Counter()
+    assert _grown(tmp_path, "tests/test_str.py", src) == []
+
+
+def test_unparseable_source_falls_back_to_text(tmp_path):
+    src = f"def broken(:\n    pytest.{SK} ('r')\n    x.{STEST}('r')\n"
+    assert _skip_sites(src) == Counter({SK: 1, STEST: 1})
+
+
+def test_site_in_non_test_module_is_not_counted(tmp_path):
+    src = f"import pytest\n\ndef bail():\n    pytest.{SK}('r')\n"
+    assert _skip_sites(src) == Counter({SK: 1})
+    assert _grown(tmp_path, "pkg/helper.py", src) == []
