@@ -1,6 +1,8 @@
+import ast
 import re
 import subprocess
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from navigator.safety.circuit_breakers import CircuitBreakers
@@ -62,23 +64,90 @@ def _check_scope(relpaths: list[str], allowed: list[str]) -> None:
 
 # live 2026-10-12: a run added 11 tests that skip when a guessed API is missing; the
 # suite passed while verifying nothing. xfail is deliberately not counted.
-_SKIP_MARKERS = ("pytest.skip(", "pytest.importorskip(", "@pytest.mark.skip", "skipif")
+# Sites are found with ast so aliased imports, unittest decorators, self.skipTest,
+# module-level pytestmark and odd spacing are all seen, while text inside strings
+# and comments is not (G1 cold audit).
+_SKIP_NAMES = frozenset({"skip", "skipif", "importorskip", "skipTest", "skipIf", "skipUnless"})
+_SKIP_FALLBACK = re.compile(r"\b(skip|skipif|importorskip|skipTest|skipIf|skipUnless)\s*\(")
 
-def _count_skips(text: str) -> int:
-    return sum(text.count(m) for m in _SKIP_MARKERS)
+def _final_name(node) -> str | None:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    return None
+
+def _is_pytestmark_target(t) -> bool:
+    if isinstance(t, ast.Name):
+        return t.id == "pytestmark"
+    if isinstance(t, (ast.Tuple, ast.List)):
+        return any(_is_pytestmark_target(e) for e in t.elts)
+    return False
+
+def _skip_sites(source: str) -> Counter:
+    """Skip sites in python source, keyed by kind (skip, skipif, importorskip,
+    skipTest, skipIf, skipUnless). Each node is counted once. Unparseable source
+    falls back to a text regex."""
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError):
+        return Counter(m.group(1) for m in _SKIP_FALLBACK.finditer(source))
+    counts: Counter = Counter()
+    seen: set[int] = set()
+
+    def hit(node, name, *also):
+        if id(node) in seen:
+            return
+        seen.add(id(node))
+        seen.update(id(a) for a in also)
+        counts[name] += 1
+
+    nodes = list(ast.walk(tree))
+    # decorators first, so @x.skipif(...) counts once (not as decorator and call)
+    for node in nodes:
+        for dec in getattr(node, "decorator_list", None) or []:
+            func = dec.func if isinstance(dec, ast.Call) else dec
+            name = _final_name(func)
+            if name in _SKIP_NAMES:
+                hit(dec, name, func)
+    for node in nodes:
+        if isinstance(node, ast.Call) and id(node) not in seen:
+            name = _final_name(node.func)
+            if name in _SKIP_NAMES:
+                hit(node, name, node.func)
+    for node in nodes:
+        if isinstance(node, ast.Assign):
+            targets, value = node.targets, node.value
+        elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+            targets, value = [node.target], node.value
+        else:
+            continue
+        if value is None or not any(_is_pytestmark_target(t) for t in targets):
+            continue
+        for sub in ast.walk(value):
+            if isinstance(sub, (ast.Name, ast.Attribute)) and id(sub) not in seen:
+                name = _final_name(sub)
+                if name in _SKIP_NAMES:
+                    hit(sub, name)
+    return counts
+
+def _skip_gated(rel: str) -> bool:
+    # conftest.py can skip whole suites; gated here only, not a test file elsewhere
+    return _is_test_file(rel) or (Path(rel).name == "conftest.py")
 
 def _added_skips(wt: Path, writes: list[tuple[str, str]]) -> list[str]:
-    """'<file>: <n>' for each written test file whose skip count grew versus the
-    file on disk before the write (empty for new files). Must run before writing."""
+    """'<file>: <n>' for each written test file (or conftest.py) where any kind of
+    skip site grew versus the file on disk before the write (empty for new files).
+    Must run before writing."""
     out = []
     for rel, content in writes:
-        if not _is_test_file(rel):
+        if not _skip_gated(rel):
             continue
         target = _resolve_write_target(wt, rel)
         original = target.read_text(errors="replace") if target.is_file() else ""
-        n = _count_skips(content) - _count_skips(original)
-        if n > 0:
-            out.append(f"{rel}: {n}")
+        grown = _skip_sites(content) - _skip_sites(original)
+        if grown:
+            out.append(f"{rel}: {sum(grown.values())}")
     return out
 
 _FAILED_TESTS = re.compile(r"(\d+) failed")
