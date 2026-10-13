@@ -78,6 +78,16 @@ class Settings:
         )
 
 
+def effective_repos(settings: Settings) -> list[RepoConfig]:
+    """The repos the daemon actually runs: settings.repos, else NAVIGATOR_REPO, else none.
+
+    Shared by build_navigator and `navigator doctor` so the two can never disagree.
+    """
+    if settings.repos:
+        return list(settings.repos)
+    return [RepoConfig(path=settings.repo)] if settings.repo else []
+
+
 def _int_env(name: str, default: str) -> int:
     raw = os.getenv(name, default)
     try:
