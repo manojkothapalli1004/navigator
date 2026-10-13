@@ -3,8 +3,11 @@
 Every decision here is recorded in ACT; the daemon acts on it next cycle.
 `cleanup [--apply]` is the exception: it removes finished runs' worktrees and
 nav/run-* branches directly (dry run unless --apply).
+`doctor [--plist PATH]` is read-only: it checks the launchd plist's environment
+with the daemon's own repo loader, the SDK version and the navigator git HEAD.
 """
 import os
+import plistlib
 import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -13,7 +16,8 @@ from navigator.observability.notify import format_verification
 from navigator.contracts.enums import (ApprovalDecision, ApprovalGate, ProposalStatus,
                                        RunPhase, RunStatus)
 
-COMMANDS = ("status", "approve", "decline", "diff", "merge", "reject", "retry", "cleanup")
+COMMANDS = ("status", "approve", "decline", "diff", "merge", "reject", "retry", "cleanup",
+            "doctor")
 ACTOR = "operator"
 
 # run statuses whose worktree/branch can go regardless of age
@@ -27,11 +31,14 @@ _ALWAYS_PROTECTED = {"main", "master"}
 def run_cli(argv: list[str], *, act, out: TextIO, worktree_root: str | None = None) -> int:
     if not argv or argv[0] not in COMMANDS:
         print(f"usage: navigator {{{'|'.join(COMMANDS)}}} [id]  "
-              f"(cleanup takes no id: navigator cleanup [--apply])", file=out)
+              f"(cleanup takes no id: navigator cleanup [--apply]; "
+              f"navigator doctor [--plist PATH])", file=out)
         return 2
     cmd, args = argv[0], argv[1:]
     if cmd == "status":
         return _status(act, out)
+    if cmd == "doctor":
+        return _doctor(args, out)
     if cmd == "cleanup":
         if args not in ([], ["--apply"]):
             print("usage: navigator cleanup [--apply]", file=out)
@@ -117,6 +124,155 @@ def _retry(act, pid, out) -> int:
     grant = act.create_approval(target=pid, gate=ApprovalGate.review)
     act.decide_approval(grant.id, ApprovalDecision.approved, actor=ACTOR)
     print(f"{pid}: one retry granted (runs on the daemon's next execute cycle)", file=out)
+    return 0
+
+
+# ---- doctor ------------------------------------------------------------------
+
+_DEFAULT_PLIST = "~/Library/LaunchAgents/com.calwbot.navigator.plist"
+_MIN_SDK = (0, 2, 165)
+_SENSITIVE_MARKERS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL", "AUTH")
+
+
+def _redact(key: str, value: str) -> str:
+    upper = key.upper()
+    if any(m in upper for m in _SENSITIVE_MARKERS):
+        return "<redacted>"
+    if upper.startswith("NAVIGATOR_") or upper == "PATH":
+        return value
+    return "<redacted>"
+
+
+def _sdk_version() -> str | None:
+    """Installed claude-agent-sdk version, or None if not installed."""
+    from importlib import metadata
+    try:
+        return metadata.version("claude-agent-sdk")
+    except metadata.PackageNotFoundError:
+        return None
+
+
+def _version_tuple(v: str) -> tuple[int, ...]:
+    parts = []
+    for piece in v.split("."):
+        digits = ""
+        for ch in piece:
+            if ch.isdigit():
+                digits += ch
+            else:
+                break
+        if not digits:
+            raise ValueError("unparseable version")
+        parts.append(int(digits))
+    return tuple(parts)
+
+
+def _load_repos_with_env(env: dict[str, str]):
+    """Call the daemon's own loader with os.environ replaced by ONLY `env`."""
+    from navigator.config import _repos_env
+    saved = dict(os.environ)
+    try:
+        os.environ.clear()
+        os.environ.update(env)
+        return _repos_env()
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
+
+
+def _doctor(args: list[str], out) -> int:
+    if args == []:
+        plist_arg = _DEFAULT_PLIST
+    elif len(args) == 2 and args[0] == "--plist":
+        plist_arg = args[1]
+    else:
+        print("usage: navigator doctor [--plist PATH]", file=out)
+        return 2
+    plist = Path(plist_arg).expanduser()
+    failures = 0
+
+    try:
+        with open(plist, "rb") as f:
+            data = plistlib.load(f)
+    except Exception as e:
+        print(f"FAIL plist: {type(e).__name__} {plist}", file=out)
+        return 1
+    if not isinstance(data, dict):
+        print(f"FAIL plist: top level is not a dict {plist}", file=out)
+        return 1
+    env_raw = data.get("EnvironmentVariables", {})
+    if not isinstance(env_raw, dict):
+        print(f"FAIL plist: EnvironmentVariables is not a dict {plist}", file=out)
+        return 1
+
+    env: dict[str, str] = {}
+    for k, v in env_raw.items():
+        key = str(k)
+        if not isinstance(v, str):
+            print(f"WARN env {key}: non-string value ({type(v).__name__}) coerced with str()",
+                  file=out)
+        env[key] = str(v)
+
+    print(f"plist: {plist}", file=out)
+    print(f"EnvironmentVariables ({len(env)}):", file=out)
+    for key in sorted(env):
+        print(f"  {key}={_redact(key, env[key])}", file=out)
+
+    # repos: the daemon's loader, seeing only the plist env
+    try:
+        repos = _load_repos_with_env(env)
+    except Exception as e:
+        failures += 1
+        print(f"FAIL repos: {type(e).__name__} {plist}", file=out)
+        repos = None
+    if repos is not None:
+        repos = list(repos or [])
+        if not repos:
+            failures += 1
+            print("FAIL repos: no repos configured", file=out)
+        for r in repos:
+            path = str(getattr(r, "path", r))
+            p = Path(path)  # deliberately no expanduser: the daemon doesn't expand
+            if not p.is_dir():
+                failures += 1
+                print(f"FAIL repo missing: {path}", file=out)
+            elif not (p / ".git").exists():
+                failures += 1
+                print(f"FAIL repo not a git repository: {path}", file=out)
+            else:
+                print(f"ok   repo {path}", file=out)
+
+    # SDK version
+    try:
+        ver = _sdk_version()
+        if ver is None:
+            failures += 1
+            print("FAIL claude-agent-sdk not installed", file=out)
+        elif _version_tuple(ver) < _MIN_SDK:
+            failures += 1
+            print(f"FAIL claude-agent-sdk {ver} < {'.'.join(map(str, _MIN_SDK))}", file=out)
+        else:
+            print(f"ok   claude-agent-sdk {ver}", file=out)
+    except Exception as e:
+        failures += 1
+        print(f"FAIL claude-agent-sdk version: {type(e).__name__}", file=out)
+
+    # navigator code HEAD (informational)
+    nav_root = Path(__file__).resolve().parent.parent
+    try:
+        head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=nav_root,
+                              capture_output=True, text=True)
+        if head.returncode == 0 and head.stdout.strip():
+            print(f"navigator HEAD {head.stdout.strip()}", file=out)
+        else:
+            print(f"WARN navigator HEAD unknown ({nav_root})", file=out)
+    except Exception as e:
+        print(f"WARN navigator HEAD: {type(e).__name__} {nav_root}", file=out)
+
+    if failures:
+        print(f"doctor: {failures} problem(s)", file=out)
+        return 1
+    print("doctor: ok", file=out)
     return 0
 
 
