@@ -3,11 +3,14 @@
 Every decision here is recorded in ACT; the daemon acts on it next cycle.
 `cleanup [--apply]` is the exception: it removes finished runs' worktrees and
 nav/run-* branches directly (dry run unless --apply).
-`doctor [--plist PATH]` is read-only: it checks the launchd plist's environment
-with the daemon's own repo loader, the SDK version and the navigator git HEAD.
+`doctor [--plist PATH]` is read-only: it replays the daemon's startup against the
+launchd plist (ONLY its EnvironmentVariables, cwd = its WorkingDirectory):
+Settings.from_env, effective_repos, the driver choice, the SDK version (only for
+driver=claude_sdk) and the navigator git HEAD.
 """
 import os
 import plistlib
+import re
 import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -131,7 +134,17 @@ def _retry(act, pid, out) -> int:
 
 _DEFAULT_PLIST = "~/Library/LaunchAgents/com.calwbot.navigator.plist"
 _MIN_SDK = (0, 2, 165)
-_SENSITIVE_MARKERS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL", "AUTH")
+_SENSITIVE_MARKERS = ("KEY", "TOKEN", "SECRET", "PASS", "CREDENTIAL", "AUTH", "PRIVATE",
+                      "COOKIE", "SESSION", "BEARER", "DSN", "CERT", "SIGNATURE")
+# drivers _make_driver accepts
+_DRIVERS = ("fake", "claude_sdk")
+# launchd's working directory when the plist sets none
+_LAUNCHD_DEFAULT_CWD = "/"
+_URL_USERINFO = re.compile(r"([A-Za-z][A-Za-z0-9+.-]*://)[^/?#\s]*@")
+
+
+def _strip_userinfo(value: str) -> str:
+    return _URL_USERINFO.sub(r"\1<redacted>@", value)
 
 
 def _redact(key: str, value: str) -> str:
@@ -139,7 +152,7 @@ def _redact(key: str, value: str) -> str:
     if any(m in upper for m in _SENSITIVE_MARKERS):
         return "<redacted>"
     if upper.startswith("NAVIGATOR_") or upper == "PATH":
-        return value
+        return _strip_userinfo(value)
     return "<redacted>"
 
 
@@ -167,17 +180,22 @@ def _version_tuple(v: str) -> tuple[int, ...]:
     return tuple(parts)
 
 
-def _load_repos_with_env(env: dict[str, str]):
-    """Call the daemon's own loader with os.environ replaced by ONLY `env`."""
-    from navigator.config import _repos_env
-    saved = dict(os.environ)
+def _settings_with_env(env: dict[str, str], cwd: str):
+    """Run the daemon's Settings.from_env + effective_repos with os.environ replaced by
+    ONLY `env` and the process cwd set to `cwd`; both are restored afterwards."""
+    from navigator.config import Settings, effective_repos
+    saved_env = dict(os.environ)
+    saved_cwd = os.getcwd()
     try:
         os.environ.clear()
         os.environ.update(env)
-        return _repos_env()
+        os.chdir(cwd)
+        settings = Settings.from_env()
+        return settings, effective_repos(settings)
     finally:
+        os.chdir(saved_cwd)
         os.environ.clear()
-        os.environ.update(saved)
+        os.environ.update(saved_env)
 
 
 def _doctor(args: list[str], out) -> int:
@@ -218,44 +236,83 @@ def _doctor(args: list[str], out) -> int:
     for key in sorted(env):
         print(f"  {key}={_redact(key, env[key])}", file=out)
 
-    # repos: the daemon's loader, seeing only the plist env
-    try:
-        repos = _load_repos_with_env(env)
-    except Exception as e:
+    # working directory: the daemon resolves relative paths against it
+    wd_raw = data.get("WorkingDirectory", _LAUNCHD_DEFAULT_CWD)
+    wd: str | None = None
+    if not isinstance(wd_raw, str):
         failures += 1
-        print(f"FAIL repos: {type(e).__name__} {plist}", file=out)
-        repos = None
+        print(f"FAIL workingdir: not a string ({type(wd_raw).__name__})", file=out)
+    elif not Path(wd_raw).is_absolute():
+        failures += 1
+        print(f"FAIL workingdir: not an absolute path {wd_raw}", file=out)
+    elif not Path(wd_raw).is_dir():
+        failures += 1
+        print(f"FAIL workingdir missing: {wd_raw}", file=out)
+    else:
+        wd = wd_raw
+        print(f"working directory: {wd}", file=out)
+
+    # settings + repos: the daemon's own startup, seeing only the plist env and cwd
+    settings = None
+    repos = None
+    if wd is not None:
+        try:
+            settings, repos = _settings_with_env(env, wd)
+        except Exception as e:
+            failures += 1
+            print(f"FAIL settings: {type(e).__name__}", file=out)
+            settings = repos = None
+
+    if settings is not None:
+        driver = settings.driver
+        if driver not in _DRIVERS:
+            failures += 1
+            print(f"FAIL driver: unknown NAVIGATOR_DRIVER {driver!r}", file=out)
+        else:
+            print(f"ok   driver {driver}", file=out)
+    else:
+        driver = env.get("NAVIGATOR_DRIVER", "fake")
+
     if repos is not None:
-        repos = list(repos or [])
+        repos = list(repos)
         if not repos:
             failures += 1
             print("FAIL repos: no repos configured", file=out)
         for r in repos:
-            path = str(getattr(r, "path", r))
-            p = Path(path)  # deliberately no expanduser: the daemon doesn't expand
-            if not p.is_dir():
+            try:
+                path = str(getattr(r, "path", r))
+                p = Path(path)  # deliberately no expanduser: the daemon doesn't expand
+                if not p.is_absolute():
+                    p = Path(wd) / p
+                if not p.is_dir():
+                    failures += 1
+                    print(f"FAIL repo missing: {path}", file=out)
+                elif not (p / ".git").exists():
+                    failures += 1
+                    print(f"FAIL repo not a git repository: {path}", file=out)
+                else:
+                    print(f"ok   repo {path}", file=out)
+            except Exception as e:
                 failures += 1
-                print(f"FAIL repo missing: {path}", file=out)
-            elif not (p / ".git").exists():
-                failures += 1
-                print(f"FAIL repo not a git repository: {path}", file=out)
-            else:
-                print(f"ok   repo {path}", file=out)
+                print(f"FAIL repo: {type(e).__name__}", file=out)
 
-    # SDK version
-    try:
-        ver = _sdk_version()
-        if ver is None:
+    # SDK version: only the claude_sdk driver needs it
+    if driver == "fake":
+        print("skip claude-agent-sdk (driver=fake)", file=out)
+    elif driver == "claude_sdk":
+        try:
+            ver = _sdk_version()
+            if ver is None:
+                failures += 1
+                print("FAIL claude-agent-sdk not installed", file=out)
+            elif _version_tuple(ver) < _MIN_SDK:
+                failures += 1
+                print(f"FAIL claude-agent-sdk {ver} < {'.'.join(map(str, _MIN_SDK))}", file=out)
+            else:
+                print(f"ok   claude-agent-sdk {ver}", file=out)
+        except Exception as e:
             failures += 1
-            print("FAIL claude-agent-sdk not installed", file=out)
-        elif _version_tuple(ver) < _MIN_SDK:
-            failures += 1
-            print(f"FAIL claude-agent-sdk {ver} < {'.'.join(map(str, _MIN_SDK))}", file=out)
-        else:
-            print(f"ok   claude-agent-sdk {ver}", file=out)
-    except Exception as e:
-        failures += 1
-        print(f"FAIL claude-agent-sdk version: {type(e).__name__}", file=out)
+            print(f"FAIL claude-agent-sdk version: {type(e).__name__}", file=out)
 
     # navigator code HEAD (informational)
     nav_root = Path(__file__).resolve().parent.parent
