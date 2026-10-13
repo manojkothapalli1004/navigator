@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 import httpx
 import structlog
 from navigator.cli import COMMANDS, run_cli
-from navigator.config import RepoConfig, Settings
+from navigator.config import RepoConfig, Settings, effective_repos
 from navigator.runtime.fleet import Fleet
 from navigator.contracts.enums import Role
 from navigator.observability.notify import NotifyingACT, make_notifier
@@ -37,7 +37,7 @@ def _make_driver(settings: Settings):
     raise ValueError(f"unknown NAVIGATOR_DRIVER {settings.driver!r}")
 
 def build_navigator(settings: Settings):
-    repos = settings.repos or ([RepoConfig(path=settings.repo)] if settings.repo else [])
+    repos = effective_repos(settings)
     if not repos:
         raise ValueError("NAVIGATOR_REPO must point at the target git repository")
     notifier = make_notifier()
