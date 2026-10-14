@@ -21,6 +21,9 @@ class Run(BaseModel):
     completed_tasks: list[str] = Field(default_factory=list)
     checkpoints: list[Checkpoint] = Field(default_factory=list)
     verification: list[dict] = Field(default_factory=list)
+    # worktree HEAD at the moment verification passed; the merge gate only merges this
+    # exact commit. None for runs recorded before this field existed.
+    verified_sha: str | None = None
     cost_usd: float = 0.0  # budget-cap estimate, not a bill (runs on the subscription)
     model_calls: int = 0
     correlation_id: str | None = None
