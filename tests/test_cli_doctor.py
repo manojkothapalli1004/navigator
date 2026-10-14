@@ -309,3 +309,88 @@ def test_environ_and_cwd_restored_when_loader_raises(tmp_path):
 def test_doctor_bad_args_usage():
     out = io.StringIO()
     assert run_cli(["doctor", "--bogus"], act=None, out=out) == 2
+
+
+# ---- C5h: _safe never prints URL secrets --------------------------------------
+
+# (leaky value, substrings that must never be printed)
+LEAKY = [
+    ("http://h.local/x?token=TOKSECRET1", ("TOKSECRET1", "token=")),
+    ("https://hooks.slack.com/services/T000/B000/HOOKSECRET2", ("HOOKSECRET2", "T000", "B000")),
+    ("http://u:p/ssSECRET3@h", ("ssSECRET3", "p/ss", "u:p")),
+    ("http://user:pa ssSECRET4@h", ("ssSECRET4", "pa ss", "user:")),
+    ("u:pwSECRET5@h:5432", ("pwSECRET5",)),
+]
+
+
+@pytest.mark.parametrize("value,secrets", LEAKY)
+def test_safe_drops_secret(value, secrets):
+    shown = cli._safe(value)
+    for s in secrets:
+        assert s not in shown
+
+
+@pytest.mark.parametrize("value,secrets", LEAKY)
+def test_doctor_output_never_contains_secret(tmp_path, value, secrets):
+    repo = _git_repo(tmp_path)
+    _, text = _doctor(_plist(tmp_path, {"NAVIGATOR_REPO": str(repo),
+                                        "NAVIGATOR_WEBHOOK_URL": value}))
+    for s in secrets:
+        assert s not in text
+
+
+def test_safe_exact_outputs():
+    assert cli._safe("http://127.0.0.1:8090") == "http://127.0.0.1:8090"
+    assert cli._safe("https://h:9/x?y=1") == "https://h:9/..."
+
+
+def test_doctor_prints_plain_url_unchanged(tmp_path):
+    repo = _git_repo(tmp_path)
+    rc, text = _doctor(_plist(tmp_path, {"NAVIGATOR_REPO": str(repo),
+                                         "NAVIGATOR_WEBHOOK_URL": "http://127.0.0.1:8090"}))
+    assert "NAVIGATOR_WEBHOOK_URL=http://127.0.0.1:8090\n" in text
+
+
+def test_credentialed_navigator_repo_not_printed(tmp_path):
+    value = "https://bob:REPOSECRET6@github.com/o/r.git"
+    rc, text = _doctor(_plist(tmp_path, {"NAVIGATOR_REPO": value}))
+    assert rc == 1
+    assert "REPOSECRET6" not in text and "bob" not in text
+    assert cli._safe(value).find("REPOSECRET6") == -1
+
+
+def test_driver_with_at_sign_not_printed(tmp_path):
+    repo = _git_repo(tmp_path)
+    value = "x:DRVSECRET7@h"
+    rc, text = _doctor(_plist(tmp_path, {"NAVIGATOR_REPO": str(repo),
+                                         "NAVIGATOR_DRIVER": value}))
+    assert rc == 1
+    assert "DRVSECRET7" not in text
+    assert "DRVSECRET7" not in cli._safe(value)
+
+
+def test_environ_restored_even_if_chdir_back_fails(tmp_path, monkeypatch):
+    repo = _git_repo(tmp_path)
+    plist = _plist(tmp_path, {"NAVIGATOR_REPO": str(repo), "ONLY_IN_PLIST": "1"})
+    cwd = os.getcwd()
+    monkeypatch.chdir(cwd)  # teardown restores the cwd
+    real_chdir = os.chdir
+    calls = []
+
+    def flaky_chdir(path):
+        calls.append(path)
+        if len(calls) == 2:  # the chdir back inside _settings_with_env
+            raise OSError("chdir back failed")
+        real_chdir(path)
+
+    before = dict(os.environ)
+    monkeypatch.setattr(os, "chdir", flaky_chdir)
+    try:
+        rc, text = _doctor(plist)
+    finally:
+        real_chdir(cwd)
+    assert len(calls) >= 2
+    assert rc == 1
+    assert "FAIL settings: OSError" in text
+    assert dict(os.environ) == before
+    assert "ONLY_IN_PLIST" not in os.environ
