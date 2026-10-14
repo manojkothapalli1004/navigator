@@ -6,7 +6,8 @@ nav/run-* branches directly (dry run unless --apply).
 `doctor [--plist PATH]` is read-only: it replays the daemon's startup against the
 launchd plist (ONLY its EnvironmentVariables, cwd = its WorkingDirectory):
 Settings.from_env, effective_repos, the driver choice, the SDK version (only for
-driver=claude_sdk) and the navigator git HEAD.
+driver=claude_sdk) and the navigator git HEAD. Every env-derived value it prints
+goes through _safe(), so URL credentials, paths and query strings never appear.
 """
 import os
 import plistlib
@@ -140,20 +141,47 @@ _SENSITIVE_MARKERS = ("KEY", "TOKEN", "SECRET", "PASS", "CREDENTIAL", "AUTH", "P
 _DRIVERS = ("fake", "claude_sdk")
 # launchd's working directory when the plist sets none
 _LAUNCHD_DEFAULT_CWD = "/"
-_URL_USERINFO = re.compile(r"([A-Za-z][A-Za-z0-9+.-]*://)[^/?#\s]*@")
+_REDACTED = "<redacted>"
+_URL_SCHEME = re.compile(r"^([A-Za-z][A-Za-z0-9+.-]*)://(.*)$", re.DOTALL)
+_AUTHORITY_END = re.compile(r"[/?#\s]")
+_HOST_PORT = re.compile(r"^(?:[A-Za-z0-9._-]*|\[[0-9A-Fa-f:.]+\])(?::[0-9]+)?$")
 
 
-def _strip_userinfo(value: str) -> str:
-    return _URL_USERINFO.sub(r"\1<redacted>@", value)
+def _safe(value) -> str:
+    """Printable form of an env-derived value that cannot leak secrets.
+
+    URL with scheme -> scheme://host[:port] plus '/...' if anything followed the
+    authority (userinfo, path, query and fragment are dropped). Anything ambiguous
+    (an '@' after the authority, a host[:port] that does not parse) -> '<redacted>'.
+    Non-URL values containing '@' (or an embedded '://') -> '<redacted>'.
+    Everything else is returned unchanged.
+    """
+    value = str(value)
+    m = _URL_SCHEME.match(value)
+    if m:
+        scheme, rest = m.group(1), m.group(2)
+        end = _AUTHORITY_END.search(rest)
+        authority = rest[:end.start()] if end else rest
+        tail = rest[len(authority):]
+        if "@" in tail:
+            # userinfo may itself contain '/', '?', '#' or spaces: can't tell where it ends
+            return _REDACTED
+        host = authority.rsplit("@", 1)[1] if "@" in authority else authority
+        if not _HOST_PORT.match(host):
+            return _REDACTED
+        return f"{scheme}://{host}" + ("/..." if tail else "")
+    if "@" in value or "://" in value:
+        return _REDACTED
+    return value
 
 
 def _redact(key: str, value: str) -> str:
     upper = key.upper()
     if any(m in upper for m in _SENSITIVE_MARKERS):
-        return "<redacted>"
+        return _REDACTED
     if upper.startswith("NAVIGATOR_") or upper == "PATH":
-        return _strip_userinfo(value)
-    return "<redacted>"
+        return _safe(value)
+    return _REDACTED
 
 
 def _sdk_version() -> str | None:
@@ -182,7 +210,9 @@ def _version_tuple(v: str) -> tuple[int, ...]:
 
 def _settings_with_env(env: dict[str, str], cwd: str):
     """Run the daemon's Settings.from_env + effective_repos with os.environ replaced by
-    ONLY `env` and the process cwd set to `cwd`; both are restored afterwards."""
+    ONLY `env` and the process cwd set to `cwd`; both are restored afterwards. The
+    environment is restored first and independently, so a failing chdir back cannot
+    leave the process running with the plist's environment."""
     from navigator.config import Settings, effective_repos
     saved_env = dict(os.environ)
     saved_cwd = os.getcwd()
@@ -193,9 +223,11 @@ def _settings_with_env(env: dict[str, str], cwd: str):
         settings = Settings.from_env()
         return settings, effective_repos(settings)
     finally:
-        os.chdir(saved_cwd)
-        os.environ.clear()
-        os.environ.update(saved_env)
+        try:
+            os.environ.clear()
+            os.environ.update(saved_env)
+        finally:
+            os.chdir(saved_cwd)
 
 
 def _doctor(args: list[str], out) -> int:
@@ -244,13 +276,13 @@ def _doctor(args: list[str], out) -> int:
         print(f"FAIL workingdir: not a string ({type(wd_raw).__name__})", file=out)
     elif not Path(wd_raw).is_absolute():
         failures += 1
-        print(f"FAIL workingdir: not an absolute path {wd_raw}", file=out)
+        print(f"FAIL workingdir: not an absolute path {_safe(wd_raw)}", file=out)
     elif not Path(wd_raw).is_dir():
         failures += 1
-        print(f"FAIL workingdir missing: {wd_raw}", file=out)
+        print(f"FAIL workingdir missing: {_safe(wd_raw)}", file=out)
     else:
         wd = wd_raw
-        print(f"working directory: {wd}", file=out)
+        print(f"working directory: {_safe(wd)}", file=out)
 
     # settings + repos: the daemon's own startup, seeing only the plist env and cwd
     settings = None
@@ -267,7 +299,7 @@ def _doctor(args: list[str], out) -> int:
         driver = settings.driver
         if driver not in _DRIVERS:
             failures += 1
-            print(f"FAIL driver: unknown NAVIGATOR_DRIVER {driver!r}", file=out)
+            print(f"FAIL driver: unknown NAVIGATOR_DRIVER {_safe(driver)!r}", file=out)
         else:
             print(f"ok   driver {driver}", file=out)
     else:
@@ -281,17 +313,18 @@ def _doctor(args: list[str], out) -> int:
         for r in repos:
             try:
                 path = str(getattr(r, "path", r))
+                shown = _safe(path)
                 p = Path(path)  # deliberately no expanduser: the daemon doesn't expand
                 if not p.is_absolute():
                     p = Path(wd) / p
                 if not p.is_dir():
                     failures += 1
-                    print(f"FAIL repo missing: {path}", file=out)
+                    print(f"FAIL repo missing: {shown}", file=out)
                 elif not (p / ".git").exists():
                     failures += 1
-                    print(f"FAIL repo not a git repository: {path}", file=out)
+                    print(f"FAIL repo not a git repository: {shown}", file=out)
                 else:
-                    print(f"ok   repo {path}", file=out)
+                    print(f"ok   repo {shown}", file=out)
             except Exception as e:
                 failures += 1
                 print(f"FAIL repo: {type(e).__name__}", file=out)
