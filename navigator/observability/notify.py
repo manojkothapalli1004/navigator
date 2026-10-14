@@ -105,7 +105,10 @@ class NotifyingACT:
     def _message(self, kind: str, p: dict) -> str | None:
         run_id = p.get("run_id", "?")
         if kind == "run.awaiting_review":
+            verified = p.get("verified_sha")
+            verified_line = f"verified {verified[:12]}\n" if verified else ""
             return (f"Navigator: {run_id} is ready for review\n{p.get('title', '')}\n"
+                    f"{verified_line}"
                     f"{_diff_summary(p.get('diff', ''))}\n"
                     f"{format_verification(p.get('verification') or [])}\n"
                     f"review: python -m navigator diff {run_id}\n"
