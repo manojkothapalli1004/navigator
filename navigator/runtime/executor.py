@@ -25,6 +25,15 @@ def _emit(act, run, kind, severity=Severity.info, **payload):
     payload = {"run_id": run.id, "proposal_id": run.proposal_id, **payload}
     act.emit_event(Event(kind=kind, severity=severity, correlation_id=run.correlation_id, payload=payload))
 
+def short_sha(sha: str | None) -> str:
+    return (sha or "")[:12] or "?"
+
+def _rev_parse(cwd, rev: str) -> str:
+    """Commit sha for `rev` (trusted runtime git call), or '' if it doesn't resolve."""
+    proc = subprocess.run(["git", "rev-parse", "--verify", "-q", f"{rev}^{{commit}}"], cwd=cwd,
+                          capture_output=True, text=True)
+    return proc.stdout.strip() if proc.returncode == 0 else ""
+
 _CODE_SHA_UNSET = object()
 _code_sha_cache = _CODE_SHA_UNSET
 
@@ -114,12 +123,14 @@ def execute_proposal(proposal: Proposal, *, act, orc, driver, runner, settings,
                        verification_notes=result.verify_output[-1500:], preserved=handle.path,
                        checkpoints_made=len(result.checkpoints), settings=settings)
         _emit(act, run, "run.failed", Severity.error); return run
+    # the merge gate merges only this exact commit
+    run.verified_sha = _rev_parse(handle.path, "HEAD") or None
     run.phase = RunPhase.awaiting_review; _save(act, run)
     act.create_approval(target=run.id, gate=ApprovalGate.merge)
     # Correction 1: store diff in event payload, not as a transient Run attribute
     diff = diff_artifact(handle.path, head)
     _emit(act, run, "run.awaiting_review", diff=diff, title=proposal.title,
-          verification=run.verification)
+          verification=run.verification, verified_sha=run.verified_sha)
     return run
 
 def _merge_approved(act, run) -> bool:
@@ -139,13 +150,29 @@ def _merge_preflight(repo: str, run: Run) -> str | None:
         return "main checkout has uncommitted changes to tracked files"
     return None
 
+def _verified_check(repo: str, run: Run) -> str | None:
+    """Reason the run branch no longer points at the verified commit, else None.
+    Runs recorded before verified_sha existed are not checked."""
+    if not run.verified_sha:
+        return None
+    current = _rev_parse(repo, f"refs/heads/{run.branch}")
+    if current != run.verified_sha:
+        return (f"branch changed since verification: "
+                f"{short_sha(current) if current else 'missing'} != {short_sha(run.verified_sha)}")
+    return None
+
 def _git_merge(repo: str, run: Run, squash: bool, title: str):
+    # merge the exact verified commit when known, never whatever the branch points at now
+    rev = run.verified_sha or run.branch
     if not squash:
-        return subprocess.run(["git", "merge", "--no-ff", "-m", f"{title} (navigator {run.id})", run.branch],
+        msg = f"{title} (navigator {run.id})"
+        if run.verified_sha:
+            msg += f" verified {short_sha(run.verified_sha)}"
+        return subprocess.run(["git", "merge", "--no-ff", "-m", msg, rev],
                               cwd=repo, capture_output=True, text=True)
     # public repos: one commit under the repo's own identity; the run branch's
     # navigator@local checkpoints never enter history
-    merge = subprocess.run(["git", "merge", "--squash", run.branch], cwd=repo,
+    merge = subprocess.run(["git", "merge", "--squash", rev], cwd=repo,
                            capture_output=True, text=True)
     if merge.returncode != 0:
         return merge
@@ -177,7 +204,7 @@ def merge_after_approval(run: Run, *, act, orc, driver, runner, settings, squash
     if not _merge_approved(act, run):
         return run  # never auto-merge
     repo = _repo_for(run, act)
-    blocked = _merge_preflight(repo, run)
+    blocked = _merge_preflight(repo, run) or _verified_check(repo, run)
     if blocked:
         # stays parked at the gate; the next poll retries once the operator is done
         _emit(act, run, "run.merge_blocked", Severity.warning, reason=blocked)
