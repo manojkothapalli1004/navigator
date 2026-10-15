@@ -4,6 +4,7 @@ from typing import Callable
 from navigator.runtime.drivers.base import ROLE_PERMISSIONS, DriverRequest, DriverResult
 from navigator.contracts.enums import Role
 from navigator.safety.budget_guard import BudgetGuard
+from navigator.safety.command_runner import git_flag_allowlist_text
 from navigator.safety.errors import DriverParseError
 
 _PROPOSAL_KEYS = {"title": str, "rationale": str, "intended_changes": str, "affected_files": list}
@@ -19,7 +20,7 @@ _ROLE_OUTPUT_SPEC = {
                    'failed with that output: fix its cause (e.g. update existing tests that call '
                    'changed APIs). '
                    'Respond with ONLY a JSON object: {"file_writes": [[relpath, FULL new file content], ...], '
-                   '"commands": [], "summary": "..."}. Each content replaces the whole file — '
+                   '"commands": [], "summary": "..."}. Each content replaces the whole file \u2014 '
                    'never elide unchanged code. Only write paths listed in context.files, plus test files. '
                    'If the repo has tests, add or update tests that exercise the new or changed '
                    'behaviour (a passing suite that never runs the new path proves nothing). '
@@ -33,6 +34,15 @@ _ROLE_OUTPUT_SPEC = {
                     'relative to it (context.changed_files already are). Respond with ONLY a JSON '
                     'object: {"commands": [[argv...], ...], "summary": "..."}'),
 }
+
+_COMMAND_ROLES = (Role.builder, Role.verifier)
+
+
+def git_flags_prompt_line() -> str:
+    return ("git flag allowlist per subcommand (applies to context.allowed_commands entries "
+            "starting with git; any other dashed git flag is rejected): "
+            + git_flag_allowlist_text())
+
 
 class ClaudeSDKDriver:
     """SubagentDriver backed by an injectable LLM query function.
@@ -60,6 +70,8 @@ class ClaudeSDKDriver:
         lines = [f"role: {request.role.value}", f"context: {json.dumps(request.context)}"]
         if request.worktree_path is not None:
             lines.append(f"worktree: {request.worktree_path}")
+        if request.role in _COMMAND_ROLES:
+            lines.append(git_flags_prompt_line())
         lines.append(_ROLE_OUTPUT_SPEC[request.role])
         return "\n".join(lines)
 
@@ -110,7 +122,7 @@ class ClaudeSDKDriver:
 
     @staticmethod
     def _parse_command(entry) -> list[str]:
-        # models sometimes send a command as one string; split it (no shell involved —
+        # models sometimes send a command as one string; split it (no shell involved \u2014
         # the command runner still applies every metacharacter/allowlist check)
         if isinstance(entry, str) and entry.strip():
             try:
