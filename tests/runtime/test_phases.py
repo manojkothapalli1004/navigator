@@ -1,9 +1,11 @@
 import subprocess
+import time
 from collections import Counter
 from pathlib import Path
 import pytest
 from navigator.runtime.worktree import create_worktree
-from navigator.runtime.phases import run_build_and_verify, _resolve_write_target, _added_skips, _skip_sites
+from navigator.runtime.phases import (run_build_and_verify, _resolve_write_target, _added_skips, _skip_sites,
+                                      _skip_sites_by_name, _skip_sites_resolved, _skip_growth)
 from navigator.runtime.drivers.base import DriverRequest, DriverResult
 from navigator.runtime.drivers.fake_driver import FakeSubagentDriver
 from navigator.safety.command_runner import CommandRunner
@@ -66,7 +68,7 @@ class _RecordingDriver:
         return DriverResult(role=Role.verifier, commands=[["python3", "-m", "py_compile", "a.py"]])
 
 def test_builder_and_verifier_receive_proposal_and_file_contents(tmp_path):
-    # observed 2026-10-09: both roles got context={} — a real LLM with tools
+    # observed 2026-10-09: both roles got context={} - a real LLM with tools
     # disabled would have to invent whole files blind
     repo, _ = _seed(tmp_path)
     (repo/"a.py").write_text("x = 1\n")
@@ -296,7 +298,7 @@ def test_builder_gets_read_only_context_of_other_repo_files(tmp_path):
 
 
 def test_previous_failure_test_files_are_given_to_the_builder_in_full(tmp_path):
-    # live 2026-10-11: a retry still couldn't update tests/test_pings.py — too big
+    # live 2026-10-11: a retry still couldn't update tests/test_pings.py - too big
     # for the reference budget, and builders write whole files
     repo, _ = _seed(tmp_path)
     (repo/"backend"/"tests").mkdir(parents=True)
@@ -484,3 +486,99 @@ def test_site_in_non_test_module_is_not_counted(tmp_path):
     src = f"import pytest\n\ndef bail():\n    pytest.{SK}('r')\n"
     assert _skip_sites(src) == Counter({SK: 1})
     assert _grown(tmp_path, "pkg/helper.py", src) == []
+
+
+# G1e-1c: resolved detector, either-detector gate delta, bounded alias resolution
+
+SKEXC = "Sk" + "ipTest"
+
+
+def _reverse_chain(n):
+    lines = ["import pytest"] + [f"a{i} = a{i + 1}" for i in range(n - 1)]
+    lines += [f"a{n - 1} = pytest.{SK}", "a0()"]
+    return "\n".join(lines) + "\n"
+
+
+def test_by_name_site_is_not_hidden_by_resolved_sites_in_old_file(tmp_path):
+    # B1: a per-kind max of the two detectors on each side hid this new site
+    old = f"from pytest import {SK} as s\n\ndef test_a():\n    s('a')\n    s('b')\n"
+    new = old + f"\ndef test_b(p):\n    p.{SK}('c')\n"
+    assert _skip_sites_by_name(old) == Counter()
+    assert _skip_sites_resolved(old) == Counter({SK: 2})
+    assert _skip_growth(new, old) == Counter({SK: 1})
+    assert _grown(tmp_path, "tests/test_b1.py", new, old=old) == ["tests/test_b1.py: 1"]
+
+
+def _superset_sources():
+    return [
+        f"import _pytest.outcomes as o\n\ndef test_a():\n    o.{SK}('r')\n",
+        f"from _pytest import outcomes\n\ndef test_a():\n    outcomes.{SK}('r')\n",
+        f"from _pytest.mark import MARK_GEN as m\n\n@m.{SK}\ndef test_a():\n    pass\n",
+        f"import nose.tools as nt\n\ndef test_a():\n    nt.{SK}('r')\n",
+        f"def test_a():\n    __import__('pytest').{SK}('r')\n",
+        f"import importlib\n\ndef test_a():\n    importlib.import_module('pytest').{SK}('r')\n",
+        f"import pytest\n\ndef m():\n    return pytest\n\ndef test_a():\n    m().{SK}('r')\n",
+        f"def test_a(db):\n    db.find().{SK}(10)\n",
+    ]
+
+
+@pytest.mark.parametrize("idx", range(8))
+def test_gate_delta_is_never_below_main(tmp_path, idx):
+    src = _superset_sources()[idx]
+    main = _skip_sites_by_name(src)
+    assert main[SK] >= 1
+    got = _skip_growth(src, "")
+    assert all(got[k] >= n for k, n in main.items())
+    assert _grown(tmp_path, "tests/test_b2.py", src) == [f"tests/test_b2.py: {sum(got.values())}"]
+
+
+def test_resolved_counts_are_exact():
+    imported = f"from pytest import {SK} as s\n\ndef test_a():\n    s('a')\n    s('b')\n"
+    marker = (f"import pytest\nm = pytest.mark.{SK}(reason='x')\n\n"
+              "@m\ndef test_a():\n    pass\n\n@m\ndef test_b():\n    pass\n")
+    bound = ("import unittest\n\nclass T(unittest.TestCase):\n"
+             f"    def test_a(self):\n        f = self.{STEST}\n        f('r')\n")
+    raised = f"import unittest\n\ndef test_a():\n    raise unittest.{SKEXC}\n"
+    assert _skip_sites_resolved(imported) == Counter({SK: 2})
+    assert _skip_sites_resolved(marker) == Counter({SK: 2})
+    assert _skip_sites_resolved(bound) == Counter({STEST: 1})
+    assert _skip_sites_resolved(raised) == Counter({SKEXC: 1})
+    assert _skip_sites(marker) == Counter({SK: 2})
+
+
+def test_reverse_alias_chain_resolves_in_any_order():
+    src = _reverse_chain(60)
+    assert _skip_sites_resolved(src) == Counter({SK: 1})
+    assert _skip_sites(src) == Counter({SK: 1})
+
+
+def test_long_reverse_alias_chain_is_fast():
+    src = _reverse_chain(2000)
+    t0 = time.perf_counter()
+    got = _skip_sites_resolved(src)
+    elapsed = time.perf_counter() - t0
+    assert isinstance(got, Counter)
+    assert got == Counter({SK: 1})
+    assert elapsed < 0.5
+
+
+def test_self_aliases_stay_bounded():
+    src = ("import pytest\n" + "".join(f"pytest = pytest.a{i}\n" for i in range(50))
+           + f"pytest.{SK}('r')\n")
+    t0 = time.perf_counter()
+    got = _skip_sites_resolved(src)
+    elapsed = time.perf_counter() - t0
+    assert got == Counter({SK: 1})
+    assert elapsed < 0.5
+
+
+def test_suffix_test_files_are_skip_gated_but_do_not_widen_scope(tmp_path):
+    from navigator.runtime.phases import _check_scope, _is_test_file, _skip_gated
+    with pytest.raises(ValueError, match="foo_test"):
+        _check_scope(["pkg/foo_test.py"], ["a.py"])
+    with pytest.raises(ValueError, match="ab_test"):
+        _check_scope(["navigator/runtime/ab_test.py"], ["a.py"])
+    assert _is_test_file("pkg/foo_test.py") is False
+    assert _skip_gated("pkg/foo_test.py")
+    src = f"import pytest\n\ndef test_a():\n    pytest.{SK}('r')\n"
+    assert _grown(tmp_path, "pkg/foo_test.py", src) == ["pkg/foo_test.py: 1"]
