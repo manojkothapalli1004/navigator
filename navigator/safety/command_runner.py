@@ -15,6 +15,75 @@ _GIT_SAFE_FLAGS = {
     "diff": {"--stat", "--name-only", "--name-status", "--cached", "--staged", "--"},
     "log": {"--oneline", "--name-only", "--stat", "-1", "-5", "-10", "-20", "--"},
 }
+# Count flags accepted per subcommand: `-n <int>`, `-n<int>`, `--max-count <int>`,
+# `--max-count=<int>` with 1 <= int <= _GIT_MAX_COUNT. The integer is consumed as
+# the flag's value (live: verifiers naturally write `git log -n 5`).
+_GIT_COUNT_FLAGS = {"log": ("-n", "--max-count")}
+_GIT_MAX_COUNT = 50
+
+
+def _allowed_flags_display(subcommand: str) -> list[str]:
+    flags = sorted(_GIT_SAFE_FLAGS.get(subcommand, set()))
+    for f in _GIT_COUNT_FLAGS.get(subcommand, ()):
+        flags.append(f"{f} <1-{_GIT_MAX_COUNT}>")
+    return flags
+
+
+def git_flag_allowlist_text() -> str:
+    """Human/LLM-readable per-subcommand git flag allowlist (prompt material)."""
+    parts = []
+    for sub in sorted(_GIT_SAFE_FLAGS):
+        line = f"git {sub}: {', '.join(_allowed_flags_display(sub))}"
+        if "--max-count" in _GIT_COUNT_FLAGS.get(sub, ()):
+            line += f" (also -n<N> and --max-count=<N>, N in 1-{_GIT_MAX_COUNT})"
+        parts.append(line)
+    return "; ".join(parts)
+
+
+def _count_ok(raw: str | None) -> bool:
+    if raw is None or not raw.isascii() or not raw.isdigit():
+        return False
+    return 1 <= int(raw) <= _GIT_MAX_COUNT
+
+
+def _split_count(token: str, args: list[str], i: int, count_flags: tuple):
+    """Return (flag, value, tokens_consumed) if token is a count flag, else None."""
+    if token in count_flags:
+        value = args[i + 1] if i + 1 < len(args) else None
+        return token, value, 2
+    if "--max-count" in count_flags and token.startswith("--max-count="):
+        return "--max-count", token.split("=", 1)[1], 1
+    if "-n" in count_flags and token.startswith("-n") and not token.startswith("--") and len(token) > 2:
+        return "-n", token[2:], 1
+    return None
+
+
+def _check_git_flags(subcommand: str, args: list[str]) -> None:
+    safe = _GIT_SAFE_FLAGS.get(subcommand, set())
+    count_flags = _GIT_COUNT_FLAGS.get(subcommand, ())
+    flags = _allowed_flags_display(subcommand)
+    allowed = ", ".join(flags) if flags else "none"
+    i = 0
+    while i < len(args):
+        token = args[i]
+        if token.startswith("-") and token not in safe:
+            split = _split_count(token, args, i, count_flags) if count_flags else None
+            if split is not None:
+                flag, value, consumed = split
+                if not _count_ok(value):
+                    raise CommandRejected(
+                        f"git flag not on safe list for 'git {subcommand}': {token!r} "
+                        f"needs an integer count 1-{_GIT_MAX_COUNT} for {flag} (got {value!r}) "
+                        f"(allowed: {allowed})"
+                    )
+                i += consumed
+                continue
+            raise CommandRejected(
+                f"git flag not on safe list for 'git {subcommand}': {token!r} "
+                f"(allowed: {allowed})"
+            )
+        i += 1
+
 
 def _clean_env() -> dict[str, str]:
     # commands run the target repo's tooling; they must not see Navigator's own
@@ -50,15 +119,7 @@ class CommandRunner:
         if not self._is_allowed(argv):
             raise CommandRejected(f"command not on allowlist: {' '.join(argv)}")
         if argv[0] == "git" and len(argv) >= 2:
-            subcommand = argv[1]
-            safe = _GIT_SAFE_FLAGS.get(subcommand, set())
-            for token in argv[2:]:
-                if token.startswith("-") and token not in safe:
-                    allowed = ", ".join(sorted(safe)) if safe else "none"
-                    raise CommandRejected(
-                        f"git flag not on safe list for 'git {subcommand}': {token!r} "
-                        f"(allowed: {allowed})"
-                    )
+            _check_git_flags(argv[1], argv[2:])
         cwd = Path(cwd).resolve()
         if cwd != self.worktree_root and self.worktree_root not in cwd.parents:
             raise CommandRejected(f"cwd outside worktree: {cwd}")

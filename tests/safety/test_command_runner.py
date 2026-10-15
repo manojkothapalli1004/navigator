@@ -130,3 +130,69 @@ def test_commands_do_not_inherit_navigator_configuration(tmp_path, monkeypatch):
     assert seen["env"] is not None
     assert not any(k.startswith("NAVIGATOR_") for k in seen["env"])
     assert "PATH" in seen["env"]
+
+
+# --- N6: bounded git log -n / --max-count ---
+
+def _repo_with_commits(tmp_path, n=2):
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
+    for i in range(n):
+        subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit",
+                        "--allow-empty", "-m", f"c{i}"], cwd=tmp_path, check=True,
+                       capture_output=True)
+
+
+@pytest.mark.parametrize("args", [
+    ["-n", "5"], ["-n5"], ["--max-count", "5"], ["--max-count=5"],
+    ["-n", "1"], ["-n", "50"], ["--oneline", "-n", "3"], ["-n", "2", "--stat"],
+    ["-1"],
+])
+def test_git_log_count_forms_accepted(tmp_path, args):
+    _repo_with_commits(tmp_path)
+    r = _runner(tmp_path).run(["git", "log", *args], cwd=tmp_path)
+    # rc 0 also proves the integer reached git as the flag's value, not a revision
+    assert r.returncode == 0, r.stderr
+
+
+def test_git_log_count_limits_output(tmp_path):
+    _repo_with_commits(tmp_path, n=3)
+    r = _runner(tmp_path).run(["git", "log", "--oneline", "-n", "2"], cwd=tmp_path)
+    assert len(r.stdout.strip().splitlines()) == 2
+
+
+@pytest.mark.parametrize("args", [
+    ["-n", "abc"], ["-n", "0"], ["-n", "999"], ["-n", "51"], ["-n"],
+    ["-n0"], ["-n999"], ["-nabc"], ["-n", "-1"], ["--max-count"],
+    ["--max-count=0"], ["--max-count=51"], ["--max-count="], ["--max-count", "x"],
+])
+def test_git_log_bad_count_rejected(tmp_path, args):
+    with pytest.raises(CommandRejected) as exc:
+        _runner(tmp_path).run(["git", "log", *args], cwd=tmp_path)
+    msg = str(exc.value)
+    assert msg.startswith("git flag not on safe list for 'git log'")
+    assert "1-50" in msg
+
+
+def test_count_flag_only_for_git_log(tmp_path):
+    with pytest.raises(CommandRejected, match="'git diff'"):
+        _runner(tmp_path).run(["git", "diff", "-n", "5"], cwd=tmp_path)
+
+
+def test_count_does_not_unlock_other_flags(tmp_path):
+    with pytest.raises(CommandRejected, match="--all"):
+        _runner(tmp_path).run(["git", "log", "-n", "5", "--all"], cwd=tmp_path)
+
+
+def test_git_log_rejection_lists_count_flags(tmp_path):
+    with pytest.raises(CommandRejected) as exc:
+        _runner(tmp_path).run(["git", "log", "--all"], cwd=tmp_path)
+    assert "-n <1-50>" in str(exc.value)
+    assert "--max-count <1-50>" in str(exc.value)
+
+
+def test_git_flag_allowlist_text_covers_every_subcommand():
+    from navigator.safety.command_runner import git_flag_allowlist_text
+    text = git_flag_allowlist_text()
+    assert "git status: " in text and "git diff: " in text and "git log: " in text
+    assert "-n <1-50>" in text and "--max-count <1-50>" in text
+    assert "--oneline" in text and "--porcelain" in text
