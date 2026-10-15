@@ -20,6 +20,9 @@ _GIT_SAFE_FLAGS = {
 # the flag's value (live: verifiers naturally write `git log -n 5`).
 _GIT_COUNT_FLAGS = {"log": ("-n", "--max-count")}
 _GIT_MAX_COUNT = 50
+# Longest digit string a valid count can have (_GIT_MAX_COUNT has 2 digits). Checked
+# before int() so huge inputs cannot hit Python's int-string-conversion limit.
+_GIT_MAX_COUNT_DIGITS = len(str(_GIT_MAX_COUNT))
 
 
 def _allowed_flags_display(subcommand: str) -> list[str]:
@@ -41,9 +44,18 @@ def git_flag_allowlist_text() -> str:
 
 
 def _count_ok(raw: str | None) -> bool:
-    if raw is None or not raw.isascii() or not raw.isdigit():
+    """True iff raw is an ASCII decimal integer in 1.._GIT_MAX_COUNT. Never raises."""
+    if raw is None or not isinstance(raw, str):
         return False
-    return 1 <= int(raw) <= _GIT_MAX_COUNT
+    if not raw or len(raw) > _GIT_MAX_COUNT_DIGITS:
+        return False
+    if not raw.isascii() or not raw.isdigit():
+        return False
+    try:
+        value = int(raw)
+    except (ValueError, TypeError):
+        return False
+    return 1 <= value <= _GIT_MAX_COUNT
 
 
 def _split_count(token: str, args: list[str], i: int, count_flags: tuple):
@@ -71,9 +83,10 @@ def _check_git_flags(subcommand: str, args: list[str]) -> None:
             if split is not None:
                 flag, value, consumed = split
                 if not _count_ok(value):
+                    shown = value if value is None or len(value) <= 40 else value[:40] + "..."
                     raise CommandRejected(
-                        f"git flag not on safe list for 'git {subcommand}': {token!r} "
-                        f"needs an integer count 1-{_GIT_MAX_COUNT} for {flag} (got {value!r}) "
+                        f"git flag not on safe list for 'git {subcommand}': {token[:60]!r} "
+                        f"needs an integer count 1-{_GIT_MAX_COUNT} for {flag} (got {shown!r}) "
                         f"(allowed: {allowed})"
                     )
                 i += consumed
@@ -116,6 +129,11 @@ class CommandRunner:
                 raise CommandRejected(f"rejected flag: {token!r}")
             if token.startswith("/"):
                 raise CommandRejected(f"absolute path token not allowed: {token!r}")
+        # git global options before the subcommand (-c, --git-dir, --exec-path, ...)
+        # can run arbitrary programs or escape the worktree; never allow them, even if
+        # an operator allowlists bare 'git'.
+        if argv and argv[0] == "git" and len(argv) >= 2 and argv[1].startswith("-"):
+            raise CommandRejected(f"git global option before subcommand not allowed: {argv[1]!r}")
         if not self._is_allowed(argv):
             raise CommandRejected(f"command not on allowlist: {' '.join(argv)}")
         if argv[0] == "git" and len(argv) >= 2:
