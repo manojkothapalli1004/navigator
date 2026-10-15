@@ -6,13 +6,26 @@ nav/run-* branches directly (dry run unless --apply).
 `doctor [--plist PATH]` is read-only: it replays the daemon's startup against the
 launchd plist (ONLY its EnvironmentVariables, cwd = its WorkingDirectory):
 Settings.from_env, effective_repos, the driver choice, the SDK version (only for
-driver=claude_sdk) and the navigator git HEAD. Every env-derived value it prints
-goes through _safe(), so URL credentials, paths and query strings never appear.
+driver=claude_sdk) and the navigator git HEAD.
+
+What doctor prints for env-derived values (all through _safe()):
+- env vars whose key has a sensitive marker, or that are neither NAVIGATOR_* nor
+  PATH, always print as '<redacted>';
+- a value of the form scheme://... prints as scheme://host[:port], plus '/...' if
+  anything followed the authority (userinfo, path, query, fragment are dropped);
+  if that form is ambiguous it prints as '<redacted>';
+- any other value containing '@', '%40', '?' or '://', or starting with
+  'scheme:/', prints as '<redacted>';
+- every other value (e.g. a plain filesystem path) prints unchanged.
+In every printed value and env key, control characters (CR, LF, tab, NUL, line/
+paragraph separators, ...) are replaced with '?', so a value cannot forge an
+extra output line.
 """
 import os
 import plistlib
 import re
 import subprocess
+import unicodedata
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TextIO
@@ -144,8 +157,18 @@ _DRIVERS = ("fake", "claude_sdk")
 _LAUNCHD_DEFAULT_CWD = "/"
 _REDACTED = "<redacted>"
 _URL_SCHEME = re.compile(r"^([A-Za-z][A-Za-z0-9+.-]*)://(.*)$", re.DOTALL)
+_SCHEME_PREFIX = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:/")
 _AUTHORITY_END = re.compile(r"[/?#\s]")
 _HOST_PORT = re.compile(r"^(?:[A-Za-z0-9._-]*|\[[0-9A-Fa-f:.]+\])(?::[0-9]+)?$")
+# control, format, surrogate and line/paragraph separator characters
+_UNPRINTABLE_CATEGORIES = ("Cc", "Cf", "Cs", "Zl", "Zp")
+
+
+def _printable(value) -> str:
+    """`value` with every control/format/line-separator character replaced by '?',
+    so printing it can never start a new output line."""
+    return "".join("?" if unicodedata.category(ch) in _UNPRINTABLE_CATEGORIES else ch
+                   for ch in str(value))
 
 
 def _safe(value) -> str:
@@ -154,8 +177,9 @@ def _safe(value) -> str:
     URL with scheme -> scheme://host[:port] plus '/...' if anything followed the
     authority (userinfo, path, query and fragment are dropped). Anything ambiguous
     (an '@' after the authority, a host[:port] that does not parse) -> '<redacted>'.
-    Non-URL values containing '@' (or an embedded '://') -> '<redacted>'.
-    Everything else is returned unchanged.
+    Non-URL values containing '@', '%40', '?' or '://', or starting with
+    'scheme:/' -> '<redacted>'. Everything else is returned unchanged except that
+    control characters (and line/paragraph separators) become '?'.
     """
     value = str(value)
     m = _URL_SCHEME.match(value)
@@ -170,10 +194,11 @@ def _safe(value) -> str:
         host = authority.rsplit("@", 1)[1] if "@" in authority else authority
         if not _HOST_PORT.match(host):
             return _REDACTED
-        return f"{scheme}://{host}" + ("/..." if tail else "")
-    if "@" in value or "://" in value:
+        return _printable(f"{scheme}://{host}" + ("/..." if tail else ""))
+    if ("@" in value or "%40" in value or "?" in value or "://" in value
+            or _SCHEME_PREFIX.match(value)):
         return _REDACTED
-    return value
+    return _printable(value)
 
 
 def _redact(key: str, value: str) -> str:
@@ -240,34 +265,35 @@ def _doctor(args: list[str], out) -> int:
         print("usage: navigator doctor [--plist PATH]", file=out)
         return 2
     plist = Path(plist_arg).expanduser()
+    shown_plist = _printable(plist)
     failures = 0
 
     try:
         with open(plist, "rb") as f:
             data = plistlib.load(f)
     except Exception as e:
-        print(f"FAIL plist: {type(e).__name__} {plist}", file=out)
+        print(f"FAIL plist: {type(e).__name__} {shown_plist}", file=out)
         return 1
     if not isinstance(data, dict):
-        print(f"FAIL plist: top level is not a dict {plist}", file=out)
+        print(f"FAIL plist: top level is not a dict {shown_plist}", file=out)
         return 1
     env_raw = data.get("EnvironmentVariables", {})
     if not isinstance(env_raw, dict):
-        print(f"FAIL plist: EnvironmentVariables is not a dict {plist}", file=out)
+        print(f"FAIL plist: EnvironmentVariables is not a dict {shown_plist}", file=out)
         return 1
 
     env: dict[str, str] = {}
     for k, v in env_raw.items():
         key = str(k)
         if not isinstance(v, str):
-            print(f"WARN env {key}: non-string value ({type(v).__name__}) coerced with str()",
-                  file=out)
+            print(f"WARN env {_printable(key)}: non-string value ({type(v).__name__}) "
+                  f"coerced with str()", file=out)
         env[key] = str(v)
 
-    print(f"plist: {plist}", file=out)
+    print(f"plist: {shown_plist}", file=out)
     print(f"EnvironmentVariables ({len(env)}):", file=out)
     for key in sorted(env):
-        print(f"  {key}={_redact(key, env[key])}", file=out)
+        print(f"  {_printable(key)}={_redact(key, env[key])}", file=out)
 
     # working directory: the daemon resolves relative paths against it
     wd_raw = data.get("WorkingDirectory", _LAUNCHD_DEFAULT_CWD)
@@ -341,9 +367,10 @@ def _doctor(args: list[str], out) -> int:
                 print("FAIL claude-agent-sdk not installed", file=out)
             elif _version_tuple(ver) < _MIN_SDK:
                 failures += 1
-                print(f"FAIL claude-agent-sdk {ver} < {'.'.join(map(str, _MIN_SDK))}", file=out)
+                print(f"FAIL claude-agent-sdk {_printable(ver)} < "
+                      f"{'.'.join(map(str, _MIN_SDK))}", file=out)
             else:
-                print(f"ok   claude-agent-sdk {ver}", file=out)
+                print(f"ok   claude-agent-sdk {_printable(ver)}", file=out)
         except Exception as e:
             failures += 1
             print(f"FAIL claude-agent-sdk version: {type(e).__name__}", file=out)
