@@ -91,7 +91,8 @@ class NotifyingACT:
     def __init__(self, inner, notifier: Notifier):
         self.inner = inner
         self.notifier = notifier
-        self._blocked_announced: set[str] = set()
+        # (run_id, reason): a new block reason on the same run is announced once
+        self._blocked_announced: set[tuple[str, str]] = set()
 
     def __getattr__(self, name):
         return getattr(self.inner, name)
@@ -115,12 +116,14 @@ class NotifyingACT:
                     f"merge:  python -m navigator merge {run_id}\n"
                     f"reject: python -m navigator reject {run_id}")
         if kind == "run.merge_blocked":
-            if run_id in self._blocked_announced:
+            reason = p.get("reason", "") or ""
+            key = (run_id, reason)
+            if key in self._blocked_announced:
                 return None
-            self._blocked_announced.add(run_id)
-            return f"Navigator: merge of {run_id} is waiting — {p.get('reason', '')}"
+            self._blocked_announced.add(key)
+            return f"Navigator: merge of {run_id} is waiting \u2014 {reason}"
         if kind == "run.failed":
-            return f"Navigator: {run_id} FAILED — {p.get('error') or 'see outcome'}"
+            return f"Navigator: {run_id} FAILED \u2014 {p.get('error') or 'see outcome'}"
         if kind == "run.declined":
             return f"Navigator: {run_id} declined; worktree kept for inspection"
         if kind == "run.completed":

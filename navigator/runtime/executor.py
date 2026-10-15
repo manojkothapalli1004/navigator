@@ -150,6 +150,15 @@ def _merge_preflight(repo: str, run: Run) -> str | None:
         return "main checkout has uncommitted changes to tracked files"
     return None
 
+def _missing_branch(repo: str, run: Run) -> str | None:
+    """Reason the run is unmergeable for good: its verified branch is gone. Waiting
+    can't fix that, so the run fails instead of parking forever."""
+    if not run.verified_sha:
+        return None
+    if _rev_parse(repo, f"refs/heads/{run.branch}"):
+        return None
+    return f"run branch missing; verified {short_sha(run.verified_sha)}"
+
 def _verified_check(repo: str, run: Run) -> str | None:
     """Reason the run branch no longer points at the verified commit, else None.
     Runs recorded before verified_sha existed are not checked."""
@@ -204,6 +213,15 @@ def merge_after_approval(run: Run, *, act, orc, driver, runner, settings, squash
     if not _merge_approved(act, run):
         return run  # never auto-merge
     repo = _repo_for(run, act)
+    missing = _missing_branch(repo, run)
+    if missing:
+        run.status = RunStatus.failed; run.phase = RunPhase.finalizing
+        run.ended_at = datetime.now(timezone.utc); _save(act, run)
+        _write_outcome(orc, run, status="failed", summary=missing,
+                       lessons=["run branch was deleted after verification — re-propose"],
+                       preserved=run.worktree_path, settings=settings)
+        _emit(act, run, "run.failed", Severity.error, error=missing)
+        return run
     blocked = _merge_preflight(repo, run) or _verified_check(repo, run)
     if blocked:
         # stays parked at the gate; the next poll retries once the operator is done
