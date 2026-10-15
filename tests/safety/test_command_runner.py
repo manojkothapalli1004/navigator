@@ -196,3 +196,57 @@ def test_git_flag_allowlist_text_covers_every_subcommand():
     assert "git status: " in text and "git diff: " in text and "git log: " in text
     assert "-n <1-50>" in text and "--max-count <1-50>" in text
     assert "--oneline" in text and "--porcelain" in text
+
+
+# --- N6b: count parsing never crashes; dangerous flags after a count; global options ---
+
+@pytest.mark.parametrize("args", [
+    ["-n5", "-p"],
+    ["-n", "5", "--output=x"],
+    ["-n", "--exec"],
+    ["--max-count=5=6"],
+    ["-n", "\uff15"],
+    ["-n", "\u0665"],
+    ["-nn5"],
+    ["-1n5"],
+    ["-n", "9" * 5000],
+    ["-n" + "9" * 5000],
+    ["--max-count=" + "9" * 5000],
+    ["--max-count", "9" * 5000],
+])
+def test_git_log_hostile_count_forms_rejected(tmp_path, args):
+    # must raise CommandRejected (never ValueError) -- phases only catch CommandRejected
+    with pytest.raises(CommandRejected):
+        _runner(tmp_path).run(["git", "log", *args], cwd=tmp_path)
+
+
+def test_huge_count_error_message_is_bounded(tmp_path):
+    with pytest.raises(CommandRejected) as exc:
+        _runner(tmp_path).run(["git", "log", "-n", "9" * 5000], cwd=tmp_path)
+    assert len(str(exc.value)) < 1000
+
+
+@pytest.mark.parametrize("raw", [
+    None, "", "0", "51", "100", "9" * 5000, "\uff15", "\u0665", "5=6", "n5", "-1",
+])
+def test_count_ok_returns_false_never_raises(raw):
+    from navigator.safety.command_runner import _count_ok
+    assert _count_ok(raw) is False
+
+
+@pytest.mark.parametrize("raw", ["1", "5", "05", "50"])
+def test_count_ok_accepts_valid(raw):
+    from navigator.safety.command_runner import _count_ok
+    assert _count_ok(raw) is True
+
+
+@pytest.mark.parametrize("argv", [
+    ["git", "-c", "core.fsmonitor=x", "status"],
+    ["git", "--git-dir=x", "log"],
+    ["git", "--exec-path=x", "status"],
+    ["git", "-C", "x", "status"],
+])
+def test_git_global_options_rejected_even_with_bare_git_allowlisted(tmp_path, argv):
+    r = CommandRunner(allowlist=["git"], worktree_root=tmp_path)
+    with pytest.raises(CommandRejected, match="global option"):
+        r.run(argv, cwd=tmp_path)
