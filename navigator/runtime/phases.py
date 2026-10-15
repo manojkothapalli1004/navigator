@@ -2,7 +2,7 @@ import ast
 import re
 import subprocess
 import time
-from collections import Counter
+from collections import Counter, deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from navigator.safety.circuit_breakers import CircuitBreakers
@@ -25,7 +25,7 @@ def _resolve_write_target(wt: Path, relpath: str) -> Path:
     """Resolve a builder write target, rejecting escapes and the worktree root itself.
 
     A valid target must be a path strictly inside the worktree (so relpath="." / ""
-    \u2014 which resolve to the worktree root \u2014 and "../x" / absolute paths are rejected
+    - which resolve to the worktree root - and "../x" / absolute paths are rejected
     with a clean ValueError rather than a later IsADirectoryError or an escape).
     """
     wt = Path(wt).resolve()
@@ -84,7 +84,7 @@ def _is_pytestmark_target(t) -> bool:
         return any(_is_pytestmark_target(e) for e in t.elts)
     return False
 
-def _skip_sites(source: str) -> Counter:
+def _skip_sites_by_name(source: str) -> Counter:
     """Skip sites in python source, keyed by kind (skip, skipif, importorskip,
     skipTest, skipIf, skipUnless). Each node is counted once. Unparseable source
     falls back to a text regex."""
@@ -131,9 +131,186 @@ def _skip_sites(source: str) -> Counter:
                     hit(sub, name)
     return counts
 
+# Resolved detector (G1e-1c): follows imports (at any scope) and `name = expr`
+# aliases to the real skip APIs, so `from pytest import skip as s; s()` or
+# `m = pytest.mark.skip(...)` then `@m` are seen. It only ever adds to the by-name
+# detector: the gate flags growth in either (see _skip_growth).
+_SKIP_TARGETS = {"pytest.skip": "skip", "pytest.importorskip": "importorskip",
+                 "pytest.mark.skip": "skip", "pytest.mark.skipif": "skipif"}
+_SKIP_TARGETS.update({f"{mod}.{name}": name for mod in ("unittest", "unittest.case")
+                      for name in ("skip", "skipIf", "skipUnless", "SkipTest")})
+# any `<expr>.skipTest` (a bound TestCase method), e.g. `f = self.skipTest; f()`
+_ANY_SKIPTEST = "*.skipTest"
+_TARGET_KINDS = {**_SKIP_TARGETS, _ANY_SKIPTEST: "skipTest"}
+_TARGET_PREFIXES = frozenset(
+    ".".join(path.split(".")[:i]) for path in _SKIP_TARGETS
+    for i in range(1, path.count(".") + 2)) | {_ANY_SKIPTEST}
+# calls that return a decorator: the skip happens where the result is applied
+_DECORATOR_FACTORIES = frozenset(
+    p for p, kind in _SKIP_TARGETS.items()
+    if kind in ("skip", "skipif", "skipIf", "skipUnless") and p != "pytest.skip")
+_MAX_BINDING_PATHS = 32
+_REQUEUE_FACTOR = 10
+
+def _bind(bindings: dict, name: str, paths) -> bool:
+    """Add paths (pruned to target prefixes, capped per set) to name's binding set.
+    Never overwrites. True if the set grew."""
+    cur = bindings.setdefault(name, set())
+    grew = False
+    for p in sorted(paths):
+        if len(cur) >= _MAX_BINDING_PATHS:
+            break
+        if p in _TARGET_PREFIXES and p not in cur:
+            cur.add(p)
+            grew = True
+    return grew
+
+def _resolve(node, bindings: dict) -> set:
+    """Target paths (or prefixes of them) an expression may evaluate to."""
+    if isinstance(node, ast.Name):
+        return set(bindings.get(node.id, ()))
+    if isinstance(node, ast.Attribute):
+        out = {f"{p}.{node.attr}" for p in _resolve(node.value, bindings)} & _TARGET_PREFIXES
+        if node.attr == "skipTest":
+            out.add(_ANY_SKIPTEST)
+        return out
+    if isinstance(node, ast.Call):
+        # e.g. m = pytest.mark.skip(reason='x'): m stands for the marker
+        return {p for p in _resolve(node.func, bindings) if p in _TARGET_KINDS}
+    return set()
+
+def _alias_statements(nodes) -> list:
+    out = []
+    for node in nodes:
+        if isinstance(node, ast.Assign):
+            out.extend((t.id, node.value) for t in node.targets if isinstance(t, ast.Name))
+        elif (isinstance(node, (ast.AnnAssign, ast.NamedExpr)) and node.value is not None
+              and isinstance(node.target, ast.Name)):
+            out.append((node.target.id, node.value))
+    return out
+
+def _resolve_aliases(aliases: list, bindings: dict) -> None:
+    """Propagate bindings through aliases with a dependency worklist, so chains
+    resolve in whatever order they appear. When a name's set grows, every alias
+    whose RHS references it is re-queued. Bounded by the per-set cap and a global
+    budget of _REQUEUE_FACTOR re-queues per alias statement."""
+    deps: dict = {}
+    for i, (_, value) in enumerate(aliases):
+        for ref in {n.id for n in ast.walk(value) if isinstance(n, ast.Name)}:
+            deps.setdefault(ref, []).append(i)
+    queue = deque(range(len(aliases)))
+    queued = set(queue)
+    budget = _REQUEUE_FACTOR * len(aliases)
+    while queue:
+        i = queue.popleft()
+        queued.discard(i)
+        name, value = aliases[i]
+        if _bind(bindings, name, _resolve(value, bindings)):
+            for j in deps.get(name, ()):
+                if j not in queued and budget > 0:
+                    budget -= 1
+                    queue.append(j)
+                    queued.add(j)
+
+def _count_resolved(tree) -> Counter:
+    nodes = list(ast.walk(tree))
+    bindings: dict = {}
+    for node in nodes:
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                if a.asname:
+                    _bind(bindings, a.asname, {a.name})
+                else:
+                    top = a.name.split(".")[0]
+                    _bind(bindings, top, {top})
+        elif isinstance(node, ast.ImportFrom) and not node.level and node.module:
+            for a in node.names:
+                if a.name != "*":
+                    _bind(bindings, a.asname or a.name, {f"{node.module}.{a.name}"})
+    aliases = _alias_statements(nodes)
+    _resolve_aliases(aliases, bindings)
+
+    counts: Counter = Counter()
+    seen: set[int] = set()
+
+    def kinds(expr) -> list:
+        return sorted({_TARGET_KINDS[p] for p in _resolve(expr, bindings) if p in _TARGET_KINDS})
+
+    def hit(node, found, *also):
+        if not found or id(node) in seen:
+            return
+        seen.add(id(node))
+        seen.update(id(a) for a in also)
+        for k in found:
+            counts[k] += 1
+
+    # module-level pytestmark = <marker or list of markers>
+    for node in nodes:
+        if isinstance(node, ast.Assign):
+            targets, value = node.targets, node.value
+        elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+            targets, value = [node.target], node.value
+        else:
+            continue
+        if value is None or not any(_is_pytestmark_target(t) for t in targets):
+            continue
+        for sub in ast.walk(value):
+            if isinstance(sub, ast.Call):
+                hit(sub, kinds(sub.func), sub.func)
+            elif isinstance(sub, (ast.Name, ast.Attribute)):
+                hit(sub, kinds(sub))
+    # m = pytest.mark.skip(...) only builds a marker; each use of m is counted instead
+    loaded = {n.id for n in nodes if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)}
+    for name, value in aliases:
+        if name == "pytestmark" or name not in loaded or not isinstance(value, ast.Call):
+            continue
+        paths = {p for p in _resolve(value.func, bindings) if p in _TARGET_KINDS}
+        if paths and paths <= _DECORATOR_FACTORIES and id(value) not in seen:
+            seen.add(id(value))
+            seen.add(id(value.func))
+    for node in nodes:
+        for dec in getattr(node, "decorator_list", None) or []:
+            func = dec.func if isinstance(dec, ast.Call) else dec
+            hit(dec, kinds(func), func)
+    for node in nodes:
+        if isinstance(node, ast.Raise) and isinstance(node.exc, (ast.Name, ast.Attribute)):
+            hit(node.exc, kinds(node.exc))
+    for node in nodes:
+        if isinstance(node, ast.Call) and id(node) not in seen:
+            hit(node, kinds(node.func), node.func)
+    return counts
+
+def _skip_sites_resolved(source: str) -> Counter:
+    """Skip sites whose callee, decorator or raised exception resolves (through
+    imports and `name = expr` aliases) to a pytest/unittest skip API, keyed by kind.
+    Unparseable or pathologically deep source yields an empty Counter (the by-name
+    detector's regex fallback still applies)."""
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError, RecursionError, MemoryError):
+        return Counter()
+    try:
+        return _count_resolved(tree)
+    except RecursionError:
+        return Counter()
+
+def _skip_sites(source: str) -> Counter:
+    """Per-kind max of the by-name and resolved detectors (display/other callers)."""
+    return _skip_sites_by_name(source) | _skip_sites_resolved(source)
+
+def _skip_growth(new: str, old: str) -> Counter:
+    """Growth is flagged if EITHER detector grows (Counter union = per-kind max of
+    the two deltas). Taking the max of the detectors per side first would let a site
+    seen only by name hide behind resolved-only sites already in the old file."""
+    return ((_skip_sites_by_name(new) - _skip_sites_by_name(old))
+            | (_skip_sites_resolved(new) - _skip_sites_resolved(old)))
+
 def _skip_gated(rel: str) -> bool:
-    # conftest.py can skip whole suites; gated here only, not a test file elsewhere
-    return _is_test_file(rel) or (Path(rel).name == "conftest.py")
+    # conftest.py can skip whole suites and pytest also collects *_test.py; both are
+    # gated here only. _is_test_file stays narrower because it widens builder scope.
+    p = Path(rel)
+    return (_is_test_file(rel) or p.name == "conftest.py"
+            or (p.suffix == ".py" and p.name.endswith("_test.py")))
 
 def _added_skips(wt: Path, writes: list[tuple[str, str]]) -> list[str]:
     """'<file>: <n>' for each written test file (or conftest.py) where any kind of
@@ -145,7 +322,7 @@ def _added_skips(wt: Path, writes: list[tuple[str, str]]) -> list[str]:
             continue
         target = _resolve_write_target(wt, rel)
         original = target.read_text(errors="replace") if target.is_file() else ""
-        grown = _skip_sites(content) - _skip_sites(original)
+        grown = _skip_growth(content, original)
         if grown:
             out.append(f"{rel}: {sum(grown.values())}")
     return out
@@ -300,7 +477,7 @@ def run_build_and_verify(driver: SubagentDriver, worktree: WorktreeHandle,
         res.verify_returncode = 1
         res.verify_output = "builder added test skips: " + "; ".join(added_skips)
         return res
-    # verifier \u2014 a verify phase with no commands is a failure, not a silent pass
+    # verifier - a verify phase with no commands is a failure, not a silent pass
     # commands run in the workdir, so hand the verifier paths relative to it
     rel_changed = [str(Path(f).relative_to(workdir)) if workdir not in (".", "")
                    and Path(f).is_relative_to(workdir) else f for f in res.file_writes]
