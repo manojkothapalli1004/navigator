@@ -86,11 +86,11 @@ def _is_pytestmark_target(t) -> bool:
 
 def _skip_sites_by_name(source: str) -> Counter:
     """Skip sites in python source, keyed by kind (skip, skipif, importorskip,
-    skipTest, skipIf, skipUnless). Each node is counted once. Unparseable source
-    falls back to a text regex."""
+    skipTest, skipIf, skipUnless). Each node is counted once. Unparseable (or too
+    deep to parse) source falls back to a text regex."""
     try:
         tree = ast.parse(source)
-    except (SyntaxError, ValueError):
+    except (SyntaxError, ValueError, RecursionError, MemoryError):
         return Counter(m.group(1) for m in _SKIP_FALLBACK.finditer(source))
     counts: Counter = Counter()
     seen: set[int] = set()
@@ -165,19 +165,51 @@ def _bind(bindings: dict, name: str, paths) -> bool:
             grew = True
     return grew
 
-def _resolve(node, bindings: dict) -> set:
-    """Target paths (or prefixes of them) an expression may evaluate to."""
-    if isinstance(node, ast.Name):
-        return set(bindings.get(node.id, ()))
-    if isinstance(node, ast.Attribute):
-        out = {f"{p}.{node.attr}" for p in _resolve(node.value, bindings)} & _TARGET_PREFIXES
-        if node.attr == "skipTest":
-            out.add(_ANY_SKIPTEST)
-        return out
-    if isinstance(node, ast.Call):
-        # e.g. m = pytest.mark.skip(reason='x'): m stands for the marker
-        return {p for p in _resolve(node.func, bindings) if p in _TARGET_KINDS}
-    return set()
+def _root_name(node) -> str | None:
+    """Name at the root of an expression's Attribute/Call-func spine - the only
+    name _resolve reads (e.g. `a` for `a.b(x).c`; call arguments are ignored).
+    None if the root is not a Name."""
+    while isinstance(node, (ast.Attribute, ast.Call)):
+        node = node.value if isinstance(node, ast.Attribute) else node.func
+    return node.id if isinstance(node, ast.Name) else None
+
+def _resolve(node, bindings: dict, memo: dict | None = None) -> set:
+    """Target paths (or prefixes of them) an expression may evaluate to.
+
+    Walks the Attribute/Call-func spine with an explicit loop, so there is no Python
+    recursion proportional to chain depth. With a memo (keyed by node id; only valid
+    while bindings don't change) each spine node is resolved once, so resolving every
+    call in a long chain stays linear."""
+    chain = []
+    cur = node
+    while True:
+        if memo is not None and id(cur) in memo:
+            paths = memo[id(cur)]
+            break
+        if isinstance(cur, ast.Attribute):
+            chain.append(cur)
+            cur = cur.value
+        elif isinstance(cur, ast.Call):
+            chain.append(cur)
+            cur = cur.func
+        else:
+            paths = (frozenset(bindings.get(cur.id, ())) if isinstance(cur, ast.Name)
+                     else frozenset())
+            if memo is not None:
+                memo[id(cur)] = paths
+            break
+    for n in reversed(chain):
+        if isinstance(n, ast.Attribute):
+            out = {f"{p}.{n.attr}" for p in paths} & _TARGET_PREFIXES
+            if n.attr == "skipTest":
+                out.add(_ANY_SKIPTEST)
+        else:
+            # e.g. m = pytest.mark.skip(reason='x'): m stands for the marker
+            out = {p for p in paths if p in _TARGET_KINDS}
+        paths = frozenset(out)
+        if memo is not None:
+            memo[id(n)] = paths
+    return set(paths)
 
 def _alias_statements(nodes) -> list:
     out = []
@@ -189,30 +221,40 @@ def _alias_statements(nodes) -> list:
             out.append((node.target.id, node.value))
     return out
 
-def _resolve_aliases(aliases: list, bindings: dict) -> None:
+def _resolve_aliases(aliases: list, bindings: dict) -> bool:
     """Propagate bindings through aliases with a dependency worklist, so chains
     resolve in whatever order they appear. When a name's set grows, every alias
-    whose RHS references it is re-queued. Bounded by the per-set cap and a global
-    budget of _REQUEUE_FACTOR re-queues per alias statement."""
+    whose RHS spine is rooted at it is re-queued (call arguments are not deps:
+    _resolve never reads them). Bounded by the per-set cap and a global budget of
+    _REQUEUE_FACTOR re-queues per alias statement. Returns True if the budget ran
+    out while a re-queue was still needed (the result may be incomplete)."""
     deps: dict = {}
     for i, (_, value) in enumerate(aliases):
-        for ref in {n.id for n in ast.walk(value) if isinstance(n, ast.Name)}:
-            deps.setdefault(ref, []).append(i)
+        root = _root_name(value)
+        if root is not None:
+            deps.setdefault(root, []).append(i)
     queue = deque(range(len(aliases)))
     queued = set(queue)
     budget = _REQUEUE_FACTOR * len(aliases)
+    exhausted = False
     while queue:
         i = queue.popleft()
         queued.discard(i)
         name, value = aliases[i]
         if _bind(bindings, name, _resolve(value, bindings)):
             for j in deps.get(name, ()):
-                if j not in queued and budget > 0:
-                    budget -= 1
-                    queue.append(j)
-                    queued.add(j)
+                if j in queued:
+                    continue
+                if budget <= 0:
+                    exhausted = True
+                    continue
+                budget -= 1
+                queue.append(j)
+                queued.add(j)
+    return exhausted
 
-def _count_resolved(tree) -> Counter:
+def _count_resolved(tree) -> tuple[Counter, bool]:
+    """(counts, alias budget exhausted)."""
     nodes = list(ast.walk(tree))
     bindings: dict = {}
     for node in nodes:
@@ -228,13 +270,15 @@ def _count_resolved(tree) -> Counter:
                 if a.name != "*":
                     _bind(bindings, a.asname or a.name, {f"{node.module}.{a.name}"})
     aliases = _alias_statements(nodes)
-    _resolve_aliases(aliases, bindings)
+    exhausted = _resolve_aliases(aliases, bindings)
 
     counts: Counter = Counter()
     seen: set[int] = set()
+    memo: dict = {}  # bindings are final from here on
 
     def kinds(expr) -> list:
-        return sorted({_TARGET_KINDS[p] for p in _resolve(expr, bindings) if p in _TARGET_KINDS})
+        return sorted({_TARGET_KINDS[p] for p in _resolve(expr, bindings, memo)
+                       if p in _TARGET_KINDS})
 
     def hit(node, found, *also):
         if not found or id(node) in seen:
@@ -264,7 +308,7 @@ def _count_resolved(tree) -> Counter:
     for name, value in aliases:
         if name == "pytestmark" or name not in loaded or not isinstance(value, ast.Call):
             continue
-        paths = {p for p in _resolve(value.func, bindings) if p in _TARGET_KINDS}
+        paths = {p for p in _resolve(value.func, bindings, memo) if p in _TARGET_KINDS}
         if paths and paths <= _DECORATOR_FACTORIES and id(value) not in seen:
             seen.add(id(value))
             seen.add(id(value.func))
@@ -278,32 +322,54 @@ def _count_resolved(tree) -> Counter:
     for node in nodes:
         if isinstance(node, ast.Call) and id(node) not in seen:
             hit(node, kinds(node.func), node.func)
-    return counts
+    return counts, exhausted
+
+def _resolved_analysis(source: str) -> tuple[Counter, str | None]:
+    """(resolved skip sites, reason the analysis is incomplete or None).
+    Reasons: 'budget' (alias budget ran out; counts are a lower bound),
+    'recursion' / 'memory' (source too deep to analyse; counts are empty).
+    Unparseable source is not incomplete: the interpreter can't run it either, and
+    the by-name detector's regex fallback still applies."""
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError):
+        return Counter(), None
+    except RecursionError:
+        return Counter(), "recursion"
+    except MemoryError:
+        return Counter(), "memory"
+    try:
+        counts, exhausted = _count_resolved(tree)
+    except RecursionError:
+        return Counter(), "recursion"
+    except MemoryError:
+        return Counter(), "memory"
+    return counts, ("budget" if exhausted else None)
 
 def _skip_sites_resolved(source: str) -> Counter:
     """Skip sites whose callee, decorator or raised exception resolves (through
     imports and `name = expr` aliases) to a pytest/unittest skip API, keyed by kind.
-    Unparseable or pathologically deep source yields an empty Counter (the by-name
-    detector's regex fallback still applies)."""
-    try:
-        tree = ast.parse(source)
-    except (SyntaxError, ValueError, RecursionError, MemoryError):
-        return Counter()
-    try:
-        return _count_resolved(tree)
-    except RecursionError:
-        return Counter()
+    Unparseable or pathologically deep source yields an empty Counter; the gate
+    uses _resolved_analysis to fail closed on the latter."""
+    return _resolved_analysis(source)[0]
 
 def _skip_sites(source: str) -> Counter:
     """Per-kind max of the by-name and resolved detectors (display/other callers)."""
     return _skip_sites_by_name(source) | _skip_sites_resolved(source)
 
+def _skip_gate(new: str, old: str) -> tuple[Counter, str | None]:
+    """(growth, reason the NEW file's analysis is incomplete or None). An
+    incomplete analysis of the old file keeps the old behaviour (no resolved sites)."""
+    new_resolved, incomplete = _resolved_analysis(new)
+    grown = ((_skip_sites_by_name(new) - _skip_sites_by_name(old))
+             | (new_resolved - _skip_sites_resolved(old)))
+    return grown, incomplete
+
 def _skip_growth(new: str, old: str) -> Counter:
     """Growth is flagged if EITHER detector grows (Counter union = per-kind max of
     the two deltas). Taking the max of the detectors per side first would let a site
     seen only by name hide behind resolved-only sites already in the old file."""
-    return ((_skip_sites_by_name(new) - _skip_sites_by_name(old))
-            | (_skip_sites_resolved(new) - _skip_sites_resolved(old)))
+    return _skip_gate(new, old)[0]
 
 def _skip_gated(rel: str) -> bool:
     # conftest.py can skip whole suites and pytest also collects *_test.py; both are
@@ -314,16 +380,19 @@ def _skip_gated(rel: str) -> bool:
 
 def _added_skips(wt: Path, writes: list[tuple[str, str]]) -> list[str]:
     """'<file>: <n>' for each written test file (or conftest.py) where any kind of
-    skip site grew versus the file on disk before the write (empty for new files).
-    Must run before writing."""
+    skip site grew versus the file on disk before the write (empty for new files),
+    or '<file>: skip analysis incomplete (<reason>)' when the new content could not
+    be fully analysed (fail closed). Must run before writing."""
     out = []
     for rel, content in writes:
         if not _skip_gated(rel):
             continue
         target = _resolve_write_target(wt, rel)
         original = target.read_text(errors="replace") if target.is_file() else ""
-        grown = _skip_growth(content, original)
-        if grown:
+        grown, incomplete = _skip_gate(content, original)
+        if incomplete:
+            out.append(f"{rel}: skip analysis incomplete ({incomplete})")
+        elif grown:
             out.append(f"{rel}: {sum(grown.values())}")
     return out
 

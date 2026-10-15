@@ -1,3 +1,4 @@
+import ast
 import subprocess
 import time
 from collections import Counter
@@ -509,24 +510,27 @@ def test_by_name_site_is_not_hidden_by_resolved_sites_in_old_file(tmp_path):
     assert _grown(tmp_path, "tests/test_b1.py", new, old=old) == ["tests/test_b1.py: 1"]
 
 
-def _superset_sources():
-    return [
-        f"import _pytest.outcomes as o\n\ndef test_a():\n    o.{SK}('r')\n",
-        f"from _pytest import outcomes\n\ndef test_a():\n    outcomes.{SK}('r')\n",
-        f"from _pytest.mark import MARK_GEN as m\n\n@m.{SK}\ndef test_a():\n    pass\n",
-        f"import nose.tools as nt\n\ndef test_a():\n    nt.{SK}('r')\n",
-        f"def test_a():\n    __import__('pytest').{SK}('r')\n",
-        f"import importlib\n\ndef test_a():\n    importlib.import_module('pytest').{SK}('r')\n",
-        f"import pytest\n\ndef m():\n    return pytest\n\ndef test_a():\n    m().{SK}('r')\n",
-        f"def test_a(db):\n    db.find().{SK}(10)\n",
-    ]
+# Per-kind skip counts main's gate reports for each source, frozen here so the
+# baseline does not move with this branch's own detectors.
+_MAIN_DELTAS = [
+    (f"import _pytest.outcomes as o\n\ndef test_a():\n    o.{SK}('r')\n", {SK: 1}),
+    (f"from _pytest import outcomes\n\ndef test_a():\n    outcomes.{SK}('r')\n", {SK: 1}),
+    (f"from _pytest.mark import MARK_GEN as m\n\n@m.{SK}\ndef test_a():\n    pass\n", {SK: 1}),
+    (f"import nose.tools as nt\n\ndef test_a():\n    nt.{SK}('r')\n", {SK: 1}),
+    (f"def test_a():\n    __import__('pytest').{SK}('r')\n", {SK: 1}),
+    (f"import importlib\n\ndef test_a():\n    importlib.import_module('pytest').{SK}('r')\n", {SK: 1}),
+    (f"import pytest\n\ndef m():\n    return pytest\n\ndef test_a():\n    m().{SK}('r')\n", {SK: 1}),
+    (f"def test_a(db):\n    db.find().{SK}(10)\n", {SK: 1}),
+    (f"import pytest\n\n@pytest.mark.{SKIF}(True, reason='r')\ndef test_a():\n    pass\n", {SKIF: 1}),
+    ("import unittest\n\nclass T(unittest.TestCase):\n    def test_a(self):\n        self."
+     + STEST + "('r')\n", {STEST: 1}),
+    (f"import pytest\n{PM} = pytest.mark.{SK}\n", {SK: 1}),
+]
 
 
-@pytest.mark.parametrize("idx", range(8))
+@pytest.mark.parametrize("idx", range(len(_MAIN_DELTAS)))
 def test_gate_delta_is_never_below_main(tmp_path, idx):
-    src = _superset_sources()[idx]
-    main = _skip_sites_by_name(src)
-    assert main[SK] >= 1
+    src, main = _MAIN_DELTAS[idx]
     got = _skip_growth(src, "")
     assert all(got[k] >= n for k, n in main.items())
     assert _grown(tmp_path, "tests/test_b2.py", src) == [f"tests/test_b2.py: {sum(got.values())}"]
@@ -582,3 +586,102 @@ def test_suffix_test_files_are_skip_gated_but_do_not_widen_scope(tmp_path):
     assert _skip_gated("pkg/foo_test.py")
     src = f"import pytest\n\ndef test_a():\n    pytest.{SK}('r')\n"
     assert _grown(tmp_path, "pkg/foo_test.py", src) == ["pkg/foo_test.py: 1"]
+
+
+# G1e-1d: the resolved detector can't be exhausted by padding or disabled by depth
+
+def _padding_source(n=60):
+    # Finding A: call arguments padded with names that sit on a long alias chain
+    args = ", ".join(f"c{i}" for i in range(n))
+    lines = ["import pytest"]
+    lines += [f"y{j} = f({args})" for j in range(n)]
+    lines += [f"c{i} = c{i + 1}" for i in range(n - 1)] + [f"c{n - 1} = pytest"]
+    lines += [f"q{i} = q{i + 1}" for i in range(n - 1)] + [f"q{n - 1} = pytest.{SK}", "q0()"]
+    return "\n".join(lines) + "\n"
+
+
+def _deep_chain(n):
+    # Finding B: a long Call->Attribute spine after a real aliased site
+    return f"import pytest\ns = pytest.{SK}\ns()\nz = x" + ".a()" * n + "\n"
+
+
+def test_call_argument_padding_does_not_exhaust_the_alias_budget(tmp_path):
+    src = _padding_source(60)
+    assert _skip_sites_resolved(src) == Counter({SK: 1})
+    assert _skip_growth(src, "") == Counter({SK: 1})
+    assert _grown(tmp_path, "tests/test_pad.py", src) == ["tests/test_pad.py: 1"]
+
+
+def test_alias_deps_come_from_the_spine_root_only():
+    from navigator.runtime.phases import _root_name
+    assert _root_name(ast.parse("a.b(c, d).e", mode="eval").body) == "a"
+    assert _root_name(ast.parse("f(g)", mode="eval").body) == "f"
+    assert _root_name(ast.parse("[a][0].b", mode="eval").body) is None
+
+
+def test_deep_call_chain_does_not_disable_the_detector(tmp_path):
+    src = _deep_chain(600)
+    t0 = time.perf_counter()
+    got = _skip_sites_resolved(src)
+    elapsed = time.perf_counter() - t0
+    assert got == Counter({SK: 1})
+    assert elapsed < 0.5
+    assert _grown(tmp_path, "tests/test_deep.py", src) == ["tests/test_deep.py: 1"]
+
+
+def test_very_deep_call_chain_is_counted_or_fails_closed(tmp_path):
+    src = _deep_chain(5000)
+    try:
+        ast.parse(src)
+        parsed = True
+    except (RecursionError, MemoryError):
+        parsed = False
+    except SyntaxError:
+        parsed = None  # the interpreter can't compile it either, so it can't run
+    t0 = time.perf_counter()
+    got = _skip_sites_resolved(src)
+    elapsed = time.perf_counter() - t0
+    assert elapsed < 0.5
+    gate = _grown(tmp_path, "tests/test_deep5k.py", src)
+    if parsed:
+        assert got == Counter({SK: 1})
+        assert gate == ["tests/test_deep5k.py: 1"]
+    elif parsed is False:
+        assert len(gate) == 1
+        assert gate[0].startswith("tests/test_deep5k.py: skip analysis incomplete (")
+
+
+def test_exhausted_alias_budget_fails_closed(tmp_path, monkeypatch):
+    from navigator.runtime import phases
+    monkeypatch.setattr(phases, "_REQUEUE_FACTOR", 0)
+    src = _reverse_chain(3)
+    assert _grown(tmp_path, "tests/test_budget.py", src) == [
+        "tests/test_budget.py: skip analysis incomplete (budget)"]
+    # an incomplete analysis of the OLD file keeps today's behaviour
+    clean = "def test_a():\n    assert 1\n"
+    assert _grown(tmp_path, "tests/test_old_budget.py", clean, old=src) == []
+
+
+def test_recursion_while_analysing_new_file_fails_closed(tmp_path, monkeypatch):
+    from navigator.runtime import phases
+    def boom(tree):
+        raise RecursionError("too deep")
+    monkeypatch.setattr(phases, "_count_resolved", boom)
+    src = "def test_a():\n    assert 1\n"
+    assert _skip_sites_resolved(src) == Counter()
+    assert _grown(tmp_path, "tests/test_rec.py", src) == [
+        "tests/test_rec.py: skip analysis incomplete (recursion)"]
+
+
+def test_incomplete_analysis_blocks_the_run(tmp_path, monkeypatch):
+    from navigator.runtime import phases
+    monkeypatch.setattr(phases, "_REQUEUE_FACTOR", 0)
+    h, _ = _wt(tmp_path, "run-sk5")
+    runner = _RecordingRunner()
+    drv = _ScriptedRoles([("test_chain.py", _reverse_chain(3))], [["git", "status"]])
+    res = run_build_and_verify(driver=drv, worktree=h, run_id="run-sk5", runner=runner,
+                               proposal={"affected_files": []})
+    assert res.verify_returncode == 1
+    assert res.verify_output == ("builder added test skips: "
+                                 "test_chain.py: skip analysis incomplete (budget)")
+    assert runner.calls == []
