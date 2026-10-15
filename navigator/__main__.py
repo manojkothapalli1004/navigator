@@ -13,6 +13,7 @@ from navigator.config import RepoConfig, Settings, effective_repos
 from navigator.runtime.fleet import Fleet
 from navigator.contracts.enums import Role
 from navigator.observability.notify import NotifyingACT, make_notifier
+from navigator.observability.telegram_inbox import apply_commands, make_telegram_inbox
 from navigator.clients.act_client import FakeACTClient, HTTPACTClient
 from navigator.clients.orc_client import FakeORCClient, HTTPORCClient
 from navigator.runtime.drivers.claude_sdk_driver import ClaudeSDKDriver
@@ -58,14 +59,33 @@ def build_navigator(settings: Settings):
         nav.notifier = notifier
         navs.append(nav)
     if len(navs) == 1:
-        return navs[0]
-    fleet = Fleet(navs)
-    fleet.notifier = notifier
-    return fleet
+        target = navs[0]
+    else:
+        target = Fleet(navs)
+        target.notifier = notifier
+    # opt-in (NAVIGATOR_TELEGRAM_COMMANDS=1): operator merge decisions from Telegram
+    target.telegram_inbox = make_telegram_inbox()
+    target.telegram_act = act
+    return target
 
 def _head_sha(repo: str) -> str:
     return subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo,
                           capture_output=True, text=True, check=True).stdout.strip()
+
+def _telegram_step(nav, summary: dict) -> None:
+    """Poll the operator's Telegram chat once and record merge decisions in ACT.
+    A failure here must never break the cycle."""
+    inbox = getattr(nav, "telegram_inbox", None)
+    if inbox is None:
+        return
+    try:
+        commands = inbox.poll_once()
+        act = getattr(nav, "telegram_act", None) or nav.act
+        results = apply_commands(act, commands, nav.notifier)
+        summary["telegram_commands"] = len(commands)
+        summary["telegram_applied"] = sum(1 for r in results if r.get("applied"))
+    except Exception as e:
+        summary["telegram_error"] = f"{type(e).__name__}: {e}"[:300]
 
 def _cycle(nav: Navigator, settings: Settings) -> dict:
     summary: dict = {"mode": settings.mode, "driver": settings.driver}
@@ -76,6 +96,7 @@ def _cycle(nav: Navigator, settings: Settings) -> dict:
         summary["proposals_created"] = 0
         summary["planner_error"] = f"{type(e).__name__}: {e}"[:300]
     summary["runs_executed"] = len(nav.approval_poll())
+    _telegram_step(nav, summary)
     summary["runs_finalized"] = len(nav.merge_poll())
     summary["snapshot_chars"] = nav.last_snapshot_chars
     return summary
@@ -91,7 +112,7 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 # ACT restarts take ~1 min to accept connections; Navigator racing it at boot
-# crash-looped 4x on 2026-07-17. Wait bounded, then proceed — the cycle loop's
+# crash-looped 4x on 2026-07-17. Wait bounded, then proceed \u2014 the cycle loop's
 # own error handling covers a dependency that stays down.
 _RECONCILE_ATTEMPTS = 18
 _RECONCILE_DELAY_S = 10.0

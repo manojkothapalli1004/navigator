@@ -114,7 +114,8 @@ class NotifyingACT:
                     f"{format_verification(p.get('verification') or [])}\n"
                     f"review: python -m navigator diff {run_id}\n"
                     f"merge:  python -m navigator merge {run_id}\n"
-                    f"reject: python -m navigator reject {run_id}")
+                    f"reject: python -m navigator reject {run_id}\n"
+                    f"telegram: /merge {run_id}  (after audit)")
         if kind == "run.merge_blocked":
             reason = p.get("reason", "") or ""
             key = (run_id, reason)
