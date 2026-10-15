@@ -1,6 +1,9 @@
 """Operator commands: `python -m navigator <command> [id]`.
 
 Every decision here is recorded in ACT; the daemon acts on it next cycle.
+`audited <run-id> [--note TEXT]` marks a run awaiting review as audited (a
+'run.audited' event plus an approved review-gate approval targeting the run); only
+audited runs accept a merge decision from Telegram. The CLI `merge` does not need it.
 `cleanup [--apply]` is the exception: it removes finished runs' worktrees and
 nav/run-* branches directly (dry run unless --apply).
 `doctor [--plist PATH]` is read-only: it replays the daemon's startup against the
@@ -32,10 +35,12 @@ from typing import TextIO
 from navigator.observability.notify import format_verification
 from navigator.contracts.enums import (ApprovalDecision, ApprovalGate, ProposalStatus,
                                        RunPhase, RunStatus)
+from navigator.contracts.event import Event
 
 COMMANDS = ("status", "approve", "decline", "diff", "merge", "reject", "retry", "cleanup",
-            "doctor")
+            "doctor", "audited")
 ACTOR = "operator"
+AUDITOR = "auditor"
 
 # run statuses whose worktree/branch can go regardless of age
 _FINISHED_STATUSES = {"completed", "declined", "aborted"}
@@ -49,13 +54,16 @@ def run_cli(argv: list[str], *, act, out: TextIO, worktree_root: str | None = No
     if not argv or argv[0] not in COMMANDS:
         print(f"usage: navigator {{{'|'.join(COMMANDS)}}} [id]  "
               f"(cleanup takes no id: navigator cleanup [--apply]; "
-              f"navigator doctor [--plist PATH])", file=out)
+              f"navigator doctor [--plist PATH]; "
+              f"navigator audited <run-id> [--note TEXT])", file=out)
         return 2
     cmd, args = argv[0], argv[1:]
     if cmd == "status":
         return _status(act, out)
     if cmd == "doctor":
         return _doctor(args, out)
+    if cmd == "audited":
+        return _audited(act, args, out)
     if cmd == "cleanup":
         if args not in ([], ["--apply"]):
             print("usage: navigator cleanup [--apply]", file=out)
@@ -111,6 +119,39 @@ def _decide_merge(act, run_id, out, decision: ApprovalDecision) -> int:
 
 def _find_run(act, run_id):
     return next((r for r in act.list_open_runs() if r.id == run_id), None)
+
+
+def is_audited(act, run_id: str) -> bool:
+    """True once an approved review-gate approval targets the run (`navigator audited`)."""
+    return bool(act.list_approvals(target=run_id, gate=ApprovalGate.review,
+                                   decision=ApprovalDecision.approved))
+
+
+def _audited(act, args: list[str], out) -> int:
+    if len(args) == 1:
+        note = None
+    elif len(args) == 3 and args[1] == "--note":
+        note = args[2]
+    else:
+        print("usage: navigator audited <run-id> [--note TEXT]", file=out)
+        return 2
+    run_id = args[0]
+    run = _find_run(act, run_id)
+    if run is None:
+        print(f"no open run: {run_id}", file=out)
+        return 1
+    if run.phase != RunPhase.awaiting_review:
+        print(f"{run_id} is {run.phase.value}, not awaiting_review", file=out)
+        return 1
+    if is_audited(act, run_id):
+        print(f"{run_id} is already marked audited", file=out)
+        return 0
+    act.emit_event(Event(kind="run.audited", correlation_id=run.correlation_id,
+                         payload={"run_id": run_id, "note": note, "actor": AUDITOR}))
+    grant = act.create_approval(target=run_id, gate=ApprovalGate.review)
+    act.decide_approval(grant.id, ApprovalDecision.approved, actor=AUDITOR)
+    print(f"{run_id} marked audited (telegram /merge {run_id} is now accepted)", file=out)
+    return 0
 
 
 def _diff(act, run_id, out) -> int:
