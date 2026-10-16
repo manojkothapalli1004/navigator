@@ -1,5 +1,6 @@
 import subprocess
 from pathlib import Path
+from navigator.cli import ACTOR
 from navigator.runtime.executor import execute_proposal, merge_after_approval
 from navigator.runtime.drivers.fake_driver import FakeSubagentDriver
 from navigator.clients.act_client import FakeACTClient
@@ -43,7 +44,7 @@ def test_merge_only_after_approval(tmp_path):
     repo, sha = _seed(tmp_path); d = _deps(tmp_path, repo)
     run = execute_proposal(_proposal(repo, sha), **d)
     approval = d["act"].list_approvals(target=run.id, gate=ApprovalGate.merge)[0]
-    d["act"].decide_approval(approval.id, ApprovalDecision.approved, actor="manoj")
+    d["act"].decide_approval(approval.id, ApprovalDecision.approved, actor=ACTOR)
     merge_after_approval(run, **d)
     merged = subprocess.run(["git","log","--oneline"], cwd=repo, capture_output=True, text=True).stdout
     assert "navigator-checkpoint" in merged or "Merge" in merged
@@ -56,7 +57,7 @@ def test_successful_run_appends_outcome_to_store(tmp_path):
     d["settings"].outcome_path = str(tmp_path / "outcomes.jsonl")
     run = execute_proposal(_proposal(repo, sha), **d)
     approval = d["act"].list_approvals(target=run.id, gate=ApprovalGate.merge)[0]
-    d["act"].decide_approval(approval.id, ApprovalDecision.approved, actor="m")
+    d["act"].decide_approval(approval.id, ApprovalDecision.approved, actor=ACTOR)
     merge_after_approval(run, **d)
     stored = OutcomeStore(tmp_path / "outcomes.jsonl").for_proposal(run.proposal_id)
     assert [o.run_id for o in stored] == [run.id]
@@ -86,7 +87,7 @@ def test_success_removes_worktree(tmp_path):
     wt_path = run.worktree_path
     assert Path(wt_path).exists()
     approval = d["act"].list_approvals(target=run.id, gate=ApprovalGate.merge)[0]
-    d["act"].decide_approval(approval.id, ApprovalDecision.approved, actor="manoj")
+    d["act"].decide_approval(approval.id, ApprovalDecision.approved, actor=ACTOR)
     merge_after_approval(run, **d)
     assert not Path(wt_path).exists()  # worktree cleaned up on success
 
@@ -116,7 +117,7 @@ def test_execute_and_merge_work_through_protocol_only_client(tmp_path):
     run = execute_proposal(_proposal(repo, sha), **d)
     assert run.phase == RunPhase.awaiting_review
     appr = inner.list_approvals(target=run.id, gate=ApprovalGate.merge)[0]
-    inner.decide_approval(appr.id, ApprovalDecision.approved, actor="manoj")
+    inner.decide_approval(appr.id, ApprovalDecision.approved, actor=ACTOR)
     merge_after_approval(run, **d)
     assert inner.runs[run.id].status == RunStatus.completed
 
