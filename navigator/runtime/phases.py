@@ -1,8 +1,11 @@
 import ast
+import inspect
+import os
 import re
 import subprocess
 import time
 from collections import Counter, deque
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from navigator.safety.circuit_breakers import CircuitBreakers
@@ -507,6 +510,68 @@ def _normalize_affected(wt: Path, paths: list[str], workdir: str) -> list[str]:
             out.append(p)
     return out
 
+# S3b: verifier commands execute builder-written test code (arbitrary Python) on the
+# same host as ACT/ORC. The Navigator process holds their URLs and tokens in its
+# environment; a verifier subprocess must not inherit them, and must not be able to
+# reach the local services through a proxy it picks up from the environment either.
+# This is defence in depth, not a sandbox: a determined test can still open a raw
+# socket to 127.0.0.1:8090. It removes the easy path (credentials and discovery)
+# and makes any such attempt deliberate and visible in the diff.
+_SEALED_FRAGMENTS = ("ACT_", "ORC_", "TOKEN")
+_DEAD_PROXY = "http://127.0.0.1:9"
+_PROXY_KEYS = ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy")
+_NO_PROXY_KEYS = ("NO_PROXY", "no_proxy")
+
+def sealed_verifier_env(base: dict | None = None) -> dict[str, str]:
+    """Environment for verifier subprocesses: os.environ (or `base`) with every
+    NAVIGATOR_* key and every key containing ACT_, ORC_ or TOKEN removed, HTTP(S)
+    proxies pointed at a dead port (9, discard) and NO_PROXY cleared so the dead
+    proxy applies to localhost too. PATH, HOME and everything else are kept."""
+    src = os.environ if base is None else base
+    env: dict[str, str] = {}
+    for key, value in src.items():
+        upper = key.upper()
+        if upper.startswith("NAVIGATOR_") or any(f in upper for f in _SEALED_FRAGMENTS):
+            continue
+        env[key] = value
+    for key in _PROXY_KEYS:
+        env[key] = _DEAD_PROXY
+    for key in _NO_PROXY_KEYS:
+        env[key] = ""
+    return env
+
+def _accepts_env(fn) -> bool:
+    try:
+        params = inspect.signature(fn).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(p.name == "env" or p.kind is p.VAR_KEYWORD for p in params)
+
+@contextmanager
+def _environ_replaced(env: dict[str, str]):
+    """Temporarily make os.environ exactly `env`, so a runner that spawns with the
+    default (inherited) environment spawns with the sealed one. Navigator is
+    single-flight, so nothing else reads os.environ meanwhile."""
+    saved = dict(os.environ)
+    os.environ.clear()
+    os.environ.update(env)
+    try:
+        yield
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
+
+def _run_sealed(runner, argv: list[str], cwd: Path):
+    """The one place verifier commands are spawned. Passes the sealed env explicitly
+    when the runner accepts `env=`, and replaces os.environ for the duration of the
+    call either way (a runner that inherits the process environment then inherits
+    the sealed one). CommandRejected propagates unchanged."""
+    env = sealed_verifier_env()
+    with _environ_replaced(env):
+        if _accepts_env(runner.run):
+            return runner.run(argv, cwd=cwd, env=env)
+        return runner.run(argv, cwd=cwd)
+
 def run_build_and_verify(driver: SubagentDriver, worktree: WorktreeHandle,
                          run_id: str, runner: CommandRunner,
                          proposal: dict | None = None,
@@ -574,7 +639,7 @@ def run_build_and_verify(driver: SubagentDriver, worktree: WorktreeHandle,
         if breakers:
             breakers.check_duration(started)
         try:
-            r = runner.run(argv, cwd=run_dir)
+            r = _run_sealed(runner, argv, run_dir)
         except CommandRejected as e:
             # a disallowed command is a verification result, not a crash
             res.verify_returncode = 126
@@ -610,7 +675,7 @@ def _run_full_suite(runner, run_dir: Path, res: PhaseResult, breakers) -> None:
         return
     argv = entry.split() + ["-q"]
     try:
-        r = runner.run(argv, cwd=run_dir)
+        r = _run_sealed(runner, argv, run_dir)
         rc, out = r.returncode, r.stdout + r.stderr
     except CommandRejected as e:
         rc, out = 126, f"full-suite command rejected: {e}"
