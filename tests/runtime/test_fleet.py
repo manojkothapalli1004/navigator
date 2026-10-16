@@ -1,6 +1,7 @@
 import json
 import subprocess
 from pathlib import Path
+from navigator.cli import ACTOR
 from navigator.runtime.loop import Navigator
 from navigator.runtime.fleet import Fleet
 from navigator.clients.act_client import FakeACTClient
@@ -57,7 +58,7 @@ def test_each_navigator_only_executes_and_merges_its_own_repo(tmp_path):
     assert len(runs) == 2
     for r in runs:
         appr = act.list_approvals(target=r.id, gate=ApprovalGate.merge)[0]
-        act.decide_approval(appr.id, ApprovalDecision.approved, actor="m")
+        act.decide_approval(appr.id, ApprovalDecision.approved, actor=ACTOR)
     assert len(fleet.merge_poll()) == 2
     for repo in (a, b):  # each change landed in its own repo, not the other one
         assert "navigator_touch.py" in subprocess.run(["git", "ls-files"], cwd=repo,
