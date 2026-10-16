@@ -1,5 +1,6 @@
 import subprocess
 from pathlib import Path
+from navigator.cli import ACTOR
 from navigator.runtime.loop import Navigator
 from navigator.clients.act_client import FakeACTClient
 from navigator.clients.orc_client import FakeORCClient
@@ -36,7 +37,7 @@ def _setup(tmp_path):
 
 def _decide(nav, run, decision):
     appr = nav.act.list_approvals(target=run.id, gate=ApprovalGate.merge)[0]
-    nav.act.decide_approval(appr.id, decision, actor="manoj")
+    nav.act.decide_approval(appr.id, decision, actor=ACTOR)
 
 
 def test_merge_poll_merges_after_operator_approval(tmp_path):
