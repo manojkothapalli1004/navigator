@@ -2,6 +2,7 @@ import asyncio
 import json
 import re
 import time
+from datetime import datetime, timezone
 from typing import Callable
 
 DEFAULT_SYSTEM_PROMPT = (
@@ -53,14 +54,20 @@ def make_sdk_query_fn(*, model: str | None = None,
     logging configuration.
 
     Model fallback (off unless `fallbacks` is non-empty AND `model` is set):
-    an account/model error (usage credits, credit balance, usage/session limit,
-    unsupported or unknown model) re-issues the same prompt on the next model of
-    model_chain(model, fallbacks); the failing model enters `cooldowns` (shared
-    across query fns when the caller passes one dict) for `cooldown_s` seconds
-    of `clock` time and later calls skip it. One 'sdk_query.model_fallback'
-    event per switch carries the marker only, never the error text. Timeouts,
-    'not logged in' and every other error are never fallen back; if the whole
-    chain fails the last error is raised unchanged.
+    a model-specific error (usage credits, credit balance, usage/weekly/Opus limit,
+    unsupported, unknown or inaccessible model) re-issues the same prompt on the
+    next model of model_chain(model, fallbacks); the failing model enters
+    `cooldowns` (shared across query fns when the caller passes one dict) as
+    (expiry, account_wide=False) for `cooldown_s` seconds of `clock` time and
+    later calls skip it. One 'sdk_query.model_fallback' event per switch carries
+    the marker only, never the error text. An account-wide error ('session
+    limit') never falls back: every model of THIS fn's chain cools down at once
+    (account_wide=True), one 'sdk_query.account_cooldown' event is emitted and
+    the error is raised unchanged after a single SDK call. When every model of
+    the chain is cooling, a call raises RuntimeError('claude-agent-sdk: all
+    models cooling down until <iso>') without any SDK call. Timeouts, 'not
+    logged in' and every other error are never fallen back; if the whole chain
+    fails the last error is raised unchanged.
     """
     try:
         from claude_agent_sdk import ClaudeAgentOptions, ResultMessage, query
@@ -94,6 +101,14 @@ def make_sdk_query_fn(*, model: str | None = None,
         try:
             logger.warning("sdk_query.model_fallback", from_model=from_model,
                            to_model=to_model, reason=reason)
+        except Exception:
+            pass
+
+    def _emit_account_cooldown(use_model, reason: str) -> None:
+        # marker only, never the error text; `models` lists every model now cooling
+        try:
+            logger.warning("sdk_query.account_cooldown", model=use_model, reason=reason,
+                           models=list(chain), cooldown_s=cooldown_s)
         except Exception:
             pass
 
@@ -193,16 +208,32 @@ def make_sdk_query_fn(*, model: str | None = None,
         # the failure surfaces with head/tail detail \u2014 never invent structure
         return retry
 
+    def _until(m) -> float:
+        # entries are (expiry, account_wide); bare floats written by older callers
+        # are read as model-specific expiries
+        entry = cooldowns.get(m)
+        if entry is None:
+            return float("-inf")
+        if isinstance(entry, (tuple, list)):
+            return float(entry[0])
+        return float(entry)
+
     def _cooling(m, now: float) -> bool:
-        return cooldowns.get(m, float("-inf")) > now
+        return _until(m) > now
 
     def query_fn(prompt: str) -> str:
         if not fallback_enabled:
             return _attempt(prompt, model)
         now = clock()
-        # a model still cooling down from a recent account error is skipped; if every
-        # model is cooling, try the whole chain rather than fail without a single call
-        candidates = [m for m in chain if not _cooling(m, now)] or list(chain)
+        # a model still cooling down from a recent account error is skipped; when every
+        # model is cooling, fail fast without an SDK call instead of re-querying the
+        # whole chain on every call (cold audit of N7 rev5)
+        candidates = [m for m in chain if not _cooling(m, now)]
+        if not candidates:
+            earliest = min(_until(m) for m in chain)
+            wall = time.time() + (earliest - now)
+            until_iso = datetime.fromtimestamp(wall, tz=timezone.utc).isoformat(timespec="seconds")
+            raise RuntimeError(f"claude-agent-sdk: all models cooling down until {until_iso}")
         for i, use_model in enumerate(candidates):
             try:
                 return _attempt(prompt, use_model)
@@ -212,7 +243,16 @@ def make_sdk_query_fn(*, model: str | None = None,
                 marker = _fallback_marker(e)
                 if marker is None:
                     raise  # 'not logged in' and everything else: today's behaviour
-                cooldowns[use_model] = clock() + cooldown_s
+                until = clock() + cooldown_s
+                if marker in _ACCOUNT_WIDE_MARKERS:
+                    # the whole account is limited: falling back would only burn more
+                    # failing calls, so every model of the chain cools and the error
+                    # surfaces unchanged after this single call
+                    for m in chain:
+                        cooldowns[m] = (until, True)
+                    _emit_account_cooldown(use_model, marker)
+                    raise
+                cooldowns[use_model] = (until, False)
                 if i == len(candidates) - 1:
                     raise  # chain exhausted: the last error surfaces unchanged
                 _emit_fallback(use_model, candidates[i + 1], marker)
@@ -249,8 +289,15 @@ def _is_retryable(e: Exception) -> bool:
 # account/model failures that justify the next model in the chain. These do NOT
 # change _is_retryable: with fallback disabled the retry logic is untouched.
 # Only the marker ever reaches the fallback log event, never the error text.
-_FALLBACK_MARKERS = ("usage credits", "credit balance", "does not support this model",
-                     "usage limit", "session limit", "model not available", "model not found")
+# 'session limit' is account-wide: every model fails the same way, so the chain cools as
+# a whole and no fallback call is made. Everything else is model-specific: credits are
+# per model (Fable needs its own), weekly/Opus limits name a model, and 'issue with the
+# selected model' is Claude Code's invalid/no-access model message.
+_ACCOUNT_WIDE_MARKERS = ("session limit",)
+_FALLBACK_MARKERS = ("session limit", "usage credits", "credit balance",
+                     "does not support this model", "issue with the selected model",
+                     "usage limit", "weekly limit", "opus limit", "limit for this model",
+                     "model not available", "model not found")
 
 
 def _fallback_marker(e: Exception) -> str | None:
