@@ -4,7 +4,8 @@ downstream check (scope, skip gate, checkpoints, verification) are unchanged.
 """
 import json
 import pytest
-from navigator.runtime.drivers.claude_sdk_driver import ClaudeSDKDriver
+from navigator.runtime import phases
+from navigator.runtime.drivers.claude_sdk_driver import ClaudeSDKDriver, _MAX_FILE_CHARS
 from navigator.runtime.drivers.base import DriverRequest
 from navigator.contracts.enums import Role
 from navigator.safety.budget_guard import BudgetGuard
@@ -149,3 +150,84 @@ def test_builder_prompt_tells_the_model_to_use_file_edits_for_existing_files():
     # the full-rewrite path and the testing instructions are still spelled out
     assert "FULL new file content" in p and "never elide unchanged code" in p
     assert "new or changed behaviour" in p and "context.test_files" in p
+
+
+# N9b: phases._read_affected cuts context.files at _MAX_FILE_CHARS without a marker;
+# an edit resolved against that base would silently drop the rest of the file.
+def test_driver_truncation_cap_is_the_one_phases_truncates_at():
+    assert _MAX_FILE_CHARS == phases._MAX_FILE_CHARS == 60_000
+
+
+def test_edit_on_a_file_at_the_truncation_cap_is_refused_naming_only_the_relpath():
+    big = "x" * (_MAX_FILE_CHARS - 1) + "\n"
+    assert len(big) == _MAX_FILE_CHARS
+    with pytest.raises(DriverParseError,
+                       match=r"file_edits\[0\]: 'big\.py': file is truncated in context "
+                             r"\(>= 60000 chars\); edits refused") as ei:
+        _run({"file_edits": [["big.py", "x\n", "y\n"]], "summary": "s"}, files={"big.py": big})
+    msg = str(ei.value)
+    assert "xxx" not in msg and "cannot be safely changed by the builder" in msg
+
+
+def test_edit_on_a_file_one_char_under_the_cap_is_applied():
+    small = "x" * (_MAX_FILE_CHARS - 2) + "\n"
+    assert len(small) == _MAX_FILE_CHARS - 1
+    res = _run({"file_edits": [["big.py", "x\n", "y\n"]], "summary": "s"}, files={"big.py": small})
+    assert res.file_writes == [("big.py", "x" * (_MAX_FILE_CHARS - 3) + "y\n")]
+
+
+def test_dot_slash_write_path_collides_with_bare_edit_path():
+    with pytest.raises(DriverParseError, match=r"file_edits\[0\].*both file_edits and file_writes"):
+        _run({"file_writes": [["./a.py", "whole\n"]],
+              "file_edits": [["a.py", "return 1\n", "return 2\n"]],
+              "summary": "s"}, files={"a.py": BASE})
+
+
+def test_bare_write_path_collides_with_dot_slash_edit_path():
+    with pytest.raises(DriverParseError, match="both file_edits and file_writes"):
+        _run({"file_writes": [["a.py", "whole\n"]],
+              "file_edits": [["./a.py", "return 1\n", "return 2\n"]],
+              "summary": "s"}, files={"a.py": BASE})
+
+
+def test_dot_slash_edit_path_is_looked_up_against_the_bare_context_key_and_grouped():
+    res = _run({"file_edits": [["./a.py", "return 1\n", "return 11\n"],
+                               ["a.py", "return 2\n", "return 22\n"]],
+                "summary": "s"}, files={"a.py": BASE})
+    assert res.file_writes == [("./a.py", "def a():\n    return 11\n\n\ndef b():\n    return 22\n")]
+
+
+def test_bare_edit_path_is_looked_up_against_a_dot_slash_context_key():
+    res = _run({"file_edits": [["a.py", "return 1\n", "return 3\n"]], "summary": "s"},
+               files={"./a.py": BASE})
+    assert res.file_writes == [("a.py", "def a():\n    return 3\n\n\ndef b():\n    return 2\n")]
+
+
+def test_count_mismatch_error_carries_lengths_but_never_the_old_or_new_text():
+    old, new = "Q" * 20, "ZZZZZ"
+    with pytest.raises(DriverParseError,
+                       match=r"file_edits\[0\] for 'a\.py': old text occurs 0 times "
+                             r"\(must be exactly 1\); len\(old\)=20 len\(new\)=5$") as ei:
+        _run({"file_edits": [["a.py", old, new]], "summary": "s"}, files={"a.py": BASE})
+    msg = str(ei.value)
+    assert "QQ" not in msg and "ZZ" not in msg and BASE not in msg
+
+
+def test_duplicate_old_error_never_carries_the_old_text():
+    with pytest.raises(DriverParseError, match="occurs 2 times") as ei:
+        _run({"file_edits": [["dup.py", "SECRETLINE", "y"]], "summary": "s"},
+             files={"dup.py": "SECRETLINE\nSECRETLINE\n"})
+    assert "SECRET" not in str(ei.value)
+
+
+@pytest.mark.parametrize("entry,shape", [
+    (["SEKRIT.py", "SEKRITOLD"], "list of 2 (str, str)"),
+    (["SEKRIT.py", 1, "SEKRITNEW"], "list of 3 (str, int, str)"),
+    ("SEKRIT.py old new", "str"),
+    ({"relpath": "SEKRIT.py"}, "dict"),
+])
+def test_malformed_entry_error_describes_the_shape_but_carries_no_entry_text(entry, shape):
+    with pytest.raises(DriverParseError, match=r"file_edits\[0\] must be a") as ei:
+        _run({"file_edits": [entry], "summary": "s"}, files={"a.py": BASE})
+    msg = str(ei.value)
+    assert shape in msg and "SEKRIT" not in msg
