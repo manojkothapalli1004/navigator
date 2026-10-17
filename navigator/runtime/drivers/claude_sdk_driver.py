@@ -20,9 +20,19 @@ _ROLE_OUTPUT_SPEC = {
                    'If context.proposal.previous_attempt_failure is present, a previous attempt '
                    'failed with that output: fix its cause (e.g. update existing tests that call '
                    'changed APIs). '
-                   'Respond with ONLY a JSON object: {"file_writes": [[relpath, FULL new file content], ...], '
-                   '"commands": [], "summary": "..."}. Each content replaces the whole file \u2014 '
-                   'never elide unchanged code. Only write paths listed in context.files, plus test files. '
+                   'Respond with ONLY a JSON object: {"file_edits": [[relpath, old, new], ...], '
+                   '"file_writes": [[relpath, FULL new file content], ...], '
+                   '"commands": [], "summary": "..."}. '
+                   'Use file_edits for EXISTING files: each old is a snippet copied verbatim from '
+                   'context.files (same indentation, whitespace and line breaks) with enough '
+                   'surrounding lines to occur exactly once in that file, and new is its '
+                   'replacement; an old that occurs zero or several times is rejected. Keep each '
+                   'edit small; several edits to one file apply in order to the progressively '
+                   'edited text. Use file_writes only for NEW files (null in context.files) or '
+                   'when a full rewrite is genuinely shorter than the edits; a file_writes content '
+                   'replaces the whole file \u2014 never elide unchanged code. Never list one path in '
+                   'both file_edits and file_writes. '
+                   'Only write paths listed in context.files, plus test files. '
                    'If the repo has tests, add or update tests that exercise the new or changed '
                    'behaviour (a passing suite that never runs the new path proves nothing). '
                    'You MAY add new test files not in context.files; follow the layout and '
@@ -91,7 +101,12 @@ class ClaudeSDKDriver:
         query_fn = self.role_query_fns.get(request.role, self.query_fn)
         raw = query_fn(self._build_prompt(request))
         self.budget_guard.record_spend(self.estimated_cost_per_call_usd)
-        return self._parse(request.role, raw)
+        # N9: the builder's file_edits are resolved against the file contents it was
+        # shown (context.files: relpath -> current text, None for a new file)
+        files = None
+        if request.role == Role.builder and isinstance(request.context, dict):
+            files = request.context.get("files")
+        return self._parse(request.role, raw, files=files)
 
     def _build_prompt(self, request: DriverRequest) -> str:
         lines = [f"role: {request.role.value}", f"context: {json.dumps(request.context)}"]
@@ -102,7 +117,7 @@ class ClaudeSDKDriver:
         lines.append(_ROLE_OUTPUT_SPEC[request.role])
         return "\n".join(lines)
 
-    def _parse(self, role: Role, raw: str) -> DriverResult:
+    def _parse(self, role: Role, raw: str, files: dict | None = None) -> DriverResult:
         try:
             payload = json.loads(raw)
         except (ValueError, TypeError) as e:
@@ -113,7 +128,7 @@ class ClaudeSDKDriver:
             raise DriverParseError(f"response must be a JSON object, got {type(payload).__name__}")
 
         perms = ROLE_PERMISSIONS[role]
-        if payload.get("file_writes") and "write" not in perms:
+        if (payload.get("file_writes") or payload.get("file_edits")) and "write" not in perms:
             raise DriverParseError(f"{role.value} is not permitted to write files")
         if payload.get("commands") and "run" not in perms:
             raise DriverParseError(f"{role.value} is not permitted to run commands")
@@ -136,6 +151,17 @@ class ClaudeSDKDriver:
                     raise DriverParseError(f"affected_files must be a list of strings: {p['affected_files']!r}")
 
         file_writes = [self._parse_file_write(entry) for entry in payload.get("file_writes", [])]
+        raw_edits = payload.get("file_edits") or []
+        if not isinstance(raw_edits, list):
+            raise DriverParseError(
+                f"file_edits must be a list of [relpath, old, new] string triples, "
+                f"got {type(raw_edits).__name__}")
+        file_edits = [self._parse_file_edit(entry, i) for i, entry in enumerate(raw_edits)]
+        if file_edits:
+            # N9: search/replace edits become full-content writes here, so phases.py
+            # and every downstream check (scope, skip gate, checkpoints, verification)
+            # see exactly what a whole-file rewrite would have produced
+            file_writes += self._apply_file_edits(file_edits, files, {rel for rel, _ in file_writes})
         commands = [self._parse_command(entry) for entry in payload.get("commands", [])]
         return DriverResult(role=role, proposals=proposals,
                             file_writes=file_writes, commands=commands, summary=summary)
@@ -146,6 +172,52 @@ class ClaudeSDKDriver:
                 or not all(isinstance(x, str) for x in entry)):
             raise DriverParseError(f"file_writes entries must be [relpath, content] string pairs, got {entry!r}")
         return (entry[0], entry[1])
+
+    @staticmethod
+    def _parse_file_edit(entry, index: int) -> tuple[str, str, str]:
+        if (not isinstance(entry, (list, tuple)) or len(entry) != 3
+                or not all(isinstance(x, str) for x in entry)):
+            raise DriverParseError(
+                f"file_edits[{index}] must be a [relpath, old, new] string triple, got {entry!r}"[:300])
+        return (entry[0], entry[1], entry[2])
+
+    @staticmethod
+    def _apply_file_edits(edits: list[tuple[str, str, str]], files: dict | None,
+                          written: set[str]) -> list[tuple[str, str]]:
+        """Resolve [relpath, old, new] edits into (relpath, full new content) pairs.
+
+        `files` is context.files (relpath -> current text, None for a new file).
+        Edits for one relpath apply in order to the progressively edited text; each
+        `old` must be non-empty and occur exactly once in the current text. Errors
+        name the relpath, edit index and occurrence count, never the file content.
+        """
+        base_files = files if isinstance(files, dict) else {}
+        texts: dict[str, str] = {}
+        for i, (rel, old, new) in enumerate(edits):
+            if rel in written:
+                raise DriverParseError(
+                    f"file_edits[{i}]: {rel!r} appears in both file_edits and file_writes; use one")
+            if rel not in base_files:
+                raise DriverParseError(
+                    f"file_edits[{i}]: {rel!r} is not in context.files; only files the builder "
+                    f"was shown can be edited (new files need file_writes)")
+            if rel not in texts:
+                base = base_files[rel]
+                if not isinstance(base, str):
+                    raise DriverParseError(
+                        f"file_edits[{i}]: {rel!r} is a new file (null in context.files); "
+                        f"use file_writes with the full content")
+                texts[rel] = base
+            if not old:
+                raise DriverParseError(
+                    f"file_edits[{i}] for {rel!r}: old must be a non-empty string copied from the file")
+            n = texts[rel].count(old)
+            if n != 1:
+                raise DriverParseError(
+                    f"file_edits[{i}] for {rel!r}: old text occurs {n} times (must be exactly 1); "
+                    f"old head={old[:60]!r}")
+            texts[rel] = texts[rel].replace(old, new, 1)
+        return list(texts.items())
 
     @staticmethod
     def _parse_command(entry) -> list[str]:
