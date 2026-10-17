@@ -1,6 +1,7 @@
 import json
 import shlex
 from typing import Callable
+from navigator.config import Settings
 from navigator.runtime.drivers.base import ROLE_PERMISSIONS, DriverRequest, DriverResult
 from navigator.contracts.enums import Role
 from navigator.safety.budget_guard import BudgetGuard
@@ -58,6 +59,32 @@ class ClaudeSDKDriver:
         self.role_query_fns = role_query_fns or {}
         self.budget_guard = budget_guard
         self.estimated_cost_per_call_usd = estimated_cost_per_call_usd
+
+    @classmethod
+    def from_settings(cls, settings: Settings, *, budget_guard: BudgetGuard,
+                      make_query_fn: Callable[..., Callable[[str], str]] | None = None,
+                      estimated_cost_per_call_usd: float = 0.25) -> "ClaudeSDKDriver":
+        """Wire the live driver from Settings: per-role models (cheaper models where
+        the role doesn't need the strongest one), the model fallback chain and ONE
+        cooldown dict shared by every query fn, so a model that ran out of credits
+        for the builder is skipped by the other roles too.
+
+        make_query_fn is injectable (default: make_sdk_query_fn) so the wiring is
+        testable without the sdk extra.
+        """
+        if make_query_fn is None:
+            from navigator.runtime.drivers.sdk_query import make_sdk_query_fn
+            make_query_fn = make_sdk_query_fn
+        cooldowns: dict = {}
+        common = dict(timeout_s=settings.sdk_timeout_s,
+                      fallbacks=tuple(settings.sdk_model_fallbacks),
+                      cooldown_s=settings.sdk_model_cooldown_s,
+                      cooldowns=cooldowns)
+        role_fns = {Role(role): make_query_fn(model=model, **common)
+                    for role, model in settings.sdk_role_models.items()}
+        return cls(query_fn=make_query_fn(model=settings.sdk_model, **common),
+                   role_query_fns=role_fns, budget_guard=budget_guard,
+                   estimated_cost_per_call_usd=estimated_cost_per_call_usd)
 
     def run_role(self, request: DriverRequest) -> DriverResult:
         self.budget_guard.check_before_call(self.estimated_cost_per_call_usd)

@@ -7,6 +7,12 @@ DEFAULT_ALLOWLIST = [
     "pytest", "python3 -m py_compile", "uv run pytest",
 ]
 
+# operator decision 2026-10-15: when the configured model's account runs out of credits
+# (or hits a usage/session limit) the same query moves to the next model in this chain
+# instead of failing the run; the failing model is skipped for the cooldown period
+DEFAULT_SDK_MODEL_FALLBACKS = ["claude-opus-5-5", "claude-sonnet-5-5"]
+DEFAULT_SDK_MODEL_COOLDOWN_S = 3600
+
 @dataclass
 class RepoConfig:
     path: str
@@ -45,6 +51,9 @@ class Settings:
     sdk_model: str | None = None
     sdk_role_models: dict[str, str] = field(default_factory=dict)
     sdk_timeout_s: float = 300.0
+    # ordered model fallback chain; empty = fallback disabled
+    sdk_model_fallbacks: list[str] = field(default_factory=lambda: list(DEFAULT_SDK_MODEL_FALLBACKS))
+    sdk_model_cooldown_s: int = DEFAULT_SDK_MODEL_COOLDOWN_S
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -75,6 +84,10 @@ class Settings:
                              for role in ("planner", "builder", "verifier")
                              if os.getenv(f"NAVIGATOR_SDK_MODEL_{role.upper()}")},
             sdk_timeout_s=_positive_float_env("NAVIGATOR_SDK_TIMEOUT_S", "300.0"),
+            sdk_model_fallbacks=_model_list_env("NAVIGATOR_SDK_MODEL_FALLBACKS",
+                                                ",".join(DEFAULT_SDK_MODEL_FALLBACKS)),
+            sdk_model_cooldown_s=_positive_int_env("NAVIGATOR_SDK_MODEL_COOLDOWN_S",
+                                                   str(DEFAULT_SDK_MODEL_COOLDOWN_S)),
         )
 
 
@@ -116,6 +129,14 @@ def _positive_float_env(name: str, default: str) -> float:
     if v <= 0:
         raise ValueError(f"{name} must be > 0, got {v}")
     return v
+
+
+def _model_list_env(name: str, default: str) -> list[str]:
+    # comma-separated model ids; blanks dropped; an empty value disables fallback entirely
+    raw = os.getenv(name, default)
+    if raw is None:
+        raw = default
+    return [e.strip() for e in raw.split(",") if e.strip()]
 
 
 _ALLOWLIST_FORBIDDEN = set(";|&$`><\n*?!\\/")

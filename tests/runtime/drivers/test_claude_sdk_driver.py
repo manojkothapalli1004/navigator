@@ -1,5 +1,6 @@
 import json
 import pytest
+from navigator.config import Settings
 from navigator.runtime.drivers.claude_sdk_driver import ClaudeSDKDriver
 from navigator.runtime.drivers.base import DriverRequest
 from navigator.contracts.enums import Role
@@ -48,7 +49,7 @@ def test_prompt_contains_role_context_and_worktree():
     assert "/tmp/w1" in prompts[0]
 
 def test_planner_proposal_missing_required_key_rejected():
-    # live haiku regression 2026-07-13: model invented its own keys → KeyError in loop
+    # live haiku regression 2026-07-13: model invented its own keys \u2192 KeyError in loop
     bad = {k: v for k, v in PROPOSAL.items() if k != "intended_changes"}
     d = make_driver({"proposals": [bad], "summary": "s"})
     with pytest.raises(DriverParseError, match="intended_changes"):
@@ -172,3 +173,59 @@ def test_builder_is_told_to_test_the_behaviour_it_changes():
     # test files may be ADDED even though they aren't in context.files
     assert "must be listed in context.files" not in seen["p"]
     assert "context.test_files" in seen["p"]
+
+
+# --- from_settings: model fallback chain wiring (operator decision 2026-10-15) --------
+
+def test_from_settings_wires_role_models_fallback_chain_and_one_shared_cooldown_dict():
+    built = []
+    def fake_make(*, model, timeout_s, fallbacks, cooldown_s, cooldowns):
+        built.append({"model": model, "timeout_s": timeout_s, "fallbacks": fallbacks,
+                      "cooldown_s": cooldown_s, "cooldowns": cooldowns})
+        return lambda prompt: model
+    s = Settings(sdk_model="claude-fable-5-1",
+                 sdk_role_models={"planner": "claude-sonnet-5-5", "verifier": "claude-sonnet-5-5"},
+                 sdk_model_fallbacks=["claude-opus-5-5", "claude-sonnet-5-5"],
+                 sdk_model_cooldown_s=120, sdk_timeout_s=42.0)
+    drv = ClaudeSDKDriver.from_settings(s, budget_guard=BudgetGuard(1.5), make_query_fn=fake_make)
+    assert isinstance(drv, ClaudeSDKDriver)
+    assert drv.budget_guard.max_cost_usd == 1.5
+    assert drv.query_fn("x") == "claude-fable-5-1"
+    assert drv.role_query_fns[Role.planner]("x") == "claude-sonnet-5-5"
+    assert drv.role_query_fns[Role.verifier]("x") == "claude-sonnet-5-5"
+    assert Role.builder not in drv.role_query_fns
+    assert len(built) == 3
+    for b in built:
+        assert b["fallbacks"] == ("claude-opus-5-5", "claude-sonnet-5-5")
+        assert isinstance(b["fallbacks"], tuple)
+        assert b["cooldown_s"] == 120 and b["timeout_s"] == 42.0
+        assert b["cooldowns"] is built[0]["cooldowns"]  # ONE dict shared by every role
+    assert isinstance(built[0]["cooldowns"], dict) and built[0]["cooldowns"] == {}
+
+
+def test_from_settings_empty_fallbacks_disable_the_chain():
+    built = []
+    def fake_make(*, model, **kw):
+        built.append(kw)
+        return lambda prompt: model
+    s = Settings(sdk_model="m", sdk_model_fallbacks=[])
+    ClaudeSDKDriver.from_settings(s, budget_guard=BudgetGuard(1.0), make_query_fn=fake_make)
+    assert built == [{"timeout_s": 300.0, "fallbacks": (), "cooldown_s": 3600,
+                      "cooldowns": built[0]["cooldowns"]}]
+
+
+def test_from_settings_defaults_to_the_real_sdk_query_factory(monkeypatch):
+    import sys, types
+    mod = types.ModuleType("claude_agent_sdk")
+    mod.query = None; mod.ClaudeAgentOptions = None; mod.ResultMessage = None
+    monkeypatch.setitem(sys.modules, "claude_agent_sdk", mod)
+    drv = ClaudeSDKDriver.from_settings(Settings(sdk_model="m", sdk_role_models={"planner": "p"}),
+                                        budget_guard=BudgetGuard(1.0))
+    assert callable(drv.query_fn) and callable(drv.role_query_fns[Role.planner])
+
+
+def test_from_settings_requires_sdk_extra(monkeypatch):
+    import sys
+    monkeypatch.setitem(sys.modules, "claude_agent_sdk", None)
+    with pytest.raises(ValueError, match="claude-agent-sdk"):
+        ClaudeSDKDriver.from_settings(Settings(sdk_model="m"), budget_guard=BudgetGuard(1.0))

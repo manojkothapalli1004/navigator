@@ -10,6 +10,14 @@ driver = "fake"                 # NAVIGATOR_DRIVER: "fake" (deterministic) | "cl
 sdk_model = ""                  # NAVIGATOR_SDK_MODEL: e.g. "claude-opus-5-5" (live deployment)
 # Optional per-role model overrides (unset = use NAVIGATOR_SDK_MODEL):
 #   NAVIGATOR_SDK_MODEL_PLANNER, NAVIGATOR_SDK_MODEL_BUILDER, NAVIGATOR_SDK_MODEL_VERIFIER
+# Model fallback chain (operator decision 2026-10-15): when a query fails with an
+# account/model error (usage credits, credit balance, usage/session limit, model not
+# available/supported) the SAME query is re-issued on the next model in the chain and
+# the failing model is skipped for NAVIGATOR_SDK_MODEL_COOLDOWN_S seconds. Never falls
+# back "up": a role already running on a chain model only tries the models after it.
+# An empty list disables fallback; "not logged in" and all other errors never fall back.
+sdk_model_fallbacks = ["claude-opus-5-5", "claude-sonnet-5-5"]  # NAVIGATOR_SDK_MODEL_FALLBACKS (comma list)
+sdk_model_cooldown_s = 3600     # NAVIGATOR_SDK_MODEL_COOLDOWN_S: seconds a failed model is skipped (>= 1)
 sdk_timeout_s = 300.0           # NAVIGATOR_SDK_TIMEOUT_S: wall-clock cap per SDK query
 
 [mode]
