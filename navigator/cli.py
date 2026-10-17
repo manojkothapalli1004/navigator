@@ -2,8 +2,12 @@
 
 Every decision here is recorded in ACT; the daemon acts on it next cycle.
 `audited <run-id> [--note TEXT]` marks a run awaiting review as audited (a
-'run.audited' event plus an approved review-gate approval targeting the run); only
-audited runs accept a merge decision from Telegram. The CLI `merge` does not need it.
+'run.audited' event carrying the run's verified_sha plus an approved review-gate
+approval targeting the run); only audited runs accept a merge decision from
+Telegram. The CLI `merge` does not need it.
+`inbox [--since UPDATE_ID]` prints the Telegram inbox file (JSON lines, newest
+last) so other tools read operator messages from the file instead of calling
+getUpdates themselves.
 `cleanup [--apply]` is the exception: it removes finished runs' worktrees and
 nav/run-* branches directly (dry run unless --apply).
 `doctor [--plist PATH]` is read-only: it replays the daemon's startup against the
@@ -24,6 +28,7 @@ In every printed value and env key, control characters (CR, LF, tab, NUL, line/
 paragraph separators, ...) are replaced with '?', so a value cannot forge an
 extra output line.
 """
+import json
 import os
 import plistlib
 import re
@@ -38,7 +43,7 @@ from navigator.contracts.enums import (ApprovalDecision, ApprovalGate, ProposalS
 from navigator.contracts.event import Event
 
 COMMANDS = ("status", "approve", "decline", "diff", "merge", "reject", "retry", "cleanup",
-            "doctor", "audited")
+            "doctor", "audited", "inbox")
 ACTOR = "operator"
 AUDITOR = "auditor"
 
@@ -55,7 +60,8 @@ def run_cli(argv: list[str], *, act, out: TextIO, worktree_root: str | None = No
         print(f"usage: navigator {{{'|'.join(COMMANDS)}}} [id]  "
               f"(cleanup takes no id: navigator cleanup [--apply]; "
               f"navigator doctor [--plist PATH]; "
-              f"navigator audited <run-id> [--note TEXT])", file=out)
+              f"navigator audited <run-id> [--note TEXT]; "
+              f"navigator inbox [--since UPDATE_ID])", file=out)
         return 2
     cmd, args = argv[0], argv[1:]
     if cmd == "status":
@@ -64,6 +70,8 @@ def run_cli(argv: list[str], *, act, out: TextIO, worktree_root: str | None = No
         return _doctor(args, out)
     if cmd == "audited":
         return _audited(act, args, out)
+    if cmd == "inbox":
+        return _inbox(args, out)
     if cmd == "cleanup":
         if args not in ([], ["--apply"]):
             print("usage: navigator cleanup [--apply]", file=out)
@@ -121,10 +129,91 @@ def _find_run(act, run_id):
     return next((r for r in act.list_open_runs() if r.id == run_id), None)
 
 
-def is_audited(act, run_id: str) -> bool:
-    """True once an approved review-gate approval targets the run (`navigator audited`)."""
-    return bool(act.list_approvals(target=run_id, gate=ApprovalGate.review,
-                                   decision=ApprovalDecision.approved))
+# the only event kinds is_audited looks at
+_AUDIT_EVENT_KINDS = frozenset({"run.audited", "run.awaiting_review"})
+# how many client wrappers (.inner) to unwrap when looking for list_events
+_MAX_WRAPPER_DEPTH = 8
+
+
+def _events(act):
+    """Audit-relevant navigator events read back from ACT, or None when they cannot
+    be listed (a client without list_events, or the call failed). Callers treat
+    None as 'not audited' (fail closed). Wrappers such as NotifyingACT are unwrapped
+    through their .inner attribute."""
+    target = act
+    for _ in range(_MAX_WRAPPER_DEPTH):
+        if hasattr(target, "list_events"):
+            break
+        target = getattr(target, "inner", None)
+        if target is None:
+            return None
+    else:
+        return None
+    try:
+        return list(target.list_events(kinds=set(_AUDIT_EVENT_KINDS)))
+    except Exception:
+        return None
+
+
+def _as_utc(value) -> datetime | None:
+    """`value` (datetime or ISO string) as an aware UTC datetime; naive means UTC.
+    None when missing or unparsable."""
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if not isinstance(value, datetime):
+        return None
+    return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+
+
+def _payload(event) -> dict:
+    payload = getattr(event, "payload", None)
+    return payload if isinstance(payload, dict) else {}
+
+
+def is_audited(act, run) -> bool:
+    """True once the run's CURRENT verified_sha has been audited (`navigator audited`).
+
+    `run` is a Run or the id of an open run. All of the following, read back from
+    ACT, are required:
+    - a 'run.audited' event for the run whose payload verified_sha equals the run's
+      verified_sha (None never matches: an unverified run cannot be audited), and
+    - an approved review-gate approval targeting the run with actor 'auditor',
+    both strictly AFTER the run's latest 'run.awaiting_review' event (equal
+    timestamps do not count): an audit recorded before verification finished, e.g.
+    by code running inside the run, is worthless.
+
+    The actor name 'auditor' is a convention that tells `navigator audited` apart
+    from the CLI `retry` grant (actor 'operator'); it is NOT authentication: anyone
+    who can write to ACT can forge it. Fails closed: when the events cannot be listed
+    (a client without list_events, ACT unreachable) the run is not audited.
+    """
+    if isinstance(run, str):
+        run = _find_run(act, run)
+    if run is None or not run.verified_sha:
+        return False
+    events = _events(act)
+    if events is None:
+        return False
+    mine = [e for e in events if _payload(e).get("run_id") == run.id]
+    reviewed = [t for e in mine if getattr(e, "kind", None) == "run.awaiting_review"
+                if (t := _as_utc(getattr(e, "ts", None))) is not None]
+    if not reviewed:
+        return False
+    since = max(reviewed)
+    sha_audited = any(getattr(e, "kind", None) == "run.audited"
+                      and _payload(e).get("verified_sha") == run.verified_sha
+                      and (t := _as_utc(getattr(e, "ts", None))) is not None and t > since
+                      for e in mine)
+    if not sha_audited:
+        return False
+    grants = act.list_approvals(target=run.id, gate=ApprovalGate.review,
+                                decision=ApprovalDecision.approved)
+    return any(a.actor == AUDITOR
+               and (t := _as_utc(a.decided_at)) is not None and t > since
+               for a in grants)
 
 
 def _audited(act, args: list[str], out) -> int:
@@ -143,14 +232,64 @@ def _audited(act, args: list[str], out) -> int:
     if run.phase != RunPhase.awaiting_review:
         print(f"{run_id} is {run.phase.value}, not awaiting_review", file=out)
         return 1
-    if is_audited(act, run_id):
+    if not run.verified_sha:
+        print(f"{run_id} has no verified_sha recorded; nothing to audit", file=out)
+        return 1
+    if is_audited(act, run):
         print(f"{run_id} is already marked audited", file=out)
         return 0
+    # the audit is bound to the exact commit that was verified: a run re-verified at
+    # another sha must be audited again
     act.emit_event(Event(kind="run.audited", correlation_id=run.correlation_id,
-                         payload={"run_id": run_id, "note": note, "actor": AUDITOR}))
+                         payload={"run_id": run_id, "note": note, "actor": AUDITOR,
+                                  "verified_sha": run.verified_sha}))
     grant = act.create_approval(target=run_id, gate=ApprovalGate.review)
     act.decide_approval(grant.id, ApprovalDecision.approved, actor=AUDITOR)
-    print(f"{run_id} marked audited (telegram /merge {run_id} is now accepted)", file=out)
+    print(f"{run_id} marked audited at {run.verified_sha[:12]} "
+          f"(telegram /merge {run_id} is now accepted)", file=out)
+    return 0
+
+
+# ---- inbox -------------------------------------------------------------------
+
+def _inbox_path() -> Path:
+    env = os.environ.get("NAVIGATOR_TELEGRAM_INBOX_PATH")
+    if env:
+        return Path(env)
+    # imported lazily: telegram_inbox imports is_audited from this module
+    from navigator.observability.telegram_inbox import DEFAULT_INBOX_PATH
+    return Path(DEFAULT_INBOX_PATH)
+
+
+def _inbox(args: list[str], out) -> int:
+    """Print the Telegram inbox file as written by TelegramInbox: one JSON object per
+    line, newest last. With --since only entries whose update_id is greater than
+    UPDATE_ID. Lines that are not JSON (a partial write) are skipped; bytes that are
+    not UTF-8 are replaced, never fatal. A missing file prints nothing."""
+    if args == []:
+        since = None
+    elif len(args) == 2 and args[0] == "--since" and args[1].lstrip("-").isdigit():
+        since = int(args[1])
+    else:
+        print("usage: navigator inbox [--since UPDATE_ID]", file=out)
+        return 2
+    try:
+        text = _inbox_path().read_text(encoding="utf-8", errors="replace")
+    except FileNotFoundError:
+        return 0
+    for line in text.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if since is not None:
+            uid = entry.get("update_id") if isinstance(entry, dict) else None
+            if not isinstance(uid, int) or isinstance(uid, bool) or uid <= since:
+                continue
+        print(line, file=out)
     return 0
 
 
