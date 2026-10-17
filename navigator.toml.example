@@ -23,6 +23,9 @@ sdk_timeout_s = 300.0           # NAVIGATOR_SDK_TIMEOUT_S: wall-clock cap per SD
 [mode]
 mode = "dry_run"                # NAVIGATOR_MODE: "dry_run" proposes only; "execute" runs approved
                                 # proposals and acts on merge decisions
+merge_in_dry_run = false        # NAVIGATOR_MERGE_IN_DRY_RUN: "1"/"true" lets merge_poll act on
+                                # operator merge decisions (merge/decline) while mode is dry_run;
+                                # builds stay off. "0"/"false"/unset = off; anything else is an error
 
 [services]
 act_base_url = ""               # NAVIGATOR_ACT_BASE_URL: unset = in-memory FakeACTClient
