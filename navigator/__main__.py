@@ -28,13 +28,12 @@ def _make_driver(settings: Settings):
     if settings.driver == "fake":
         return FakeSubagentDriver()
     if settings.driver == "claude_sdk":
-        # per-role models: cheaper models where the role doesn't need the strongest one
-        role_fns = {Role(role): make_sdk_query_fn(model=model, timeout_s=settings.sdk_timeout_s)
-                    for role, model in settings.sdk_role_models.items()}
-        return ClaudeSDKDriver(query_fn=make_sdk_query_fn(model=settings.sdk_model,
-                                                          timeout_s=settings.sdk_timeout_s),
-                               role_query_fns=role_fns,
-                               budget_guard=BudgetGuard(settings.max_cost_usd))
+        # from_settings wires per-role models, the model fallback chain
+        # (NAVIGATOR_SDK_MODEL_FALLBACKS / _COOLDOWN_S) and one shared cooldown dict.
+        # make_sdk_query_fn is passed from this module so tests can monkeypatch it.
+        return ClaudeSDKDriver.from_settings(settings,
+                                             budget_guard=BudgetGuard(settings.max_cost_usd),
+                                             make_query_fn=make_sdk_query_fn)
     raise ValueError(f"unknown NAVIGATOR_DRIVER {settings.driver!r}")
 
 def build_navigator(settings: Settings):
