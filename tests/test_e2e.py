@@ -1,5 +1,6 @@
 import subprocess
 from pathlib import Path
+from navigator.cli import ACTOR
 from navigator.runtime.loop import Navigator
 from navigator.runtime.executor import merge_after_approval
 from navigator.clients.act_client import FakeACTClient
@@ -30,7 +31,7 @@ def test_full_loop_propose_approve_execute_review_merge_outcome(tmp_path):
     run = nav.approval_poll()[0]
     merge_appr = nav.act.list_approvals(target=run.id, gate=ApprovalGate.merge)[0]
     # operator approves merge
-    nav.act.decide_approval(merge_appr.id, ApprovalDecision.approved, actor="manoj")
+    nav.act.decide_approval(merge_appr.id, ApprovalDecision.approved, actor=ACTOR)
     merge_after_approval(run, act=nav.act, orc=nav.orc, driver=nav.driver, runner=nav.runner, settings=s)
     assert nav.act.runs[run.id].status == RunStatus.completed
     assert any(sec in ("status","decisions") for sec, _, _ in nav.orc.updates)

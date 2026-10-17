@@ -16,6 +16,12 @@ from navigator.ids import new_id
 from navigator.safety.approval_engine import require_gate
 from navigator.safety.circuit_breakers import CircuitBreakers
 
+# Operator identities whose merge approvals the gate honours: navigator.cli.ACTOR and
+# navigator.observability.telegram_inbox.TELEGRAM_ACTOR. Spelled out here instead of
+# imported because both of those modules import the runtime (import cycle);
+# tests/runtime/test_merge_gate_actor.py pins this set to those constants.
+_OPERATOR_ACTORS = frozenset({"operator", "operator-telegram"})
+
 def _save(act, run: Run) -> None:
     # every persisted transition doubles as a liveness heartbeat for reconcile
     run.heartbeat_at = datetime.now(timezone.utc)
@@ -133,9 +139,32 @@ def execute_proposal(proposal: Proposal, *, act, orc, driver, runner, settings,
           verification=run.verification, verified_sha=run.verified_sha)
     return run
 
+def _as_utc(dt: datetime) -> datetime:
+    # naive timestamps (older ACT rows, fakes) are taken as UTC
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+
 def _merge_approved(act, run) -> bool:
-    appr = act.list_approvals(target=run.id, gate=ApprovalGate.merge, decision=ApprovalDecision.approved)
-    return len(appr) > 0
+    """True only if an OPERATOR approved the merge AFTER the run opened for review.
+
+    Defence in depth, not a sandbox: verification runs builder-written code on the
+    same host as ACT, so code could create+approve a merge approval for its own run.
+    Such an approval is ignored unless its actor is one of the operator identities
+    (navigator CLI or the Telegram inbox) and, when both timestamps are known, it was
+    decided no earlier than the run's awaiting_review heartbeat (the _save that moved
+    the run into awaiting_review; naive datetimes are treated as UTC). An approval
+    without decided_at is judged on actor alone.
+    """
+    approvals = act.list_approvals(target=run.id, gate=ApprovalGate.merge,
+                                  decision=ApprovalDecision.approved)
+    opened = getattr(run, "heartbeat_at", None)
+    for appr in approvals:
+        if appr.actor not in _OPERATOR_ACTORS:
+            continue
+        decided = getattr(appr, "decided_at", None)
+        if decided is not None and opened is not None and _as_utc(decided) < _as_utc(opened):
+            continue  # decided before the run was reviewable: cannot be the operator's verdict
+        return True
+    return False
 
 def _merge_preflight(repo: str, run: Run) -> str | None:
     """Reason the main checkout can't take the merge right now, else None. The main

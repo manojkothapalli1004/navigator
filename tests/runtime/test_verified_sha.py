@@ -1,5 +1,6 @@
 import subprocess
 from pathlib import Path
+from navigator.cli import ACTOR
 from navigator.runtime.executor import execute_proposal, merge_after_approval
 from navigator.runtime.outcome_store import OutcomeStore
 from navigator.observability.notify import NotifyingACT
@@ -14,7 +15,7 @@ def _head(cwd, rev="HEAD"):
 
 def _approve(d, run):
     a = d["act"].list_approvals(target=run.id, gate=ApprovalGate.merge)[0]
-    d["act"].decide_approval(a.id, ApprovalDecision.approved, actor="manoj")
+    d["act"].decide_approval(a.id, ApprovalDecision.approved, actor=ACTOR)
 
 
 def _tracked(repo):

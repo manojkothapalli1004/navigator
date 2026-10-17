@@ -1,4 +1,5 @@
 import pytest
+from navigator.cli import ACTOR
 from navigator.clients.act_client import FakeACTClient
 from navigator.contracts.proposal import Proposal
 from navigator.contracts.enums import ApprovalGate, ApprovalDecision, ProposalStatus
@@ -23,7 +24,7 @@ def test_merge_gate_requires_approved_merge_approval():
     a = act.create_approval(target="run-1", gate=ApprovalGate.merge)
     with pytest.raises(GateNotApproved):
         require_gate(act, ApprovalGate.merge, "run-1")
-    act.decide_approval(a.id, ApprovalDecision.approved, actor="m")
+    act.decide_approval(a.id, ApprovalDecision.approved, actor=ACTOR)
     require_gate(act, ApprovalGate.merge, "run-1")
 
 @pytest.mark.parametrize("gate", [ApprovalGate.architecture, ApprovalGate.destructive,
