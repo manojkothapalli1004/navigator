@@ -2,6 +2,8 @@ from datetime import datetime, timezone
 import subprocess
 import time
 from pathlib import Path
+from navigator.cli import ACTOR
+from navigator.observability.telegram_inbox import TELEGRAM_ACTOR
 from navigator.contracts.proposal import Proposal
 from navigator.contracts.run import Run, Checkpoint
 from navigator.contracts.outcome import Outcome, Rollback
@@ -16,11 +18,18 @@ from navigator.ids import new_id
 from navigator.safety.approval_engine import require_gate
 from navigator.safety.circuit_breakers import CircuitBreakers
 
-# Operator identities whose merge approvals the gate honours: navigator.cli.ACTOR and
-# navigator.observability.telegram_inbox.TELEGRAM_ACTOR. Spelled out here instead of
-# imported because both of those modules import the runtime (import cycle);
-# tests/runtime/test_merge_gate_actor.py pins this set to those constants.
-_OPERATOR_ACTORS = frozenset({"operator", "operator-telegram"})
+# Operator identities whose merge approvals the gate honours: the navigator CLI and
+# the Telegram inbox. Imported from their definitions so a renamed actor cannot
+# silently lock the operator out of the merge gate.
+_OPERATOR_ACTORS = frozenset({ACTOR, TELEGRAM_ACTOR})
+
+# S3c: an approved merge approval that no operator gave after review would otherwise
+# park the run silently forever; the operator sees this reason once per run.
+_NOT_OPERATOR_REASON = "approval not from an operator after review"
+# (run_id, reason) pairs already announced, the same per-run, per-reason dedupe
+# NotifyingACT (N4b) applies to its notifications - here so ACT also records the
+# block once rather than on every poll.
+_blocked_announced: set[tuple[str, str]] = set()
 
 def _save(act, run: Run) -> None:
     # every persisted transition doubles as a liveness heartbeat for reconcile
@@ -30,6 +39,16 @@ def _save(act, run: Run) -> None:
 def _emit(act, run, kind, severity=Severity.info, **payload):
     payload = {"run_id": run.id, "proposal_id": run.proposal_id, **payload}
     act.emit_event(Event(kind=kind, severity=severity, correlation_id=run.correlation_id, payload=payload))
+
+def _emit_blocked_once(act, run, reason: str, **payload) -> bool:
+    """Emit run.merge_blocked for `reason` the first time it applies to this run;
+    later polls with the same reason are silent. True if an event was emitted."""
+    key = (run.id, reason)
+    if key in _blocked_announced:
+        return False
+    _blocked_announced.add(key)
+    _emit(act, run, "run.merge_blocked", Severity.warning, reason=reason, **payload)
+    return True
 
 def short_sha(sha: str | None) -> str:
     return (sha or "")[:12] or "?"
@@ -143,6 +162,24 @@ def _as_utc(dt: datetime) -> datetime:
     # naive timestamps (older ACT rows, fakes) are taken as UTC
     return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
 
+def _approved_merge_approvals(act, run) -> list:
+    """Every merge approval for the run that is in the approved state, whoever gave it."""
+    return list(act.list_approvals(target=run.id, gate=ApprovalGate.merge,
+                                   decision=ApprovalDecision.approved))
+
+def _operator_approved(approvals, run) -> bool:
+    """True only if one of `approvals` was given by an OPERATOR AFTER the run opened
+    for review (see _merge_approved for the rationale)."""
+    opened = getattr(run, "heartbeat_at", None)
+    for appr in approvals:
+        if appr.actor not in _OPERATOR_ACTORS:
+            continue
+        decided = getattr(appr, "decided_at", None)
+        if decided is not None and opened is not None and _as_utc(decided) < _as_utc(opened):
+            continue  # decided before the run was reviewable: cannot be the operator's verdict
+        return True
+    return False
+
 def _merge_approved(act, run) -> bool:
     """True only if an OPERATOR approved the merge AFTER the run opened for review.
 
@@ -154,17 +191,7 @@ def _merge_approved(act, run) -> bool:
     the run into awaiting_review; naive datetimes are treated as UTC). An approval
     without decided_at is judged on actor alone.
     """
-    approvals = act.list_approvals(target=run.id, gate=ApprovalGate.merge,
-                                  decision=ApprovalDecision.approved)
-    opened = getattr(run, "heartbeat_at", None)
-    for appr in approvals:
-        if appr.actor not in _OPERATOR_ACTORS:
-            continue
-        decided = getattr(appr, "decided_at", None)
-        if decided is not None and opened is not None and _as_utc(decided) < _as_utc(opened):
-            continue  # decided before the run was reviewable: cannot be the operator's verdict
-        return True
-    return False
+    return _operator_approved(_approved_merge_approvals(act, run), run)
 
 def _merge_preflight(repo: str, run: Run) -> str | None:
     """Reason the main checkout can't take the merge right now, else None. The main
@@ -239,7 +266,13 @@ def _previous_failure(settings, proposal_id: str) -> dict:
     return {"previous_attempt_failure": f"{last.summary}: {detail}"}
 
 def merge_after_approval(run: Run, *, act, orc, driver, runner, settings, squash: bool = False) -> Run:
-    if not _merge_approved(act, run):
+    approvals = _approved_merge_approvals(act, run)
+    if not _operator_approved(approvals, run):
+        if approvals:
+            # approved, but by nobody the gate trusts (or before the run was reviewable):
+            # the run stays parked, and the operator is told why - once per run
+            _emit_blocked_once(act, run, _NOT_OPERATOR_REASON,
+                               actors=sorted({str(a.actor) for a in approvals}))
         return run  # never auto-merge
     repo = _repo_for(run, act)
     missing = _missing_branch(repo, run)
