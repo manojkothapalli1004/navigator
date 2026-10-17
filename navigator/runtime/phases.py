@@ -510,34 +510,52 @@ def _normalize_affected(wt: Path, paths: list[str], workdir: str) -> list[str]:
             out.append(p)
     return out
 
-# S3b: verifier commands execute builder-written test code (arbitrary Python) on the
-# same host as ACT/ORC. The Navigator process holds their URLs and tokens in its
+# S3b/S3c: verifier commands execute builder-written test code (arbitrary Python) on
+# the same host as ACT/ORC. The Navigator process holds their URLs and tokens in its
 # environment; a verifier subprocess must not inherit them, and must not be able to
 # reach the local services through a proxy it picks up from the environment either.
 # This is defence in depth, not a sandbox: a determined test can still open a raw
-# socket to 127.0.0.1:8090. It removes the easy path (credentials and discovery)
-# and makes any such attempt deliberate and visible in the diff.
-_SEALED_FRAGMENTS = ("ACT_", "ORC_", "TOKEN")
+# socket to 127.0.0.1:8090, and HOME stays readable. It removes the easy path
+# (credentials and discovery) and makes any such attempt deliberate and visible in
+# the diff.
+_SEALED_PREFIXES = ("NAVIGATOR_", "ACT_", "ORC_")
+_SEALED_SUFFIXES = ("_TOKEN", "_SECRET", "_PASSWORD", "_API_KEY")
+_SEALED_EXACT = frozenset({"TOKEN"})
 _DEAD_PROXY = "http://127.0.0.1:9"
 _PROXY_KEYS = ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy")
 _NO_PROXY_KEYS = ("NO_PROXY", "no_proxy")
+# `uv run pytest` behind the dead proxy would otherwise retry the network for every
+# wheel it cannot find before giving up; offline mode makes uv use its cache (which
+# already works warm) and fail fast and clearly when it cannot.
+_OFFLINE_KEYS = {"UV_OFFLINE": "1"}
+
+def _is_sealed_key(key: str) -> bool:
+    """Keys the sealed env drops (case-insensitive): Navigator/ACT/ORC addresses
+    (NAVIGATOR_*, ACT_*, ORC_*) and common credential names (*_TOKEN, *_SECRET,
+    *_PASSWORD, *_API_KEY, TOKEN). Prefix/suffix matches, not substring ones, so
+    CONTACT_*, EXACT_* and TOKENIZERS_PARALLELISM are kept."""
+    upper = key.upper()
+    return (upper.startswith(_SEALED_PREFIXES) or upper.endswith(_SEALED_SUFFIXES)
+            or upper in _SEALED_EXACT)
 
 def sealed_verifier_env(base: dict | None = None) -> dict[str, str]:
-    """Environment for verifier subprocesses: os.environ (or `base`) with every
-    NAVIGATOR_* key and every key containing ACT_, ORC_ or TOKEN removed, HTTP(S)
-    proxies pointed at a dead port (9, discard) and NO_PROXY cleared so the dead
-    proxy applies to localhost too. PATH, HOME and everything else are kept."""
+    """Environment for verifier subprocesses: os.environ (or `base`) with the
+    Navigator/ACT/ORC addresses and common credential names removed (see
+    _is_sealed_key), HTTP(S) proxies pointed at a dead port (9, discard), NO_PROXY
+    cleared so the dead proxy applies to localhost too, and UV_OFFLINE=1 so uv
+    fails fast instead of retrying the network. Not a sandbox: PATH, HOME (which
+    stays readable, dotfiles included) and everything else are kept."""
     src = os.environ if base is None else base
     env: dict[str, str] = {}
     for key, value in src.items():
-        upper = key.upper()
-        if upper.startswith("NAVIGATOR_") or any(f in upper for f in _SEALED_FRAGMENTS):
+        if _is_sealed_key(key):
             continue
         env[key] = value
     for key in _PROXY_KEYS:
         env[key] = _DEAD_PROXY
     for key in _NO_PROXY_KEYS:
         env[key] = ""
+    env.update(_OFFLINE_KEYS)
     return env
 
 def _accepts_env(fn) -> bool:
@@ -564,8 +582,9 @@ def _environ_replaced(env: dict[str, str]):
 def _run_sealed(runner, argv: list[str], cwd: Path):
     """The one place verifier commands are spawned. Passes the sealed env explicitly
     when the runner accepts `env=`, and replaces os.environ for the duration of the
-    call either way (a runner that inherits the process environment then inherits
-    the sealed one). CommandRejected propagates unchanged."""
+    call either way (a runner that inherits the process environment - like
+    CommandRunner, which derives its child env from os.environ - then inherits the
+    sealed one). CommandRejected propagates unchanged."""
     env = sealed_verifier_env()
     with _environ_replaced(env):
         if _accepts_env(runner.run):
