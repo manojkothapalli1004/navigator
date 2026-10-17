@@ -12,7 +12,8 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from navigator.runtime.drivers.sdk_query import _PROBE_KEY, make_sdk_query_fn, model_chain
+from navigator.runtime.drivers.sdk_query import (_ACCOUNT_KEY, _PROBE_KEY, make_sdk_query_fn,
+                                                 model_chain)
 
 FABLE, OPUS, SONNET = "claude-fable-5-1", "claude-opus-5-5", "claude-sonnet-5-5"
 CHAIN = (OPUS, SONNET)
@@ -345,7 +346,7 @@ def test_session_limit_cools_the_whole_chain_after_one_call_and_raises_unchanged
         fn("x")
     assert str(exc.value) == f"claude-agent-sdk error result: {SESSION}"
     assert calls == [FABLE]
-    assert cooldowns == {FABLE: (3600.0, True), OPUS: (3600.0, True), SONNET: (3600.0, True)}
+    assert cooldowns == {_ACCOUNT_KEY: 3600.0}  # N7e: one entry for the whole account
     assert log.fallbacks() == []
     assert log.kinds() == ["sdk_query.failed", "sdk_query.account_cooldown"]
     cooldown = log.events[1][1]
@@ -384,7 +385,8 @@ def test_session_limit_on_the_last_model_still_raises_it_unchanged(monkeypatch):
     with pytest.raises(RuntimeError, match="session limit"):
         _fn(cooldowns=cooldowns, clock=lambda: 0.0, logger=log)("x")
     assert calls == [FABLE, OPUS, SONNET]
-    assert cooldowns == {FABLE: (3600.0, True), OPUS: (3600.0, True), SONNET: (3600.0, True)}
+    # N7e F1: the account-wide expiry no longer overwrites the credit cooldowns
+    assert cooldowns == {FABLE: (3600.0, False), OPUS: (3600.0, False), _ACCOUNT_KEY: 3600.0}
     assert log.kinds() == ["sdk_query.failed", "sdk_query.model_fallback", "sdk_query.failed",
                            "sdk_query.model_fallback", "sdk_query.failed",
                            "sdk_query.account_cooldown"]
@@ -412,11 +414,11 @@ def test_planner_session_limit_blocks_the_builder_without_a_call(monkeypatch):
     builder = _fn(cooldowns=cooldowns, clock=lambda: 1.0, wall_clock=lambda: WALL)
     with pytest.raises(RuntimeError, match="session limit"):
         planner("x")
-    assert cooldowns == {SONNET: (3600.0, True)}
+    assert cooldowns == {_ACCOUNT_KEY: 3600.0}  # a single-model chain blocks everyone too
     with pytest.raises(RuntimeError, match=ALL_COOLING) as exc:
         builder("x")
     assert calls == [SONNET]
-    assert cooldowns[SONNET] == (3600.0, True)
+    assert cooldowns == {_ACCOUNT_KEY: 3600.0, _PROBE_KEY: 1.0}
     expected = datetime.fromtimestamp(WALL + 3599.0, tz=timezone.utc).isoformat(timespec="seconds")
     assert str(exc.value).endswith(f"until {expected}")
 
@@ -477,7 +479,7 @@ def test_reset_time_in_the_error_ends_the_cooldown_at_that_wall_time(monkeypatch
     with pytest.raises(RuntimeError, match="session limit"):
         fn("x")
     assert calls == [FABLE]
-    assert cooldowns == {FABLE: (12000.0, True), OPUS: (12000.0, True), SONNET: (12000.0, True)}
+    assert cooldowns == {_ACCOUNT_KEY: 12000.0}
     assert log.events[1][1]["cooldown_s"] == 12000.0
 
 
@@ -499,7 +501,7 @@ def test_reset_more_than_six_hours_away_is_clamped(monkeypatch):
     with pytest.raises(RuntimeError, match="session limit"):
         fn("x")
     assert calls == [FABLE]
-    assert cooldowns[FABLE] == (21600.0, True)  # 21.5h away: clamped to 6h
+    assert cooldowns[_ACCOUNT_KEY] == 21600.0  # 21.5h away: clamped to 6h
 
 
 def test_reset_less_than_a_minute_away_is_clamped_to_sixty_seconds(monkeypatch):
@@ -510,7 +512,7 @@ def test_reset_less_than_a_minute_away_is_clamped_to_sixty_seconds(monkeypatch):
     with pytest.raises(RuntimeError, match="session limit"):
         fn("x")
     assert calls == [FABLE]
-    assert cooldowns[FABLE] == (60.0, True)
+    assert cooldowns[_ACCOUNT_KEY] == 60.0
 
 
 def test_reset_without_a_timezone_uses_local_time_within_the_clamp(monkeypatch):
@@ -525,7 +527,7 @@ def test_reset_without_a_timezone_uses_local_time_within_the_clamp(monkeypatch):
     assert calls == [FABLE]
     expected = _local_delay(ONE_AM_ET, 22, 30)
     assert 60.0 <= expected <= 21600.0
-    assert cooldowns[FABLE] == (expected, True)
+    assert cooldowns[_ACCOUNT_KEY] == expected
 
 
 def test_unknown_timezone_name_falls_back_to_local_time_without_raising(monkeypatch):
@@ -536,7 +538,7 @@ def test_unknown_timezone_name_falls_back_to_local_time_without_raising(monkeypa
     with pytest.raises(RuntimeError, match="session limit"):
         fn("x")
     assert calls == [FABLE]
-    assert cooldowns[FABLE] == (_local_delay(ONE_AM_ET, 22, 30), True)
+    assert cooldowns[_ACCOUNT_KEY] == _local_delay(ONE_AM_ET, 22, 30)
 
 
 @pytest.mark.parametrize("wall_dt,reset,expected", [
@@ -554,7 +556,7 @@ def test_hour_only_reset_times_are_read_exactly(monkeypatch, wall_dt, reset, exp
     with pytest.raises(RuntimeError, match="session limit"):
         fn("x")
     assert calls == [FABLE]
-    assert cooldowns[FABLE] == (expected, True)
+    assert cooldowns[_ACCOUNT_KEY] == expected
 
 
 @pytest.mark.parametrize("text", ["You've hit your session limit \u00b7 resets soon",
@@ -568,7 +570,7 @@ def test_unparseable_or_absent_reset_uses_cooldown_s(monkeypatch, text):
     with pytest.raises(RuntimeError, match="session limit"):
         fn("x")
     assert calls == [FABLE]
-    assert cooldowns == {FABLE: (3600.0, True), OPUS: (3600.0, True), SONNET: (3600.0, True)}
+    assert cooldowns == {_ACCOUNT_KEY: 3600.0}
 
 
 def test_all_cooling_probes_the_first_model_once_after_five_minutes_and_clears_on_success(monkeypatch):
@@ -613,8 +615,7 @@ def test_failed_probe_refreshes_the_cooldowns_and_raises_all_cooling(monkeypatch
     with pytest.raises(RuntimeError, match=ALL_COOLING):
         fn("x")
     assert calls == [FABLE, FABLE]
-    assert cooldowns[FABLE] == (4000.0, True)
-    assert cooldowns[OPUS] == (4000.0, True) and cooldowns[SONNET] == (4000.0, True)
+    assert cooldowns == {_ACCOUNT_KEY: 4000.0, _PROBE_KEY: 400.0}  # refreshed, gate kept
     assert log.kinds() == ["sdk_query.failed", "sdk_query.account_cooldown",
                            "sdk_query.failed", "sdk_query.account_cooldown"]
     now["t"] = 699.0  # within the next probe interval: zero calls again
@@ -677,7 +678,7 @@ def test_probe_skips_a_model_in_its_own_cooldown_and_success_keeps_it_cooling(mo
     now["t"] = 10.0
     with pytest.raises(RuntimeError, match="session limit"):
         planner("x")
-    assert cooldowns == {FABLE: (3600.0, False), SONNET: (3610.0, True)}
+    assert cooldowns == {FABLE: (3600.0, False), _ACCOUNT_KEY: 3610.0}
     now["t"] = 11.0  # account-wide: the builder is blocked, the probe interval starts
     with pytest.raises(RuntimeError, match=ALL_COOLING):
         builder("x")
@@ -709,8 +710,10 @@ def test_every_chain_model_in_its_own_cooldown_under_an_account_limit_never_prob
     assert cooldowns == seeded
 
 
-def test_healthy_builder_traffic_does_not_reset_the_planners_probe_gate(monkeypatch):
-    # N7c audit S2: the normal path used to pop the gate whenever any role had candidates
+def test_healthy_traffic_without_an_account_block_clears_the_probe_gate(monkeypatch):
+    # N7e F2: the gate only matters while an account-wide block is live (then NO chain has
+    # candidates); a call that finds candidates means the outage is over, so the gate goes
+    # instead of lingering as a stale timestamp for the next outage
     now = {"t": 0.0}
     cooldowns = {}
     calls = _install(monkeypatch, {SONNET: [("error", CREDITS)], FABLE: [("ok", GOOD)]})
@@ -721,15 +724,15 @@ def test_healthy_builder_traffic_does_not_reset_the_planners_probe_gate(monkeypa
     now["t"] = 1.0
     with pytest.raises(RuntimeError, match=ALL_COOLING):
         planner("x")
-    assert cooldowns[_PROBE_KEY] == 1.0
+    assert cooldowns == {SONNET: (3600.0, False), _PROBE_KEY: 1.0}
     now["t"] = 2.0
     assert builder("x") == GOOD
-    assert cooldowns[_PROBE_KEY] == 1.0  # the builder's traffic left the gate alone
-    now["t"] = 302.0  # gate open, but sonnet is in its own cooldown: nothing to probe
+    assert cooldowns == {SONNET: (3600.0, False)}  # no account block: the gate is dropped
+    now["t"] = 302.0  # sonnet still in its own cooldown: the gate restarts, nothing probed
     with pytest.raises(RuntimeError, match=ALL_COOLING):
         planner("x")
     assert calls == [SONNET, FABLE]
-    assert cooldowns == {SONNET: (3600.0, False), _PROBE_KEY: 1.0}
+    assert cooldowns == {SONNET: (3600.0, False), _PROBE_KEY: 302.0}
 
 
 def test_probe_failing_with_credits_cools_only_the_probed_model(monkeypatch):
@@ -755,7 +758,7 @@ def test_probe_failing_with_credits_cools_only_the_probed_model(monkeypatch):
     with pytest.raises(RuntimeError, match=ALL_COOLING):
         builder("x")
     assert calls == [FABLE, OPUS, SONNET, OPUS]
-    assert cooldowns == {FABLE: (3600.0, False), SONNET: (3610.0, True),
+    assert cooldowns == {FABLE: (3600.0, False), _ACCOUNT_KEY: 3610.0,
                          OPUS: (3911.0, False), _PROBE_KEY: 311.0}
     assert log.kinds() == ["sdk_query.failed", "sdk_query.model_fallback", "sdk_query.completed",
                            "sdk_query.failed", "sdk_query.account_cooldown", "sdk_query.failed"]
@@ -763,3 +766,103 @@ def test_probe_failing_with_credits_cools_only_the_probed_model(monkeypatch):
     with pytest.raises(RuntimeError, match=ALL_COOLING):
         builder("x")
     assert calls == [FABLE, OPUS, SONNET, OPUS]
+
+
+# --- N7e: account-wide cooldown kept apart from model-specific ones; gate re-armed -----
+
+
+def test_same_chain_session_limit_keeps_fables_own_credit_cooldown(monkeypatch):
+    # N7e F1: fable out of credits, then opus hits the SESSION limit in the same call. The
+    # account-wide entries used to overwrite fable's credit cooldown, so the probe went to
+    # fable and fable was a candidate again as soon as the account limit lapsed
+    now = {"t": 0.0}
+    cooldowns = {}
+    calls = _install(monkeypatch, {FABLE: [("error", CREDITS), ("ok", GOOD)],
+                                   OPUS: [("error", SESSION), ("ok", GOOD)],
+                                   SONNET: [("ok", GOOD)]})
+    log = _Log()
+    fn = _fn(cooldown_s=3600, cooldowns=cooldowns, clock=lambda: now["t"], logger=log)
+    with pytest.raises(RuntimeError, match="session limit"):
+        fn("x")
+    assert calls == [FABLE, OPUS]
+    assert cooldowns == {FABLE: (3600.0, False), _ACCOUNT_KEY: 3600.0}
+    assert log.kinds() == ["sdk_query.failed", "sdk_query.model_fallback", "sdk_query.failed",
+                           "sdk_query.account_cooldown"]
+    now["t"] = 1.0  # account-wide: zero calls, the probe interval starts
+    with pytest.raises(RuntimeError, match=ALL_COOLING):
+        fn("x")
+    assert calls == [FABLE, OPUS]
+    assert cooldowns == {FABLE: (3600.0, False), _ACCOUNT_KEY: 3600.0, _PROBE_KEY: 1.0}
+    now["t"] = 301.0  # the probe targets opus (blocked only by the account), never fable
+    assert fn("x") == GOOD
+    assert calls == [FABLE, OPUS, OPUS]
+    assert cooldowns == {FABLE: (3600.0, False)}  # account block cleared, fable untouched
+    now["t"] = 302.0  # fable is still no candidate: opus first
+    assert fn("x") == GOOD
+    assert calls == [FABLE, OPUS, OPUS, OPUS]
+    now["t"] = 3601.0  # fable's own credit cooldown expired: tried again
+    assert fn("x") == GOOD
+    assert calls == [FABLE, OPUS, OPUS, OPUS, FABLE]
+    # the expired entry is inert and stays until fable fails again (as on main)
+    assert cooldowns == {FABLE: (3600.0, False)}
+
+
+def test_outage_ending_by_expiry_rearms_the_probe_gate_for_the_next_outage(monkeypatch):
+    # N7e F2: the gate used to be cleared only by a successful probe, so after an outage
+    # that ended by natural expiry the stale timestamp made the first all-cooling call of
+    # the NEXT outage probe immediately
+    now = {"t": 0.0}
+    cooldowns = {}
+    calls = _install(monkeypatch, {FABLE: [("error", SESSION), ("ok", GOOD),
+                                           ("error", SESSION), ("ok", GOOD)],
+                                   OPUS: [("ok", GOOD)], SONNET: [("ok", GOOD)]})
+    fn = _fn(cooldown_s=3600, cooldowns=cooldowns, clock=lambda: now["t"])
+    with pytest.raises(RuntimeError, match="session limit"):
+        fn("x")
+    now["t"] = 100.0
+    with pytest.raises(RuntimeError, match=ALL_COOLING):
+        fn("x")
+    assert cooldowns == {_ACCOUNT_KEY: 3600.0, _PROBE_KEY: 100.0}
+    now["t"] = 3601.0  # the limit lapsed by itself: normal traffic drops the stale gate
+    assert fn("x") == GOOD
+    assert calls == [FABLE, FABLE]
+    assert cooldowns == {_ACCOUNT_KEY: 3600.0}  # expired, inert; the gate is gone
+    now["t"] = 4000.0  # a new session limit
+    with pytest.raises(RuntimeError, match="session limit"):
+        fn("x")
+    assert calls == [FABLE, FABLE, FABLE]
+    assert cooldowns == {_ACCOUNT_KEY: 7600.0}
+    now["t"] = 4001.0  # first all-cooling call of the new outage: zero SDK calls
+    with pytest.raises(RuntimeError, match=ALL_COOLING):
+        fn("x")
+    assert calls == [FABLE, FABLE, FABLE]
+    assert cooldowns == {_ACCOUNT_KEY: 7600.0, _PROBE_KEY: 4001.0}
+    now["t"] = 4300.0  # 299s on: still no probe
+    with pytest.raises(RuntimeError, match=ALL_COOLING):
+        fn("x")
+    assert calls == [FABLE, FABLE, FABLE]
+    now["t"] = 4301.0  # the interval elapsed: one probe, success clears everything
+    assert fn("x") == GOOD
+    assert calls == [FABLE, FABLE, FABLE, FABLE]
+    assert cooldowns == {}
+
+
+def test_legacy_account_wide_model_entries_still_block_everyone_and_clear_on_probe(monkeypatch):
+    # a dict written by an older navigator holds the account limit as (expiry, True) on
+    # the failing role's model: it blocks the builder's whole chain with zero calls and a
+    # successful probe removes it
+    now = {"t": 0.0}
+    cooldowns = {"claude-haiku-5": (3600.0, True)}
+    calls = _install(monkeypatch, {FABLE: [("ok", GOOD)], OPUS: [("ok", GOOD)],
+                                   SONNET: [("ok", GOOD)]})
+    fn = _fn(cooldowns=cooldowns, clock=lambda: now["t"])
+    with pytest.raises(RuntimeError, match=ALL_COOLING) as exc:
+        fn("x")
+    assert calls == []
+    expected = datetime.fromtimestamp(WALL + 3600.0, tz=timezone.utc).isoformat(timespec="seconds")
+    assert str(exc.value).endswith(f"until {expected}")
+    assert cooldowns == {"claude-haiku-5": (3600.0, True), _PROBE_KEY: 0.0}
+    now["t"] = 300.0
+    assert fn("x") == GOOD
+    assert calls == [FABLE]
+    assert cooldowns == {}
