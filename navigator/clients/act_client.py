@@ -23,7 +23,8 @@ class ACTClient(Protocol):
     def list_approvals(self, target: str, gate: ApprovalGate,
                        decision: ApprovalDecision | None = None) -> list[Approval]: ...
     def emit_event(self, event: Event) -> None: ...
-    def list_events(self, kinds: set[str] | None = None) -> list: ...
+    def list_events(self, kinds: set[str] | None = None,
+                    since: datetime | None = None) -> list: ...
 
 class FakeACTClient:
     def __init__(self):
@@ -64,15 +65,31 @@ class FakeACTClient:
                 and (decision is None or a.decision == decision)]
     def emit_event(self, event: Event) -> None:
         self.events.append(event)
-    def list_events(self, kinds: set[str] | None = None) -> list[Event]:
+    def list_events(self, kinds: set[str] | None = None,
+                    since: datetime | None = None) -> list[Event]:
+        floor = _parse_ts(since)
         return [e.model_copy(deep=True) for e in self.events
-                if kinds is None or e.kind in kinds]
+                if (kinds is None or e.kind in kinds) and _not_before(e.ts, floor)]
 
 # ACT clamps list endpoints at 500; request the max so nothing is silently dropped.
 _LIST_LIMIT = 500
 # events are paged with after=<cursor>; a page shorter than the limit is the last one
 _EVENT_PAGE_LIMIT = 500
 _EVENT_MAX_PAGES = 50
+
+
+class ACTEventsTooLarge(RuntimeError):
+    """list_events gave up: ACT holds more than _EVENT_MAX_PAGES full pages of
+    navigator events (callers that only need recent ones should pass `since`)."""
+
+
+def _not_before(ts, floor: datetime | None) -> bool:
+    """True unless `ts` parses to a timestamp strictly before `floor`. An unparsable
+    or missing ts is kept (never silently dropped); equal timestamps are kept."""
+    if floor is None:
+        return True
+    t = _parse_ts(ts)
+    return t is None or t >= floor
 
 
 def _parse_ts(value) -> datetime | None:
@@ -276,13 +293,19 @@ class HTTPACTClient:
                         payload=payload if isinstance(payload, dict) else {},
                         correlation_id=d.get("correlation_id"), id=d.get("id"))
 
-    def list_events(self, kinds: set[str] | None = None) -> list[ACTEvent]:
+    def list_events(self, kinds: set[str] | None = None,
+                    since: datetime | None = None) -> list[ACTEvent]:
         """Every event ACT holds for source 'navigator' (only those of `kinds` when
-        given), oldest first. Pages through GET /api/v1/sources/navigator/events with
-        limit=500 and after=<cursor> until a page is shorter than the limit; the
-        cursor is the response's next_cursor or, for a bare list, the last event id.
-        More than 50 pages is a RuntimeError rather than an unbounded walk."""
+        given, and when `since` is given only those whose ts is not before it; a
+        naive `since` means UTC, an event with an unparsable ts is kept), oldest
+        first. Pages through GET /api/v1/sources/navigator/events with limit=500 and
+        after=<cursor> until a page is shorter than the limit; the cursor is the
+        response's next_cursor or, for a bare list, the last event id. The ACT API
+        has no newest-first order, so `since` is applied client-side and does not
+        shorten the walk. More than 50 pages is an ACTEventsTooLarge (a RuntimeError)
+        rather than an unbounded walk."""
         url = f"{self._root_url}/sources/navigator/events"
+        floor = _parse_ts(since)
         out: list[ACTEvent] = []
         after = None
         for _ in range(_EVENT_MAX_PAGES):
@@ -303,7 +326,9 @@ class HTTPACTClient:
                 raise RuntimeError("ACT events: response is not a list of events")
             for d in page:
                 if isinstance(d, dict) and (kinds is None or d.get("kind") in kinds):
-                    out.append(self._event_from(d))
+                    ev = self._event_from(d)
+                    if _not_before(ev.ts, floor):
+                        out.append(ev)
             if len(page) < _EVENT_PAGE_LIMIT:
                 return out
             if cursor is None and isinstance(page[-1], dict):
@@ -311,4 +336,4 @@ class HTTPACTClient:
             if cursor is None:
                 raise RuntimeError("ACT events: full page without a cursor")
             after = cursor
-        raise RuntimeError(f"ACT events: more than {_EVENT_MAX_PAGES} pages")
+        raise ACTEventsTooLarge(f"ACT events: more than {_EVENT_MAX_PAGES} pages")
