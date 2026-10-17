@@ -1,3 +1,4 @@
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Protocol
 import httpx
@@ -22,6 +23,7 @@ class ACTClient(Protocol):
     def list_approvals(self, target: str, gate: ApprovalGate,
                        decision: ApprovalDecision | None = None) -> list[Approval]: ...
     def emit_event(self, event: Event) -> None: ...
+    def list_events(self, kinds: set[str] | None = None) -> list: ...
 
 class FakeACTClient:
     def __init__(self):
@@ -62,9 +64,40 @@ class FakeACTClient:
                 and (decision is None or a.decision == decision)]
     def emit_event(self, event: Event) -> None:
         self.events.append(event)
+    def list_events(self, kinds: set[str] | None = None) -> list[Event]:
+        return [e.model_copy(deep=True) for e in self.events
+                if kinds is None or e.kind in kinds]
 
 # ACT clamps list endpoints at 500; request the max so nothing is silently dropped.
 _LIST_LIMIT = 500
+# events are paged with after=<cursor>; a page shorter than the limit is the last one
+_EVENT_PAGE_LIMIT = 500
+_EVENT_MAX_PAGES = 50
+
+
+def _parse_ts(value) -> datetime | None:
+    """ISO timestamp from ACT as an aware datetime (naive = UTC); None if unusable."""
+    if isinstance(value, datetime):
+        dt = value
+    elif isinstance(value, str):
+        try:
+            dt = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    else:
+        return None
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+
+
+@dataclass
+class ACTEvent:
+    """An event read back from ACT (its severity vocabulary differs from Event's, so
+    this is deliberately not the Event model)."""
+    kind: str
+    ts: datetime | None
+    payload: dict = field(default_factory=dict)
+    correlation_id: str | None = None
+    id: str | None = None
 
 # ACT's severity vocabulary uses "warn"; Navigator's enum uses "warning".
 _SEVERITY_TO_ACT = {"warning": "warn"}
@@ -229,3 +262,53 @@ class HTTPACTClient:
             "severity": _SEVERITY_TO_ACT.get(event.severity.value, event.severity.value),
             "correlation_id": event.correlation_id,
             "payload": event.payload}).raise_for_status()
+
+    @property
+    def _root_url(self) -> str:
+        """<act>/api/v1: the agent resource's base_url without its trailing '/agent'."""
+        suffix = "/agent"
+        return self.base_url[:-len(suffix)] if self.base_url.endswith(suffix) else self.base_url
+
+    @staticmethod
+    def _event_from(d: dict) -> ACTEvent:
+        payload = d.get("payload")
+        return ACTEvent(kind=str(d.get("kind", "")), ts=_parse_ts(d.get("ts")),
+                        payload=payload if isinstance(payload, dict) else {},
+                        correlation_id=d.get("correlation_id"), id=d.get("id"))
+
+    def list_events(self, kinds: set[str] | None = None) -> list[ACTEvent]:
+        """Every event ACT holds for source 'navigator' (only those of `kinds` when
+        given), oldest first. Pages through GET /api/v1/sources/navigator/events with
+        limit=500 and after=<cursor> until a page is shorter than the limit; the
+        cursor is the response's next_cursor or, for a bare list, the last event id.
+        More than 50 pages is a RuntimeError rather than an unbounded walk."""
+        url = f"{self._root_url}/sources/navigator/events"
+        out: list[ACTEvent] = []
+        after = None
+        for _ in range(_EVENT_MAX_PAGES):
+            params: dict = {"limit": _EVENT_PAGE_LIMIT}
+            if after is not None:
+                params["after"] = after
+            r = self.client.get(url, params=params)
+            r.raise_for_status()
+            data = r.json()
+            if isinstance(data, dict):
+                page = data.get("events")
+                if page is None:
+                    page = data.get("items") or []
+                cursor = data.get("next_cursor")
+            else:
+                page, cursor = data, None
+            if not isinstance(page, list):
+                raise RuntimeError("ACT events: response is not a list of events")
+            for d in page:
+                if isinstance(d, dict) and (kinds is None or d.get("kind") in kinds):
+                    out.append(self._event_from(d))
+            if len(page) < _EVENT_PAGE_LIMIT:
+                return out
+            if cursor is None and isinstance(page[-1], dict):
+                cursor = page[-1].get("id")
+            if cursor is None:
+                raise RuntimeError("ACT events: full page without a cursor")
+            after = cursor
+        raise RuntimeError(f"ACT events: more than {_EVENT_MAX_PAGES} pages")
