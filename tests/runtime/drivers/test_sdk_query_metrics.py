@@ -204,7 +204,8 @@ def test_exhausted_chain_emits_failed_for_every_model_and_raises_last_error(monk
     events = [(ev, f.get("model"), f.get("to_model")) for _, ev, f in log.events]
     assert events == [("sdk_query.failed", FABLE, None), ("sdk_query.model_fallback", None, OPUS),
                       ("sdk_query.failed", OPUS, None), ("sdk_query.model_fallback", None, SONNET),
-                      ("sdk_query.failed", SONNET, None)]
+                      ("sdk_query.failed", SONNET, None),
+                      ("sdk_query.account_cooldown", SONNET, None)]
     for _, ev, f in log.events:
         if ev == "sdk_query.model_fallback":
             assert set(f) == {"from_model", "to_model", "reason"}
