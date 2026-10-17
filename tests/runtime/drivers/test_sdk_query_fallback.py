@@ -4,6 +4,7 @@ Fake claude_agent_sdk, no network, no sleep: the fake answers per model named in
 options, so every test states exactly which models were called and in what order.
 """
 import asyncio
+import re
 import sys
 import types
 
@@ -16,6 +17,8 @@ CHAIN = (OPUS, SONNET)
 GOOD = '{"commands": [], "summary": "ok"}'
 CREDITS = "Usage credits are required for this model."
 MAX_TURNS = "Reached maximum number of turns (4)"
+SESSION = "You've hit your session limit \u00b7 resets 10:30pm"
+ALL_COOLING = "all models cooling down until"
 
 
 def _install(monkeypatch, behaviour, stall=None):
@@ -70,6 +73,9 @@ class _Log:
 
     def fallbacks(self):
         return [f for ev, f in self.events if ev == "sdk_query.model_fallback"]
+
+    def kinds(self):
+        return [ev for ev, _ in self.events]
 
 
 def _fn(model=FABLE, **kw):
@@ -142,7 +148,7 @@ def test_cooldown_skips_the_failed_model_until_it_expires(monkeypatch):
     fn = _fn(cooldown_s=3600, cooldowns=cooldowns, clock=lambda: now["t"])
     assert fn("x") == GOOD
     assert calls == [FABLE, OPUS]
-    assert cooldowns == {FABLE: 3600.0}
+    assert cooldowns == {FABLE: (3600.0, False)}  # model-specific entry
     now["t"] = 100.0  # within COOLDOWN_S: start directly at opus
     assert fn("x") == GOOD
     assert calls == [FABLE, OPUS, OPUS]
@@ -164,11 +170,17 @@ def test_cooldown_dict_shared_between_query_fns_skips_the_model_everywhere(monke
     assert calls == [FABLE, OPUS, OPUS]
 
 
-def test_all_models_cooling_still_tries_the_chain(monkeypatch):
+def test_all_models_cooling_fails_fast_without_an_sdk_call(monkeypatch):
+    # rev2: re-querying a chain known to be cooling burned three failing calls per tick;
+    # bare-float entries written by older callers are honoured too
     calls = _install(monkeypatch, {FABLE: [("ok", GOOD)]})
-    cooldowns = {FABLE: 1e9, OPUS: 1e9, SONNET: 1e9}
-    assert _fn(cooldowns=cooldowns, clock=lambda: 0.0)("x") == GOOD
-    assert calls == [FABLE]
+    cooldowns = {FABLE: 1e9, OPUS: (1e9, False), SONNET: (1e9, True)}
+    log = _Log()
+    with pytest.raises(RuntimeError, match=ALL_COOLING) as exc:
+        _fn(cooldowns=cooldowns, clock=lambda: 0.0, logger=log)("x")
+    assert calls == []
+    assert re.search(r"until \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}", str(exc.value))
+    assert log.events == []  # no query: no sdk_query.* event either
 
 
 def test_planner_on_sonnet_never_calls_opus_or_fable(monkeypatch):
@@ -263,15 +275,22 @@ def test_non_model_not_found_errors_do_not_fall_back(monkeypatch, text):
     ("API Error: 404 model not available", "model not available"),
     ("model not found: claude-x", "model not found"),
     ("API Error: 400 Claude Code 2.1.165 does not support this model", "does not support this model"),
-    ("You've hit your session limit \u00b7 resets 10:30pm", "session limit"),
+    ("There was an issue with the selected model. Try again or pick another.",
+     "issue with the selected model"),
     ("usage limit reached", "usage limit"),
+    ("You've hit your weekly limit for Opus \u00b7 resets Monday", "weekly limit"),
+    ("You've reached your Opus limit for this week", "opus limit"),
+    ("You've hit the limit for this model", "limit for this model"),
 ])
 def test_model_specific_markers_fall_back(monkeypatch, text, marker):
     calls = _install(monkeypatch, {FABLE: [("error", text)], OPUS: [("ok", GOOD)]})
     log = _Log()
-    assert _fn(logger=log)("x") == GOOD
+    cooldowns = {}
+    assert _fn(logger=log, cooldowns=cooldowns, clock=lambda: 0.0)("x") == GOOD
     assert calls == [FABLE, OPUS]
     assert log.fallbacks() == [{"from_model": FABLE, "to_model": OPUS, "reason": marker}]
+    assert cooldowns == {FABLE: (3600.0, False)}  # only the failing model, not account-wide
+    assert "sdk_query.account_cooldown" not in log.kinds()
 
 
 def test_timeout_is_never_fallen_back(monkeypatch):
@@ -288,3 +307,121 @@ def test_other_exceptions_never_fall_back(monkeypatch):
     with pytest.raises(ValueError, match="bad options"):
         _fn()("x")
     assert calls == [FABLE]
+
+
+# --- rev2: account-wide limits fail fast (cold audit of N7 rev5) ----------------------
+
+
+def test_session_limit_cools_the_whole_chain_after_one_call_and_raises_unchanged(monkeypatch):
+    # live 2026-10-15: 'session limit' is account-wide, so falling back made two more
+    # failing calls per query. Now: one SDK call, every model cooling, error unchanged.
+    calls = _install(monkeypatch, {FABLE: [("error", SESSION)], OPUS: [("ok", GOOD)],
+                                   SONNET: [("ok", GOOD)]})
+    cooldowns = {}
+    log = _Log()
+    fn = _fn(cooldown_s=3600, cooldowns=cooldowns, clock=lambda: 0.0, logger=log)
+    with pytest.raises(RuntimeError, match="session limit") as exc:
+        fn("x")
+    assert str(exc.value) == f"claude-agent-sdk error result: {SESSION}"
+    assert calls == [FABLE]
+    assert cooldowns == {FABLE: (3600.0, True), OPUS: (3600.0, True), SONNET: (3600.0, True)}
+    assert log.fallbacks() == []
+    assert log.kinds() == ["sdk_query.failed", "sdk_query.account_cooldown"]
+    cooldown = log.events[1][1]
+    assert cooldown["model"] == FABLE and cooldown["reason"] == "session limit"
+    assert cooldown["models"] == [FABLE, OPUS, SONNET]
+    assert SESSION not in str(cooldown)  # marker only, never the error text
+
+
+def test_session_limit_then_fail_fast_then_fable_again_after_cooldown(monkeypatch):
+    now = {"t": 0.0}
+    cooldowns = {}
+    calls = _install(monkeypatch, {FABLE: [("error", SESSION), ("ok", GOOD)],
+                                   OPUS: [("ok", GOOD)], SONNET: [("ok", GOOD)]})
+    log = _Log()
+    fn = _fn(cooldown_s=3600, cooldowns=cooldowns, clock=lambda: now["t"], logger=log)
+    with pytest.raises(RuntimeError, match="session limit"):
+        fn("x")
+    assert calls == [FABLE]
+    now["t"] = 100.0  # within the cooldown: zero SDK calls, the all-cooling error
+    with pytest.raises(RuntimeError, match=ALL_COOLING):
+        fn("x")
+    assert calls == [FABLE]
+    assert len(log.events) == 2  # nothing new was logged for the fast failure
+    now["t"] = 3601.0  # expired: fable is tried again
+    assert fn("x") == GOOD
+    assert calls == [FABLE, FABLE]
+
+
+def test_session_limit_on_the_last_model_still_raises_it_unchanged(monkeypatch):
+    # model-specific errors earlier in the chain fall back as before; the account-wide
+    # error at the end cools the chain and surfaces as the last error
+    calls = _install(monkeypatch, {FABLE: [("error", CREDITS)], OPUS: [("error", CREDITS)],
+                                   SONNET: [("error", SESSION)]})
+    cooldowns = {}
+    log = _Log()
+    with pytest.raises(RuntimeError, match="session limit"):
+        _fn(cooldowns=cooldowns, clock=lambda: 0.0, logger=log)("x")
+    assert calls == [FABLE, OPUS, SONNET]
+    assert cooldowns == {FABLE: (3600.0, True), OPUS: (3600.0, True), SONNET: (3600.0, True)}
+    assert log.kinds() == ["sdk_query.failed", "sdk_query.model_fallback", "sdk_query.failed",
+                           "sdk_query.model_fallback", "sdk_query.failed",
+                           "sdk_query.account_cooldown"]
+
+
+def test_empty_fallbacks_with_session_limit_keep_mains_behaviour(monkeypatch):
+    # fallbacks=(): one non-retryable call, no cooldown, no extra event (byte-identical)
+    calls = _install(monkeypatch, {FABLE: [("error", SESSION)], OPUS: [("ok", GOOD)]})
+    cooldowns = {}
+    log = _Log()
+    with pytest.raises(RuntimeError, match="session limit") as exc:
+        _fn(fallbacks=(), cooldowns=cooldowns, logger=log)("x")
+    assert str(exc.value) == f"claude-agent-sdk error result: {SESSION}"
+    assert calls == [FABLE]
+    assert cooldowns == {}
+    assert log.kinds() == ["sdk_query.failed"]
+
+
+def test_planner_session_limit_cools_only_its_own_chain(monkeypatch):
+    # a Sonnet planner's chain is [SONNET]: its account-wide cooldown must not reach into
+    # the builder's chain for models it never had (fable is still tried by the builder)
+    calls = _install(monkeypatch, {SONNET: [("error", SESSION)], FABLE: [("ok", GOOD)]})
+    cooldowns = {}
+    planner = _fn(model=SONNET, cooldowns=cooldowns, clock=lambda: 0.0)
+    builder = _fn(cooldowns=cooldowns, clock=lambda: 1.0)
+    with pytest.raises(RuntimeError, match="session limit"):
+        planner("x")
+    assert cooldowns == {SONNET: (3600.0, True)}
+    assert builder("x") == GOOD
+    assert calls == [SONNET, FABLE]
+
+
+def test_planner_model_specific_failure_only_cools_that_model(monkeypatch):
+    # model-specific cooldowns stay per model: the planner losing sonnet removes only
+    # sonnet from a builder sharing the dict, never fable or opus
+    calls = _install(monkeypatch, {SONNET: [("error", CREDITS)], FABLE: [("ok", GOOD)]})
+    cooldowns = {}
+    log = _Log()
+    planner = _fn(model=SONNET, cooldowns=cooldowns, clock=lambda: 0.0, logger=log)
+    builder = _fn(cooldowns=cooldowns, clock=lambda: 1.0)
+    with pytest.raises(RuntimeError, match="Usage credits"):
+        planner("x")
+    assert cooldowns == {SONNET: (3600.0, False)}
+    assert "sdk_query.account_cooldown" not in log.kinds()
+    assert builder("x") == GOOD
+    assert calls == [SONNET, FABLE]
+
+
+def test_all_cooling_error_names_the_earliest_expiry(monkeypatch):
+    calls = _install(monkeypatch, {FABLE: [("ok", GOOD)]})
+    cooldowns = {FABLE: (500.0, False), OPUS: (50.0, False), SONNET: (900.0, True)}
+    with pytest.raises(RuntimeError, match=ALL_COOLING) as exc:
+        _fn(cooldowns=cooldowns, clock=lambda: 10.0)("x")
+    assert calls == []
+    iso = str(exc.value).rsplit("until ", 1)[1]
+    from datetime import datetime
+    import time as _time
+    before = _time.time()
+    expiry = datetime.fromisoformat(iso).timestamp()
+    # the earliest expiry is opus, 40s of clock time away from now
+    assert before + 40 - 5 <= expiry <= before + 40 + 5
