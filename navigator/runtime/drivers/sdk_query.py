@@ -2,7 +2,7 @@ import asyncio
 import json
 import re
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Callable
 
 DEFAULT_SYSTEM_PROMPT = (
@@ -17,6 +17,15 @@ DEFAULT_SYSTEM_PROMPT = (
 # behaves exactly as it always did.
 DEFAULT_MODEL_FALLBACKS: tuple[str, ...] = ("claude-opus-5-5", "claude-sonnet-5-5")
 DEFAULT_MODEL_COOLDOWN_S = 3600
+# 'issue with the selected model' says "try again": a short cooldown, not an hour
+SELECTED_MODEL_COOLDOWN_S = 300
+# when every model is cooling, one probe call per interval checks whether the limit lifted
+ALL_COOLING_PROBE_INTERVAL_S = 300
+# a reset time parsed from the error text ('resets 4:20am') is clamped to this window
+MIN_RESET_COOLDOWN_S = 60
+MAX_RESET_COOLDOWN_S = 6 * 3600
+# key in the shared cooldowns dict holding the clock time of the last all-cooling probe
+_PROBE_KEY = "__all_cooling_probe_at__"
 
 
 def model_chain(model, fallbacks) -> list:
@@ -41,7 +50,8 @@ def make_sdk_query_fn(*, model: str | None = None,
                       fallbacks: tuple[str, ...] = (),
                       cooldown_s: float = DEFAULT_MODEL_COOLDOWN_S,
                       cooldowns: dict | None = None,
-                      clock: Callable[[], float] = time.monotonic) -> Callable[[str], str]:
+                      clock: Callable[[], float] = time.monotonic,
+                      wall_clock: Callable[[], float] = time.time) -> Callable[[str], str]:
     """Build a (prompt) -> str query_fn backed by claude-agent-sdk.
 
     Imported lazily so the package works without the sdk extra; the returned
@@ -59,15 +69,25 @@ def make_sdk_query_fn(*, model: str | None = None,
     next model of model_chain(model, fallbacks); the failing model enters
     `cooldowns` (shared across query fns when the caller passes one dict) as
     (expiry, account_wide=False) for `cooldown_s` seconds of `clock` time and
-    later calls skip it. One 'sdk_query.model_fallback' event per switch carries
-    the marker only, never the error text. An account-wide error ('session
-    limit') never falls back: every model of THIS fn's chain cools down at once
-    (account_wide=True), one 'sdk_query.account_cooldown' event is emitted and
-    the error is raised unchanged after a single SDK call. When every model of
-    the chain is cooling, a call raises RuntimeError('claude-agent-sdk: all
-    models cooling down until <iso>') without any SDK call. Timeouts, 'not
-    logged in' and every other error are never fallen back; if the whole chain
-    fails the last error is raised unchanged.
+    later calls skip it. When the error text names a reset time ('resets
+    4:20am', optionally followed by '(America/New_York)'; default local time,
+    read from `wall_clock`) the cooldown ends at the next such wall time
+    instead, clamped to [60s, 6h]; 'issue with the selected model' ("try
+    again") cools its model for 5 minutes. One 'sdk_query.model_fallback' event
+    per switch carries the marker only, never the error text. An account-wide
+    error ('session limit') never falls back: every model of THIS fn's chain
+    cools down at once (account_wide=True), one 'sdk_query.account_cooldown'
+    event is emitted and the error is raised unchanged after a single SDK call;
+    any live account-wide entry in `cooldowns` then blocks EVERY model of EVERY
+    fn sharing the dict. When every model of the chain is cooling, a call raises
+    RuntimeError('claude-agent-sdk: all models cooling down until <iso>')
+    without any SDK call, except that at most once per 5 minutes (per shared
+    dict) a single probe call on the first model of the chain checks whether
+    the limit lifted: on success every account-wide entry is cleared and the
+    reply returned; on a limit error the cooldowns are refreshed and the
+    all-cooling error is raised. Timeouts, 'not logged in' and every other
+    error are never fallen back; if the whole chain fails the last error is
+    raised unchanged.
     """
     try:
         from claude_agent_sdk import ClaudeAgentOptions, ResultMessage, query
@@ -104,11 +124,11 @@ def make_sdk_query_fn(*, model: str | None = None,
         except Exception:
             pass
 
-    def _emit_account_cooldown(use_model, reason: str) -> None:
+    def _emit_account_cooldown(use_model, reason: str, delay_s: float) -> None:
         # marker only, never the error text; `models` lists every model now cooling
         try:
             logger.warning("sdk_query.account_cooldown", model=use_model, reason=reason,
-                           models=list(chain), cooldown_s=cooldown_s)
+                           models=list(chain), cooldown_s=delay_s)
         except Exception:
             pass
 
@@ -218,22 +238,83 @@ def make_sdk_query_fn(*, model: str | None = None,
             return float(entry[0])
         return float(entry)
 
-    def _cooling(m, now: float) -> bool:
-        return _until(m) > now
+    def _account_until(now: float) -> float:
+        # the latest live account-wide expiry anywhere in the SHARED dict: a session limit
+        # hit by any role blocks every model of every role (N7b spec item 4, audit F1)
+        best = float("-inf")
+        for key, entry in cooldowns.items():
+            if key == _PROBE_KEY or not isinstance(entry, (tuple, list)) or len(entry) < 2:
+                continue
+            if entry[1] and float(entry[0]) > now:
+                best = max(best, float(entry[0]))
+        return best
+
+    def _blocked_until(m, account_until: float) -> float:
+        return max(_until(m), account_until)
+
+    def _all_cooling_error(now: float) -> RuntimeError:
+        account_until = _account_until(now)
+        earliest = min(_blocked_until(m, account_until) for m in chain)
+        wall = wall_clock() + (earliest - now)
+        until_iso = datetime.fromtimestamp(wall, tz=timezone.utc).isoformat(timespec="seconds")
+        return RuntimeError(f"claude-agent-sdk: all models cooling down until {until_iso}")
+
+    def _delay_s(e: Exception, marker: str) -> float:
+        if marker == "issue with the selected model":
+            return float(SELECTED_MODEL_COOLDOWN_S)
+        parsed = _reset_delay_s(str(e), wall_clock())
+        return float(cooldown_s) if parsed is None else parsed
+
+    def _record_failure(use_model, e: Exception, marker: str) -> None:
+        delay = _delay_s(e, marker)
+        until = clock() + delay
+        if marker in _ACCOUNT_WIDE_MARKERS:
+            for m in chain:
+                cooldowns[m] = (until, True)
+            _emit_account_cooldown(use_model, marker, delay)
+        else:
+            cooldowns[use_model] = (until, False)
+
+    def _probe_or_fail(prompt: str, now: float) -> str:
+        # every model is cooling: at most one probe call per interval (per shared dict)
+        # on the first model of the chain; between probes fail fast with zero SDK calls
+        last = cooldowns.get(_PROBE_KEY)
+        if last is None or now - float(last) < ALL_COOLING_PROBE_INTERVAL_S:
+            if last is None:
+                cooldowns[_PROBE_KEY] = now
+            raise _all_cooling_error(now)
+        cooldowns[_PROBE_KEY] = now
+        probe_model = chain[0]
+        try:
+            text = _attempt(prompt, probe_model)
+        except TimeoutError:
+            raise
+        except Exception as e:
+            marker = _fallback_marker(e)
+            if marker is None:
+                raise
+            _record_failure(probe_model, e, marker)
+            raise _all_cooling_error(clock()) from e
+        # the limit lifted: every account-wide entry (any role's) is cleared
+        for key in [k for k, v in cooldowns.items()
+                    if isinstance(v, (tuple, list)) and len(v) > 1 and v[1]]:
+            del cooldowns[key]
+        cooldowns.pop(probe_model, None)
+        cooldowns.pop(_PROBE_KEY, None)
+        return text
 
     def query_fn(prompt: str) -> str:
         if not fallback_enabled:
             return _attempt(prompt, model)
         now = clock()
-        # a model still cooling down from a recent account error is skipped; when every
-        # model is cooling, fail fast without an SDK call instead of re-querying the
-        # whole chain on every call (cold audit of N7 rev5)
-        candidates = [m for m in chain if not _cooling(m, now)]
+        # a model still cooling down from a recent account error is skipped; any live
+        # account-wide entry in the shared dict blocks every model; when every model is
+        # cooling, probe once per interval instead of re-querying the whole chain
+        account_until = _account_until(now)
+        candidates = [m for m in chain if _blocked_until(m, account_until) <= now]
         if not candidates:
-            earliest = min(_until(m) for m in chain)
-            wall = time.time() + (earliest - now)
-            until_iso = datetime.fromtimestamp(wall, tz=timezone.utc).isoformat(timespec="seconds")
-            raise RuntimeError(f"claude-agent-sdk: all models cooling down until {until_iso}")
+            return _probe_or_fail(prompt, now)
+        cooldowns.pop(_PROBE_KEY, None)
         for i, use_model in enumerate(candidates):
             try:
                 return _attempt(prompt, use_model)
@@ -243,16 +324,12 @@ def make_sdk_query_fn(*, model: str | None = None,
                 marker = _fallback_marker(e)
                 if marker is None:
                     raise  # 'not logged in' and everything else: today's behaviour
-                until = clock() + cooldown_s
+                # account-wide: the whole account is limited, so every model of the chain
+                # cools and the error surfaces unchanged after this single call (falling
+                # back would only burn more failing calls); otherwise only this model cools
+                _record_failure(use_model, e, marker)
                 if marker in _ACCOUNT_WIDE_MARKERS:
-                    # the whole account is limited: falling back would only burn more
-                    # failing calls, so every model of the chain cools and the error
-                    # surfaces unchanged after this single call
-                    for m in chain:
-                        cooldowns[m] = (until, True)
-                    _emit_account_cooldown(use_model, marker)
                     raise
-                cooldowns[use_model] = (until, False)
                 if i == len(candidates) - 1:
                     raise  # chain exhausted: the last error surfaces unchanged
                 _emit_fallback(use_model, candidates[i + 1], marker)
@@ -340,3 +417,40 @@ def _strip_fences(text: str) -> str:
             if last > start:
                 return stripped[start:last + 1]
         return stripped[start:]
+
+
+# 'resets 4:20am', 'resets 10:30pm (America/New_York)': the limit's own reset time
+_RESET_RE = re.compile(
+    r"resets?\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*([ap])\.?m\.?"
+    r"(?:\s*\(([A-Za-z][\w+\-]*(?:/[\w+\-]+)*)\))?", re.IGNORECASE)
+
+
+def _reset_delay_s(text: str, wall_now: float) -> float | None:
+    """Seconds from `wall_now` until the next '<H>[:MM]am|pm' named after 'resets' in
+    `text`, read in the '(<IANA tz>)' that follows it (default: local time), clamped to
+    [MIN_RESET_COOLDOWN_S, MAX_RESET_COOLDOWN_S]. None when the text names no reset time
+    or it cannot be read; the caller then uses its fixed cooldown."""
+    m = _RESET_RE.search(text)
+    if m is None:
+        return None
+    hour, minute = int(m.group(1)), int(m.group(2) or 0)
+    if not 1 <= hour <= 12 or minute > 59:
+        return None
+    hour = hour % 12 + (12 if m.group(3).lower() == "p" else 0)
+    tz = None
+    if m.group(4):
+        try:
+            from zoneinfo import ZoneInfo
+            tz = ZoneInfo(m.group(4))
+        except Exception:
+            tz = None  # unknown zone name: fall back to local time
+    try:
+        now_dt = (datetime.fromtimestamp(wall_now, tz=tz) if tz is not None
+                  else datetime.fromtimestamp(wall_now).astimezone())
+        target = now_dt.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if target <= now_dt:
+            target += timedelta(days=1)
+        delay = target.timestamp() - wall_now
+    except (ValueError, OverflowError, OSError):
+        return None
+    return float(min(max(delay, MIN_RESET_COOLDOWN_S), MAX_RESET_COOLDOWN_S))
