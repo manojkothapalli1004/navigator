@@ -8,8 +8,13 @@ messages and callback queries are ignored). Those messages are appended to a
 JSONL inbox (mode 0600, rotated to .1 above 1 MB) so other tools read operator
 messages from the file instead of calling getUpdates themselves. The exact-form
 commands '/merge <run-id>' and '/reject <run-id>' (full run id, one line) are
-returned, but only when the message is not forwarded and is less than an hour old
-(the clock is injectable for tests).
+returned, as are the N8 shorthands 'merge' / 'reject' (no argument: the one run
+waiting for merge) and 'merge <name>' / 'reject <name>' (<name> = first token of
+the proposal title without a trailing ':', e.g. 'N5b'); the leading '/' is optional
+and the word is case-insensitive. Commands count only when the message is not
+forwarded and is less than an hour old (the clock is injectable for tests). A
+shorthand is resolved at apply time against live ACT state with every check the
+full-id form applies; zero or several candidates apply nothing and get a reply.
 
 Navigator must be the only getUpdates consumer of the bot: Telegram answers a
 second consumer with HTTP 409, which poll_once reports as
@@ -51,6 +56,8 @@ log = get_logger("navigator.telegram_inbox")
 TELEGRAM_ACTOR = "operator-telegram"
 RUN_ID = re.compile(r"run-[0-9A-HJKMNP-TV-Z]{26}")
 _ACTIONS = {"/merge": "merge", "/reject": "reject"}
+# 'merge <name>': a proposal short name such as 'N5b' or 'S3a' (never a run id prefix)
+SHORT_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,31}")
 DEFAULT_OFFSET_PATH = "/Users/pradeep/calwbot/logs/navigator/telegram_offset"
 DEFAULT_INBOX_PATH = "/Users/pradeep/calwbot/logs/navigator/telegram_inbox.jsonl"
 
@@ -73,22 +80,42 @@ class TelegramError(RuntimeError):
 @dataclass(frozen=True)
 class TelegramCommand:
     action: str  # "merge" | "reject"
-    run_id: str
+    run_id: str | None  # full run id; None for the shorthand forms (resolved at apply time)
     update_id: int
+    name: str | None = None  # 'merge <name>': proposal short name; None for bare 'merge'
+
+
+def short_name(title: str) -> str:
+    """First token of a proposal title with a trailing ':' removed: 'N5b: ...' -> 'N5b'."""
+    parts = title.split()
+    return parts[0].rstrip(":") if parts else ""
 
 
 def parse_command(text, update_id: int) -> TelegramCommand | None:
-    """'/merge <run-id>' or '/reject <run-id>' on a single line: the command word is
-    case-insensitive, the run id must be the full id. Anything else is not a command."""
+    """One line, whole message, whitespace trimmed; the command word is case-insensitive
+    and its leading '/' is optional:
+      '/merge <run-id>' / '/reject <run-id>'  -> full run id (must match RUN_ID)
+      'merge' / 'reject'                      -> the one run waiting for merge
+      'merge <name>' / 'reject <name>'        -> the run whose proposal short name is <name>
+    Anything else is not a command ('merge looks good?' is ordinary chat)."""
     if not isinstance(text, str) or "\n" in text or "\r" in text:
         return None
     parts = text.strip().split()
-    if len(parts) != 2:
+    if not parts or len(parts) > 2:
         return None
-    action = _ACTIONS.get(parts[0].lower())
-    if action is None or not RUN_ID.fullmatch(parts[1]):
+    word = parts[0].lower()
+    action = _ACTIONS.get(word if word.startswith("/") else "/" + word)
+    if action is None:
         return None
-    return TelegramCommand(action=action, run_id=parts[1], update_id=update_id)
+    if len(parts) == 1:
+        return TelegramCommand(action=action, run_id=None, update_id=update_id)
+    arg = parts[1]
+    if RUN_ID.fullmatch(arg):
+        return TelegramCommand(action=action, run_id=arg, update_id=update_id)
+    # a truncated run id is not a short name: never guess which run was meant
+    if arg.lower().startswith("run-") or not SHORT_NAME.fullmatch(arg):
+        return None
+    return TelegramCommand(action=action, run_id=None, update_id=update_id, name=arg)
 
 
 def _is_int(value) -> bool:
@@ -246,10 +273,66 @@ class TelegramInbox:
 
 
 def _apply_wording() -> str:
-    """What happens next, honestly: merge_poll merges only in execute mode."""
-    if os.getenv("NAVIGATOR_MODE", "dry_run") == "execute":
+    """What happens next, honestly: merge_poll merges in execute mode, or in dry_run
+    when the operator opted in with NAVIGATOR_MERGE_IN_DRY_RUN (N8)."""
+    mode = os.getenv("NAVIGATOR_MODE", "dry_run")
+    if mode == "execute":
+        return "applies this cycle"
+    flag = (os.getenv("NAVIGATOR_MERGE_IN_DRY_RUN") or "").strip().lower()
+    if mode == "dry_run" and flag in ("1", "true"):
         return "applies this cycle"
     return "recorded; merges apply only in execute mode"
+
+
+def _label(cmd: TelegramCommand) -> str:
+    """How the operator typed it, for replies: '/merge <run-id>', '/merge N5b' or '/merge'."""
+    arg = cmd.run_id or cmd.name
+    return f"/{cmd.action} {arg}" if arg else f"/{cmd.action}"
+
+
+def _candidates(act) -> list[tuple]:
+    """Runs a shorthand command may mean: open, awaiting review, with a pending merge
+    approval and audited - the checks the full-id form applies, evaluated right now.
+    Each entry is (run, short name, title)."""
+    out = []
+    for run in act.list_open_runs():
+        if run.phase != RunPhase.awaiting_review:
+            continue
+        if not act.list_approvals(target=run.id, gate=ApprovalGate.merge,
+                                  decision=ApprovalDecision.pending):
+            continue
+        if not is_audited(act, run.id):
+            continue
+        prop = act.get_proposal(run.proposal_id)
+        title = (prop.title if prop is not None and prop.title else "").strip()
+        out.append((run, short_name(title) or run.id, title or run.id))
+    return out
+
+
+def _candidate_lines(cands, action: str) -> str:
+    return "\n".join(f"{short} - {title} - reply: {action} {short}" for _, short, title in cands)
+
+
+def _resolve(act, cmd: TelegramCommand, notifier) -> tuple[str | None, dict | None]:
+    """Shorthand -> run id against live ACT state. Exactly one match: (run_id, None).
+    Otherwise nothing is touched, the operator gets a reply and (None, result) returns."""
+    cands = _candidates(act)
+    if cmd.name is None:
+        matches = cands
+    else:
+        matches = [c for c in cands if c[1].lower() == cmd.name.lower()]
+    if len(matches) == 1:
+        return matches[0][0].id, None
+    if not cands:
+        reason = "nothing waiting for merge"
+        text = f"Navigator: {_label(cmd)} - nothing waiting for merge"
+    else:
+        reason = ("ambiguous: several runs waiting for merge" if cmd.name is None
+                  else f"no single run named {cmd.name!r}")
+        text = (f"Navigator: {_label(cmd)} not applied - {reason}; "
+                f"{len(cands)} waiting for merge:\n{_candidate_lines(cands, cmd.action)}")
+    notifier.send(text)
+    return None, {"run_id": None, "action": cmd.action, "applied": False, "reason": reason}
 
 
 def _reply(notifier, text: str) -> None:
@@ -260,24 +343,30 @@ def _reply(notifier, text: str) -> None:
 
 
 def _apply_one(act, cmd: TelegramCommand, notifier) -> dict:
-    run = next((r for r in act.list_open_runs() if r.id == cmd.run_id), None)
+    run_id = cmd.run_id
+    if run_id is None:
+        # shorthand: resolve to a run first; zero/ambiguous candidates reply and stop
+        run_id, failed = _resolve(act, cmd, notifier)
+        if failed is not None:
+            return failed
+    run = next((r for r in act.list_open_runs() if r.id == run_id), None)
     pending = []
     if run is None:
         reason = "unknown or closed run"
     elif run.phase != RunPhase.awaiting_review:
         reason = "not awaiting review"
     else:
-        pending = act.list_approvals(target=cmd.run_id, gate=ApprovalGate.merge,
+        pending = act.list_approvals(target=run_id, gate=ApprovalGate.merge,
                                      decision=ApprovalDecision.pending)
         if not pending:
             reason = "no pending merge approval"
-        elif not is_audited(act, cmd.run_id):
+        elif not is_audited(act, run_id):
             reason = "not audited yet"
         else:
             reason = None
     if reason is not None:
-        notifier.send(f"Navigator: /{cmd.action} {cmd.run_id} not applied - {reason}")
-        return {"run_id": cmd.run_id, "action": cmd.action, "applied": False, "reason": reason}
+        notifier.send(f"Navigator: /{cmd.action} {run_id} not applied - {reason}")
+        return {"run_id": run_id, "action": cmd.action, "applied": False, "reason": reason}
     merge = cmd.action == "merge"
     decision = ApprovalDecision.approved if merge else ApprovalDecision.declined
     verb = "approved" if merge else "rejected"
@@ -287,15 +376,15 @@ def _apply_one(act, cmd: TelegramCommand, notifier) -> dict:
     event_note = ""
     try:
         act.emit_event(Event(kind="run.telegram_decision", correlation_id=run.correlation_id,
-                             payload={"run_id": cmd.run_id, "decision": verb,
+                             payload={"run_id": run_id, "decision": verb,
                                       "update_id": cmd.update_id}))
     except Exception as e:
-        log.warning("telegram.decision_event_failed", run_id=cmd.run_id,
+        log.warning("telegram.decision_event_failed", run_id=run_id,
                     error=type(e).__name__)
         event_note = " (event log failed)"
-    notifier.send(f"Navigator: {cmd.run_id} merge {verb} from Telegram "
+    notifier.send(f"Navigator: {run_id} merge {verb} from Telegram "
                   f"({_apply_wording()}){event_note}")
-    return {"run_id": cmd.run_id, "action": cmd.action, "applied": True, "reason": None}
+    return {"run_id": run_id, "action": cmd.action, "applied": True, "reason": None}
 
 
 def apply_commands(act, commands: list[TelegramCommand], notifier) -> list[dict]:
@@ -310,7 +399,7 @@ def apply_commands(act, commands: list[TelegramCommand], notifier) -> list[dict]
         except Exception as e:
             name = type(e).__name__
             log.warning("telegram.apply_failed", run_id=cmd.run_id, error=name)
-            _reply(notifier, f"Navigator: could not apply /{cmd.action} {cmd.run_id}: "
+            _reply(notifier, f"Navigator: could not apply {_label(cmd)}: "
                              f"{name} - re-send it")
             results.append({"run_id": cmd.run_id, "action": cmd.action, "applied": False,
                             "reason": f"error: {name}"})

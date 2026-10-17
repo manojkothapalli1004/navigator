@@ -29,6 +29,8 @@ class RepoConfig:
 class Settings:
     driver: str = "fake"
     mode: str = "dry_run"
+    # N8: apply operator merge decisions while mode == "dry_run" (builds stay off)
+    merge_in_dry_run: bool = False
     act_base_url: str | None = None
     orc_base_url: str | None = None
     worktree_root: str = "/tmp/navigator-worktrees"
@@ -60,6 +62,7 @@ class Settings:
         return cls(
             driver=os.getenv("NAVIGATOR_DRIVER", "fake"),
             mode=os.getenv("NAVIGATOR_MODE", "dry_run"),
+            merge_in_dry_run=_bool_env("NAVIGATOR_MERGE_IN_DRY_RUN", "0"),
             act_base_url=os.getenv("NAVIGATOR_ACT_BASE_URL"),
             orc_base_url=os.getenv("NAVIGATOR_ORC_BASE_URL"),
             worktree_root=os.getenv("NAVIGATOR_WORKTREE_ROOT", "/tmp/navigator-worktrees"),
@@ -129,6 +132,19 @@ def _positive_float_env(name: str, default: str) -> float:
     if v <= 0:
         raise ValueError(f"{name} must be > 0, got {v}")
     return v
+
+
+def _bool_env(name: str, default: str) -> bool:
+    # '1'/'true' -> True; '0'/'false'/unset (or empty) -> False; anything else is an error
+    raw = os.getenv(name, default)
+    if raw is None:
+        raw = default
+    v = raw.strip().lower()
+    if v in ("1", "true"):
+        return True
+    if v in ("0", "false", ""):
+        return False
+    raise ValueError(f"{name} must be 1/true or 0/false, got {raw!r}")
 
 
 def _model_list_env(name: str, default: str) -> list[str]:

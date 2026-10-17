@@ -168,9 +168,17 @@ class Navigator:
                                          decision=ApprovalDecision.approved)
         return len(runs) <= len(grants)
 
+    def _merges_enabled(self) -> bool:
+        # N8: the operator may opt in to acting on merge decisions while the daemon
+        # stays in dry_run (NAVIGATOR_MERGE_IN_DRY_RUN=1); builds (approval_poll) stay off
+        s = self.settings
+        return s.mode == "execute" or (s.mode == "dry_run"
+                                       and bool(getattr(s, "merge_in_dry_run", False)))
+
     def merge_poll(self) -> list:
-        """Act on operator decisions at the merge gate; returns runs that finished."""
-        if self.settings.mode != "execute":
+        """Act on operator decisions at the merge gate; returns runs that finished.
+        Runs in execute mode, or in dry_run when settings.merge_in_dry_run is set."""
+        if not self._merges_enabled():
             return []
         done = []
         with self.lock.acquire():

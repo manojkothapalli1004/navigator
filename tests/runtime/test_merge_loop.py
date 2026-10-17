@@ -1,6 +1,7 @@
 import subprocess
 from pathlib import Path
 from navigator.cli import ACTOR
+from navigator.contracts.proposal import Proposal
 from navigator.runtime.loop import Navigator
 from navigator.clients.act_client import FakeACTClient
 from navigator.clients.orc_client import FakeORCClient
@@ -141,3 +142,68 @@ def test_merge_commit_message_says_what_changed(tmp_path):
     nav.merge_poll()
     subject = _git(repo, "log", "-1", "--format=%s").strip()
     assert title in subject and run.id in subject
+
+
+# ---- N8: merge decisions in dry_run (opt-in) ----------------------------------
+
+def _to_dry_run(nav, flag):
+    # the run was built in execute mode; from here the daemon runs in dry_run
+    nav.settings.mode = "dry_run"
+    nav.settings.merge_in_dry_run = flag
+
+
+def test_dry_run_without_flag_leaves_approved_run_unmerged(tmp_path):
+    nav, repo, run = _setup(tmp_path)
+    _decide(nav, run, ApprovalDecision.approved)
+    _to_dry_run(nav, False)
+    assert nav.settings.merge_in_dry_run is False  # the code default: today's behaviour
+    assert nav.merge_poll() == []
+    stored = nav.act.runs[run.id]
+    assert stored.phase == RunPhase.awaiting_review and stored.status == RunStatus.executing
+    assert "navigator_touch.py" not in _git(repo, "ls-files")
+
+
+def test_dry_run_with_flag_merges_approved_run(tmp_path):
+    nav, repo, run = _setup(tmp_path)
+    _to_dry_run(nav, True)
+    assert nav.merge_poll() == []  # not decided yet: still nothing
+    _decide(nav, run, ApprovalDecision.approved)
+    done = nav.merge_poll()
+    assert [r.id for r in done] == [run.id]
+    assert nav.act.runs[run.id].status == RunStatus.completed
+    assert "navigator_touch.py" in _git(repo, "ls-files")
+
+
+def test_dry_run_with_flag_declines_declined_run(tmp_path):
+    nav, repo, run = _setup(tmp_path)
+    _to_dry_run(nav, True)
+    _decide(nav, run, ApprovalDecision.declined)
+    assert [r.id for r in nav.merge_poll()] == [run.id]
+    stored = nav.act.runs[run.id]
+    assert stored.status == RunStatus.aborted and stored.phase == RunPhase.finalizing
+    assert "navigator_touch.py" not in _git(repo, "ls-files")
+
+
+def test_dry_run_with_flag_still_builds_nothing(tmp_path):
+    nav, repo, run = _setup(tmp_path)
+    _to_dry_run(nav, True)
+    p = nav.act.create_proposal(Proposal(
+        origin="periodic", proposal_origin_hash="hash-second", title="second: another change",
+        rationale="r", repo=str(repo), base_commit_sha=run.base_commit_sha,
+        intended_changes="add b.py", affected_files=["b.py"]))
+    nav.act.set_proposal_status(p.id, ProposalStatus.approved)
+    _decide(nav, run, ApprovalDecision.approved)
+    assert nav.approval_poll() == []  # the flag only unlocks merge_poll
+    assert nav.act.list_runs_for_proposal(p.id) == []
+    assert [r.id for r in nav.merge_poll()] == [run.id]
+    assert nav.approval_poll() == []
+    assert nav.act.list_runs_for_proposal(p.id) == []
+
+
+def test_execute_mode_is_unaffected_by_the_flag(tmp_path):
+    nav, repo, run = _setup(tmp_path)
+    assert nav.settings.mode == "execute"
+    nav.settings.merge_in_dry_run = True
+    _decide(nav, run, ApprovalDecision.approved)
+    assert [r.id for r in nav.merge_poll()] == [run.id]
+    assert nav.act.runs[run.id].status == RunStatus.completed
