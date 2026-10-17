@@ -249,7 +249,9 @@ def test_no_pending_merge_approval_is_reported(tmp_path):
 
 def test_short_run_id_is_not_a_command(tmp_path):
     assert parse_command("/merge run-01M", 1) is None
-    assert parse_command("/merge", 1) is None
+    assert parse_command("/merge run-01M", 1) is None  # a truncated id is not a short name
+    bare = parse_command("/merge", 1)  # N8: bare form resolves at apply time, never guesses an id
+    assert bare.run_id is None and bare.name is None
     assert parse_command("please /merge run-01M", 1) is None
     cmds = _inbox(tmp_path, [_update(2, "/merge run-01M")]).poll_once()
     assert cmds == []
