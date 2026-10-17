@@ -156,3 +156,20 @@ def test_repos_file_research_loop_fields(tmp_path, monkeypatch):
     r = cfg.Settings.from_env().repos[0]
     assert (r.brief, r.context_files, r.min_plan_interval_hours, r.max_proposals_per_tick) == \
         ("one experiment", ["research_manager/morning_brief.md"], 24, 1)
+
+def test_merge_in_dry_run_env_wiring(monkeypatch):
+    # N8: operator opt-in to apply merge decisions while the daemon stays in dry_run
+    import pytest
+    monkeypatch.delenv("NAVIGATOR_MERGE_IN_DRY_RUN", raising=False)
+    assert cfg.Settings().merge_in_dry_run is False
+    assert cfg.Settings.from_env().merge_in_dry_run is False
+    for v in ("1", "true", "True", " TRUE "):
+        monkeypatch.setenv("NAVIGATOR_MERGE_IN_DRY_RUN", v)
+        assert cfg.Settings.from_env().merge_in_dry_run is True, v
+    for v in ("0", "false", "False"):
+        monkeypatch.setenv("NAVIGATOR_MERGE_IN_DRY_RUN", v)
+        assert cfg.Settings.from_env().merge_in_dry_run is False, v
+    for v in ("yes", "2", "on"):
+        monkeypatch.setenv("NAVIGATOR_MERGE_IN_DRY_RUN", v)
+        with pytest.raises(ValueError, match="NAVIGATOR_MERGE_IN_DRY_RUN"):
+            cfg.Settings.from_env()
