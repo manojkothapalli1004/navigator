@@ -117,7 +117,9 @@ def test_bare_merge_with_one_candidate_applies(tmp_path):
     ev = _decisions(act)
     assert len(ev) == 1
     assert ev[0].payload == {"run_id": run.id, "decision": "approved", "update_id": 7}
-    assert rec.sent == [f"Navigator: {run.id} merge approved from Telegram (applies this cycle)"]
+    assert rec.sent == [f"Navigator: N5b - N5b: Telegram inbox ({run.id}) merge approved "
+                        f"from Telegram (applies this cycle)"]
+    assert run.id in rec.sent[0] and "N5b: Telegram inbox" in rec.sent[0]
 
 
 def test_bare_reject_with_one_candidate_declines():
@@ -129,7 +131,8 @@ def test_bare_reject_with_one_candidate_declines():
     declined = _merge(act, run.id, ApprovalDecision.declined)
     assert len(declined) == 1 and declined[0].actor == TELEGRAM_ACTOR
     assert _decisions(act)[0].payload["decision"] == "rejected"
-    assert rec.sent == [f"Navigator: {run.id} merge rejected from Telegram (applies this cycle)"]
+    assert rec.sent == [f"Navigator: N5b - N5b: Telegram inbox ({run.id}) merge rejected "
+                        f"from Telegram (applies this cycle)"]
 
 
 def test_bare_merge_with_two_candidates_applies_nothing_and_lists_both():
@@ -188,7 +191,8 @@ def test_named_merge_resolves_by_short_name_case_insensitively(tmp_path):
     assert results == [{"run_id": a.id, "action": "merge", "applied": True, "reason": None}]
     assert len(_approved(act, a.id)) == 1 and _pending(act, a.id) == 0
     assert _pending(act, b.id) == 1 and _approved(act, b.id) == []
-    assert rec.sent == [f"Navigator: {a.id} merge approved from Telegram (applies this cycle)"]
+    assert rec.sent == [f"Navigator: N5b - N5b: Telegram inbox ({a.id}) merge approved "
+                        f"from Telegram (applies this cycle)"]
     results = apply_commands(act, [TelegramCommand("reject", None, 5, name="S3A")], rec)
     assert results[0]["applied"] is True and results[0]["run_id"] == b.id
     assert len(_merge(act, b.id, ApprovalDecision.declined)) == 1
@@ -291,9 +295,92 @@ def test_dry_run_with_merge_flag_says_applies_this_cycle(monkeypatch):
     monkeypatch.setenv("NAVIGATOR_MODE", "dry_run")
     monkeypatch.setenv("NAVIGATOR_MERGE_IN_DRY_RUN", "1")
     apply_commands(act, [TelegramCommand("merge", None, 1)], rec)
-    assert rec.sent == [f"Navigator: {run.id} merge approved from Telegram (applies this cycle)"]
+    assert rec.sent == [f"Navigator: N5b - N5b: Telegram inbox ({run.id}) merge approved "
+                        f"from Telegram (applies this cycle)"]
     monkeypatch.setenv("NAVIGATOR_MERGE_IN_DRY_RUN", "0")
     other = _run(act, "S3a: squash merges")
     apply_commands(act, [TelegramCommand("merge", None, 2)], rec)
-    assert rec.sent[-1] == (f"Navigator: {other.id} merge approved from Telegram "
-                            f"(recorded; merges apply only in execute mode)")
+    assert rec.sent[-1] == (f"Navigator: S3a - S3a: squash merges ({other.id}) merge approved "
+                            f"from Telegram (recorded; merges apply only in execute mode)")
+
+
+# ---- N8b: replies name the run; listing tolerates vanished proposals -----------
+
+def test_full_id_reply_does_not_name_the_proposal():
+    act = FakeACTClient()
+    run = _run(act, "N5b: Telegram inbox")
+    rec = _Recorder()
+    apply_commands(act, [TelegramCommand("merge", run.id, 1)], rec)
+    assert rec.sent == [f"Navigator: {run.id} merge approved from Telegram (applies this cycle)"]
+    assert "N5b" not in rec.sent[0]
+
+
+def test_vanished_proposal_is_listed_by_run_id_and_others_still_resolve():
+    act = FakeACTClient()
+    a = _run(act, "N5b: Telegram inbox")
+    b = _run(act, "S3a: squash merges")
+    real = act.get_proposal
+
+    def flaky(proposal_id):
+        if proposal_id == b.proposal_id:
+            raise KeyError("proposal gone: http://act.local/botSECRETTOKEN")
+        return real(proposal_id)
+    act.get_proposal = flaky
+    rec = _Recorder()
+    results = apply_commands(act, [TelegramCommand("merge", None, 1)], rec)
+    assert results[0]["applied"] is False
+    assert results[0]["reason"] == "ambiguous: several runs waiting for merge"
+    lines = rec.sent[0].splitlines()
+    assert "N5b - N5b: Telegram inbox - reply: merge N5b" in lines
+    assert f"{b.id} - {b.id} - reply: merge {b.id}" in lines
+    assert "SECRETTOKEN" not in rec.sent[0]
+    assert _pending(act, a.id) == 1 and _pending(act, b.id) == 1
+    # the other candidate is still resolvable by name
+    results = apply_commands(act, [TelegramCommand("merge", None, 2, name="N5b")], rec)
+    assert results[0] == {"run_id": a.id, "action": "merge", "applied": True, "reason": None}
+    assert rec.sent[-1] == (f"Navigator: N5b - N5b: Telegram inbox ({a.id}) merge approved "
+                            f"from Telegram (applies this cycle)")
+    # and the vanished one by its full id
+    results = apply_commands(act, [TelegramCommand("merge", b.id, 3)], rec)
+    assert results[0]["applied"] is True
+    assert rec.sent[-1] == f"Navigator: {b.id} merge approved from Telegram (applies this cycle)"
+
+
+def test_vanished_proposal_as_sole_candidate_still_merges_by_bare_merge():
+    act = FakeACTClient()
+    run = _run(act, "N5b: Telegram inbox")
+
+    def gone(proposal_id):
+        raise RuntimeError("gone")
+    act.get_proposal = gone
+    rec = _Recorder()
+    results = apply_commands(act, [TelegramCommand("merge", None, 1)], rec)
+    assert results[0] == {"run_id": run.id, "action": "merge", "applied": True, "reason": None}
+    assert rec.sent == [f"Navigator: {run.id} - {run.id} ({run.id}) merge approved "
+                        f"from Telegram (applies this cycle)"]
+
+
+def test_non_ascii_short_name_lists_run_id_to_reply_with():
+    act = FakeACTClient()
+    a = _run(act, "\u00d15: accents in title")
+    b = _run(act, "S3a: squash merges")
+    rec = _Recorder()
+    results = apply_commands(act, [TelegramCommand("merge", None, 1)], rec)
+    assert results[0]["applied"] is False
+    lines = rec.sent[0].splitlines()
+    assert f"\u00d15 - \u00d15: accents in title - reply: merge {a.id}" in lines
+    assert "S3a - S3a: squash merges - reply: merge S3a" in lines
+    # the suggested reply is a command parse_command accepts; the name itself is not
+    assert parse_command(f"merge {a.id}", 2) == TelegramCommand("merge", a.id, 2)
+    assert parse_command("merge \u00d15", 2) is None
+    assert _pending(act, a.id) == 1 and _pending(act, b.id) == 1
+
+
+def test_run_like_short_name_lists_run_id_to_reply_with():
+    act = FakeACTClient()
+    a = _run(act, "run-01 fix the thing")
+    _run(act, "S3a: squash merges")
+    rec = _Recorder()
+    apply_commands(act, [TelegramCommand("merge", None, 1)], rec)
+    lines = rec.sent[0].splitlines()
+    assert f"run-01 - run-01 fix the thing - reply: merge {a.id}" in lines
