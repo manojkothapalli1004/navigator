@@ -82,12 +82,17 @@ def make_sdk_query_fn(*, model: str | None = None,
     fn sharing the dict. When every model of the chain is cooling, a call raises
     RuntimeError('claude-agent-sdk: all models cooling down until <iso>')
     without any SDK call, except that at most once per 5 minutes (per shared
-    dict) a single probe call on the first model of the chain checks whether
-    the limit lifted: on success every account-wide entry is cleared and the
-    reply returned; on a limit error the cooldowns are refreshed and the
-    all-cooling error is raised. Timeouts, 'not logged in' and every other
-    error are never fallen back; if the whole chain fails the last error is
-    raised unchanged.
+    dict) a single probe call checks whether the limit lifted. The probe goes to
+    the first model of the chain that is blocked ONLY by an account-wide entry
+    (a model still in its own cooldown would fail for its own reason and say
+    nothing about the account); when every model of the chain is in its own
+    cooldown no probe is made. On success every account-wide entry is cleared,
+    the probe gate is reset and the reply returned; on a limit error the
+    cooldowns are refreshed (a live model-specific cooldown is never extended)
+    and the all-cooling error is raised. Only a successful probe resets the
+    probe gate: another role's healthy traffic never re-arms it. Timeouts, 'not
+    logged in' and every other error are never fallen back; if the whole chain
+    fails the last error is raised unchanged.
     """
     try:
         from claude_agent_sdk import ClaudeAgentOptions, ResultMessage, query
@@ -238,6 +243,18 @@ def make_sdk_query_fn(*, model: str | None = None,
             return float(entry[0])
         return float(entry)
 
+    def _model_until(m) -> float:
+        # the model's OWN cooldown only: a bare float or an (expiry, account_wide=False)
+        # entry; account-wide entries are read by _account_until instead
+        entry = cooldowns.get(m)
+        if entry is None:
+            return float("-inf")
+        if isinstance(entry, (tuple, list)):
+            if len(entry) > 1 and entry[1]:
+                return float("-inf")
+            return float(entry[0])
+        return float(entry)
+
     def _account_until(now: float) -> float:
         # the latest live account-wide expiry anywhere in the SHARED dict: a session limit
         # hit by any role blocks every model of every role (N7b spec item 4, audit F1)
@@ -267,24 +284,34 @@ def make_sdk_query_fn(*, model: str | None = None,
 
     def _record_failure(use_model, e: Exception, marker: str) -> None:
         delay = _delay_s(e, marker)
-        until = clock() + delay
+        now = clock()
+        until = now + delay
         if marker in _ACCOUNT_WIDE_MARKERS:
             for m in chain:
                 cooldowns[m] = (until, True)
             _emit_account_cooldown(use_model, marker, delay)
-        else:
+        elif _model_until(use_model) <= now:
+            # N7d: a model-specific failure never extends a cooldown the model is still
+            # serving (only an expired one is replaced); candidates and probe targets
+            # never have a live one, so this is a guard, not a path
             cooldowns[use_model] = (until, False)
 
     def _probe_or_fail(prompt: str, now: float) -> str:
-        # every model is cooling: at most one probe call per interval (per shared dict)
-        # on the first model of the chain; between probes fail fast with zero SDK calls
+        # every model is cooling: at most one probe call per interval (per shared dict);
+        # between probes fail fast with zero SDK calls. The gate is reset ONLY by a
+        # successful probe (N7d S2): another role's healthy traffic never re-arms it.
         last = cooldowns.get(_PROBE_KEY)
         if last is None or now - float(last) < ALL_COOLING_PROBE_INTERVAL_S:
             if last is None:
                 cooldowns[_PROBE_KEY] = now
             raise _all_cooling_error(now)
+        # N7d S1: probe the first model blocked ONLY by the account-wide entry; a model
+        # still in its own cooldown (Fable out of credits) would fail for its own reason
+        # and say nothing about the account limit. Nothing qualifies: no probe at all.
+        probe_model = next((m for m in chain if _model_until(m) <= now), None)
+        if probe_model is None:
+            raise _all_cooling_error(now)
         cooldowns[_PROBE_KEY] = now
-        probe_model = chain[0]
         try:
             text = _attempt(prompt, probe_model)
         except TimeoutError:
@@ -314,7 +341,7 @@ def make_sdk_query_fn(*, model: str | None = None,
         candidates = [m for m in chain if _blocked_until(m, account_until) <= now]
         if not candidates:
             return _probe_or_fail(prompt, now)
-        cooldowns.pop(_PROBE_KEY, None)
+        # the probe gate is NOT touched here: only a successful probe resets it (N7d S2)
         for i, use_model in enumerate(candidates):
             try:
                 return _attempt(prompt, use_model)
