@@ -293,7 +293,8 @@ def _label(cmd: TelegramCommand) -> str:
 def _candidates(act) -> list[tuple]:
     """Runs a shorthand command may mean: open, awaiting review, with a pending merge
     approval and audited - the checks the full-id form applies, evaluated right now.
-    Each entry is (run, short name, title)."""
+    Each entry is (run, short name, title). A proposal that cannot be fetched (vanished,
+    ACT hiccup) does not break the listing: the run is named by its id instead."""
     out = []
     for run in act.list_open_runs():
         if run.phase != RunPhase.awaiting_review:
@@ -303,26 +304,41 @@ def _candidates(act) -> list[tuple]:
             continue
         if not is_audited(act, run.id):
             continue
-        prop = act.get_proposal(run.proposal_id)
+        try:
+            prop = act.get_proposal(run.proposal_id)
+        except Exception as e:
+            log.warning("telegram.candidate_proposal_failed", run_id=run.id,
+                        error=type(e).__name__)
+            prop = None
         title = (prop.title if prop is not None and prop.title else "").strip()
         out.append((run, short_name(title) or run.id, title or run.id))
     return out
 
 
+def _reply_arg(run, short: str) -> str:
+    """What to type after 'merge': the short name when parse_command accepts it, else
+    the full run id (non-ASCII names, names that look like a run id prefix)."""
+    if short.lower().startswith("run-") or not SHORT_NAME.fullmatch(short):
+        return run.id
+    return short
+
+
 def _candidate_lines(cands, action: str) -> str:
-    return "\n".join(f"{short} - {title} - reply: {action} {short}" for _, short, title in cands)
+    return "\n".join(f"{short} - {title} - reply: {action} {_reply_arg(run, short)}"
+                     for run, short, title in cands)
 
 
-def _resolve(act, cmd: TelegramCommand, notifier) -> tuple[str | None, dict | None]:
-    """Shorthand -> run id against live ACT state. Exactly one match: (run_id, None).
-    Otherwise nothing is touched, the operator gets a reply and (None, result) returns."""
+def _resolve(act, cmd: TelegramCommand, notifier) -> tuple[tuple | None, dict | None]:
+    """Shorthand -> candidate against live ACT state. Exactly one match:
+    ((run, short, title), None). Otherwise nothing is touched, the operator gets a
+    reply and (None, result) returns."""
     cands = _candidates(act)
     if cmd.name is None:
         matches = cands
     else:
         matches = [c for c in cands if c[1].lower() == cmd.name.lower()]
     if len(matches) == 1:
-        return matches[0][0].id, None
+        return matches[0], None
     if not cands:
         reason = "nothing waiting for merge"
         text = f"Navigator: {_label(cmd)} - nothing waiting for merge"
@@ -344,11 +360,13 @@ def _reply(notifier, text: str) -> None:
 
 def _apply_one(act, cmd: TelegramCommand, notifier) -> dict:
     run_id = cmd.run_id
+    resolved = None
     if run_id is None:
         # shorthand: resolve to a run first; zero/ambiguous candidates reply and stop
-        run_id, failed = _resolve(act, cmd, notifier)
+        resolved, failed = _resolve(act, cmd, notifier)
         if failed is not None:
             return failed
+        run_id = resolved[0].id
     run = next((r for r in act.list_open_runs() if r.id == run_id), None)
     pending = []
     if run is None:
@@ -382,7 +400,9 @@ def _apply_one(act, cmd: TelegramCommand, notifier) -> dict:
         log.warning("telegram.decision_event_failed", run_id=run_id,
                     error=type(e).__name__)
         event_note = " (event log failed)"
-    notifier.send(f"Navigator: {run_id} merge {verb} from Telegram "
+    # a shorthand resolved against live state: say which run it picked, by name
+    who = run_id if resolved is None else f"{resolved[1]} - {resolved[2]} ({run_id})"
+    notifier.send(f"Navigator: {who} merge {verb} from Telegram "
                   f"({_apply_wording()}){event_note}")
     return {"run_id": run_id, "action": cmd.action, "applied": True, "reason": None}
 
@@ -398,7 +418,7 @@ def apply_commands(act, commands: list[TelegramCommand], notifier) -> list[dict]
             results.append(_apply_one(act, cmd, notifier))
         except Exception as e:
             name = type(e).__name__
-            log.warning("telegram.apply_failed", run_id=cmd.run_id, error=name)
+            log.warning("telegram.apply_failed", command=_label(cmd), error=name)
             _reply(notifier, f"Navigator: could not apply {_label(cmd)}: "
                              f"{name} - re-send it")
             results.append({"run_id": cmd.run_id, "action": cmd.action, "applied": False,
