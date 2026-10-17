@@ -13,7 +13,8 @@ from navigator.config import RepoConfig, Settings, effective_repos
 from navigator.runtime.fleet import Fleet
 from navigator.contracts.enums import Role
 from navigator.observability.notify import NotifyingACT, make_notifier
-from navigator.observability.telegram_inbox import apply_commands, make_telegram_inbox
+from navigator.observability.telegram_inbox import (TelegramError, apply_commands,
+                                                    make_telegram_inbox)
 from navigator.clients.act_client import FakeACTClient, HTTPACTClient
 from navigator.clients.orc_client import FakeORCClient, HTTPORCClient
 from navigator.runtime.drivers.claude_sdk_driver import ClaudeSDKDriver
@@ -71,9 +72,20 @@ def _head_sha(repo: str) -> str:
     return subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo,
                           capture_output=True, text=True, check=True).stdout.strip()
 
+def _telegram_error_kind(e: Exception) -> str:
+    """What the operator is told. A TelegramError's message is fixed text; any other
+    exception is named only, since its text could carry the token-bearing URL."""
+    if isinstance(e, TelegramError):
+        return f"{type(e).__name__}: {e}"
+    return type(e).__name__
+
+
 def _telegram_step(nav, summary: dict) -> None:
     """Poll the operator's Telegram chat once and record merge decisions in ACT.
-    A failure here must never break the cycle."""
+    A failure here must never break the cycle: it goes into the summary, and the
+    operator is told ONCE per distinct error kind (e.g. a second getUpdates consumer
+    answered with 409 every cycle), not every cycle. A successful poll re-arms the
+    notice."""
     inbox = getattr(nav, "telegram_inbox", None)
     if inbox is None:
         return
@@ -83,8 +95,18 @@ def _telegram_step(nav, summary: dict) -> None:
         results = apply_commands(act, commands, nav.notifier)
         summary["telegram_commands"] = len(commands)
         summary["telegram_applied"] = sum(1 for r in results if r.get("applied"))
+        nav.telegram_last_error = None
     except Exception as e:
         summary["telegram_error"] = f"{type(e).__name__}: {e}"[:300]
+        kind = _telegram_error_kind(e)
+        if getattr(nav, "telegram_last_error", None) == kind:
+            return
+        nav.telegram_last_error = kind
+        try:
+            nav.notifier.send(f"Navigator: Telegram commands not polled - {kind} "
+                              f"(no further notice until this changes)")
+        except Exception:
+            pass
 
 def _cycle(nav: Navigator, settings: Settings) -> dict:
     summary: dict = {"mode": settings.mode, "driver": settings.driver}
