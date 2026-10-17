@@ -8,10 +8,39 @@ DEFAULT_SYSTEM_PROMPT = (
     "You are a Navigator subagent. Reply with ONLY the requested JSON object \u2014 "
     "no prose, no markdown fences.")
 
+# operator decision 2026-10-15: the builder runs on claude-fable-5-1, whose credits run
+# out first; an account/model error must move the SAME query to the next model in the
+# chain instead of failing the run (2026-08-25..10-09: 216 cycles lost to a masked Fable
+# credits error; 2026-10-15: a retry burned on 'session limit'). Only Settings / the
+# driver pass this chain: make_sdk_query_fn's own default is () so a bare query fn
+# behaves exactly as it always did.
+DEFAULT_MODEL_FALLBACKS: tuple[str, ...] = ("claude-opus-5-5", "claude-sonnet-5-5")
+DEFAULT_MODEL_COOLDOWN_S = 3600
+
+
+def model_chain(model, fallbacks) -> list:
+    """Models to try, in order, for a role configured on `model`.
+
+    Never falls back UP: a model that is itself in the chain only tries the
+    models after it (a Sonnet planner never calls Opus or Fable). Duplicates keep
+    their first position; empty entries are dropped.
+    """
+    if not model or not fallbacks:
+        return [model]
+    ordered = [m for m in dict.fromkeys(fallbacks) if m]
+    if model in ordered:
+        return ordered[ordered.index(model):]
+    return [model] + ordered
+
+
 def make_sdk_query_fn(*, model: str | None = None,
                       system_prompt: str = DEFAULT_SYSTEM_PROMPT,
                       timeout_s: float = 300.0,
-                      logger=None) -> Callable[[str], str]:
+                      logger=None,
+                      fallbacks: tuple[str, ...] = (),
+                      cooldown_s: float = DEFAULT_MODEL_COOLDOWN_S,
+                      cooldowns: dict | None = None,
+                      clock: Callable[[], float] = time.monotonic) -> Callable[[str], str]:
     """Build a (prompt) -> str query_fn backed by claude-agent-sdk.
 
     Imported lazily so the package works without the sdk extra; the returned
@@ -22,6 +51,16 @@ def make_sdk_query_fn(*, model: str | None = None,
     ('sdk_query.completed' or 'sdk_query.failed'); logging failures never
     affect results. Pass a logger to observe metrics without touching global
     logging configuration.
+
+    Model fallback (off unless `fallbacks` is non-empty AND `model` is set):
+    an account/model error (usage credits, credit balance, usage/session limit,
+    unsupported or unknown model) re-issues the same prompt on the next model of
+    model_chain(model, fallbacks); the failing model enters `cooldowns` (shared
+    across query fns when the caller passes one dict) for `cooldown_s` seconds
+    of `clock` time and later calls skip it. One 'sdk_query.model_fallback'
+    event per switch carries the marker only, never the error text. Timeouts,
+    'not logged in' and every other error are never fallen back; if the whole
+    chain fails the last error is raised unchanged.
     """
     try:
         from claude_agent_sdk import ClaudeAgentOptions, ResultMessage, query
@@ -34,6 +73,12 @@ def make_sdk_query_fn(*, model: str | None = None,
         from navigator.observability.logging import get_logger
         logger = get_logger("navigator.sdk")
 
+    fallbacks = tuple(fallbacks or ())
+    chain = model_chain(model, fallbacks)
+    fallback_enabled = bool(model) and bool(fallbacks)
+    if cooldowns is None:
+        cooldowns = {}
+
     def _emit(ok: bool, fields: dict) -> None:
         # metrics are best-effort: a broken logger must never change a result
         try:
@@ -44,14 +89,22 @@ def make_sdk_query_fn(*, model: str | None = None,
         except Exception:
             pass
 
-    def _run_query(prompt: str, meta: dict) -> str:
+    def _emit_fallback(from_model, to_model, reason: str) -> None:
+        # marker only: the full error text already went to sdk_query.failed
+        try:
+            logger.warning("sdk_query.model_fallback", from_model=from_model,
+                           to_model=to_model, reason=reason)
+        except Exception:
+            pass
+
+    def _run_query(prompt: str, meta: dict, use_model) -> str:
         # max_turns=4 not 1: the CLI occasionally burns turns before the
         # final reply (observed live 2026-07-08, and again 2026-07-18 at 2).
         # Tools are disabled, so unused headroom costs nothing.
         # setting_sources=[] keeps the operator's hooks/plugins/skills out of
         # the subagent session \u2014 with them loaded, skill reminders push the
         # model into tool calls until max_turns errors (observed same day).
-        options = ClaudeAgentOptions(system_prompt=system_prompt, model=model,
+        options = ClaudeAgentOptions(system_prompt=system_prompt, model=use_model,
                                      max_turns=4, tools=[], allowed_tools=[],
                                      setting_sources=[], settings=_LOCKED_SETTINGS)
         results: list[str] = []
@@ -91,17 +144,18 @@ def make_sdk_query_fn(*, model: str | None = None,
             raise RuntimeError("claude-agent-sdk returned no result message")
         return _strip_fences(results[-1])
 
-    def _query_once(prompt: str) -> str:
+    def _query_once(prompt: str, use_model) -> str:
         meta: dict = {"num_turns": None, "subtype": None}
         start = time.monotonic()
 
         def _fields(reply_chars: int) -> dict:
-            return {"model": model, "elapsed_s": round(time.monotonic() - start, 3),
+            # `model` is the one actually queried, so fallbacks are visible per event
+            return {"model": use_model, "elapsed_s": round(time.monotonic() - start, 3),
                     "num_turns": meta.get("num_turns"), "subtype": meta.get("subtype"),
                     "reply_chars": reply_chars}
 
         try:
-            text = _run_query(prompt, meta)
+            text = _run_query(prompt, meta, use_model)
         except TimeoutError as e:
             fields = _fields(0)
             fields["timeout_s"] = timeout_s
@@ -116,25 +170,53 @@ def make_sdk_query_fn(*, model: str | None = None,
         _emit(True, _fields(len(text)))
         return text
 
-    def query_fn(prompt: str) -> str:
+    def _attempt(prompt: str, use_model) -> str:
         # one bounded retry for model-side flakes (max-turns error results,
         # missing result message, truncated/non-JSON output \u2014 all observed
         # live on fable-5 through 2026-07-18). Wall-clock timeouts are NOT
         # retried: doubling a 300s wait starves the tick cadence.
+        # With fallback disabled this is byte-for-byte the historical behaviour.
         try:
-            text = _query_once(prompt)
+            text = _query_once(prompt, use_model)
         except TimeoutError:
             raise
         except Exception as e:
+            if fallback_enabled and _fallback_marker(e) is not None:
+                raise  # the chain switches model; a same-model retry would only repeat it
             if not _is_retryable(e):
                 raise
-            return _query_once(prompt)
+            return _query_once(prompt, use_model)
         if _is_valid_json_object(text):
             return text
-        retry = _query_once(prompt)
+        retry = _query_once(prompt, use_model)
         # still bad after the retry: hand it to the driver's strict parser so
         # the failure surfaces with head/tail detail \u2014 never invent structure
         return retry
+
+    def _cooling(m, now: float) -> bool:
+        return cooldowns.get(m, float("-inf")) > now
+
+    def query_fn(prompt: str) -> str:
+        if not fallback_enabled:
+            return _attempt(prompt, model)
+        now = clock()
+        # a model still cooling down from a recent account error is skipped; if every
+        # model is cooling, try the whole chain rather than fail without a single call
+        candidates = [m for m in chain if not _cooling(m, now)] or list(chain)
+        for i, use_model in enumerate(candidates):
+            try:
+                return _attempt(prompt, use_model)
+            except TimeoutError:
+                raise  # never fallen back: a second full wait starves the tick
+            except Exception as e:
+                marker = _fallback_marker(e)
+                if marker is None:
+                    raise  # 'not logged in' and everything else: today's behaviour
+                cooldowns[use_model] = clock() + cooldown_s
+                if i == len(candidates) - 1:
+                    raise  # chain exhausted: the last error surfaces unchanged
+                _emit_fallback(use_model, candidates[i + 1], marker)
+        raise AssertionError("unreachable: model chain exhausted without an error")
 
     return query_fn
 
@@ -162,6 +244,25 @@ def _is_retryable(e: Exception) -> bool:
     if isinstance(e, RuntimeError) and "no result message" in msg:
         return True
     return "maximum number of turns" in msg or "error result" in msg
+
+
+# account/model failures that justify the next model in the chain. These do NOT
+# change _is_retryable: with fallback disabled the retry logic is untouched.
+# Only the marker ever reaches the fallback log event, never the error text.
+_FALLBACK_MARKERS = ("usage credits", "credit balance", "does not support this model",
+                     "usage limit", "session limit", "model not available", "model not found")
+
+
+def _fallback_marker(e: Exception) -> str | None:
+    msg = str(e).lower()
+    for marker in _FALLBACK_MARKERS:
+        if marker in msg:
+            return marker
+    # the API's not_found_error only means "no such model" when it says so:
+    # session_not_found / file_not_found must never switch models
+    if "not_found_error" in msg and "model" in msg:
+        return "not_found_error"
+    return None
 
 
 def _is_valid_json_object(text: str) -> bool:
