@@ -105,7 +105,7 @@ def test_daemon_is_default_when_once_absent(tmp_path, monkeypatch, capsys):
     assert [l["cycle"] for l in lines] == [1]
 
 def test_daemon_survives_a_failing_cycle(tmp_path, monkeypatch, capsys):
-    # live regression 2026-07-13: ORC restart mid-boot → ConnectError killed the daemon
+    # live regression 2026-07-13: ORC restart mid-boot \u2192 ConnectError killed the daemon
     _daemon_env(tmp_path, monkeypatch)
     import navigator.__main__ as m
     monkeypatch.setattr(m.time, "sleep", lambda s: None)
@@ -187,7 +187,7 @@ def test_operator_commands_dispatch_to_cli_against_act(monkeypatch, capsys):
     assert "proposed (0)" in capsys.readouterr().out
 
 def test_daemon_health_alert_once_per_failure_streak_then_recovery(tmp_path, monkeypatch, capsys):
-    # 2026-08-25 → 10-09: 216 consecutive failed cycles went unnoticed for six weeks
+    # 2026-08-25 \u2192 10-09: 216 consecutive failed cycles went unnoticed for six weeks
     import navigator.__main__ as m
     monkeypatch.setattr(m.time, "sleep", lambda s: None)
     sent = []
@@ -235,7 +235,8 @@ def test_per_role_sdk_models_are_wired(tmp_path, monkeypatch):
     import navigator.__main__ as m
     from navigator.contracts.enums import Role
     built = []
-    monkeypatch.setattr(m, "make_sdk_query_fn", lambda model, timeout_s: built.append(model) or (lambda p: model))
+    monkeypatch.setattr(m, "make_sdk_query_fn",
+                        lambda model, timeout_s, **kw: built.append(model) or (lambda p: model))
     s = _settings(tmp_path, _seed_repo(tmp_path), driver="claude_sdk", sdk_model="claude-opus-5-5",
                   sdk_role_models={"planner": "claude-sonnet-5-5", "verifier": "claude-sonnet-5-5"})
     drv = build_navigator(s).driver
@@ -243,6 +244,31 @@ def test_per_role_sdk_models_are_wired(tmp_path, monkeypatch):
     assert drv.role_query_fns[Role.planner]("x") == "claude-sonnet-5-5"
     assert drv.role_query_fns[Role.verifier]("x") == "claude-sonnet-5-5"
     assert Role.builder not in drv.role_query_fns
+
+def test_sdk_model_fallback_chain_is_wired_into_the_daemon(tmp_path, monkeypatch):
+    # operator 2026-10-15: NAVIGATOR_SDK_MODEL_FALLBACKS / _COOLDOWN_S must actually
+    # reach every query fn the daemon builds, with ONE cooldown dict shared by all
+    import navigator.__main__ as m
+    built = []
+    def fake_make(model, timeout_s, **kw):
+        built.append((model, timeout_s, kw))
+        return lambda p: model
+    monkeypatch.setattr(m, "make_sdk_query_fn", fake_make)
+    s = _settings(tmp_path, _seed_repo(tmp_path), driver="claude_sdk", sdk_model="claude-fable-5-1",
+                  sdk_role_models={"planner": "claude-sonnet-5-5", "verifier": "claude-sonnet-5-5"},
+                  sdk_model_fallbacks=["claude-opus-5-5", "claude-sonnet-5-5"],
+                  sdk_model_cooldown_s=900, sdk_timeout_s=77.0, max_cost_usd=1.25)
+    drv = build_navigator(s).driver
+    assert drv.budget_guard.max_cost_usd == 1.25
+    assert sorted(model for model, _, _ in built) == ["claude-fable-5-1", "claude-sonnet-5-5",
+                                                      "claude-sonnet-5-5"]
+    for _, timeout_s, kw in built:
+        assert timeout_s == 77.0
+        assert kw["fallbacks"] == ("claude-opus-5-5", "claude-sonnet-5-5")
+        assert isinstance(kw["fallbacks"], tuple)
+        assert kw["cooldown_s"] == 900
+    dicts = [kw["cooldowns"] for _, _, kw in built]
+    assert isinstance(dicts[0], dict) and all(d is dicts[0] for d in dicts)
 
 def test_repos_file_builds_a_fleet_with_per_repo_runners(tmp_path):
     from navigator.config import RepoConfig
