@@ -37,6 +37,8 @@ import unicodedata
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TextIO
+from navigator.clients.act_client import _parse_ts
+from navigator.observability.logging import get_logger
 from navigator.observability.notify import format_verification
 from navigator.contracts.enums import (ApprovalDecision, ApprovalGate, ProposalStatus,
                                        RunPhase, RunStatus)
@@ -46,6 +48,7 @@ COMMANDS = ("status", "approve", "decline", "diff", "merge", "reject", "retry", 
             "doctor", "audited", "inbox")
 ACTOR = "operator"
 AUDITOR = "auditor"
+_log = get_logger("navigator.cli")
 
 # run statuses whose worktree/branch can go regardless of age
 _FINISHED_STATUSES = {"completed", "declined", "aborted"}
@@ -133,13 +136,25 @@ def _find_run(act, run_id):
 _AUDIT_EVENT_KINDS = frozenset({"run.audited", "run.awaiting_review"})
 # how many client wrappers (.inner) to unwrap when looking for list_events
 _MAX_WRAPPER_DEPTH = 8
+# events are only read from this long before the run started: the run's own
+# events cannot predate it by more than clock skew between navigator and ACT
+_AUDIT_SINCE_SKEW = timedelta(minutes=5)
 
 
-def _events(act):
-    """Audit-relevant navigator events read back from ACT, or None when they cannot
-    be listed (a client without list_events, or the call failed). Callers treat
-    None as 'not audited' (fail closed). Wrappers such as NotifyingACT are unwrapped
-    through their .inner attribute."""
+def _audit_since(run) -> datetime | None:
+    """Lower bound for the ACT events is_audited needs: the run's started_at minus a
+    skew allowance. None when the run has no usable started_at (read everything)."""
+    started = _parse_ts(getattr(run, "started_at", None))
+    return started - _AUDIT_SINCE_SKEW if started is not None else None
+
+
+def _events(act, since: datetime | None = None):
+    """Audit-relevant navigator events read back from ACT (only those not before
+    `since` when given), or None when they cannot be listed (a client without
+    list_events, or the call failed; the failure is logged as 'cli.events_unreadable'
+    with the exception CLASS name only). Callers treat None as 'not audited' (fail
+    closed). Wrappers such as NotifyingACT are unwrapped through their .inner
+    attribute."""
     target = act
     for _ in range(_MAX_WRAPPER_DEPTH):
         if hasattr(target, "list_events"):
@@ -150,22 +165,16 @@ def _events(act):
     else:
         return None
     try:
-        return list(target.list_events(kinds=set(_AUDIT_EVENT_KINDS)))
-    except Exception:
+        return list(target.list_events(kinds=set(_AUDIT_EVENT_KINDS), since=since))
+    except Exception as e:
+        # class name only: an exception message may carry URLs or response bodies
+        _log.warning("cli.events_unreadable", error=type(e).__name__)
         return None
 
 
-def _as_utc(value) -> datetime | None:
-    """`value` (datetime or ISO string) as an aware UTC datetime; naive means UTC.
-    None when missing or unparsable."""
-    if isinstance(value, str):
-        try:
-            value = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
-        except ValueError:
-            return None
-    if not isinstance(value, datetime):
-        return None
-    return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+# one timestamp parser for the whole audit path (datetime or ISO string -> aware
+# UTC, naive means UTC, None when unusable); kept under its old name for importers
+_as_utc = _parse_ts
 
 
 def _payload(event) -> dict:
@@ -194,25 +203,25 @@ def is_audited(act, run) -> bool:
         run = _find_run(act, run)
     if run is None or not run.verified_sha:
         return False
-    events = _events(act)
+    events = _events(act, since=_audit_since(run))
     if events is None:
         return False
     mine = [e for e in events if _payload(e).get("run_id") == run.id]
     reviewed = [t for e in mine if getattr(e, "kind", None) == "run.awaiting_review"
-                if (t := _as_utc(getattr(e, "ts", None))) is not None]
+                if (t := _parse_ts(getattr(e, "ts", None))) is not None]
     if not reviewed:
         return False
     since = max(reviewed)
     sha_audited = any(getattr(e, "kind", None) == "run.audited"
                       and _payload(e).get("verified_sha") == run.verified_sha
-                      and (t := _as_utc(getattr(e, "ts", None))) is not None and t > since
+                      and (t := _parse_ts(getattr(e, "ts", None))) is not None and t > since
                       for e in mine)
     if not sha_audited:
         return False
     grants = act.list_approvals(target=run.id, gate=ApprovalGate.review,
                                 decision=ApprovalDecision.approved)
     return any(a.actor == AUDITOR
-               and (t := _as_utc(a.decided_at)) is not None and t > since
+               and (t := _parse_ts(a.decided_at)) is not None and t > since
                for a in grants)
 
 
@@ -263,9 +272,11 @@ def _inbox_path() -> Path:
 
 def _inbox(args: list[str], out) -> int:
     """Print the Telegram inbox file as written by TelegramInbox: one JSON object per
-    line, newest last. With --since only entries whose update_id is greater than
-    UPDATE_ID. Lines that are not JSON (a partial write) are skipped; bytes that are
-    not UTF-8 are replaced, never fatal. A missing file prints nothing."""
+    line, newest last. The rotated file <path>.1 (if present) is printed first, then
+    <path>, so entries that were just rotated out are not lost. With --since only
+    entries whose update_id is greater than UPDATE_ID (applied across both files).
+    Lines that are not JSON (a partial write) are skipped; bytes that are not UTF-8
+    are replaced, never fatal. A missing file prints nothing."""
     if args == []:
         since = None
     elif len(args) == 2 and args[0] == "--since" and args[1].lstrip("-").isdigit():
@@ -273,23 +284,25 @@ def _inbox(args: list[str], out) -> int:
     else:
         print("usage: navigator inbox [--since UPDATE_ID]", file=out)
         return 2
-    try:
-        text = _inbox_path().read_text(encoding="utf-8", errors="replace")
-    except FileNotFoundError:
-        return 0
-    for line in text.split("\n"):
-        line = line.strip()
-        if not line:
-            continue
+    path = _inbox_path()
+    for p in (Path(f"{path}.1"), path):
         try:
-            entry = json.loads(line)
-        except ValueError:
+            text = p.read_text(encoding="utf-8", errors="replace")
+        except FileNotFoundError:
             continue
-        if since is not None:
-            uid = entry.get("update_id") if isinstance(entry, dict) else None
-            if not isinstance(uid, int) or isinstance(uid, bool) or uid <= since:
+        for line in text.split("\n"):
+            line = line.strip()
+            if not line:
                 continue
-        print(line, file=out)
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                continue
+            if since is not None:
+                uid = entry.get("update_id") if isinstance(entry, dict) else None
+                if not isinstance(uid, int) or isinstance(uid, bool) or uid <= since:
+                    continue
+            print(line, file=out)
     return 0
 
 

@@ -77,6 +77,34 @@ def test_inbox_invalid_utf8_and_partial_lines_never_raise(inbox_path):
     assert [json.loads(l)["update_id"] for l in out.splitlines()] == [4]
 
 
+def test_inbox_reads_the_rotated_file_first_then_the_current_one(inbox_path):
+    rotated = inbox_path.with_name(inbox_path.name + ".1")
+    rotated.write_text("\n".join(_entry(i, f"m{i}") for i in (1, 2)) + "\n")
+    inbox_path.write_text("\n".join(_entry(i, f"m{i}") for i in (3, 4)) + "\n")
+    rc, out = _cli("inbox")
+    assert rc == 0
+    assert [json.loads(l)["update_id"] for l in out.splitlines()] == [1, 2, 3, 4]
+    assert out.splitlines() == [_entry(i, f"m{i}") for i in (1, 2, 3, 4)]
+    # --since filters across both files
+    rc, out = _cli("inbox", "--since", "1")
+    assert rc == 0
+    assert [json.loads(l)["update_id"] for l in out.splitlines()] == [2, 3, 4]
+    rc, out = _cli("inbox", "--since", "3")
+    assert rc == 0
+    assert [json.loads(l)["update_id"] for l in out.splitlines()] == [4]
+    rc, out = _cli("inbox", "--since", "4")
+    assert rc == 0 and out == ""
+    # only the rotated file present (current not written yet after rotation)
+    inbox_path.unlink()
+    rc, out = _cli("inbox")
+    assert rc == 0
+    assert [json.loads(l)["update_id"] for l in out.splitlines()] == [1, 2]
+    # only the current file present: unchanged behaviour
+    rotated.unlink()
+    inbox_path.write_text(_entry(7, "solo") + "\n")
+    assert _cli("inbox") == (0, _entry(7, "solo") + "\n")
+
+
 def test_inbox_bad_arguments(inbox_path):
     assert _cli("inbox", "--since")[0] == 2
     assert _cli("inbox", "--since", "x")[0] == 2

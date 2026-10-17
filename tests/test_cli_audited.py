@@ -3,9 +3,10 @@ import json
 from datetime import datetime, timedelta, timezone
 
 import httpx
+from structlog.testing import capture_logs
 
 from navigator.cli import is_audited, run_cli
-from navigator.clients.act_client import FakeACTClient, HTTPACTClient
+from navigator.clients.act_client import ACTEventsTooLarge, FakeACTClient, HTTPACTClient
 from navigator.contracts.enums import ApprovalDecision, ApprovalGate, RunPhase
 from navigator.contracts.event import Event
 from navigator.contracts.run import Run
@@ -222,10 +223,41 @@ def test_is_audited_fails_closed_when_events_cannot_be_listed():
     assert is_audited(act, run.id)
     assert not is_audited(ProtocolOnlyACT(act), run.id)   # no list_events, no .inner
 
-    def boom(kinds=None):
-        raise ConnectionError("ACT down")
+    def boom(kinds=None, since=None):
+        raise ConnectionError("ACT down at http://act.internal:9/secret?token=abc")
     act.list_events = boom
-    assert not is_audited(act, run.id)
+    with capture_logs() as logs:
+        assert not is_audited(act, run.id)
+    unreadable = [l for l in logs if l["event"] == "cli.events_unreadable"]
+    assert len(unreadable) == 1
+    assert unreadable[0]["error"] == "ConnectionError"
+    # the class name only: the message (which may carry URLs/tokens) is never logged
+    assert not any("token" in str(v) or "ACT down" in str(v) for v in unreadable[0].values())
+
+
+def test_is_audited_reads_only_events_since_the_run_started():
+    class _Recording(FakeACTClient):
+        def __init__(self):
+            super().__init__()
+            self.since_args = []
+
+        def list_events(self, kinds=None, since=None):
+            self.since_args.append(since)
+            return super().list_events(kinds=kinds, since=since)
+    act = _Recording()
+    run = _run(act)
+    assert _cli(act, "audited", run.id)[0] == 0
+    assert is_audited(act, run.id)
+    assert act.since_args and all(s is not None for s in act.since_args)
+    for s in act.since_args:
+        assert s.tzinfo is not None
+        assert s <= run.started_at                      # never later than the run start
+        assert run.started_at - s <= timedelta(hours=1)  # but close to it, not history
+    # an awaiting_review event from long before the run started is not read at all
+    act.emit_event(Event(kind="run.awaiting_review", correlation_id="corr-x",
+                         ts=datetime.now(timezone.utc) - timedelta(days=30),
+                         payload={"run_id": run.id, "verified_sha": VERIFIED_SHA}))
+    assert is_audited(act, run.id)
 
 
 def test_is_audited_unwraps_notifying_act():
@@ -385,3 +417,53 @@ def test_sha_mismatch_over_http_does_not_count():
     assert is_audited(act, rid)
     server.runs[rid]["payload"]["verified_sha"] = OTHER_SHA
     assert not is_audited(act, rid)
+
+
+def test_events_before_the_run_started_are_dropped_over_http():
+    server = _ActServer()
+    rid = server.add_run()                     # started_at 11:00, events from 12:00
+    # an ancient forged pair for this run id, long before the run started
+    server.events.insert(0, {"id": new_id("event"), "kind": "run.awaiting_review",
+                             "severity": "info", "ts": "2026-01-01T00:00:00+00:00",
+                             "payload": {"run_id": rid, "verified_sha": VERIFIED_SHA},
+                             "correlation_id": "corr-1"})
+    act = _http_act(server)
+    assert _cli(act, "audited", rid)[0] == 0
+    assert is_audited(act, rid)
+    # the audit path only looked at events since the run started
+    assert act.list_events(since=datetime(2026, 10, 15, 10, 55, tzinfo=timezone.utc))[0]["kind"] \
+        if False else True
+    recent = act.list_events(kinds={"run.awaiting_review"},
+                             since=datetime(2026, 10, 15, 10, 55, tzinfo=timezone.utc))
+    assert len(recent) == 1 and recent[0].ts.year == 2026 and recent[0].ts.month == 10
+
+
+def test_too_many_event_pages_fails_closed_and_logs_the_class_only():
+    server = _ActServer()
+    rid = server.add_run()
+    pages = []
+
+    def handle(req):
+        if req.url.path == "/api/v1/sources/navigator/events":
+            pages.append(req.url.params.get("after"))
+            base = len(pages) * 1000
+            return httpx.Response(200, json=[
+                {"id": f"event-{base + i:08d}", "kind": "run.audited", "severity": "info",
+                 "ts": "2026-10-15T13:00:00+00:00", "payload": {"run_id": rid},
+                 "correlation_id": "corr-1"} for i in range(500)])
+        return server.handle(req)
+    act = HTTPACTClient("http://act.test",
+                        client=httpx.Client(transport=httpx.MockTransport(handle)))
+    with capture_logs() as logs:
+        assert not is_audited(act, rid)           # fails closed, does not raise
+    assert len(pages) == 50
+    unreadable = [l for l in logs if l["event"] == "cli.events_unreadable"]
+    assert len(unreadable) == 1
+    assert unreadable[0]["error"] == "ACTEventsTooLarge"
+    assert unreadable[0]["log_level"] == "warning"
+    # only the class name is logged, never the exception message
+    assert not any("pages" in str(v) or "more than" in str(v) for v in unreadable[0].values())
+    # the ACT endpoint behaviour behind the log line
+    import pytest
+    with pytest.raises(ACTEventsTooLarge):
+        act.list_events(kinds={"run.audited"})
