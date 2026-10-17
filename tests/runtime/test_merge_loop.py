@@ -207,3 +207,38 @@ def test_execute_mode_is_unaffected_by_the_flag(tmp_path):
     _decide(nav, run, ApprovalDecision.approved)
     assert [r.id for r in nav.merge_poll()] == [run.id]
     assert nav.act.runs[run.id].status == RunStatus.completed
+
+
+# ---- N10: a build in another process holds the lock; merge_poll defers quietly ------
+
+def test_merge_poll_defers_while_lock_held_then_merges_after_release(tmp_path):
+    # live 2026-10-17: every daemon cycle during a once.sh build logged error
+    # 'single-flight lock held' because merge_poll raised instead of waiting a cycle
+    from structlog.testing import capture_logs
+    from navigator.runtime.lock import SingleFlightLock
+    nav, repo, run = _setup(tmp_path)
+    _decide(nav, run, ApprovalDecision.approved)
+    with SingleFlightLock(tmp_path/"nav.lock").acquire():  # this live process is the holder
+        with capture_logs() as logs:
+            assert nav.merge_poll() == []  # deferred, not raised
+        assert (tmp_path/"nav.lock").exists()
+    assert any(e["event"] == "merge_poll.deferred_lock_held" for e in logs)
+    stored = nav.act.runs[run.id]
+    assert stored.phase == RunPhase.awaiting_review and stored.status == RunStatus.executing
+    assert "navigator_touch.py" not in _git(repo, "ls-files")
+    # the decision was recorded in ACT; the next cycle after release acts on it
+    assert [r.id for r in nav.merge_poll()] == [run.id]
+    assert nav.act.runs[run.id].status == RunStatus.completed
+    assert "navigator_touch.py" in _git(repo, "ls-files")
+
+
+def test_merge_poll_still_raises_unrelated_lock_errors(tmp_path):
+    import pytest
+    nav, repo, run = _setup(tmp_path)
+    _decide(nav, run, ApprovalDecision.approved)
+    def boom():
+        raise RuntimeError("disk on fire")
+    nav.lock.acquire = boom
+    with pytest.raises(RuntimeError, match="disk on fire"):
+        nav.merge_poll()
+    assert nav.act.runs[run.id].phase == RunPhase.awaiting_review

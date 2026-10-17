@@ -1,6 +1,7 @@
 import json
 import re
 import subprocess
+from contextlib import ExitStack
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from navigator.contracts.proposal import Proposal, compute_origin_hash
@@ -181,7 +182,12 @@ class Navigator:
         if not self._merges_enabled():
             return []
         done = []
-        with self.lock.acquire():
+        with ExitStack() as stack:
+            if not self._enter_lock(stack):
+                # a build in another process holds the lock; decisions stay recorded in
+                # ACT and are acted on next cycle (live 2026-10-17: every cycle errored)
+                log.info("merge_poll.deferred_lock_held", lock=str(self.lock.path))
+                return []
             for run in self.act.list_open_runs():
                 if run.phase != RunPhase.awaiting_review:
                     continue
@@ -200,20 +206,38 @@ class Navigator:
                         done.append(run)
         return done
 
+    def _enter_lock(self, stack: ExitStack) -> bool:
+        """Enter the single-flight lock on `stack`. False if a live process holds it
+        (acquire() already reclaims locks left by dead holders); other errors propagate."""
+        try:
+            stack.enter_context(self.lock.acquire())
+        except RuntimeError as e:
+            if str(e).startswith("single-flight lock held"):
+                return False
+            raise
+        return True
+
     def reconcile_on_startup(self) -> None:
-        for run in self.act.list_open_runs():
-            if run.phase == RunPhase.awaiting_review:
-                continue  # parked at the merge gate by design; merge_poll owns it
-            run.status = RunStatus.aborted
-            run.phase = RunPhase.finalizing
-            run.ended_at = datetime.now(timezone.utc)
-            self.act.update_run(run)
-            # Record a post-mortem lesson; the worktree (if any) is left on disk for inspection.
-            self.orc.apply_memory_update(
-                section="known_failures",
-                note=f"[{run.id}] aborted stale run on startup reconcile | worktree: {run.worktree_path}",
-                replace=False)
-            log.warning("reconcile.aborted_stale_run", run_id=run.id, preserved_worktree=run.worktree_path)
+        with ExitStack() as stack:
+            if not self._enter_lock(stack):
+                # N10: a live process (e.g. a supervised once.sh build) owns the in-flight
+                # runs; aborting them here threw away a healthy build on 2026-10-17
+                log.warning("reconcile.skipped_lock_held", lock=str(self.lock.path))
+                return
+            for run in self.act.list_open_runs():
+                if run.phase == RunPhase.awaiting_review:
+                    continue  # parked at the merge gate by design; merge_poll owns it
+                run.status = RunStatus.aborted
+                run.phase = RunPhase.finalizing
+                run.ended_at = datetime.now(timezone.utc)
+                self.act.update_run(run)
+                # Record a post-mortem lesson; the worktree (if any) is left on disk for inspection.
+                self.orc.apply_memory_update(
+                    section="known_failures",
+                    note=f"[{run.id}] aborted stale run on startup reconcile | worktree: {run.worktree_path}",
+                    replace=False)
+                log.warning("reconcile.aborted_stale_run", run_id=run.id,
+                            preserved_worktree=run.worktree_path)
 
 
 _ENTRY_SPLIT = re.compile(r"\n+(?=\[\d{4}-\d{2}-\d{2})")

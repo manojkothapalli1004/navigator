@@ -277,3 +277,61 @@ def test_periodic_tick_skips_near_duplicate_of_existing_any_status(tmp_path):
     ]
     created = nav.periodic_tick(base_commit_sha=sha)
     assert [p.title for p in created] == ["Add ping history endpoint with allowlist-state snapshot tests"]
+
+
+# --- N10: reconcile must not abort runs another live process is still building ---
+
+def _stale_building_run(nav, tmp_path, sha):
+    from navigator.contracts.run import Run
+    from navigator.contracts.enums import RunPhase
+    run = Run(proposal_id="p", base_commit_sha=sha, branch="nav/run-b", phase=RunPhase.building,
+              worktree_path=str(tmp_path/"wt/run-b"))
+    nav.act.create_run(run)
+    return run
+
+def test_reconcile_skips_when_lock_held_by_live_process(tmp_path):
+    # live 2026-10-17 17:53: a daemon restart aborted run-01M55XC17WF7N8ZA2S5QNERA2D while
+    # its once.sh builder process was alive and holding the lock
+    from structlog.testing import capture_logs
+    from navigator.runtime.lock import SingleFlightLock
+    from navigator.contracts.enums import RunPhase
+    repo, sha = _seed(tmp_path)
+    nav = _nav(tmp_path, repo, mode="execute")
+    building = _stale_building_run(nav, tmp_path, sha)
+    with SingleFlightLock(tmp_path/"nav.lock").acquire():  # this (live) process is the holder
+        with capture_logs() as logs:
+            nav.reconcile_on_startup()
+        assert (tmp_path/"nav.lock").exists()  # the live holder's lock is untouched
+    stored = nav.act.runs[building.id]
+    assert stored.status == RunStatus.executing and stored.phase == RunPhase.building
+    assert nav.orc.updates == []
+    assert any(e["event"] == "reconcile.skipped_lock_held" for e in logs)
+    assert not any(e["event"] == "reconcile.aborted_stale_run" for e in logs)
+
+def test_reconcile_without_lock_still_aborts_building_run(tmp_path):
+    repo, sha = _seed(tmp_path)
+    nav = _nav(tmp_path, repo, mode="execute")
+    building = _stale_building_run(nav, tmp_path, sha)
+    assert not (tmp_path/"nav.lock").exists()
+    nav.reconcile_on_startup()
+    assert nav.act.runs[building.id].status == RunStatus.aborted
+    assert any(sec == "known_failures" and building.id in note for sec, note, _ in nav.orc.updates)
+    assert not (tmp_path/"nav.lock").exists()  # reconcile released the lock it took
+
+def test_reconcile_recovers_lock_left_by_dead_process(tmp_path):
+    repo, sha = _seed(tmp_path)
+    nav = _nav(tmp_path, repo, mode="execute")
+    building = _stale_building_run(nav, tmp_path, sha)
+    (tmp_path/"nav.lock").write_text("999999999")  # PID far above pid_max: dead holder
+    nav.reconcile_on_startup()
+    assert nav.act.runs[building.id].status == RunStatus.aborted
+
+def test_reconcile_propagates_unrelated_lock_errors(tmp_path):
+    import pytest
+    repo, sha = _seed(tmp_path)
+    nav = _nav(tmp_path, repo, mode="execute")
+    def boom():
+        raise RuntimeError("disk on fire")
+    nav.lock.acquire = boom
+    with pytest.raises(RuntimeError, match="disk on fire"):
+        nav.reconcile_on_startup()
