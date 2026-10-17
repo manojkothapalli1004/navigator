@@ -3,6 +3,7 @@ import json
 import stat
 import time
 import types
+from datetime import datetime, timedelta, timezone
 
 import httpx
 import pytest
@@ -24,6 +25,7 @@ from navigator.observability.telegram_inbox import (CONFLICT_MESSAGE, FETCH_FAIL
 CHAT = "4242"
 EPOCH = 1760000000      # _update(uid) messages are dated EPOCH + uid
 NOW = EPOCH + 600       # the injected clock: every _update is a few minutes old
+VERIFIED_SHA = "0123456789abcdef0123456789abcdef01234567"
 
 
 @pytest.fixture(autouse=True)
@@ -76,8 +78,14 @@ def _offset(tmp_path):
 
 
 def _run(act, phase=RunPhase.awaiting_review, pending=True, audited=False):
+    # a verified run whose run.awaiting_review event is already recorded: the audit
+    # (is_audited) is bound to verified_sha and must come after that event
     run = act.create_run(Run(proposal_id="proposal-x", base_commit_sha="abc",
-                             branch="nav/x", phase=phase))
+                             branch="nav/x", phase=phase, correlation_id="corr-x",
+                             verified_sha=VERIFIED_SHA))
+    act.emit_event(Event(kind="run.awaiting_review", correlation_id="corr-x",
+                         ts=datetime.now(timezone.utc) - timedelta(seconds=1),
+                         payload={"run_id": run.id, "verified_sha": VERIFIED_SHA}))
     if pending:
         act.create_approval(target=run.id, gate=ApprovalGate.merge)
     if audited:
