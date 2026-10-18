@@ -77,6 +77,15 @@ def _inbox_lines(tmp_path):
     return [json.loads(l) for l in p.read_text().splitlines()] if p.exists() else []
 
 
+CONFLICT = f"TelegramError: {CONFLICT_MESSAGE}"
+FETCH_FAILED = f"TelegramError: {FETCH_FAILED_MESSAGE}"
+
+
+def _notice(kind):
+    return (f"Navigator: Telegram reader not polling - {kind} "
+            f"(this error is repeated at most once an hour)")
+
+
 # ---- run_reader ----------------------------------------------------------------------
 
 def test_status_is_answered_in_the_same_iteration(tmp_path):
@@ -128,19 +137,86 @@ def test_other_chat_is_ignored_entirely(tmp_path):
 
 
 def test_409_notifies_once_backs_off_and_rearms_after_success(tmp_path):
+    """N11b: this test used to pin the single-success re-arm (a 409 after one good poll
+    sent a second notice). Re-arming now takes 3 consecutive successful polls, so the
+    409 after the lone good poll is silent; the backoff, the status reply and the
+    first notice are asserted exactly as before."""
     act = FakeACTClient()
     _prop(act, "N1: a")
     inbox, calls = _serve(tmp_path, [409, 409, [_update(1, "status")], 409])
     rec, sleeps = _Recorder(), []
-    assert run_reader(inbox, act, rec, CHAT, max_iterations=4, sleep=sleeps.append) == 0
+    assert run_reader(inbox, act, rec, CHAT, max_iterations=4, sleep=sleeps.append,
+                      clock=lambda: 0.0) == 0
     assert len(calls) == 4
     assert sleeps == [30.0, 30.0, 30.0]
-    notice = (f"Navigator: Telegram reader not polling - TelegramError: {CONFLICT_MESSAGE} "
-              f"(no further notice until this changes)")
-    assert rec.sent[0] == notice
+    assert rec.sent[0] == _notice(CONFLICT)
     assert "N1: a" in rec.sent[1]
-    assert rec.sent[2] == notice  # re-armed by the successful poll in between
-    assert len(rec.sent) == 3
+    assert len(rec.sent) == 2  # one good poll does not re-arm: the last 409 is silent
+
+
+def test_alternating_409_and_success_sends_exactly_one_notice(tmp_path):
+    inbox, calls = _serve(tmp_path, [409, []] * 5)
+    rec, sleeps = _Recorder(), []
+    assert run_reader(inbox, FakeACTClient(), rec, CHAT, max_iterations=10,
+                      sleep=sleeps.append, clock=lambda: 0.0) == 0
+    assert len(calls) == 10
+    assert sleeps == [30.0] * 5
+    assert rec.sent == [_notice(CONFLICT)]
+
+
+def test_two_consecutive_successes_do_not_rearm_the_notice(tmp_path):
+    inbox, _ = _serve(tmp_path, [409, [], [], 409])
+    rec, sleeps = _Recorder(), []
+    assert run_reader(inbox, FakeACTClient(), rec, CHAT, max_iterations=4,
+                      sleep=sleeps.append, clock=lambda: 0.0) == 0
+    assert sleeps == [30.0, 30.0]
+    assert rec.sent == [_notice(CONFLICT)]
+
+
+def test_three_consecutive_successes_rearm_the_notice(tmp_path):
+    inbox, _ = _serve(tmp_path, [409, [], [], [], 409])
+    rec, sleeps = _Recorder(), []
+    assert run_reader(inbox, FakeACTClient(), rec, CHAT, max_iterations=5,
+                      sleep=sleeps.append, clock=lambda: 0.0) == 0
+    assert sleeps == [30.0, 30.0]
+    assert rec.sent == [_notice(CONFLICT), _notice(CONFLICT)]
+
+
+def test_rearm_after_is_configurable(tmp_path):
+    inbox, _ = _serve(tmp_path, [409, [], 409])
+    rec = _Recorder()
+    assert run_reader(inbox, FakeACTClient(), rec, CHAT, max_iterations=3,
+                      sleep=lambda s: None, clock=lambda: 0.0, rearm_after=1) == 0
+    assert rec.sent == [_notice(CONFLICT), _notice(CONFLICT)]
+
+
+def test_same_error_is_repeated_once_the_notice_interval_has_passed(tmp_path):
+    ticks = iter([0.0, 3599.0, 3600.0])
+    inbox, _ = _serve(tmp_path, [409, 409, 409])
+    rec, sleeps = _Recorder(), []
+    assert run_reader(inbox, FakeACTClient(), rec, CHAT, max_iterations=3,
+                      sleep=sleeps.append, clock=lambda: next(ticks)) == 0
+    assert sleeps == [30.0, 30.0, 30.0]
+    assert rec.sent == [_notice(CONFLICT), _notice(CONFLICT)]  # 3599 s: silent; 3600 s: sent
+
+
+def test_notice_interval_is_configurable(tmp_path):
+    ticks = iter([0.0, 5.0, 10.0])
+    inbox, _ = _serve(tmp_path, [409, 409, 409])
+    rec = _Recorder()
+    assert run_reader(inbox, FakeACTClient(), rec, CHAT, max_iterations=3,
+                      sleep=lambda s: None, clock=lambda: next(ticks),
+                      notice_interval_s=10.0) == 0
+    assert rec.sent == [_notice(CONFLICT), _notice(CONFLICT)]
+
+
+def test_a_different_error_kind_is_announced_at_once(tmp_path):
+    inbox, _ = _serve(tmp_path, [409, httpx.ConnectError("down"), 409])
+    rec, sleeps = _Recorder(), []
+    assert run_reader(inbox, FakeACTClient(), rec, CHAT, max_iterations=3,
+                      sleep=sleeps.append, clock=lambda: 0.0) == 0
+    assert sleeps == [30.0, 30.0, 30.0]
+    assert rec.sent == [_notice(CONFLICT), _notice(FETCH_FAILED), _notice(CONFLICT)]
 
 
 def test_a_failing_message_does_not_stop_the_others(tmp_path, monkeypatch):
@@ -172,8 +248,7 @@ def test_token_never_reaches_logs_or_notifications(tmp_path, monkeypatch):
     with capture_logs() as logs:
         assert run_reader(inbox, act, rec, CHAT, max_iterations=2, sleep=sleeps.append) == 0
     assert sleeps == [30.0]
-    assert rec.sent == [f"Navigator: Telegram reader not polling - TelegramError: "
-                        f"{FETCH_FAILED_MESSAGE} (no further notice until this changes)"]
+    assert rec.sent == [_notice(FETCH_FAILED)]
     events = [(l["event"], l.get("error")) for l in logs]
     assert ("telegram_reader.poll_failed", f"TelegramError: {FETCH_FAILED_MESSAGE}") in events
     assert ("telegram_reader.handle_failed", "ConnectionError") in events
@@ -192,8 +267,7 @@ def test_non_telegram_poll_failure_is_named_only(tmp_path, monkeypatch):
     assert run_reader(inbox, FakeACTClient(), rec, CHAT, max_iterations=2,
                       error_backoff_s=5.0, sleep=sleeps.append) == 0
     assert sleeps == [5.0, 5.0]
-    assert rec.sent == ["Navigator: Telegram reader not polling - OSError "
-                        "(no further notice until this changes)"]
+    assert rec.sent == [_notice("OSError")]
 
 
 # ---- main_reader / dispatch ----------------------------------------------------------
