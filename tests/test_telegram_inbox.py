@@ -607,3 +607,49 @@ def test_telegram_decision_event_sends_no_extra_notification():
     apply_commands(act, [TelegramCommand("merge", run.id, 1)], rec)
     assert len(rec.sent) == 1
     assert is_audited(inner, run.id)
+
+
+# ---- N11: long-poll entry point for the always-on reader -----------------------
+
+def _timeout_handler(updates, seen, timeouts):
+    def handler(req):
+        seen.append(dict(req.url.params))
+        timeouts.append(req.extensions.get("timeout"))
+        return httpx.Response(200, json={"ok": True, "result": updates})
+    return handler
+
+
+def test_poll_messages_long_polls_and_returns_raw_authorized_messages(tmp_path):
+    seen, timeouts = [], []
+    updates = [_update(1, "status"), _update(2, "status", chat="999"),
+               _update(3, "old", date=NOW - 7200), _update(4, "/merge", key="edited_message")]
+    inbox = _inbox(tmp_path, updates, handler=_timeout_handler(updates, seen, timeouts))
+    msgs = inbox.poll_messages(long_poll_s=25)
+    assert seen == [{"timeout": "25", "offset": "0"}]
+    assert timeouts[0]["read"] == 35 and timeouts[0]["connect"] == 35
+    assert [m["text"] for m in msgs] == ["status", "old"]
+    assert msgs[0] == updates[0]["message"]  # the raw message, not the inbox entry
+    assert [l.get("ignored") for l in _inbox_lines(tmp_path)] == [None, "stale"]
+    assert _offset(tmp_path) == "5"
+
+
+def test_poll_messages_first_poll_learns_position_only(tmp_path):
+    seen, timeouts = [], []
+    updates = [_update(1, "status")]
+    inbox = _inbox(tmp_path, updates, offset=None,
+                   handler=_timeout_handler(updates, seen, timeouts))
+    assert inbox.poll_messages() == []
+    assert seen == [{"timeout": "25"}]
+    assert timeouts[0]["read"] == 35
+    assert _inbox_lines(tmp_path) == [] and _offset(tmp_path) == "2"
+
+
+def test_poll_once_still_uses_no_long_poll_and_the_client_timeout(tmp_path):
+    seen, timeouts = [], []
+    updates = [_update(1, "/merge"), _update(2, "hello")]
+    inbox = _inbox(tmp_path, updates, handler=_timeout_handler(updates, seen, timeouts))
+    assert inbox.poll_once() == [TelegramCommand("merge", None, 1)]
+    assert seen == [{"timeout": "0", "offset": "0"}]
+    assert timeouts[0] == inbox.client.timeout.as_dict()
+    assert [l["text"] for l in _inbox_lines(tmp_path)] == ["/merge", "hello"]
+    assert _offset(tmp_path) == "3"
