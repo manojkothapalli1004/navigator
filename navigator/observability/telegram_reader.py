@@ -13,13 +13,13 @@ recorded in ACT exactly as from the daemon and merge_poll acts on them.
 
 Telegram allows one getUpdates consumer per bot, so main_reader refuses to start
 when NAVIGATOR_TELEGRAM_COMMANDS=1 (the daemon is that consumer). A failing poll
-(409 from a second consumer, network down) is reported to the operator when its kind
-differs from the last reported one or an hour has passed since that notice (N11b: a
-competing consumer that lets the reader win a poll now and then must not flood the
-chat), and the last kind is forgotten only after 3 consecutive successful polls; a
-message whose
-handling raises is logged by exception class name only (the getUpdates URL carries
-the bot token) and the loop goes on.
+(409 from a second consumer, network down) is reported to the operator at most once
+per notice interval PER ERROR KIND (N11c: each kind keeps its own clock and a
+successful poll never re-arms a notice, so neither a competing consumer that lets the
+reader win a poll now and then nor two alternating error kinds can flood the chat);
+the notice states the configured interval. A message whose handling raises is logged
+by exception class name only (the getUpdates URL carries the bot token) and the loop
+goes on.
 
 Run with: python -m navigator telegram-reader
 """
@@ -41,7 +41,6 @@ DEFAULT_ACT_BASE_URL = "http://127.0.0.1:8090"
 LONG_POLL_S = 25
 ERROR_BACKOFF_S = 30.0
 NOTICE_INTERVAL_S = 3600.0  # same error kind: at most one notice per interval
-REARM_AFTER = 3  # consecutive successful polls that forget the last error kind
 
 
 class Terminated(BaseException):
@@ -60,6 +59,15 @@ def _error_kind(e: Exception) -> str:
     return type(e).__name__
 
 
+def _interval_text(seconds: float) -> str:
+    """The notice interval as the operator reads it: '10 s', '10 min', '1 h', '2 h'."""
+    if seconds < 60:
+        return f"{int(seconds)} s"
+    if seconds < 3600:
+        return f"{int(seconds // 60)} min"
+    return f"{seconds / 3600:g} h"
+
+
 def _notify(notifier, text: str) -> None:
     try:
         notifier.send(text)
@@ -70,20 +78,17 @@ def _notify(notifier, text: str) -> None:
 def run_reader(inbox, act, notifier, chat_id, *, long_poll_s: int = LONG_POLL_S,
                error_backoff_s: float = ERROR_BACKOFF_S, max_iterations: int | None = None,
                sleep=time.sleep, clock=time.monotonic,
-               notice_interval_s: float = NOTICE_INTERVAL_S,
-               rearm_after: int = REARM_AFTER) -> int:
+               notice_interval_s: float = NOTICE_INTERVAL_S) -> int:
     """Long-poll the operator's chat and handle every message as it arrives.
     max_iterations bounds the loop for tests (None = run until interrupted).
 
-    Poll-failure notices (N11b): an error kind is announced when it differs from the
-    last announced kind or notice_interval_s has passed since that notice; the last
-    kind is forgotten only after rearm_after consecutive successful polls, so a
-    competing getUpdates consumer that lets the reader win a poll now and then
-    cannot flood the chat."""
+    Poll-failure notices (N11c): each error kind is announced at most once per
+    notice_interval_s, measured from its own last notice; a successful poll changes
+    nothing (no re-arm), so neither a competing getUpdates consumer that lets the
+    reader win a poll now and then nor two alternating error kinds can flood the
+    chat."""
     chat_id = str(chat_id)
-    last_error: str | None = None
-    last_notice_at: float | None = None
-    successes = 0
+    announced: dict[str, float] = {}  # error kind -> clock() at its last notice
     iterations = 0
     while max_iterations is None or iterations < max_iterations:
         iterations += 1
@@ -92,21 +97,14 @@ def run_reader(inbox, act, notifier, chat_id, *, long_poll_s: int = LONG_POLL_S,
         except Exception as e:
             kind = _error_kind(e)
             log.warning("telegram_reader.poll_failed", error=kind)
-            successes = 0
             now = clock()
-            if (kind != last_error or last_notice_at is None
-                    or now - last_notice_at >= notice_interval_s):
-                last_error = kind
-                last_notice_at = now
+            if kind not in announced or now - announced[kind] >= notice_interval_s:
+                announced[kind] = now
                 _notify(notifier, f"Navigator: Telegram reader not polling - {kind} "
-                                  f"(this error is repeated at most once an hour)")
+                                  f"(this error is repeated at most once every "
+                                  f"{_interval_text(notice_interval_s)})")
             sleep(error_backoff_s)
             continue
-        if last_error is not None:
-            successes += 1
-            if successes >= rearm_after:
-                last_error = None  # re-armed: the next failure of any kind is announced
-                successes = 0
         for msg in messages:
             try:
                 handle_operator_message(msg, act, notifier, chat_id)
