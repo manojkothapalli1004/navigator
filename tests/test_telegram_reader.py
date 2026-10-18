@@ -81,9 +81,9 @@ CONFLICT = f"TelegramError: {CONFLICT_MESSAGE}"
 FETCH_FAILED = f"TelegramError: {FETCH_FAILED_MESSAGE}"
 
 
-def _notice(kind):
+def _notice(kind, interval="1 h"):
     return (f"Navigator: Telegram reader not polling - {kind} "
-            f"(this error is repeated at most once an hour)")
+            f"(this error is repeated at most once every {interval})")
 
 
 # ---- run_reader ----------------------------------------------------------------------
@@ -136,11 +136,10 @@ def test_other_chat_is_ignored_entirely(tmp_path):
     assert act.get_proposal(p.id).status == ProposalStatus.proposed
 
 
-def test_409_notifies_once_backs_off_and_rearms_after_success(tmp_path):
-    """N11b: this test used to pin the single-success re-arm (a 409 after one good poll
-    sent a second notice). Re-arming now takes 3 consecutive successful polls, so the
-    409 after the lone good poll is silent; the backoff, the status reply and the
-    first notice are asserted exactly as before."""
+def test_409_notifies_once_and_backs_off(tmp_path):
+    """N11c: an error kind is announced at most once per notice interval and a
+    successful poll never re-arms it, so the 409 after the good poll is silent; the
+    backoff, the status reply and the first notice are asserted as before."""
     act = FakeACTClient()
     _prop(act, "N1: a")
     inbox, calls = _serve(tmp_path, [409, 409, [_update(1, "status")], 409])
@@ -164,30 +163,13 @@ def test_alternating_409_and_success_sends_exactly_one_notice(tmp_path):
     assert rec.sent == [_notice(CONFLICT)]
 
 
-def test_two_consecutive_successes_do_not_rearm_the_notice(tmp_path):
-    inbox, _ = _serve(tmp_path, [409, [], [], 409])
+def test_successes_never_rearm_within_the_interval(tmp_path):
+    inbox, _ = _serve(tmp_path, [409, [], [], [], [], 409])
     rec, sleeps = _Recorder(), []
-    assert run_reader(inbox, FakeACTClient(), rec, CHAT, max_iterations=4,
+    assert run_reader(inbox, FakeACTClient(), rec, CHAT, max_iterations=6,
                       sleep=sleeps.append, clock=lambda: 0.0) == 0
     assert sleeps == [30.0, 30.0]
     assert rec.sent == [_notice(CONFLICT)]
-
-
-def test_three_consecutive_successes_rearm_the_notice(tmp_path):
-    inbox, _ = _serve(tmp_path, [409, [], [], [], 409])
-    rec, sleeps = _Recorder(), []
-    assert run_reader(inbox, FakeACTClient(), rec, CHAT, max_iterations=5,
-                      sleep=sleeps.append, clock=lambda: 0.0) == 0
-    assert sleeps == [30.0, 30.0]
-    assert rec.sent == [_notice(CONFLICT), _notice(CONFLICT)]
-
-
-def test_rearm_after_is_configurable(tmp_path):
-    inbox, _ = _serve(tmp_path, [409, [], 409])
-    rec = _Recorder()
-    assert run_reader(inbox, FakeACTClient(), rec, CHAT, max_iterations=3,
-                      sleep=lambda s: None, clock=lambda: 0.0, rearm_after=1) == 0
-    assert rec.sent == [_notice(CONFLICT), _notice(CONFLICT)]
 
 
 def test_same_error_is_repeated_once_the_notice_interval_has_passed(tmp_path):
@@ -207,16 +189,43 @@ def test_notice_interval_is_configurable(tmp_path):
     assert run_reader(inbox, FakeACTClient(), rec, CHAT, max_iterations=3,
                       sleep=lambda s: None, clock=lambda: next(ticks),
                       notice_interval_s=10.0) == 0
-    assert rec.sent == [_notice(CONFLICT), _notice(CONFLICT)]
+    assert rec.sent == [_notice(CONFLICT, "10 s"), _notice(CONFLICT, "10 s")]
 
 
-def test_a_different_error_kind_is_announced_at_once(tmp_path):
-    inbox, _ = _serve(tmp_path, [409, httpx.ConnectError("down"), 409])
+def test_each_error_kind_is_announced_once_per_interval(tmp_path):
+    inbox, _ = _serve(tmp_path, [409, httpx.ConnectError("down"), 409,
+                                 httpx.ConnectError("down"), 409, httpx.ConnectError("down")])
     rec, sleeps = _Recorder(), []
-    assert run_reader(inbox, FakeACTClient(), rec, CHAT, max_iterations=3,
+    assert run_reader(inbox, FakeACTClient(), rec, CHAT, max_iterations=6,
                       sleep=sleeps.append, clock=lambda: 0.0) == 0
-    assert sleeps == [30.0, 30.0, 30.0]
+    assert sleeps == [30.0] * 6
+    assert rec.sent == [_notice(CONFLICT), _notice(FETCH_FAILED)]
+
+
+def test_each_kind_has_its_own_clock(tmp_path):
+    ticks = iter([0.0, 100.0, 3600.0, 3650.0])
+    inbox, _ = _serve(tmp_path, [409, httpx.ConnectError("down"), 409,
+                                 httpx.ConnectError("down")])
+    rec = _Recorder()
+    assert run_reader(inbox, FakeACTClient(), rec, CHAT, max_iterations=4,
+                      sleep=lambda s: None, clock=lambda: next(ticks)) == 0
+    # CONFLICT at 0 and again at 3600; FETCH_FAILED at 100, silent at 3650 (3550 s later)
     assert rec.sent == [_notice(CONFLICT), _notice(FETCH_FAILED), _notice(CONFLICT)]
+
+
+def test_notice_text_states_the_configured_interval(tmp_path):
+    inbox, _ = _serve(tmp_path, [409])
+    rec = _Recorder()
+    assert run_reader(inbox, FakeACTClient(), rec, CHAT, max_iterations=1,
+                      sleep=lambda s: None, clock=lambda: 0.0,
+                      notice_interval_s=600.0) == 0
+    assert len(rec.sent) == 1
+    assert rec.sent[0].endswith("(this error is repeated at most once every 10 min)")
+
+
+def test_interval_text():
+    assert [tr._interval_text(s) for s in (10.0, 600.0, 3600.0, 7200.0)] == [
+        "10 s", "10 min", "1 h", "2 h"]
 
 
 def test_a_failing_message_does_not_stop_the_others(tmp_path, monkeypatch):
