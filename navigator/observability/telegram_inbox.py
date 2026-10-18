@@ -16,8 +16,14 @@ forwarded and is less than an hour old (the clock is injectable for tests). A
 shorthand is resolved at apply time against live ACT state with every check the
 full-id form applies; zero or several candidates apply nothing and get a reply.
 
+poll_messages(long_poll_s) is the always-on reader's entry point (N11,
+telegram_reader.py): same filtering, inbox file and offset as poll_once, but
+Telegram holds the request up to long_poll_s and the raw operator messages come
+back for telegram_proposals.handle_operator_message, so status/approve/decline are
+answered at once instead of once per daemon cycle.
+
 Navigator must be the only getUpdates consumer of the bot: Telegram answers a
-second consumer with HTTP 409, which poll_once reports as
+second consumer with HTTP 409, which poll_once and poll_messages report as
 TelegramError('another Telegram getUpdates consumer is active'). Every network
 failure becomes a TelegramError with a fixed message: the URL carries the bot
 token and must never reach a log, a summary or a notification.
@@ -211,10 +217,13 @@ class TelegramInbox:
 
     # ---- polling ---------------------------------------------------------------
 
-    def _fetch(self, params: dict) -> list[dict]:
+    def _fetch(self, params: dict, timeout_s: float | None = None) -> list[dict]:
         # every failure becomes fixed text: the URL contains the bot token
         try:
-            r = self.client.get(self.url, params=params)
+            if timeout_s is None:
+                r = self.client.get(self.url, params=params)
+            else:
+                r = self.client.get(self.url, params=params, timeout=timeout_s)
         except Exception:
             raise TelegramError(FETCH_FAILED_MESSAGE) from None
         if r.status_code == 409:
@@ -232,12 +241,18 @@ class TelegramInbox:
             raise TelegramError("telegram getUpdates returned no result list")
         return result
 
-    def poll_once(self) -> list[TelegramCommand]:
+    def _consume(self, long_poll_s: int) -> list[tuple[dict, dict]]:
+        """Fetch new updates, append the operator's text messages to the inbox file and
+        persist the offset. Returns one (inbox entry, raw message) pair per authorized
+        text message, ignored ones included (entry['ignored'] says why). long_poll_s > 0
+        asks Telegram to hold the request (the always-on reader); 0 returns at once
+        (the daemon cycle)."""
         offset = self._load_offset()
-        params = {"timeout": 0}
+        params = {"timeout": long_poll_s}
         if offset is not None:
             params["offset"] = offset
-        result = self._fetch(params)
+        # a long poll must outlive Telegram's hold time; 0 keeps the client's own timeout
+        result = self._fetch(params, timeout_s=long_poll_s + 10 if long_poll_s > 0 else None)
         updates = [(u["update_id"], u) for u in result
                    if isinstance(u, dict) and _is_int(u.get("update_id"))]
         if offset is None:
@@ -248,7 +263,7 @@ class TelegramInbox:
             return []
         now = self.clock()
         entries: list[dict] = []
-        commands: list[TelegramCommand] = []
+        pairs: list[tuple[dict, dict]] = []
         last = None
         for uid, update in updates:
             if uid < offset:
@@ -265,15 +280,29 @@ class TelegramInbox:
             if ignored is not None:
                 entry["ignored"] = ignored
             entries.append(entry)
-            if ignored is not None:
-                continue
-            cmd = parse_command(text, uid)
-            if cmd is not None:
-                commands.append(cmd)
+            pairs.append((entry, msg))
         self._append_inbox(entries)
         if last is not None:
             self._save_offset(last + 1)
+        return pairs
+
+    def poll_once(self) -> list[TelegramCommand]:
+        """One short poll (timeout=0) for the daemon cycle: the merge commands found."""
+        commands: list[TelegramCommand] = []
+        for entry, _msg in self._consume(0):
+            if "ignored" in entry:
+                continue
+            cmd = parse_command(entry["text"], entry["update_id"])
+            if cmd is not None:
+                commands.append(cmd)
         return commands
+
+    def poll_messages(self, long_poll_s: int = 25) -> list[dict]:
+        """One long poll for the always-on reader (N11): the raw authorized text
+        messages, ignored (forwarded/stale) ones included - handle_operator_message
+        applies its own freshness checks. Inbox file and offset are updated as for
+        poll_once."""
+        return [msg for _entry, msg in self._consume(long_poll_s)]
 
 
 def _apply_wording() -> str:
