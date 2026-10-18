@@ -217,6 +217,11 @@ def _configure_logging() -> None:
 def main(argv: list[str] | None = None) -> int:
     _configure_logging()
     argv = sys.argv[1:] if argv is None else argv
+    if argv and argv[0] == "telegram-reader":
+        # N11: the always-on Telegram reader (long poll); imported lazily so the daemon
+        # and the CLI do not pay for it
+        from navigator.observability.telegram_reader import main_reader
+        return main_reader()
     if argv and argv[0] in COMMANDS:
         url = os.getenv("NAVIGATOR_ACT_BASE_URL") or "http://127.0.0.1:8090"
         return run_cli(argv, act=HTTPACTClient(url), out=sys.stdout)
