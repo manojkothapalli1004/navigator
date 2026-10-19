@@ -11,6 +11,11 @@ Each cycle, before planning:
      a deterministic order is used (milestone proposals first, then newest).
 The order is persisted (triage.json) so Telegram 'status' shows the top 3 without a
 model call; a new top 3 is pushed to the operator once.
+
+Every write to triage.json goes through update(): a blocking lock beside the file
+(file_lock) serializes the daemon and the Telegram reader, the file is replaced
+atomically, and the 'more' cursor never moves backwards unless a writer asks for a
+rewind explicitly (set_cursor: the operator restarting paging).
 """
 import hashlib
 import json
@@ -24,6 +29,7 @@ from pathlib import Path
 from navigator.contracts.enums import ProposalStatus
 from navigator.contracts.event import Event
 from navigator.observability.logging import get_logger
+from navigator.runtime.lock import file_lock
 
 log = get_logger("navigator.triage")
 
@@ -139,6 +145,34 @@ def _save(path, data: dict) -> None:
         raise
 
 
+def lock_path(path) -> Path:
+    """The advisory lock beside triage.json; every writer (daemon and reader) takes it."""
+    path = Path(path)
+    return path.with_name(path.name + ".lock")
+
+
+def cursor_of(state: dict) -> int:
+    try:
+        return max(0, int(state.get("cursor") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def update(path, mutate: Callable[[dict], dict], *, rewind_cursor: bool = False) -> dict:
+    """Locked, atomic read-modify-write of triage.json. `mutate` gets the state as it is
+    on disk NOW (never a stale copy) and returns the new state. The cursor never moves
+    backwards unless rewind_cursor is set: a writer that lost it (an old load, a rebuilt
+    dict) or that carries a lower value keeps what another process stored meanwhile."""
+    with file_lock(lock_path(path)):
+        state = load(path)
+        before = cursor_of(state)
+        new = mutate(dict(state))
+        if not rewind_cursor and cursor_of(new) < before:
+            new["cursor"] = before
+        _save(path, new)
+        return new
+
+
 def ordered(open_props: list, path) -> list[tuple]:
     """(proposal, why) for every open proposal in triage order: ranked ids first, then
     anything newer than the last ranking in fallback order."""
@@ -238,12 +272,14 @@ class Triage:
                 self.act.set_proposal_status(p.id, ProposalStatus.declined)
                 self._event(p, "proposal.triage_declined", why)
             kept = [p for p, _ in order]
-            state = {"ts": self.now().isoformat(timespec="seconds"),
-                     "ts_epoch": self.now().timestamp(), "fingerprint": fingerprint(kept),
-                     "source": source, "top_sent": state.get("top_sent"),
-                     "ranked": [{"id": p.id, "title": p.title, "why": why}
-                                for p, why in order]}
-            _save(self.path, state)
+            ranking = {"ts": self.now().isoformat(timespec="seconds"),
+                       "ts_epoch": self.now().timestamp(), "fingerprint": fingerprint(kept),
+                       "source": source,
+                       "ranked": [{"id": p.id, "title": p.title, "why": why}
+                                  for p, why in order]}
+            # locked merge: the reader may have moved the cursor while the model ran, so
+            # cursor and top_sent come from the file as it is now, not from the old load
+            state = update(self.path, lambda s: {**s, **ranking})
 
         top = [p.id for p, _ in order[:TOP_N]]
         if retired or dropped:
@@ -254,8 +290,7 @@ class Triage:
             self.notifier.send("\n".join(lines))
         if top and top != state.get("top_sent"):
             self.notifier.send(format_top(order, start=0))
-            state["top_sent"] = top
-            _save(self.path, state)
+            state = update(self.path, lambda s: {**s, "top_sent": top})
         return {"triage_retired": len(retired), "triage_dropped": len(dropped),
                 "triage_open": len(order), "triage_source": source}
 
@@ -276,7 +311,16 @@ def format_top(order: list[tuple], start: int = 0, n: int = TOP_N) -> str:
 
 
 def set_cursor(path, start: int) -> None:
-    """Where 'more' continues from; kept beside the ranking for the bot process."""
-    state = load(path)
-    state["cursor"] = start
-    _save(path, state)
+    """Where 'more' continues from; kept beside the ranking for the bot process.
+    Serialized with every other writer and written atomically. An explicit set is the
+    operator's own position ('status' restarts paging at the top), so it may rewind;
+    use advance_cursor for writes that must only ever move forward."""
+    start = max(0, int(start))
+    update(path, lambda s: {**s, "cursor": start}, rewind_cursor=True)
+
+
+def advance_cursor(path, start: int) -> int:
+    """Move the cursor forward to `start`, never backwards; returns the stored cursor.
+    Interleaved advances from two processes end at the highest position."""
+    start = max(0, int(start))
+    return cursor_of(update(path, lambda s: {**s, "cursor": start}))
