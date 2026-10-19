@@ -1,5 +1,8 @@
+import threading
+import time
+
 import pytest
-from navigator.runtime.lock import SingleFlightLock
+from navigator.runtime.lock import SingleFlightLock, file_lock
 
 def test_second_acquire_fails(tmp_path):
     lock = SingleFlightLock(tmp_path/"nav.lock")
@@ -37,3 +40,48 @@ def test_unparseable_lock_content_is_treated_as_stale(tmp_path):
     with SingleFlightLock(p).acquire():
         pass  # unverifiable holder: reclaim
     assert not p.exists()
+
+
+def test_is_held_reports_a_live_holder_only(tmp_path):
+    p = tmp_path / "nav.lock"
+    assert SingleFlightLock(p).is_held() is False
+    with SingleFlightLock(p).acquire():
+        assert SingleFlightLock(p).is_held() is True
+    assert SingleFlightLock(p).is_held() is False
+    p.write_text("999999999")  # stale: dead holder
+    assert SingleFlightLock(p).is_held() is False
+
+
+def test_file_lock_blocks_a_second_holder_until_release(tmp_path):
+    lock = tmp_path / "locks" / "triage.json.lock"  # the parent directory is created
+    order, entered, release = [], threading.Event(), threading.Event()
+
+    def holder():
+        with file_lock(lock):
+            entered.set()
+            release.wait(5)
+            order.append("holder-out")
+
+    def waiter():
+        entered.wait(5)
+        with file_lock(lock):
+            order.append("waiter-in")
+
+    threads = [threading.Thread(target=holder), threading.Thread(target=waiter)]
+    for t in threads:
+        t.start()
+    assert entered.wait(5)
+    time.sleep(0.2)
+    assert order == []  # the waiter is blocked, not refused
+    release.set()
+    for t in threads:
+        t.join(5)
+    assert order == ["holder-out", "waiter-in"]
+    assert lock.exists()  # the file stays; only the flock is released
+
+
+def test_file_lock_can_be_taken_again_after_release(tmp_path):
+    with file_lock(tmp_path / "a.lock"):
+        pass
+    with file_lock(tmp_path / "a.lock"):
+        pass  # no error, no deadlock

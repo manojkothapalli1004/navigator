@@ -4,6 +4,7 @@ operator message to telegram_proposals.handle_operator_message in the same itera
 and never merges or calls an LLM itself."""
 import itertools
 import json
+import os
 import signal
 import time
 from pathlib import Path
@@ -32,6 +33,7 @@ _seq = itertools.count(1)
 @pytest.fixture(autouse=True)
 def _triage_file(tmp_path, monkeypatch):
     monkeypatch.setenv("NAVIGATOR_TRIAGE_PATH", str(tmp_path / "triage.json"))
+    monkeypatch.setenv("NAVIGATOR_TELEGRAM_READER_LOCK", str(tmp_path / "reader.lock"))
 
 
 class _Recorder:
@@ -424,3 +426,76 @@ def test_sigterm_stops_the_reader_cleanly_and_restores_the_handler(monkeypatch):
 def test_main_dispatches_telegram_reader_before_the_cli(monkeypatch):
     monkeypatch.setattr(tr, "main_reader", lambda: 7)
     assert m.main(["telegram-reader"]) == 7
+
+
+# ---- reader start guard: one reader per bot (shared lock, not just the env) ----------
+
+def test_main_reader_refuses_when_another_reader_holds_the_lock(tmp_path, monkeypatch, capsys):
+    _no_http(monkeypatch)
+    _creds(monkeypatch)
+    lock = tmp_path / "reader.lock"
+    monkeypatch.setenv("NAVIGATOR_TELEGRAM_READER_LOCK", str(lock))
+    lock.write_text(str(os.getpid()))  # a live reader: our own pid stands in for it
+    assert main_reader() == 2
+    err = capsys.readouterr().err
+    assert "another telegram-reader" in err and str(lock) in err
+    assert lock.read_text() == str(os.getpid())  # a live holder's lock is left alone
+
+
+def test_main_reader_holds_the_reader_lock_while_running_and_releases_it(tmp_path, monkeypatch):
+    lock = tmp_path / "locks" / "reader.lock"  # the parent directory is created
+    monkeypatch.setenv("NAVIGATOR_TELEGRAM_READER_LOCK", str(lock))
+    seen = {}
+
+    def fake_run(inbox, act, notifier, chat_id, **kwargs):
+        seen["holder"] = lock.read_text()
+        raise KeyboardInterrupt
+    monkeypatch.setattr(tr, "run_reader", fake_run)
+    monkeypatch.setattr(tr, "HTTPACTClient", lambda url: None)
+    _creds(monkeypatch)
+    assert main_reader() == 0
+    assert seen["holder"] == str(os.getpid())
+    assert not lock.exists()
+
+
+def test_main_reader_releases_the_lock_on_sigterm_and_on_a_crash(tmp_path, monkeypatch):
+    lock = tmp_path / "reader.lock"
+    monkeypatch.setenv("NAVIGATOR_TELEGRAM_READER_LOCK", str(lock))
+    monkeypatch.setattr(tr, "HTTPACTClient", lambda url: None)
+    _creds(monkeypatch)
+    monkeypatch.setattr(tr, "run_reader",
+                        lambda *a, **k: tr._on_sigterm(signal.SIGTERM, None))
+    assert main_reader() == 0
+    assert not lock.exists()
+
+    def crash(*a, **k):
+        raise RuntimeError("boom")
+    monkeypatch.setattr(tr, "run_reader", crash)
+    with pytest.raises(RuntimeError, match="boom"):
+        main_reader()
+    assert not lock.exists()
+
+
+def test_stale_reader_lock_from_a_dead_pid_is_reclaimed(tmp_path, monkeypatch):
+    lock = tmp_path / "reader.lock"
+    monkeypatch.setenv("NAVIGATOR_TELEGRAM_READER_LOCK", str(lock))
+    lock.write_text("999999999")  # PID far above pid_max: guaranteed dead
+
+    def fake_run(inbox, act, notifier, chat_id, **kwargs):
+        raise KeyboardInterrupt
+    monkeypatch.setattr(tr, "run_reader", fake_run)
+    monkeypatch.setattr(tr, "HTTPACTClient", lambda url: None)
+    _creds(monkeypatch)
+    assert main_reader() == 0
+    assert not lock.exists()
+
+
+def test_reader_lock_path_defaults_beside_the_offset_file(tmp_path, monkeypatch):
+    monkeypatch.setenv("NAVIGATOR_TELEGRAM_READER_LOCK", str(tmp_path / "explicit.lock"))
+    assert tr.reader_lock_path() == tmp_path / "explicit.lock"
+    monkeypatch.delenv("NAVIGATOR_TELEGRAM_READER_LOCK")
+    monkeypatch.setenv("NAVIGATOR_TELEGRAM_OFFSET_PATH", str(tmp_path / "o" / "offset"))
+    assert tr.reader_lock_path() == tmp_path / "o" / "offset.reader.lock"
+    monkeypatch.delenv("NAVIGATOR_TELEGRAM_OFFSET_PATH", raising=False)
+    assert tr.reader_lock_path() == Path(DEFAULT_OFFSET_PATH).with_name(
+        Path(DEFAULT_OFFSET_PATH).name + ".reader.lock")

@@ -13,7 +13,11 @@ The reader never merges anything and never calls an LLM: merge decisions are
 recorded in ACT exactly as from the daemon and merge_poll acts on them.
 
 Telegram allows one getUpdates consumer per bot, so main_reader refuses to start
-when NAVIGATOR_TELEGRAM_COMMANDS=1 (the daemon is that consumer). A failing poll
+when NAVIGATOR_TELEGRAM_COMMANDS=1 (the daemon is that consumer) and, independently
+of its own environment, when another reader holds the shared reader lock
+(SingleFlightLock at NAVIGATOR_TELEGRAM_READER_LOCK, default beside the offset file;
+a lock left by a dead process is reclaimed). The lock is held for the reader's whole
+life and released on SIGTERM, Ctrl-C or a crash. A failing poll
 (409 from a second consumer, network down) is reported to the operator at most once
 per notice interval PER ERROR KIND (N11c: each kind keeps its own clock and a
 successful poll never re-arms a notice, so neither a competing consumer that lets the
@@ -28,6 +32,8 @@ import os
 import signal
 import sys
 import time
+from contextlib import ExitStack
+from pathlib import Path
 
 from navigator.clients.act_client import HTTPACTClient
 from navigator.observability.logging import get_logger
@@ -35,6 +41,7 @@ from navigator.observability.notify import load_telegram_credentials, make_notif
 from navigator.observability.telegram_inbox import (DEFAULT_INBOX_PATH, DEFAULT_OFFSET_PATH,
                                                     TelegramError, TelegramInbox)
 from navigator.observability.telegram_proposals import handle_operator_message
+from navigator.runtime.lock import SingleFlightLock
 
 log = get_logger("navigator.telegram_reader")
 
@@ -131,6 +138,16 @@ def _restore_sigterm(previous) -> None:
         pass
 
 
+def reader_lock_path() -> Path:
+    """NAVIGATOR_TELEGRAM_READER_LOCK, or '<offset file>.reader.lock' beside the offset
+    file every reader of this bot shares."""
+    explicit = os.getenv("NAVIGATOR_TELEGRAM_READER_LOCK")
+    if explicit:
+        return Path(explicit)
+    offset = Path(os.getenv("NAVIGATOR_TELEGRAM_OFFSET_PATH") or DEFAULT_OFFSET_PATH)
+    return offset.with_name(offset.name + ".reader.lock")
+
+
 def main_reader() -> int:
     """Entry point of `python -m navigator telegram-reader`."""
     if os.getenv("NAVIGATOR_TELEGRAM_COMMANDS") == "1":
@@ -145,15 +162,26 @@ def main_reader() -> int:
               "NAVIGATOR_NOTIFY_ENV_FILE)", file=sys.stderr)
         return 2
     token, chat_id = creds
-    inbox = TelegramInbox(token, chat_id,
-                          os.getenv("NAVIGATOR_TELEGRAM_OFFSET_PATH") or DEFAULT_OFFSET_PATH,
-                          os.getenv("NAVIGATOR_TELEGRAM_INBOX_PATH") or DEFAULT_INBOX_PATH)
-    act = HTTPACTClient(os.getenv("NAVIGATOR_ACT_BASE_URL") or DEFAULT_ACT_BASE_URL)
-    notifier = make_notifier()
-    previous = _install_sigterm()
+    lock = SingleFlightLock(reader_lock_path())
+    lock.path.parent.mkdir(parents=True, exist_ok=True)
+    stack = ExitStack()
     try:
-        return run_reader(inbox, act, notifier, chat_id)
-    except (KeyboardInterrupt, Terminated):
-        return 0
-    finally:
-        _restore_sigterm(previous)
+        stack.enter_context(lock.acquire())
+    except RuntimeError:
+        print(f"navigator telegram-reader: refusing to start - another telegram-reader is "
+              f"running (lock {lock.path}); Telegram allows one getUpdates consumer per bot",
+              file=sys.stderr)
+        return 2
+    with stack:  # the lock is released however the reader ends
+        inbox = TelegramInbox(token, chat_id,
+                              os.getenv("NAVIGATOR_TELEGRAM_OFFSET_PATH") or DEFAULT_OFFSET_PATH,
+                              os.getenv("NAVIGATOR_TELEGRAM_INBOX_PATH") or DEFAULT_INBOX_PATH)
+        act = HTTPACTClient(os.getenv("NAVIGATOR_ACT_BASE_URL") or DEFAULT_ACT_BASE_URL)
+        notifier = make_notifier()
+        previous = _install_sigterm()
+        try:
+            return run_reader(inbox, act, notifier, chat_id)
+        except (KeyboardInterrupt, Terminated):
+            return 0
+        finally:
+            _restore_sigterm(previous)

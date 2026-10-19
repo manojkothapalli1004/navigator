@@ -2,6 +2,7 @@
 planner model (learning from the operator's own decisions), show only the top 3."""
 import itertools
 import json
+import threading
 from datetime import datetime, timedelta, timezone
 
 from navigator.clients.act_client import FakeACTClient
@@ -182,3 +183,70 @@ def test_format_top_pages_three_at_a_time():
     last = format_top(order, start=6)
     assert "top 7-7 of 7" in last and "more" not in last
     assert "nothing waiting" in format_top([])
+
+
+# ---- triage.json cursor: locked, atomic, never regresses -----------------------------
+
+def test_set_cursor_is_serialized_and_written_atomically(tmp_path):
+    path = tmp_path / "triage.json"
+    triage.set_cursor(path, 3)
+    assert triage.load(path)["cursor"] == 3
+    assert triage.lock_path(path) == tmp_path / "triage.json.lock"
+    assert triage.lock_path(path).exists()
+    assert [p.name for p in tmp_path.iterdir() if p.name.startswith(".triage.")] == []
+
+
+def test_advance_cursor_never_moves_backwards_but_set_cursor_may(tmp_path):
+    path = tmp_path / "triage.json"
+    assert triage.advance_cursor(path, 6) == 6
+    assert triage.advance_cursor(path, 3) == 6
+    assert triage.load(path)["cursor"] == 6
+    triage.set_cursor(path, 3)  # the operator restarted paging ('status')
+    assert triage.load(path)["cursor"] == 3
+
+
+def test_update_keeps_the_cursor_a_stale_writer_would_drop_or_lower(tmp_path):
+    path = tmp_path / "triage.json"
+    triage.set_cursor(path, 6)
+    stale = {"ranked": [], "source": "fallback"}  # built from an old load: no cursor
+    assert triage.update(path, lambda s: dict(stale))["cursor"] == 6
+    assert triage.update(path, lambda s: {**s, "cursor": 2})["cursor"] == 6
+    assert triage.update(path, lambda s: {**s, "cursor": 2},
+                         rewind_cursor=True)["cursor"] == 2
+    state = triage.load(path)
+    assert state["ranked"] == [] and state["cursor"] == 2
+
+
+def test_interleaved_advances_from_many_threads_end_at_the_highest(tmp_path):
+    path = tmp_path / "triage.json"
+    results = []
+
+    def worker(start):
+        results.append((start, triage.advance_cursor(path, start)))
+
+    threads = [threading.Thread(target=worker, args=(3 * i,)) for i in range(1, 21)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(10)
+    assert len(results) == 20
+    assert all(stored >= start for start, stored in results)
+    assert triage.load(path)["cursor"] == 60
+
+
+def test_cursor_written_while_the_daemon_ranks_survives_the_rerank(tmp_path):
+    act = FakeACTClient()
+    _prop(act, "N1: retry")
+    _prop(act, "N2: lessons")
+    path = tmp_path / "triage.json"
+
+    def model(prompt):
+        triage.set_cursor(path, 6)  # the reader answers 'more' while the model runs
+        return json.dumps({"ranked": [], "drop": []})
+
+    t, rec = _triage(act, tmp_path, model)
+    t.run()
+    state = triage.load(path)
+    assert state["cursor"] == 6 and len(state["ranked"]) == 2 and state["top_sent"]
+    t.run()  # cached pass: the daemon's later saves never lower it either
+    assert triage.load(path)["cursor"] == 6
