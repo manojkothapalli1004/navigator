@@ -4,9 +4,10 @@ Operator 2026-10-18: Navigator should read Telegram like chat, with no delay, an
 every message must reach the inbox file the Claude session reads. The daemon's
 _telegram_step polls getUpdates once per cycle (up to 900 s apart) and only handles
 /merge and /reject; this process long-polls getUpdates continuously
-(TelegramInbox.poll_messages) and hands every operator message to
-telegram_proposals.handle_operator_message in the same iteration, so status, more,
-all, approve, decline, help and the merge shorthands are answered at once.
+(TelegramInbox.poll_updates) and hands every operator message, together with its
+Telegram update_id, to telegram_proposals.handle_operator_message in the same
+iteration, so status, more, all, approve, decline, help and the merge shorthands are
+answered at once and a merge decision event records the update that caused it.
 
 The reader never merges anything and never calls an LLM: merge decisions are
 recorded in ACT exactly as from the daemon and merge_poll acts on them.
@@ -93,7 +94,7 @@ def run_reader(inbox, act, notifier, chat_id, *, long_poll_s: int = LONG_POLL_S,
     while max_iterations is None or iterations < max_iterations:
         iterations += 1
         try:
-            messages = inbox.poll_messages(long_poll_s=long_poll_s)
+            updates = inbox.poll_updates(long_poll_s=long_poll_s)
         except Exception as e:
             kind = _error_kind(e)
             log.warning("telegram_reader.poll_failed", error=kind)
@@ -105,9 +106,9 @@ def run_reader(inbox, act, notifier, chat_id, *, long_poll_s: int = LONG_POLL_S,
                                   f"{_interval_text(notice_interval_s)})")
             sleep(error_backoff_s)
             continue
-        for msg in messages:
+        for update_id, msg in updates:
             try:
-                handle_operator_message(msg, act, notifier, chat_id)
+                handle_operator_message(msg, act, notifier, chat_id, update_id=update_id)
             except Exception as e:
                 # the message is consumed (offset persisted); the next one still gets handled
                 log.warning("telegram_reader.handle_failed", error=type(e).__name__)

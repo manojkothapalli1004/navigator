@@ -14,8 +14,11 @@ from structlog.testing import capture_logs
 
 import navigator.__main__ as m
 from navigator.clients.act_client import FakeACTClient
-from navigator.contracts.enums import ProposalStatus
+from navigator.contracts.enums import ApprovalGate, ProposalStatus, RunPhase
 from navigator.contracts.proposal import Proposal
+from navigator.contracts.run import Run
+from navigator.observability import telegram_inbox as ti
+from navigator.observability import telegram_proposals as tp
 from navigator.observability import telegram_reader as tr
 from navigator.observability.telegram_inbox import (CONFLICT_MESSAGE, DEFAULT_INBOX_PATH,
                                                     DEFAULT_OFFSET_PATH, FETCH_FAILED_MESSAGE,
@@ -110,6 +113,59 @@ def test_approve_from_the_reader_changes_the_proposal(tmp_path):
     run_reader(inbox, act, rec, CHAT, max_iterations=2)
     assert act.get_proposal(p.id).status == ProposalStatus.approved
     assert len(rec.sent) == 1 and "approved" in rec.sent[0]
+
+
+def _event_field(e, name):
+    return getattr(e, name) if hasattr(e, name) else e[name]
+
+
+def test_merge_decision_event_carries_the_originating_update_id(tmp_path, monkeypatch):
+    """A /merge typed in Telegram reaches ACT with the update_id of the message that
+    caused it, never the placeholder 0, so decisions can be replayed or deduplicated
+    by update_id."""
+    monkeypatch.setattr(ti, "is_audited", lambda act, run_id: True)
+    act = FakeACTClient()
+    p = _prop(act, "N1: a")
+    run = act.create_run(Run(proposal_id=p.id, base_commit_sha="abc", branch="nav/x",
+                             phase=RunPhase.awaiting_review, correlation_id="corr-1"))
+    act.create_approval(target=run.id, gate=ApprovalGate.merge)
+    inbox, _ = _serve(tmp_path, [[_update(7, f"/merge {run.id}")], []])
+    rec = _Recorder()
+    assert run_reader(inbox, act, rec, CHAT, max_iterations=2) == 0
+    decisions = [e for e in act.events
+                 if _event_field(e, "kind") == "run.telegram_decision"]
+    assert len(decisions) == 1
+    assert _event_field(decisions[0], "payload") == {
+        "run_id": run.id, "decision": "approved", "update_id": 7}
+    assert len(rec.sent) == 1 and "approved" in rec.sent[0]
+
+
+def test_reader_hands_each_message_with_its_update_id(tmp_path, monkeypatch):
+    seen = []
+
+    def fake(msg, act, notifier, chat_id, update_id=0):
+        seen.append((msg["text"], update_id))
+        return True
+    monkeypatch.setattr(tr, "handle_operator_message", fake)
+    inbox, _ = _serve(tmp_path, [[_update(41, "status"), _update(43, "hi")], []])
+    assert run_reader(inbox, FakeACTClient(), _Recorder(), CHAT, max_iterations=2) == 0
+    assert seen == [("status", 41), ("hi", 43)]
+
+
+def test_poll_updates_returns_update_id_message_pairs(tmp_path):
+    inbox, _ = _serve(tmp_path, [[_update(5, "status"), _update(6, "approve 1", chat="999")]])
+    pairs = inbox.poll_updates(long_poll_s=1)
+    assert [(uid, msg["text"]) for uid, msg in pairs] == [(5, "status")]
+
+
+def test_handle_operator_message_passes_the_update_id_to_merge_commands(monkeypatch):
+    seen = []
+    monkeypatch.setattr(tp, "apply_commands",
+                        lambda act, cmds, notifier: seen.extend(cmds) or [])
+    msg = _update(11, "merge N5b")["message"]
+    assert tp.handle_operator_message(msg, FakeACTClient(), _Recorder(), CHAT,
+                                      update_id=11) is True
+    assert [(c.action, c.name, c.update_id) for c in seen] == [("merge", "N5b", 11)]
 
 
 def test_plain_chat_reaches_the_inbox_but_gets_no_reply(tmp_path):
@@ -231,16 +287,16 @@ def test_interval_text():
 def test_a_failing_message_does_not_stop_the_others(tmp_path, monkeypatch):
     handled = []
 
-    def fake(msg, act, notifier, chat_id):
+    def fake(msg, act, notifier, chat_id, update_id=0):
         if msg["text"] == "boom":
             raise RuntimeError("x")
-        handled.append((msg["text"], chat_id))
+        handled.append((msg["text"], chat_id, update_id))
         return True
     monkeypatch.setattr(tr, "handle_operator_message", fake)
     inbox, _ = _serve(tmp_path, [[_update(1, "boom"), _update(2, "status")], []])
     rec = _Recorder()
     assert run_reader(inbox, FakeACTClient(), rec, CHAT, max_iterations=2) == 0
-    assert handled == [("status", CHAT)]
+    assert handled == [("status", CHAT, 2)]
     assert rec.sent == []
 
 
@@ -250,7 +306,7 @@ def test_token_never_reaches_logs_or_notifications(tmp_path, monkeypatch):
     boom = httpx.ConnectError("down: https://api.telegram.org/botSECRETTOKEN/getUpdates")
     inbox, _ = _serve(tmp_path, [boom, [_update(1, "status")]], token="SECRETTOKEN")
 
-    def broken(msg, act, notifier, chat_id):
+    def broken(msg, act, notifier, chat_id, update_id=0):
         raise ConnectionError("ACT down at http://act.local/botSECRETTOKEN")
     monkeypatch.setattr(tr, "handle_operator_message", broken)
     rec, sleeps = _Recorder(), []

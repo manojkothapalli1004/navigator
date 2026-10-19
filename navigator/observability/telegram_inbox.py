@@ -297,12 +297,17 @@ class TelegramInbox:
                 commands.append(cmd)
         return commands
 
+    def poll_updates(self, long_poll_s: int = 25) -> list[tuple[int, dict]]:
+        """One long poll for the always-on reader (N11): (update_id, raw message) pairs
+        for the authorized text messages, ignored (forwarded/stale) ones included -
+        handle_operator_message applies its own freshness checks. The update_id is
+        what a merge decision event records. Inbox file and offset are updated as
+        for poll_once."""
+        return [(entry["update_id"], msg) for entry, msg in self._consume(long_poll_s)]
+
     def poll_messages(self, long_poll_s: int = 25) -> list[dict]:
-        """One long poll for the always-on reader (N11): the raw authorized text
-        messages, ignored (forwarded/stale) ones included - handle_operator_message
-        applies its own freshness checks. Inbox file and offset are updated as for
-        poll_once."""
-        return [msg for _entry, msg in self._consume(long_poll_s)]
+        """poll_updates without the update ids: the raw authorized text messages."""
+        return [msg for _uid, msg in self.poll_updates(long_poll_s)]
 
 
 def _apply_wording() -> str:

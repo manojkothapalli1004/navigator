@@ -1,17 +1,28 @@
 """Proposal decisions typed in Telegram (operator 2026-10-03: approve from Telegram).
 
-The manojtest bot is the bot's only getUpdates consumer; it hands every message to
-handle_operator_message, which applies the inbox's checks (operator's private chat,
-not forwarded, under an hour old) and then handles:
+handle_operator_message is the single handler behind the always-on reader (N11,
+telegram_reader.py): the reader long-polls getUpdates (TelegramInbox.poll_updates)
+and hands every operator message here in the same iteration, together with its
+Telegram update_id, so replies arrive at once instead of once per daemon cycle. The
+handler applies the inbox's checks (operator's private chat, not forwarded, under an
+hour old) and then handles:
   'status' / 'more' / 'all'      -> the top 3 in triage order (runtime/triage.py), the
                                     next 3, or the whole numbered list
   'approve <t> ...' / 'decline <t> ...'
                                  -> <t> is a number from that list, a range '4-33',
-                                    a short name ('N1') or a full proposal id
+                                    a short name ('N1') or a full proposal id;
+                                    the proposal status is set in ACT and the
+                                    builder starts on the next daemon cycle
   'help'                         -> the command list
-  merge/reject forms             -> telegram_inbox.apply_commands, unchanged
+  merge/reject forms             -> telegram_inbox.apply_commands, unchanged; the
+                                    run.telegram_decision event carries the update_id
+                                    of the originating message (0 only when the
+                                    caller has none)
 Targets resolve against one snapshot of the list; if any target is unknown or
-ambiguous nothing is changed. Anything else returns False (ordinary chat).
+ambiguous nothing is changed. Anything else returns False (ordinary chat). A command
+whose handling raises is answered with the exception class name only (N11c: never an
+exception's text, which could carry the token-bearing URL); its offset is already
+persisted, so the operator is told to re-send it.
 """
 import os
 import re
@@ -148,13 +159,15 @@ def _decide(act, cmd: ProposalCommand, notifier, path: str | None) -> None:
 
 
 def handle_operator_message(msg: dict, act, notifier, chat_id: str,
-                            now: float | None = None, triage_file: str | None = None) -> bool:
+                            now: float | None = None, triage_file: str | None = None,
+                            update_id: int = 0) -> bool:
     """True when the message was a Navigator command (handled or refused with a
-    reply); False for other senders and ordinary chat."""
+    reply); False for other senders and ordinary chat. update_id is the Telegram
+    update that delivered msg; merge/reject decisions record it in their event."""
     if not isinstance(msg, dict) or not is_operator_message(msg, chat_id):
         return False
     text = msg.get("text")
-    merge_cmd = parse_command(text, 0)
+    merge_cmd = parse_command(text, update_id)
     prop_cmd = None if merge_cmd else parse_proposal_command(text)
     if merge_cmd is None and prop_cmd is None:
         return False
