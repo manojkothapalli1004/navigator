@@ -7,6 +7,10 @@ document them for operators:
   The app does not load it.
 * deploy/launchd/com.navigator.plist.example: the launchd template. Its
   EnvironmentVariables dict is what a deployed daemon actually runs with.
+* deploy/launchd/com.calwbot.navigator-telegram.plist.example: the always-on
+  Telegram reader's launchd template.
+* README.md '## Telegram reader operations': the runbook. Its default paths are
+  checked against the DEFAULT_* constants in telegram_inbox.py so they cannot drift.
 
 If a key is misspelled in the plist, launchd silently runs on the code default.
 These tests catch that drift.
@@ -21,11 +25,25 @@ import pytest
 
 from navigator import config
 from navigator.config import Settings
+from navigator.observability.telegram_inbox import DEFAULT_INBOX_PATH, DEFAULT_OFFSET_PATH
 
 ROOT = Path(__file__).resolve().parent.parent
 TOML_EXAMPLE = ROOT / "navigator.toml.example"
 PLIST_EXAMPLE = ROOT / "deploy" / "launchd" / "com.navigator.plist.example"
+READER_PLIST_EXAMPLE = ROOT / "deploy" / "launchd" / "com.calwbot.navigator-telegram.plist.example"
+README = ROOT / "README.md"
+READER_SECTION = "## Telegram reader operations"
 PACKAGE_DIR = ROOT / "navigator"
+
+# keys the Telegram reader reads with os.getenv (not Settings)
+READER_KEYS: set[str] = {
+    "NAVIGATOR_ACT_BASE_URL",
+    "NAVIGATOR_TELEGRAM_OFFSET_PATH",
+    "NAVIGATOR_TELEGRAM_INBOX_PATH",
+    "NAVIGATOR_TELEGRAM_READER_LOCK",
+}
+# a Telegram bot token looks like 123456789:AAxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+TOKEN_RE = re.compile(r"\d{6,}:[A-Za-z0-9_-]{20,}")
 
 ENV_KEY_RE = re.compile(r"\bNAVIGATOR_[A-Z0-9]+(?:_[A-Z0-9]+)*\b")
 
@@ -135,6 +153,159 @@ def test_keys_read_outside_settings_are_still_referenced():
 
 def test_plist_example_defaults_to_dry_run():
     assert _plist_env().get("NAVIGATOR_MODE") == "dry_run"
+
+
+# ---- Telegram reader plist example ------------------------------------------
+
+def _reader_plist() -> dict:
+    with READER_PLIST_EXAMPLE.open("rb") as fh:
+        plist = plistlib.load(fh)
+    assert isinstance(plist, dict)
+    return plist
+
+
+def _reader_env() -> dict:
+    env = _reader_plist().get("EnvironmentVariables")
+    assert isinstance(env, dict), "reader plist example has no EnvironmentVariables dict"
+    return env
+
+
+def test_reader_plist_label():
+    assert _reader_plist()["Label"] == "com.calwbot.navigator-telegram"
+
+
+def test_reader_plist_runs_the_telegram_reader():
+    args = _reader_plist()["ProgramArguments"]
+    assert isinstance(args, list) and len(args) >= 4
+    assert args[-3:] == ["-m", "navigator", "telegram-reader"]
+    assert Path(args[0]).is_absolute(), args[0]
+    assert args[0].endswith("/python"), args[0]
+
+
+def test_reader_plist_keeps_alive():
+    assert _reader_plist().get("KeepAlive") is True
+
+
+def test_reader_plist_working_directory_is_absolute():
+    wd = _reader_plist().get("WorkingDirectory")
+    assert isinstance(wd, str) and Path(wd).is_absolute(), wd
+
+
+def test_reader_plist_log_paths():
+    plist = _reader_plist()
+    out, err = plist.get("StandardOutPath"), plist.get("StandardErrorPath")
+    assert isinstance(out, str) and out.endswith("telegram-reader.out.log"), out
+    assert isinstance(err, str) and err.endswith("telegram-reader.err.log"), err
+    assert Path(out).is_absolute() and Path(err).is_absolute()
+    assert out != err
+
+
+def test_reader_plist_never_makes_the_daemon_poll():
+    # one getUpdates consumer per bot: the reader refuses to start when this is "1"
+    env = _reader_env()
+    assert "NAVIGATOR_TELEGRAM_COMMANDS" not in env, env
+
+
+def test_reader_plist_sets_only_known_keys(settings_keys):
+    known = settings_keys | READ_OUTSIDE_SETTINGS | READER_KEYS
+    unknown = {k for k in _reader_env() if k.startswith("NAVIGATOR_")} - known
+    assert not unknown, f"reader plist example sets keys nothing reads (typo?): {sorted(unknown)}"
+
+
+def test_reader_keys_are_referenced_in_package():
+    source = _package_source()
+    unreferenced = {k for k in READER_KEYS if k not in source}
+    assert not unreferenced, sorted(unreferenced)
+
+
+def test_reader_plist_uses_env_file_and_act_url():
+    env = _reader_env()
+    assert Path(env["NAVIGATOR_NOTIFY_ENV_FILE"]).is_absolute()
+    assert env["NAVIGATOR_ACT_BASE_URL"] == "http://127.0.0.1:8090"
+
+
+def test_reader_plist_has_no_secret_looking_values():
+    env = _reader_env()
+    assert "NAVIGATOR_TELEGRAM_BOT_TOKEN" not in env
+    assert "NAVIGATOR_TELEGRAM_CHAT_ID" not in env
+    for key, value in env.items():
+        assert not TOKEN_RE.search(str(value)), key
+        assert "YOU" in str(value) or not str(value).startswith("/Users/"), (
+            f"{key}: real home directory in an example; use /Users/YOU")
+    raw = READER_PLIST_EXAMPLE.read_text()
+    assert not TOKEN_RE.search(raw), "bot token in the reader plist example"
+
+
+def test_reader_plist_override_block_is_commented_out_and_explains_sharing():
+    raw = READER_PLIST_EXAMPLE.read_text()
+    env = _reader_env()
+    for key in ("NAVIGATOR_TELEGRAM_OFFSET_PATH", "NAVIGATOR_TELEGRAM_INBOX_PATH",
+                "NAVIGATOR_TELEGRAM_READER_LOCK"):
+        assert key in raw, f"{key} override example missing"
+        assert key not in env, f"{key} must stay commented out in the example"
+    assert "DEFAULT_*" in raw
+    assert "navigator/observability/telegram_inbox.py" in raw
+    assert "set the SAME values in the daemon plist" in raw
+    assert "navigator inbox" in raw
+    assert "relative" not in raw.lower()
+
+
+# ---- README runbook ------------------------------------------------------------
+
+def _readme_reader_section() -> str:
+    text = README.read_text()
+    assert READER_SECTION in text, f"README.md lacks the {READER_SECTION!r} section"
+    start = text.index(READER_SECTION)
+    rest = text[start + len(READER_SECTION):]
+    m = re.search(r"\n## ", rest)
+    return rest if m is None else rest[:m.start()]
+
+
+def test_readme_reader_section_states_the_code_defaults():
+    section = _readme_reader_section()
+    assert DEFAULT_OFFSET_PATH in section
+    assert DEFAULT_INBOX_PATH in section
+    assert ".reader.lock" in section
+    assert "DEFAULT_OFFSET_PATH" in section and "DEFAULT_INBOX_PATH" in section
+    assert "telegram_inbox.py" in section
+
+
+def test_readme_reader_section_warns_that_three_consumers_share_paths():
+    section = _readme_reader_section()
+    assert "navigator inbox" in section
+    assert "NAVIGATOR_TELEGRAM_OFFSET_PATH" in section
+    assert "NAVIGATOR_TELEGRAM_INBOX_PATH" in section
+    assert "NAVIGATOR_TELEGRAM_READER_LOCK" in section
+    assert "all three together or none" in section
+
+
+def test_readme_reader_section_does_not_call_defaults_relative():
+    section = _readme_reader_section().lower()
+    for m in re.finditer(r"relative", section):
+        window = section[max(0, m.start() - 200):m.end() + 200]
+        assert "default" not in window, (
+            "README calls a default path relative; the defaults are absolute constants")
+
+
+def test_readme_reader_section_says_doctor_checks_only_the_daemon_plist():
+    section = _readme_reader_section().replace("\n", " ")
+    sentences = re.split(r"[.!?](?:\s|$)", section)
+    assert any("doctor" in s and "daemon" in s for s in sentences), (
+        "no sentence mentions both doctor and daemon")
+
+
+def test_readme_reader_section_covers_the_runbook():
+    section = _readme_reader_section()
+    assert "com.calwbot.navigator-telegram" in section
+    assert "com.calwbot.navigator`" in section
+    assert "NAVIGATOR_TELEGRAM_COMMANDS" in section
+    assert "409" in section and "30 s" in section and "per hour per error kind" in section
+    assert "exit 2" in section
+    assert "telegram-reader.out.log" in section and "telegram-reader.err.log" in section
+    assert "launchctl kickstart -k" in section
+    assert "bootout" in section and "bootstrap" in section
+    assert "http://127.0.0.1:8090" in section
+    assert not TOKEN_RE.search(section)
 
 
 def test_toml_example_defaults_match_settings():
