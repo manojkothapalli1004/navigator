@@ -44,6 +44,11 @@ worktree_root = "/tmp/navigator-worktrees"     # NAVIGATOR_WORKTREE_ROOT
 lock_path = "/tmp/navigator.lock"              # NAVIGATOR_LOCK_PATH: single-flight lock
 outcome_path = "/tmp/navigator-outcomes.jsonl" # NAVIGATOR_OUTCOME_PATH: local outcome trail
 tick_interval_s = 900           # NAVIGATOR_TICK_INTERVAL_S
+rebase_stale_runs = true        # NAVIGATOR_REBASE_STALE_RUNS: after a merge, rebase the repo's other
+                                # runs parked at the merge gate onto the new HEAD and re-run their
+                                # recorded verification (no model call); an audit carries over when
+                                # the diff is unchanged. A conflict or failed re-verify fails the run
+                                # and grants exactly one automatic rebuild. "0"/"false" = off
 
 [planner]
 max_proposals_per_tick = 3      # NAVIGATOR_MAX_PROPOSALS_PER_TICK

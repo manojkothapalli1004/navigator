@@ -599,7 +599,7 @@ def run_build_and_verify(driver: SubagentDriver, worktree: WorktreeHandle,
                          workdir: str = ".") -> PhaseResult:
     res = PhaseResult()
     wt = Path(worktree.path)
-    run_dir = _resolve_write_target(wt, workdir) if workdir not in (".", "") else wt
+    run_dir = run_dir_for(wt, workdir)
     proposal = dict(proposal or {})
     proposal["affected_files"] = _normalize_affected(wt, proposal.get("affected_files", []), workdir)
     started = time.monotonic() if started_monotonic is None else started_monotonic
@@ -663,14 +663,16 @@ def run_build_and_verify(driver: SubagentDriver, worktree: WorktreeHandle,
             # a disallowed command is a verification result, not a crash
             res.verify_returncode = 126
             res.verify_output = f"verifier command rejected: {e}"
-            res.verify_log.append({"argv": " ".join(argv), "returncode": 126,
+            res.verify_log.append({"argv": " ".join(argv), "argv_list": list(argv),
+                                   "returncode": 126,
                                    "output_tail": res.verify_output[-1500:]})
             if breakers:
                 breakers.record_failure(f"rejected:{argv[0]}")
             break
         res.verify_returncode = r.returncode
         res.verify_output = r.stdout + r.stderr
-        res.verify_log.append({"argv": " ".join(argv), "returncode": r.returncode,
+        res.verify_log.append({"argv": " ".join(argv), "argv_list": list(argv),
+                               "returncode": r.returncode,
                                "output_tail": res.verify_output[-1500:]})
         if r.returncode != 0:
             if breakers:
@@ -698,9 +700,63 @@ def _run_full_suite(runner, run_dir: Path, res: PhaseResult, breakers) -> None:
         rc, out = r.returncode, r.stdout + r.stderr
     except CommandRejected as e:
         rc, out = 126, f"full-suite command rejected: {e}"
-    res.verify_log.append({"argv": " ".join(argv), "returncode": rc, "output_tail": out[-1500:]})
+    res.verify_log.append({"argv": " ".join(argv), "argv_list": list(argv), "returncode": rc,
+                           "output_tail": out[-1500:]})
     res.verify_returncode, res.verify_output = rc, out
     if rc != 0 and breakers:
         m = _FAILED_TESTS.search(out)
         if m:
             breakers.check_failed_tests(int(m.group(1)))
+
+
+def run_dir_for(wt: Path, workdir: str) -> Path:
+    """Where verifier commands run: the repo's workdir inside the worktree (validated to
+    stay inside it), or the worktree itself when workdir is '.' or ''."""
+    wt = Path(wt)
+    return _resolve_write_target(wt, workdir) if workdir not in (".", "") else wt
+
+
+def reverify(runner, run_dir: Path, argvs: list[list[str]], breakers=None,
+             changed_files: list[str] | None = None) -> PhaseResult:
+    """Re-run a run's recorded verification commands in `run_dir` (N12d: a rebased
+    sibling is re-verified with the commands that verified it; no driver call). Same
+    per-command loop as run_build_and_verify: stop at the first non-zero return code, a
+    rejected command is rc 126, and no commands at all is a failure (rc 1). When the
+    rebased change (`changed_files`, repo-relative) is a python change in a repo with a
+    test suite, the full suite runs afterwards unless it is already among `argvs`."""
+    res = PhaseResult()
+    run_dir = Path(run_dir)
+    argvs = [list(a) for a in argvs if a]
+    if not argvs:
+        res.verify_returncode = 1
+        res.verify_output = "no recorded verification commands to re-run"
+        return res
+    for argv in argvs:
+        try:
+            r = _run_sealed(runner, argv, run_dir)
+        except CommandRejected as e:
+            res.verify_returncode = 126
+            res.verify_output = f"verifier command rejected: {e}"
+            res.verify_log.append({"argv": " ".join(argv), "argv_list": list(argv),
+                                   "returncode": 126,
+                                   "output_tail": res.verify_output[-1500:]})
+            if breakers:
+                breakers.record_failure(f"rejected:{argv[0]}")
+            break
+        res.verify_returncode = r.returncode
+        res.verify_output = r.stdout + r.stderr
+        res.verify_log.append({"argv": " ".join(argv), "argv_list": list(argv),
+                               "returncode": r.returncode,
+                               "output_tail": res.verify_output[-1500:]})
+        if r.returncode != 0:
+            if breakers:
+                m = _FAILED_TESTS.search(res.verify_output)
+                if m:
+                    breakers.check_failed_tests(int(m.group(1)))
+                breakers.record_failure(" ".join(argv))
+            break
+    if res.verify_returncode == 0 and _requires_tests(run_dir, list(changed_files or [])):
+        entry = next((a for a in runner.allowlist if "pytest" in a.split()), None)
+        if entry is None or entry.split() + ["-q"] not in argvs:
+            _run_full_suite(runner, run_dir, res, breakers)
+    return res

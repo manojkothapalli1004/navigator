@@ -1,9 +1,11 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+import shlex
 import subprocess
 import time
 from pathlib import Path
-from navigator.cli import ACTOR
+from navigator.cli import ACTOR, AUDITOR, is_audited
 from navigator.observability.telegram_inbox import TELEGRAM_ACTOR
+from navigator.observability.logging import get_logger
 from navigator.contracts.proposal import Proposal
 from navigator.contracts.run import Run, Checkpoint
 from navigator.contracts.outcome import Outcome, Rollback
@@ -13,7 +15,7 @@ from navigator.runtime.worktree import (
     WorktreeHandle, create_worktree, preserve_failed, remove_worktree)
 from navigator.runtime.checkpoint import diff_artifact
 from navigator.runtime.outcome_store import OutcomeStore
-from navigator.runtime.phases import run_build_and_verify
+from navigator.runtime.phases import reverify, run_build_and_verify, run_dir_for
 from navigator.ids import new_id
 from navigator.safety.approval_engine import require_gate
 from navigator.safety.circuit_breakers import CircuitBreakers
@@ -357,3 +359,234 @@ def _write_outcome(orc, run, *, status, summary, lessons, verification_notes=Non
         except OSError:
             pass  # local trail is best-effort; a store failure must not fail the run
     return out
+
+
+# ---- N12d: rebase parked sibling runs after a merge --------------------------------
+# live 2026-10-19: 5 runs were built from one base; after the first merge the other 4
+# conflicted textually and cost 3 extra build rounds. Instead, each sibling parked at
+# the merge gate is rebased onto the new HEAD and re-verified with its own recorded
+# commands (no model call). Its audit is carried forward when the normalized diff is
+# unchanged. A conflict or a failed re-verify fails the run and grants exactly one
+# automatic rebuild (the CLI `retry` record) so the next approval_poll rebuilds it.
+_log = get_logger("navigator.executor")
+_GIT_FLAGS = ["-c", "user.email=navigator@local", "-c", "user.name=navigator",
+              "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false"]
+_GIT_TIMEOUT_S = 600
+_CLOCK_ADVANCE_MAX_S = 3.0
+
+
+def _git_run(cwd, *args) -> subprocess.CompletedProcess:
+    """Trusted runtime git call with a timeout; a timeout is a failed call (rc 124)."""
+    argv = ["git", *args]
+    try:
+        return subprocess.run(argv, cwd=cwd, capture_output=True, text=True,
+                              timeout=_GIT_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(argv, 124, stdout="",
+                                           stderr=f"git timed out after {_GIT_TIMEOUT_S}s")
+
+
+def _head(wt) -> str:
+    proc = _git_run(wt, "rev-parse", "--verify", "-q", "HEAD^{commit}")
+    return proc.stdout.strip() if proc.returncode == 0 else ""
+
+
+def _normalized_diff(wt, base: str) -> str | None:
+    """The run's diff (base..HEAD, as diff_artifact) with the 'index <blob>..<blob>' lines
+    removed, so the same change replayed onto another parent compares equal. None when
+    git fails."""
+    proc = _git_run(wt, "diff", f"{base}..HEAD")
+    if proc.returncode != 0:
+        return None
+    return "\n".join(l for l in proc.stdout.splitlines() if not l.startswith("index "))
+
+
+def _wait_clock_advance(after: datetime) -> None:
+    """Sleep (at most _CLOCK_ADVANCE_MAX_S) until the UTC clock's whole second is past
+    `after`'s whole second: a record written next then sorts strictly after one written
+    at `after` even where timestamps are stored at second resolution."""
+    target = _as_utc(after).replace(microsecond=0) + timedelta(seconds=1)
+    deadline = time.monotonic() + _CLOCK_ADVANCE_MAX_S
+    while datetime.now(timezone.utc) < target and time.monotonic() < deadline:
+        time.sleep(0.02)
+
+
+def _grant_audit(act, run: Run) -> None:
+    """Carry an audit forward to the run's NEW verified_sha with the same records
+    `navigator audited` writes (cli._audited): a run.audited event and an approved
+    REVIEW-gate approval by AUDITOR. The gate must be review: that is the gate
+    cli.is_audited reads (a merge-gate approval is never recognised)."""
+    _emit(act, run, "run.audited", verified_sha=run.verified_sha, actor=AUDITOR,
+          carried_forward=True)
+    appr = act.create_approval(target=run.id, gate=ApprovalGate.review)
+    act.decide_approval(appr.id, ApprovalDecision.approved, actor=AUDITOR)
+
+
+def _grant_rebuild(act, run: Run) -> bool:
+    """One automatic rebuild grant for the run's proposal (the CLI `retry` record, actor
+    ACTOR, which Navigator._may_run counts), unless the proposal already holds a grant
+    per run: never more than one rebuild per stale failure. True if one was created."""
+    runs = act.list_runs_for_proposal(run.proposal_id)
+    grants = act.list_approvals(target=run.proposal_id, gate=ApprovalGate.review,
+                                decision=ApprovalDecision.approved)
+    if len(grants) >= len(runs):
+        return False
+    appr = act.create_approval(target=run.proposal_id, gate=ApprovalGate.review)
+    act.decide_approval(appr.id, ApprovalDecision.approved, actor=ACTOR)
+    return True
+
+
+def _fail_stale(act, orc, run: Run, settings, *, summary: str, lessons: list[str],
+                notes: str | None = None) -> None:
+    """Fail a sibling that could not be carried over the merge, keep its worktree for
+    inspection and schedule exactly one rebuild."""
+    run.status = RunStatus.failed; run.phase = RunPhase.finalizing
+    run.ended_at = datetime.now(timezone.utc); _save(act, run)
+    _write_outcome(orc, run, status="failed", summary=summary, lessons=lessons,
+                   verification_notes=notes, preserved=run.worktree_path, settings=settings)
+    _emit(act, run, "run.failed", Severity.error, error=summary)
+    granted = _grant_rebuild(act, run)
+    _emit(act, run, "run.rebuild_scheduled", granted=granted)
+
+
+def _stale_skip_reason(repo: str, run: Run) -> str | None:
+    """Reason a parked run must be left alone (never rebase what was not verified, or a
+    branch/worktree someone touched since verification), else None."""
+    if not run.verified_sha:
+        return "no verified sha"
+    wt = run.worktree_path
+    if not wt or not Path(wt).is_dir():
+        return "no worktree on disk"
+    reason = _verified_check(repo, run)
+    if reason:
+        return reason
+    if _head(wt) != run.verified_sha:
+        return "worktree HEAD != verified_sha"
+    status = _git_run(wt, "status", "--porcelain", "--untracked-files=no")
+    if status.returncode != 0 or status.stdout.strip():
+        return "worktree has uncommitted changes"
+    return None
+
+
+def _recorded_argvs(verification) -> list[list[str]]:
+    """The commands a run was verified with: argv_list where recorded, else the argv
+    string split shell-style (entries recorded before argv_list existed)."""
+    out = []
+    for entry in verification or []:
+        if not isinstance(entry, dict):
+            continue
+        argv = entry.get("argv_list") or shlex.split(str(entry.get("argv") or ""))
+        if argv:
+            out.append([str(a) for a in argv])
+    return out
+
+
+def _rebase_one(run: Run, merged: Run, new_head: str, *, act, orc, runner, settings,
+                workdir: str, state: dict) -> bool:
+    """Rebase one parked sibling onto new_head and re-verify it. True if the run is
+    parked again (rebased); False if it failed (a rebuild was scheduled)."""
+    wt = run.worktree_path
+    was_audited = bool(is_audited(act, run))  # judged on the records BEFORE any git
+    before = _normalized_diff(wt, run.base_commit_sha)
+    rebase = _git_run(wt, *_GIT_FLAGS, "rebase", new_head)
+    if rebase.returncode != 0:
+        output = rebase.stdout + rebase.stderr
+        _git_run(wt, *_GIT_FLAGS, "rebase", "--abort")
+        status = _git_run(wt, "status", "--porcelain", "--untracked-files=no")
+        if status.returncode != 0 or status.stdout.strip():
+            _log.warning("rebase_stale.worktree_dirty_after_abort", run_id=run.id)
+        if "CONFLICT" in output:
+            summary = f"stale after merge of {merged.id}: rebase conflict"
+        else:
+            first = next((l.strip() for l in output.splitlines() if l.strip()), "")[:200]
+            summary = f"stale after merge of {merged.id}: rebase failed: {first}"
+        _fail_stale(act, orc, run, settings, summary=summary, notes=output[-1500:],
+                    lessons=["a sibling merged first; rebuilt once against the new HEAD"])
+        return False
+    state["rebased"] = True
+    names = _git_run(wt, "diff", "--name-only", f"{new_head}..HEAD")
+    changed = ([l.strip() for l in names.stdout.splitlines() if l.strip()]
+               if names.returncode == 0 else [])
+    res = reverify(runner, run_dir_for(Path(wt), workdir), _recorded_argvs(run.verification),
+                   changed_files=changed)
+    if res.verify_returncode != 0:
+        _fail_stale(act, orc, run, settings,
+                    summary=f"stale after merge of {merged.id}: re-verify failed",
+                    lessons=[f"re-verify rc={res.verify_returncode}: {res.verify_output[-300:]}"],
+                    notes=res.verify_output[-1500:])
+        return False
+    old_sha = run.verified_sha
+    run.base_commit_sha = new_head
+    run.verified_sha = _head(wt) or None
+    run.verification = res.verify_log
+    after = _normalized_diff(wt, new_head)
+    identical = before is not None and after is not None and before == after
+    if identical:
+        act.update_run(run)  # what the operator reviewed is unchanged: keep the heartbeat
+    else:
+        _save(act, run)      # a new diff: earlier merge decisions no longer count
+    prop = act.get_proposal(run.proposal_id)
+    _emit(act, run, "run.awaiting_review", diff=diff_artifact(wt, new_head),
+          title=prop.title if prop else run.id, verification=run.verification,
+          verified_sha=run.verified_sha, rebased_from=old_sha, merged_run_id=merged.id)
+    emitted_at = datetime.now(timezone.utc)
+    if identical and was_audited:
+        _wait_clock_advance(emitted_at)  # the carried audit must sort strictly later
+        _grant_audit(act, run)
+    else:
+        _emit(act, run, "run.rebased_needs_audit",
+              reason="diff changed on rebase" if was_audited else "no prior audit")
+    return True
+
+
+def rebase_stale_runs(merged: Run, *, act, orc, runner, settings, repo: str,
+                      workdir: str = ".", exclude_ids=()) -> list[Run]:
+    """After `merged` landed in `repo`: rebase every other run of the repo parked at
+    the merge gate onto the new HEAD and re-verify it (no model call). Returns the runs
+    that failed (conflict, re-verify failure or bookkeeping error after a successful
+    rebase); each of those got exactly one rebuild grant. Runs whose branch or worktree
+    moved since verification are left untouched (run.rebase_skipped)."""
+    failed: list[Run] = []
+    try:
+        new_head = _rev_parse(repo, "HEAD")
+        candidates = list(act.list_open_runs())
+    except (OSError, subprocess.SubprocessError, TypeError) as e:
+        _log.warning("rebase_stale.unavailable", error=type(e).__name__)
+        return failed
+    if not new_head:
+        _log.warning("rebase_stale.no_head", repo=str(repo))
+        return failed
+    skip = set(exclude_ids) | {merged.id}
+    for run in candidates:
+        if run.id in skip or run.phase != RunPhase.awaiting_review:
+            continue
+        prop = act.get_proposal(run.proposal_id)
+        if prop is None or prop.repo != repo:
+            continue
+        state = {"rebased": False}
+        try:
+            reason = _stale_skip_reason(repo, run)
+            if reason:
+                _emit(act, run, "run.rebase_skipped", Severity.warning, reason=reason,
+                      merged_run_id=merged.id)
+                continue
+            if not _rebase_one(run, merged, new_head, act=act, orc=orc, runner=runner,
+                               settings=settings, workdir=workdir, state=state):
+                failed.append(run)
+        except Exception as e:
+            # class name only: a message may carry paths or command output
+            _log.warning("rebase_stale.run_failed", run_id=run.id, error=type(e).__name__)
+            try:
+                if state["rebased"]:
+                    _fail_stale(act, orc, run, settings,
+                                summary=f"stale after merge of {merged.id}: rebase bookkeeping failed",
+                                lessons=[f"rebase bookkeeping raised {type(e).__name__}"])
+                    failed.append(run)
+                else:
+                    _emit(act, run, "run.rebase_skipped", Severity.warning,
+                          reason=f"error: {type(e).__name__}", merged_run_id=merged.id)
+            except Exception as e2:
+                _log.warning("rebase_stale.cleanup_failed", run_id=run.id,
+                             error=type(e2).__name__)
+            continue
+    return failed

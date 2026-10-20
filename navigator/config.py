@@ -31,6 +31,9 @@ class Settings:
     mode: str = "dry_run"
     # N8: apply operator merge decisions while mode == "dry_run" (builds stay off)
     merge_in_dry_run: bool = False
+    # N12d: after a merge, rebase the repo's other runs parked at the merge gate onto the
+    # new HEAD and re-verify them with their recorded commands (no model call)
+    rebase_stale_runs: bool = True
     act_base_url: str | None = None
     orc_base_url: str | None = None
     worktree_root: str = "/tmp/navigator-worktrees"
@@ -63,6 +66,7 @@ class Settings:
             driver=os.getenv("NAVIGATOR_DRIVER", "fake"),
             mode=os.getenv("NAVIGATOR_MODE", "dry_run"),
             merge_in_dry_run=_bool_env("NAVIGATOR_MERGE_IN_DRY_RUN", "0"),
+            rebase_stale_runs=_bool_env("NAVIGATOR_REBASE_STALE_RUNS", "1"),
             act_base_url=os.getenv("NAVIGATOR_ACT_BASE_URL"),
             orc_base_url=os.getenv("NAVIGATOR_ORC_BASE_URL"),
             worktree_root=os.getenv("NAVIGATOR_WORKTREE_ROOT", "/tmp/navigator-worktrees"),

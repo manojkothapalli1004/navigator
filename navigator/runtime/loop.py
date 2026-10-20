@@ -7,7 +7,8 @@ from pathlib import Path
 from navigator.contracts.proposal import Proposal, compute_origin_hash
 from navigator.contracts.enums import (ProposalStatus, RunStatus, RunPhase, ApprovalGate,
                                        ApprovalDecision)
-from navigator.runtime.executor import execute_proposal, merge_after_approval, decline_run
+from navigator.runtime.executor import (execute_proposal, merge_after_approval, decline_run,
+                                        rebase_stale_runs)
 from navigator.runtime.lock import SingleFlightLock
 from navigator.runtime.outcome_store import OutcomeStore
 from navigator.observability.logging import get_logger
@@ -198,7 +199,13 @@ class Navigator:
                 # ACT and are acted on next cycle (live 2026-10-17: every cycle errored)
                 log.info("merge_poll.deferred_lock_held", lock=str(self.lock.path))
                 return []
-            for run in self.act.list_open_runs():
+            seen: set[str] = set()
+            pending = list(self.act.list_open_runs())
+            while pending:
+                run = pending.pop(0)
+                if run.id in seen:
+                    continue
+                seen.add(run.id)
                 if run.phase != RunPhase.awaiting_review:
                     continue
                 prop = self.act.get_proposal(run.proposal_id)
@@ -214,6 +221,20 @@ class Navigator:
                                                squash=self.squash)
                     if run.status != RunStatus.executing:
                         done.append(run)
+                    if (run.status == RunStatus.completed
+                            and getattr(self.settings, "rebase_stale_runs", True)):
+                        # N12d: the repo's other parked runs are now stale; rebase and
+                        # re-verify them (no model call) while this process holds the lock
+                        failed = rebase_stale_runs(run, act=self.act, orc=self.orc,
+                                                   runner=self.runner, settings=self.settings,
+                                                   repo=self.repo, workdir=self.workdir,
+                                                   exclude_ids={r.id for r in done})
+                        done.extend(failed)
+                        seen.update(r.id for r in failed)
+                        log.info("merge_poll.rebased_stale", merged=run.id,
+                                 failed=[r.id for r in failed])
+                        # the rebase changed the runs' recorded state: re-read the rest
+                        pending = [r for r in self.act.list_open_runs() if r.id not in seen]
         return done
 
     def _enter_lock(self, stack: ExitStack) -> bool:
