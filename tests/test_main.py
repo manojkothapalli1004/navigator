@@ -1,7 +1,9 @@
 import json
 import subprocess
+from datetime import datetime
 import pytest
 from navigator.__main__ import build_navigator, main
+from navigator.safety.errors import QuotaExhaustedError
 from navigator.config import Settings
 from navigator.clients.act_client import FakeACTClient, HTTPACTClient
 from navigator.runtime.drivers.fake_driver import FakeSubagentDriver
@@ -284,3 +286,27 @@ def test_repos_file_builds_a_fleet_with_per_repo_runners(tmp_path):
     assert nb.workdir == "backend" and nb.runner.allowlist == ["git status", "uv run --extra dev pytest"]
     assert na.runner.allowlist == s.allowed_commands
     assert na.act is nb.act and na.driver is nb.driver  # one ACT, one model driver
+
+def test_cycle_reports_quota_exhausted_without_the_sdk_text(tmp_path, monkeypatch):
+    # N16: a quota-limited planner tick and a deferred build are reported by class name
+    # and reset time only; the SDK text (which may carry a login URL) never reaches stdout
+    import navigator.__main__ as m
+    nav = build_navigator(_settings(tmp_path, _seed_repo(tmp_path)))
+    iso = "2026-10-20T11:20:00+00:00"
+    def broken_tick(base_commit_sha=None):
+        raise QuotaExhaustedError("You've hit your session limit https://claude.ai/login?token=SECRET",
+                                  marker="session limit", resets_at=iso)
+    def fake_poll():
+        nav.quota_deferral = {"error": "QuotaExhaustedError", "resets_at": iso}
+        nav.quota_paused_until = datetime.fromisoformat(iso)
+        return []
+    monkeypatch.setattr(nav, "periodic_tick", broken_tick)
+    monkeypatch.setattr(nav, "approval_poll", fake_poll)
+    monkeypatch.setattr(nav, "merge_poll", lambda: [])
+    summary = m._cycle(nav, nav.settings)
+    assert summary["planner_error"] == f"QuotaExhaustedError: resets_at={iso}"
+    assert summary["quota_exhausted"] == {"error": "QuotaExhaustedError", "resets_at": iso}
+    assert summary["quota_paused_until"] == iso
+    assert "error" not in summary
+    blob = json.dumps(summary)
+    assert "SECRET" not in blob and "session limit" not in blob and "claude.ai" not in blob
