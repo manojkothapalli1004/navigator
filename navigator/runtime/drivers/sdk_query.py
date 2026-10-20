@@ -3,7 +3,9 @@ import json
 import re
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Callable
+from typing import Callable, NoReturn
+
+from navigator.safety.errors import QuotaExhaustedError
 
 DEFAULT_SYSTEM_PROMPT = (
     "You are a Navigator subagent. Reply with ONLY the requested JSON object \u2014 "
@@ -101,7 +103,10 @@ def make_sdk_query_fn(*, model: str | None = None,
     live, so the outage is over): the next outage again starts with a zero-call
     failure and probes only after the interval. Timeouts, 'not logged in' and
     every other error are never fallen back; if the whole chain fails the last
-    error is raised unchanged.
+    error is raised unchanged. An account-wide error (and an all-cooling failure
+    caused by one) is raised as navigator.safety.errors.QuotaExhaustedError, a
+    RuntimeError subclass with the same message plus .marker and .resets_at (ISO-8601
+    UTC, clamped like the cooldown, or None).
     """
     try:
         from claude_agent_sdk import ClaudeAgentOptions, ResultMessage, query
@@ -219,6 +224,28 @@ def make_sdk_query_fn(*, model: str | None = None,
         _emit(True, _fields(len(text)))
         return text
 
+    def _classify(e: Exception) -> Exception:
+        # N16: an account-wide error becomes QuotaExhaustedError (same message, plus the
+        # marker and a bounded resets_at) so consumers can defer instead of failing;
+        # anything else is returned as it is
+        if isinstance(e, QuotaExhaustedError):
+            return e
+        marker = _account_marker(e)
+        if marker is None:
+            return e
+        wall_now = wall_clock()
+        delay = _reset_delay_s(str(e), wall_now)
+        if delay is None and fallback_enabled:
+            delay = float(cooldown_s)  # the cooldown the chain actually enters
+        return QuotaExhaustedError(str(e), marker=marker,
+                                   resets_at=_resets_at_iso(wall_now, delay))
+
+    def _raise_classified(e: Exception) -> NoReturn:
+        classified = _classify(e)
+        if classified is not e:
+            raise classified from e
+        raise e
+
     def _attempt(prompt: str, use_model) -> str:
         # one bounded retry for model-side flakes (max-turns error results,
         # missing result message, truncated/non-JSON output \u2014 all observed
@@ -231,10 +258,14 @@ def make_sdk_query_fn(*, model: str | None = None,
             raise
         except Exception as e:
             if fallback_enabled and _fallback_marker(e) is not None:
-                raise  # the chain switches model; a same-model retry would only repeat it
+                # the chain switches model; a same-model retry would only repeat it
+                _raise_classified(e)
             if not _is_retryable(e):
-                raise
-            return _query_once(prompt, use_model)
+                _raise_classified(e)
+            try:
+                return _query_once(prompt, use_model)
+            except Exception as e2:
+                _raise_classified(e2)
         if _is_valid_json_object(text):
             return text
         retry = _query_once(prompt, use_model)
@@ -288,7 +319,12 @@ def make_sdk_query_fn(*, model: str | None = None,
         earliest = min(_blocked_until(m, account_until) for m in chain)
         wall = wall_clock() + (earliest - now)
         until_iso = datetime.fromtimestamp(wall, tz=timezone.utc).isoformat(timespec="seconds")
-        return RuntimeError(f"claude-agent-sdk: all models cooling down until {until_iso}")
+        message = f"claude-agent-sdk: all models cooling down until {until_iso}"
+        if account_until > now:
+            # N16: a live account-wide expiry blocks the chain: that is a quota, not a
+            # set of per-model cooldowns
+            return QuotaExhaustedError(message, marker="all models cooling", resets_at=until_iso)
+        return RuntimeError(message)
 
     def _delay_s(e: Exception, marker: str) -> float:
         if marker == "issue with the selected model":
@@ -373,7 +409,7 @@ def make_sdk_query_fn(*, model: str | None = None,
                 # back would only burn more failing calls); otherwise only this model cools
                 _record_failure(use_model, e, marker)
                 if marker in _ACCOUNT_WIDE_MARKERS:
-                    raise
+                    _raise_classified(e)
                 if i == len(candidates) - 1:
                     raise  # chain exhausted: the last error surfaces unchanged
                 _emit_fallback(use_model, candidates[i + 1], marker)
@@ -431,6 +467,22 @@ def _fallback_marker(e: Exception) -> str | None:
     if "not_found_error" in msg and "model" in msg:
         return "not_found_error"
     return None
+
+
+def _account_marker(e: Exception) -> str | None:
+    """The first _ACCOUNT_WIDE_MARKERS entry named in the error text, else None."""
+    msg = str(e).lower()
+    for marker in _ACCOUNT_WIDE_MARKERS:
+        if marker in msg:
+            return marker
+    return None
+
+
+def _resets_at_iso(wall_now: float, delay_s: float | None) -> str | None:
+    """ISO-8601 UTC wall time (seconds) `delay_s` after `wall_now`; None when unknown."""
+    if delay_s is None:
+        return None
+    return datetime.fromtimestamp(wall_now + delay_s, tz=timezone.utc).isoformat(timespec="seconds")
 
 
 def _is_valid_json_object(text: str) -> bool:
