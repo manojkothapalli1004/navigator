@@ -1,6 +1,10 @@
+import json
 import subprocess
 from pathlib import Path
+import pytest
 from navigator.cli import ACTOR
+from navigator.runtime.outcome_store import OutcomeStore
+from navigator.safety.errors import QuotaExhaustedError
 from navigator.runtime.executor import execute_proposal, merge_after_approval
 from navigator.runtime.drivers.fake_driver import FakeSubagentDriver
 from navigator.clients.act_client import FakeACTClient
@@ -299,3 +303,78 @@ def test_code_sha_is_none_when_git_fails(monkeypatch):
     monkeypatch.setattr(executor.subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(
         a, 128, stdout="", stderr="fatal: not a git repository"))
     assert executor.code_sha() is None
+
+
+# --- N16: an account-wide limit defers the run instead of failing it -----------------
+
+RESETS = "2026-10-20T11:20:00+00:00"
+
+
+class _QuotaDriver:
+    def __init__(self, text):
+        self.text = text
+        self.calls = 0
+
+    def run_role(self, request):
+        self.calls += 1
+        raise QuotaExhaustedError(self.text, marker="session limit", resets_at=RESETS)
+
+
+def test_quota_exhausted_defers_the_run_and_grants_one_rebuild(tmp_path):
+    repo, sha = _seed(tmp_path); d = _deps(tmp_path, repo)
+    d["driver"] = _QuotaDriver("You've hit your session limit")
+    p = _proposal(repo, sha)
+    with pytest.raises(QuotaExhaustedError):
+        execute_proposal(p, **d)
+    runs = d["act"].list_runs_for_proposal(p.id)
+    assert len(runs) == 1
+    run = runs[0]
+    assert run.status == RunStatus.aborted and run.phase == RunPhase.finalizing
+    assert run.ended_at is not None
+    assert run.worktree_path is None and not (tmp_path / "wt" / run.id).exists()
+    kinds = [e.kind for e in d["act"].events]
+    assert "run.deferred" in kinds and "run.failed" not in kinds
+    deferred = [e for e in d["act"].events if e.kind == "run.deferred"][0]
+    assert deferred.payload == {"run_id": run.id, "proposal_id": p.id,
+                               "error": "QuotaExhaustedError", "resets_at": RESETS}
+    scheduled = [e for e in d["act"].events if e.kind == "run.rebuild_scheduled"][0]
+    assert scheduled.payload["granted"] is True
+    grants = d["act"].list_approvals(target=p.id, gate=ApprovalGate.review,
+                                     decision=ApprovalDecision.approved)
+    assert len(grants) == 1 and grants[0].actor == ACTOR
+    assert any(sec == "status" and "deferred: quota exhausted until " + RESETS in note
+               for sec, note, _ in d["orc"].updates)
+    assert not any(sec == "known_failures" for sec, _, _ in d["orc"].updates)
+    assert OutcomeStore(d["settings"].outcome_path).for_proposal(p.id)[0].status == "deferred"
+    assert d["driver"].calls == 1
+
+
+def test_quota_deferral_never_records_the_sdk_text(tmp_path, capsys):
+    # the SDK text may carry a token-bearing login URL: no event, outcome, ORC note, log
+    # line or Telegram message may contain it - class name and resets_at only
+    from navigator.observability.notify import NotifyingACT
+    secret = "tok_9f2c1"
+    text = f"You've hit your session limit \u00b7 resets 4:20am https://claude.ai/login?token={secret}"
+    repo, sha = _seed(tmp_path); d = _deps(tmp_path, repo)
+    inner = FakeACTClient()
+    sent = []
+
+    class _Rec:
+        def send(self, t):
+            sent.append(t)
+
+    d["act"] = NotifyingACT(inner, _Rec())
+    d["driver"] = _QuotaDriver(text)
+    p = _proposal(repo, sha)
+    with pytest.raises(QuotaExhaustedError):
+        execute_proposal(p, **d)
+    captured = capsys.readouterr()
+    corpus = [json.dumps([e.model_dump(mode="json") for e in inner.events]),
+              json.dumps(d["orc"].updates),
+              Path(d["settings"].outcome_path).read_text(),
+              captured.out, captured.err, "\n".join(sent)]
+    for blob in corpus:
+        assert secret not in blob and "session limit" not in blob and "claude.ai" not in blob
+    assert len(sent) == 1 and "deferred" in sent[0] and RESETS in sent[0]
+    assert "QuotaExhaustedError" in sent[0]
+    assert "QuotaExhaustedError" in corpus[0]
