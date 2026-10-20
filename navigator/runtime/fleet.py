@@ -13,6 +13,9 @@ class Fleet:
         self._next = 0
         self.last_snapshot_chars = 0
         self.notifier = NullNotifier()
+        # N16: mirrors of the member navigators' quota state after each approval_poll
+        self.quota_deferral = None
+        self.quota_paused_until = None
 
     @property
     def driver(self):
@@ -32,7 +35,13 @@ class Fleet:
         return created
 
     def approval_poll(self) -> list:
-        return [run for nav in self.navigators for run in nav.approval_poll()]
+        runs = [run for nav in self.navigators for run in nav.approval_poll()]
+        self.quota_deferral = next((getattr(n, "quota_deferral", None) for n in self.navigators
+                                    if getattr(n, "quota_deferral", None)), None)
+        self.quota_paused_until = max((getattr(n, "quota_paused_until", None)
+                                       for n in self.navigators
+                                       if getattr(n, "quota_paused_until", None)), default=None)
+        return runs
 
     def merge_poll(self) -> list:
         return [run for nav in self.navigators for run in nav.merge_poll()]

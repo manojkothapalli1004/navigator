@@ -27,6 +27,7 @@ from navigator.runtime.outcome_store import OutcomeStore
 from navigator.runtime.triage import Triage
 from navigator.safety.budget_guard import BudgetGuard
 from navigator.safety.command_runner import CommandRunner
+from navigator.safety.errors import QuotaExhaustedError
 
 def _make_driver(settings: Settings):
     if settings.driver == "fake":
@@ -139,10 +140,21 @@ def _cycle(nav: Navigator, settings: Settings) -> dict:
     # planning failures (LLM limits, timeouts) must not block approved work or merges
     try:
         summary["proposals_created"] = len(nav.periodic_tick())
+    except QuotaExhaustedError as e:
+        # N16: class name + bounded reset time only; the SDK text may carry a login URL
+        summary["proposals_created"] = 0
+        summary["planner_error"] = f"{type(e).__name__}: resets_at={e.resets_at}"
     except Exception as e:
         summary["proposals_created"] = 0
         summary["planner_error"] = f"{type(e).__name__}: {e}"[:300]
     summary["runs_executed"] = len(nav.approval_poll())
+    # N16: a build deferred on an account-wide limit is reported, not counted as a failure
+    deferral = getattr(nav, "quota_deferral", None)
+    if deferral:
+        summary["quota_exhausted"] = dict(deferral)
+    paused = getattr(nav, "quota_paused_until", None)
+    if paused:
+        summary["quota_paused_until"] = paused.isoformat(timespec="seconds")
     _telegram_step(nav, summary)
     summary["runs_finalized"] = len(nav.merge_poll())
     summary["snapshot_chars"] = nav.last_snapshot_chars

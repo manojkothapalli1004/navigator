@@ -4,3 +4,15 @@ class BudgetExceeded(Exception): ...
 class GateNotImplemented(NotImplementedError): ...
 class DriverParseError(Exception): ...
 class GateNotApproved(Exception): ...
+
+
+class QuotaExhaustedError(RuntimeError):
+    """An account-wide claude-agent-sdk limit (today: 'session limit', or every model
+    cooling because of one). str(e) is the SDK's own text and may carry a token-bearing
+    URL: consumers log/notify type(e).__name__ and .resets_at ONLY, never str(e).
+    resets_at is an ISO-8601 UTC string (timespec seconds) or None when unknown."""
+
+    def __init__(self, message: str, *, marker: str, resets_at: str | None = None):
+        super().__init__(message)
+        self.marker = marker
+        self.resets_at = resets_at
