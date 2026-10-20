@@ -19,6 +19,7 @@ from navigator.runtime.drivers.base import DriverResult
 from navigator.runtime.loop import Navigator
 from navigator.safety.command_runner import CommandRunner
 from structlog.testing import capture_logs
+from tests.test_cli import _cli
 
 PY = ["python3", "-m", "py_compile"]
 DEFAULT_BUILDS = {"A": [("a.py", "A = 1\n")], "B": [("b.py", "B = 1\n")]}
@@ -101,6 +102,18 @@ def _grants(nav, run):
 def _audits(nav, run):
     return nav.act.list_approvals(target=run.id, gate=ApprovalGate.review,
                                   decision=ApprovalDecision.approved)
+
+
+def _pending(nav, run):
+    return nav.act.list_approvals(target=run.id, gate=ApprovalGate.merge,
+                                  decision=ApprovalDecision.pending)
+
+
+def _approve_pending(nav, run):
+    """The operator's OK on the run's (single) PENDING merge request."""
+    pending = _pending(nav, run)
+    assert len(pending) == 1
+    nav.act.decide_approval(pending[0].id, ApprovalDecision.approved, actor=ACTOR)
 
 
 def test_sibling_is_rebased_and_reverified_after_merge(tmp_path):
@@ -440,3 +453,96 @@ def test_whitespace_only_diff_change_does_not_carry_the_audit(tmp_path):
     assert [g.actor for g in _audits(nav, b)] == [AUDITOR]  # only the original audit
     assert _grants(nav, b) == []
     assert Path(sb.worktree_path, "wide.py").read_text() == a_wide + "B = 1\n"
+
+
+# ---- N12g: a rebase re-opens the merge gate with a fresh pending request -----------
+# A's trailing space on line 38 sits inside the context of B's hunk, so B rebases
+# cleanly but with a changed diff: the rebase re-opens the run for review (heartbeat
+# moves) and an operator OK given before it no longer counts.
+_WIDE = "".join(f"L{i} = {i}\n" for i in range(1, 41))
+_REBASE_BUILDS = {"A": [("wide.py", _WIDE.replace("L38 = 38\n", "L38 = 38 \n"))],
+                  "B": [("wide.py", _WIDE + "B = 1\n")]}
+
+
+def test_rebase_opens_a_fresh_pending_merge_approval(tmp_path):
+    builds = {**_REBASE_BUILDS, "C": [("c.py", "C = 1\n")]}
+    nav, repo, a, b = _setup(tmp_path, builds, extra_base={"wide.py": _WIDE})
+    c = next(r for r in nav.act.list_open_runs() if r.id not in (a.id, b.id))
+    assert _audited(nav.act, [b.id, "--note", "x"], io.StringIO()) == 0
+    assert is_audited(nav.act, b)
+    _approve_pending(nav, b)  # the operator's OK, given BEFORE A lands
+    assert _pending(nav, b) == []
+    with capture_logs() as logs:
+        done = _merge(nav, a)
+    assert a.id in {r.id for r in done}
+    assert nav.act.runs[a.id].status == RunStatus.completed
+    sb = nav.act.runs[b.id]
+    assert sb.status == RunStatus.executing and sb.phase == RunPhase.awaiting_review
+    assert sb.verified_sha != b.verified_sha and sb.base_commit_sha == _head(repo)
+    # the stale OK is not honoured, and exactly one fresh request is open
+    assert len(_pending(nav, b)) == 1
+    ev = _events(nav, b, "run.awaiting_review")[-1].payload
+    assert ev["rebased"] is True and ev["merge_reapproval_needed"] is True
+    entries = [l for l in logs if l["event"] == "rebase_stale.reapproval_needed"]
+    assert len(entries) == 1 and entries[0]["run_id"] == b.id
+    assert set(entries[0]) - {"event", "log_level"} == {"run_id"}
+    # C was rebased too; its original (never decided) request still serves
+    sc = nav.act.runs[c.id]
+    assert sc.verified_sha != c.verified_sha and sc.phase == RunPhase.awaiting_review
+    assert len(_pending(nav, c)) == 1
+    assert _events(nav, c, "run.awaiting_review")[-1].payload["rebased"] is True
+    # a second rebase of B (after C merges) does not open a second pending request
+    _approve_pending(nav, sc)
+    done = nav.merge_poll()
+    assert nav.act.runs[c.id].status == RunStatus.completed
+    sb2 = nav.act.runs[b.id]
+    assert sb2.phase == RunPhase.awaiting_review and sb2.base_commit_sha == _head(repo)
+    assert sb2.verified_sha != sb.verified_sha
+    assert len(_pending(nav, b)) == 1
+    assert len(_events(nav, b, "run.awaiting_review")) == 3
+    # the fresh request is what the gate honours
+    _approve_pending(nav, sb2)
+    done = nav.merge_poll()
+    assert [r.id for r in done] == [b.id]
+    assert nav.act.runs[b.id].status == RunStatus.completed
+    assert _pending(nav, b) == []
+    assert (repo / "wide.py").read_text() == _REBASE_BUILDS["A"][0][1] + "B = 1\n"
+
+
+def test_rebase_without_prior_ok_flags_no_reapproval(tmp_path):
+    nav, repo, a, b = _setup(tmp_path)
+    assert len(_pending(nav, b)) == 1
+    with capture_logs() as logs:
+        assert [r.id for r in _merge(nav, a)] == [a.id]
+    sb = nav.act.runs[b.id]
+    assert sb.phase == RunPhase.awaiting_review and sb.verified_sha != b.verified_sha
+    # the never-decided request still serves: no second one is opened
+    assert len(_pending(nav, b)) == 1
+    assert len(nav.act.list_approvals(target=b.id, gate=ApprovalGate.merge)) == 1
+    ev = _events(nav, b, "run.awaiting_review")[-1].payload
+    assert ev["rebased"] is True and ev["merge_reapproval_needed"] is False
+    assert not any(l["event"] == "rebase_stale.reapproval_needed" for l in logs)
+    assert [r.id for r in _merge(nav, sb)] == [b.id]
+    assert nav.act.runs[b.id].status == RunStatus.completed
+
+
+def test_cli_merge_works_after_rebase(tmp_path):
+    nav, repo, a, b = _setup(tmp_path, _REBASE_BUILDS, extra_base={"wide.py": _WIDE})
+    _approve_pending(nav, b)  # the only request is decided before the rebase
+    assert _pending(nav, b) == []
+    assert a.id in {r.id for r in _merge(nav, a)}
+    sb = nav.act.runs[b.id]
+    assert sb.phase == RunPhase.awaiting_review and sb.verified_sha != b.verified_sha
+    assert sb.status == RunStatus.executing
+    assert len(_pending(nav, b)) == 1
+    code, out = _cli(nav, "merge", b.id)
+    assert code == 0, out
+    assert _pending(nav, b) == []
+    fresh = [x for x in nav.act.list_approvals(target=b.id, gate=ApprovalGate.merge,
+                                                decision=ApprovalDecision.approved)
+             if x.decided_at and x.decided_at >= sb.heartbeat_at]
+    assert len(fresh) == 1 and fresh[0].actor == ACTOR
+    done = nav.merge_poll()
+    assert [r.id for r in done] == [b.id]
+    assert nav.act.runs[b.id].status == RunStatus.completed
+    assert "B = 1" in (repo / "wide.py").read_text() and _clean(repo)
