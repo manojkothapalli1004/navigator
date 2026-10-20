@@ -14,6 +14,8 @@ from navigator.observability.telegram_proposals import (ProposalCommand,
                                                         handle_operator_message,
                                                         numbered_proposals,
                                                         parse_proposal_command)
+from navigator.runtime import triage
+from navigator.runtime.triage import Triage
 
 CHAT = "4242"
 NOW = 1_800_000_000.0
@@ -129,7 +131,8 @@ def test_approve_by_number_and_short_name():
     act = FakeACTClient()
     a, b, c = _prop(act, "N1: a"), _prop(act, "N2: b"), _prop(act, "N3: c")
     rec = _Recorder()
-    # order: N3, N2, N1 -> '1' is N3
+    handle_operator_message(_msg("all"), act, rec, CHAT, now=NOW)
+    # the list shown: N3, N2, N1 -> '1' is N3
     handle_operator_message(_msg("approve 1 n1"), act, rec, CHAT, now=NOW)
     assert _status(act, a.id) == ProposalStatus.approved
     assert _status(act, b.id) == ProposalStatus.proposed
@@ -140,6 +143,7 @@ def test_approve_by_number_and_short_name():
 def test_decline_range_resolves_against_one_snapshot():
     act = FakeACTClient()
     props = [_prop(act, f"T{i}: t") for i in range(5)][::-1]  # newest first
+    handle_operator_message(_msg("all"), act, _Recorder(), CHAT, now=NOW)
     handle_operator_message(_msg("decline 2-4"), act, _Recorder(), CHAT, now=NOW)
     assert [_status(act, p.id) for p in props] == [
         ProposalStatus.proposed, ProposalStatus.declined, ProposalStatus.declined,
@@ -157,6 +161,7 @@ def test_nothing_changes_when_any_target_is_bad():
     act = FakeACTClient()
     a, _ = _prop(act, "Add tests: x"), _prop(act, "Add tests: y")
     rec = _Recorder()
+    handle_operator_message(_msg("all"), act, rec, CHAT, now=NOW)
     for text in ("approve 1 9", "approve 1 Add", "approve 3-1", "approve 0"):
         handle_operator_message(_msg(text), act, rec, CHAT, now=NOW)
         assert _status(act, a.id) == ProposalStatus.proposed
@@ -214,3 +219,158 @@ def test_act_failure_is_reported_by_class_name_only():
     rec = _Recorder()
     assert handle_operator_message(_msg("status"), Broken(), rec, CHAT, now=NOW) is True
     assert "ConnectionError" in rec.sent[-1] and "secret" not in rec.sent[-1]
+
+
+# ---- N13: numbers bind to the list the operator saw, never to the live order ---------
+
+def _run_triage(act, rec, tmp_path):
+    return Triage(act, query_fn=None, notifier=rec, path=tmp_path / "triage.json").run()
+
+
+def test_numbers_bind_to_the_list_the_operator_saw():
+    act = FakeACTClient()
+    a, b, c = _prop(act, "Add a"), _prop(act, "Add b"), _prop(act, "Add c")
+    rec = _Recorder()
+    handle_operator_message(_msg("status"), act, rec, CHAT, now=NOW)
+    assert "1. [r] Add c" in rec.sent[-1] and "3. [r] Add a" in rec.sent[-1]
+    newer = _prop(act, "N9: newer")  # a milestone: live #1 from now on
+    assert numbered_proposals(act)[0].id == newer.id
+    handle_operator_message(_msg("approve 1"), act, rec, CHAT, now=NOW)
+    assert _status(act, c.id) == ProposalStatus.approved
+    assert _status(act, newer.id) == ProposalStatus.proposed
+    assert _status(act, a.id) == _status(act, b.id) == ProposalStatus.proposed
+    assert "Add c" in rec.sent[-1] and "N9" not in rec.sent[-1]
+
+
+def test_more_pages_the_same_snapshot():
+    act = FakeACTClient()
+    for i in range(5):
+        _prop(act, f"Add {i}")
+    rec = _Recorder()
+    handle_operator_message(_msg("status"), act, rec, CHAT, now=NOW)
+    assert "top 1-3 of 5" in rec.sent[-1]
+    _prop(act, "N9: newer")
+    handle_operator_message(_msg("more"), act, rec, CHAT, now=NOW)
+    assert "top 4-5 of 5" in rec.sent[-1] and "N9" not in rec.sent[-1]
+    assert "4. [r] Add 1" in rec.sent[-1] and "5. [r] Add 0" in rec.sent[-1]
+    handle_operator_message(_msg("status"), act, rec, CHAT, now=NOW)
+    assert "top 1-3 of 6" in rec.sent[-1] and "1. [r] N9: newer" in rec.sent[-1]
+
+
+def test_number_of_a_decided_proposal_is_refused():
+    act = FakeACTClient()
+    a, b, c = _prop(act, "Add a"), _prop(act, "Add b"), _prop(act, "Add c")
+    rec = _Recorder()
+    handle_operator_message(_msg("status"), act, rec, CHAT, now=NOW)
+    act.set_proposal_status(b.id, ProposalStatus.approved)  # #2, decided out of band
+    handle_operator_message(_msg("approve 1 2"), act, rec, CHAT, now=NOW)
+    assert "no longer waiting" in rec.sent[-1] and "nothing changed" in rec.sent[-1]
+    assert "2. Add b" in rec.sent[-1]
+    assert _status(act, c.id) == ProposalStatus.proposed
+    assert _status(act, a.id) == ProposalStatus.proposed
+
+
+def test_numbers_refused_without_a_list():
+    act = FakeACTClient()
+    a = _prop(act, "N1: a")
+    rec = _Recorder()
+    assert handle_operator_message(_msg("approve 1"), act, rec, CHAT, now=NOW) is True
+    assert "send 'status'" in rec.sent[-1] and "nothing changed" in rec.sent[-1]
+    assert _status(act, a.id) == ProposalStatus.proposed
+    handle_operator_message(_msg("approve N1"), act, rec, CHAT, now=NOW)
+    assert _status(act, a.id) == ProposalStatus.approved
+
+
+def test_daemon_top3_push_is_the_list_numbers_refer_to(tmp_path):
+    act = FakeACTClient()
+    a, b, c = _prop(act, "Add a"), _prop(act, "Add b"), _prop(act, "Add c")
+    rec = _Recorder()
+    _run_triage(act, rec, tmp_path)
+    assert "top 1-3 of 3" in rec.sent[-1] and "1. [r] Add c" in rec.sent[-1]
+    newer = _prop(act, "N9: newer")
+    handle_operator_message(_msg("approve 1"), act, rec, CHAT, now=NOW)
+    assert _status(act, c.id) == ProposalStatus.approved
+    assert _status(act, newer.id) == ProposalStatus.proposed
+    assert _status(act, a.id) == _status(act, b.id) == ProposalStatus.proposed
+    assert "Add c" in rec.sent[-1]
+
+
+def test_all_takes_a_fresh_snapshot():
+    act = FakeACTClient()
+    c = _prop(act, "Add c")
+    rec = _Recorder()
+    handle_operator_message(_msg("status"), act, rec, CHAT, now=NOW)
+    newer = _prop(act, "N9: newer")
+    handle_operator_message(_msg("all"), act, rec, CHAT, now=NOW)
+    assert "1. N9: newer" in rec.sent[-1] and "2. Add c" in rec.sent[-1]
+    handle_operator_message(_msg("approve 1"), act, rec, CHAT, now=NOW)
+    assert _status(act, newer.id) == ProposalStatus.approved
+    assert _status(act, c.id) == ProposalStatus.proposed
+
+
+def test_more_renders_decided_entries():
+    act = FakeACTClient()
+    props = [_prop(act, f"Add {i}") for i in range(5)]
+    rec = _Recorder()
+    handle_operator_message(_msg("status"), act, rec, CHAT, now=NOW)
+    act.set_proposal_status(props[1].id, ProposalStatus.approved)  # #4 of the snapshot
+    handle_operator_message(_msg("more"), act, rec, CHAT, now=NOW)
+    lines = rec.sent[-1].splitlines()
+    assert next(l for l in lines if l.startswith("4.")) == "4. [r] Add 1 (decided)"
+    assert next(l for l in lines if l.startswith("5.")) == "5. [r] Add 0"
+
+
+def test_more_after_a_push_restarts_from_the_new_list(tmp_path):
+    act = FakeACTClient()
+    for i in range(8):
+        _prop(act, f"Add {i}")
+    rec = _Recorder()
+    for text in ("status", "more", "more"):
+        handle_operator_message(_msg(text), act, rec, CHAT, now=NOW)
+    assert "top 7-8 of 8" in rec.sent[-1]
+    assert triage.load(tmp_path / "triage.json")["cursor"] == 6
+    _prop(act, "N9: newer")  # the open set changes: the daemon pushes a new top 3
+    _run_triage(act, rec, tmp_path)
+    assert "top 1-3 of 9" in rec.sent[-1] and "1. [r] N9: newer" in rec.sent[-1]
+    assert triage.load(tmp_path / "triage.json")["cursor"] == 6  # the push never pages
+    handle_operator_message(_msg("more"), act, rec, CHAT, now=NOW)
+    assert "top 4-6 of 9" in rec.sent[-1] and "4. [r] Add 5" in rec.sent[-1]
+    handle_operator_message(_msg("more"), act, rec, CHAT, now=NOW)
+    assert "top 7-9 of 9" in rec.sent[-1]
+
+
+def test_range_with_a_decided_entry_is_refused():
+    act = FakeACTClient()
+    a, b, c = _prop(act, "Add a"), _prop(act, "Add b"), _prop(act, "Add c")
+    rec = _Recorder()
+    handle_operator_message(_msg("status"), act, rec, CHAT, now=NOW)
+    act.set_proposal_status(b.id, ProposalStatus.approved)
+    handle_operator_message(_msg("decline 1-3"), act, rec, CHAT, now=NOW)
+    assert "no longer waiting" in rec.sent[-1] and "nothing changed" in rec.sent[-1]
+    assert _status(act, a.id) == ProposalStatus.proposed
+    assert _status(act, c.id) == ProposalStatus.proposed
+
+
+def test_malformed_shown_is_ignored(tmp_path):
+    act = FakeACTClient()
+    a = _prop(act, "N1: a")
+    (tmp_path / "triage.json").write_text(json.dumps({"shown": {"entries": [1, 2]}}))
+    rec = _Recorder()
+    assert handle_operator_message(_msg("approve 1"), act, rec, CHAT, now=NOW) is True
+    assert "send 'status'" in rec.sent[-1] and "nothing changed" in rec.sent[-1]
+    assert _status(act, a.id) == ProposalStatus.proposed
+    assert handle_operator_message(_msg("more"), act, rec, CHAT, now=NOW) is True
+    assert "send 'status'" in rec.sent[-1]
+    assert not any("could not apply" in t for t in rec.sent)
+
+
+def test_empty_list_then_more_and_numbers_say_nothing_waiting():
+    act = FakeACTClient()
+    rec = _Recorder()
+    handle_operator_message(_msg("status"), act, rec, CHAT, now=NOW)
+    assert "nothing waiting for a decision" in rec.sent[-1]
+    handle_operator_message(_msg("more"), act, rec, CHAT, now=NOW)
+    assert "nothing waiting for a decision" in rec.sent[-1]
+    handle_operator_message(_msg("approve 1"), act, rec, CHAT, now=NOW)
+    assert "nothing waiting for a decision" in rec.sent[-1]
+    assert "nothing changed" in rec.sent[-1] and "no list" not in rec.sent[-1]
