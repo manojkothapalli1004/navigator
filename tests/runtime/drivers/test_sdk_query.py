@@ -1,8 +1,11 @@
 import json
+import re
 import sys
 import types
+from datetime import datetime, timezone
 import pytest
 from navigator.runtime.drivers.sdk_query import make_sdk_query_fn
+from navigator.safety.errors import QuotaExhaustedError
 from navigator.runtime.drivers.claude_sdk_driver import ClaudeSDKDriver
 from navigator.runtime.drivers.base import DriverRequest
 from navigator.contracts.enums import Role
@@ -279,3 +282,27 @@ def test_trailing_prose_after_json_is_dropped(monkeypatch):
     _stub_sdk(monkeypatch, captured, results=(
         '{"commands": [["git", "status"]], "summary": "s"}\nNote: "uv run --extra dev pytest" matches.',))
     assert make_sdk_query_fn()("x") == '{"commands": [["git", "status"]], "summary": "s"}'
+
+
+def test_session_limit_without_fallback_is_quota_exhausted(monkeypatch):
+    # N16: no fallback chain, a reset time in the text: one call, QuotaExhaustedError with
+    # a resets_at clamped like the cooldown ([60s, 6h] from now)
+    calls = _stub_sdk_error_result(monkeypatch, "You've hit your session limit \u00b7 resets 10:30pm")
+    with pytest.raises(QuotaExhaustedError) as exc:
+        make_sdk_query_fn()("x")
+    assert calls["n"] == 1
+    assert exc.value.marker == "session limit"
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\+00:00", exc.value.resets_at)
+    remaining = (datetime.fromisoformat(exc.value.resets_at)
+                 - datetime.now(timezone.utc)).total_seconds()
+    assert 60 <= remaining <= 6 * 3600 + 5
+    # no reset time and no fallback chain: the reset is unknown
+    _stub_sdk_error_result(monkeypatch, "You've hit your session limit")
+    with pytest.raises(QuotaExhaustedError) as exc:
+        make_sdk_query_fn()("x")
+    assert exc.value.resets_at is None
+    # per-model credits are never an account-wide quota
+    _stub_sdk_error_result(monkeypatch, "Usage credits are required for this model.")
+    with pytest.raises(RuntimeError) as exc:
+        make_sdk_query_fn()("x")
+    assert not isinstance(exc.value, QuotaExhaustedError)
