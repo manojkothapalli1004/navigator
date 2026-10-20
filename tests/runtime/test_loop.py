@@ -1,12 +1,15 @@
 import subprocess
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from navigator.runtime.loop import Navigator
+from navigator.runtime.loop import Navigator, QUOTA_DEFAULT_PAUSE_S
+from navigator.contracts.proposal import Proposal, compute_origin_hash
+from navigator.safety.errors import QuotaExhaustedError
 from navigator.clients.act_client import FakeACTClient
 from navigator.clients.orc_client import FakeORCClient
 from navigator.runtime.drivers.fake_driver import FakeSubagentDriver
 from navigator.safety.command_runner import CommandRunner
 from navigator.config import Settings
-from navigator.contracts.enums import ProposalStatus, RunStatus
+from navigator.contracts.enums import ProposalStatus, RiskTier, RunStatus
 
 def _seed(tmp_path):
     repo = tmp_path/"repo"; repo.mkdir()
@@ -355,3 +358,60 @@ def test_planner_sees_operator_decisions_for_its_repo_only(tmp_path):
     assert {"title": "liked", "decision": "approved"} in decisions
     assert {"title": "disliked", "decision": "declined"} in decisions
     assert all(d["title"] not in ("other repo", "still open") for d in decisions)
+
+
+# --- N16: a quota-exhausted build pauses execution until the limit lifts -------------
+
+class _QuotaDriver:
+    def __init__(self, resets_at, text="You've hit your session limit"):
+        self.resets_at = resets_at
+        self.text = text
+        self.calls = 0
+
+    def run_role(self, request):
+        self.calls += 1
+        raise QuotaExhaustedError(self.text, marker="session limit", resets_at=self.resets_at)
+
+
+def _approved_proposal(nav, repo, sha):
+    return nav.act.create_proposal(Proposal(
+        title="t", rationale="r", repo=str(repo), base_commit_sha=sha, intended_changes="x",
+        affected_files=["navigator_touch.py"], risk_tier=RiskTier.low, origin="periodic",
+        status="approved",
+        proposal_origin_hash=compute_origin_hash(str(repo), "x", ["navigator_touch.py"],
+                                                 "periodic", None)))
+
+
+def test_quota_deferral_pauses_execution_until_resets_at(tmp_path):
+    repo, sha = _seed(tmp_path)
+    nav = _nav(tmp_path, repo, mode="execute")
+    future = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(timespec="seconds")
+    nav.driver = _QuotaDriver(resets_at=future)
+    p = _approved_proposal(nav, repo, sha)
+    assert nav.approval_poll() == []  # the deferred run did not execute
+    assert nav.quota_deferral == {"error": "QuotaExhaustedError", "resets_at": future}
+    assert nav.quota_paused_until == datetime.fromisoformat(future)
+    runs = nav.act.list_runs_for_proposal(p.id)
+    assert len(runs) == 1 and runs[0].status == RunStatus.aborted
+    assert nav.driver.calls == 1
+    # paused: no execution, no new run, nothing deferred by this poll
+    assert nav.approval_poll() == []
+    assert nav.driver.calls == 1
+    assert nav.quota_deferral is None
+    assert nav.quota_paused_until == datetime.fromisoformat(future)
+    # the pause lapsed: the grant bought exactly one rebuild, which deferred and re-paused
+    nav.quota_paused_until = datetime.now(timezone.utc) - timedelta(seconds=1)
+    assert nav.approval_poll() == []
+    assert nav.driver.calls == 2
+    assert len(nav.act.list_runs_for_proposal(p.id)) == 2
+    assert nav.quota_paused_until == datetime.fromisoformat(future)
+    # no reset time known: pause for about QUOTA_DEFAULT_PAUSE_S
+    (tmp_path / "two").mkdir()
+    repo2, sha2 = _seed(tmp_path / "two")
+    nav2 = _nav(tmp_path / "two", repo2, mode="execute")
+    nav2.driver = _QuotaDriver(resets_at=None)
+    _approved_proposal(nav2, repo2, sha2)
+    assert nav2.approval_poll() == []
+    assert nav2.quota_deferral == {"error": "QuotaExhaustedError", "resets_at": None}
+    remaining = (nav2.quota_paused_until - datetime.now(timezone.utc)).total_seconds()
+    assert 3500 < remaining <= QUOTA_DEFAULT_PAUSE_S
