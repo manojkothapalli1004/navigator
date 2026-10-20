@@ -381,11 +381,70 @@ def _skip_gated(rel: str) -> bool:
     return (_is_test_file(rel) or p.name == "conftest.py"
             or (p.suffix == ".py" and p.name.endswith("_test.py")))
 
-def _added_skips(wt: Path, writes: list[tuple[str, str]]) -> list[str]:
+# The failure message quotes the added skip lines, so a builder that runs with no
+# tools sees exactly what to remove (live 2026-10-19: '<file>: 4' gave the one
+# granted rebuild nothing to act on).
+_SKIP_LINE_NAMES = _SKIP_NAMES | {"SkipTest"}
+_SKIP_LINES_CAP = 10
+_SKIP_LINE_CHARS = 120
+_NO_SKIP_INSTRUCTION = "Do not skip tests; fix the code or the test so it passes."
+
+def _skip_site_lines(source: str) -> list[str]:
+    """Stripped source lines of the skip sites the by-name detector sees (decorators,
+    calls, raised SkipTest, pytestmark markers), in file order, one entry per line.
+    Best effort for the message only: aliased sites seen only by the resolved
+    detector are not listed. Unparseable source falls back to the text regex."""
+    lines = source.splitlines()
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError, RecursionError, MemoryError):
+        return [l.strip() for l in lines if _SKIP_FALLBACK.search(l)]
+    linenos: set[int] = set()
+    try:
+        for node in ast.walk(tree):
+            for dec in getattr(node, "decorator_list", None) or []:
+                func = dec.func if isinstance(dec, ast.Call) else dec
+                if _final_name(func) in _SKIP_LINE_NAMES:
+                    linenos.add(dec.lineno)
+            if isinstance(node, ast.Call):
+                if _final_name(node.func) in _SKIP_LINE_NAMES:
+                    linenos.add(node.lineno)
+            elif isinstance(node, ast.Raise):
+                exc = node.exc.func if isinstance(node.exc, ast.Call) else node.exc
+                if _final_name(exc) in _SKIP_LINE_NAMES:
+                    linenos.add(node.lineno)
+            elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                if node.value is not None and any(_is_pytestmark_target(t) for t in targets):
+                    for sub in ast.walk(node.value):
+                        if (isinstance(sub, (ast.Name, ast.Attribute))
+                                and _final_name(sub) in _SKIP_LINE_NAMES):
+                            linenos.add(sub.lineno)
+    except (RecursionError, MemoryError):
+        return []
+    return [lines[n - 1].strip() for n in sorted(linenos) if 0 < n <= len(lines)]
+
+def _added_skip_lines(new: str, old: str, cap: int = _SKIP_LINES_CAP) -> list[str]:
+    """Skip-site lines of `new` that are not (as text) already skip sites in `old`,
+    in file order, at most `cap`, each truncated to _SKIP_LINE_CHARS."""
+    remaining = Counter(_skip_site_lines(old))
+    out: list[str] = []
+    for line in _skip_site_lines(new):
+        if remaining[line] > 0:
+            remaining[line] -= 1
+            continue
+        out.append(line[:_SKIP_LINE_CHARS])
+        if len(out) >= cap:
+            break
+    return out
+
+def _added_skips(wt: Path, writes: list[tuple[str, str]], with_lines: bool = False) -> list[str]:
     """'<file>: <n>' for each written test file (or conftest.py) where any kind of
     skip site grew versus the file on disk before the write (empty for new files),
     or '<file>: skip analysis incomplete (<reason>)' when the new content could not
-    be fully analysed (fail closed). Must run before writing."""
+    be fully analysed (fail closed). With with_lines, a grown entry also quotes the
+    added skip lines: '<file>: <n> [<line> | <line> ...]' (at most _SKIP_LINES_CAP).
+    Must run before writing."""
     out = []
     for rel, content in writes:
         if not _skip_gated(rel):
@@ -396,7 +455,12 @@ def _added_skips(wt: Path, writes: list[tuple[str, str]]) -> list[str]:
         if incomplete:
             out.append(f"{rel}: skip analysis incomplete ({incomplete})")
         elif grown:
-            out.append(f"{rel}: {sum(grown.values())}")
+            entry = f"{rel}: {sum(grown.values())}"
+            if with_lines:
+                lines = _added_skip_lines(content, original)
+                if lines:
+                    entry += " [" + " | ".join(lines) + "]"
+            out.append(entry)
     return out
 
 _FAILED_TESTS = re.compile(r"(\d+) failed")
@@ -617,7 +681,7 @@ def run_build_and_verify(driver: SubagentDriver, worktree: WorktreeHandle,
     if breakers:
         breakers.check_duration(started)
     # compare against the originals before they are overwritten
-    added_skips = _added_skips(wt, build.file_writes)
+    added_skips = _added_skips(wt, build.file_writes, with_lines=True)
     for n, (relpath, content) in enumerate(build.file_writes, start=1):
         target = _resolve_write_target(wt, relpath)
         cp_before = checkpoint(wt, run_id=run_id, n=n, label=f"pre-write-{relpath}")
@@ -628,7 +692,8 @@ def run_build_and_verify(driver: SubagentDriver, worktree: WorktreeHandle,
     if added_skips:
         # a skipped test verifies nothing; don't let the suite "pass" on them
         res.verify_returncode = 1
-        res.verify_output = "builder added test skips: " + "; ".join(added_skips)
+        res.verify_output = ("builder added test skips: " + "; ".join(added_skips)
+                             + ". " + _NO_SKIP_INSTRUCTION)
         return res
     # verifier - a verify phase with no commands is a failure, not a silent pass
     # commands run in the workdir, so hand the verifier paths relative to it
