@@ -439,7 +439,8 @@ def _grant_rebuild(act, run: Run) -> bool:
 def _fail_stale(act, orc, run: Run, settings, *, summary: str, lessons: list[str],
                 notes: str | None = None) -> None:
     """Fail a sibling that could not be carried over the merge, keep its worktree for
-    inspection and schedule exactly one rebuild."""
+    inspection and schedule exactly one rebuild. Sets run.status first so a caller can
+    tell a failure that raised part-way from one that never started."""
     run.status = RunStatus.failed; run.phase = RunPhase.finalizing
     run.ended_at = datetime.now(timezone.utc); _save(act, run)
     _write_outcome(orc, run, status="failed", summary=summary, lessons=lessons,
@@ -544,8 +545,10 @@ def rebase_stale_runs(merged: Run, *, act, orc, runner, settings, repo: str,
     """After `merged` landed in `repo`: rebase every other run of the repo parked at
     the merge gate onto the new HEAD and re-verify it (no model call). Returns the runs
     that failed (conflict, re-verify failure or bookkeeping error after a successful
-    rebase); each of those got exactly one rebuild grant. Runs whose branch or worktree
-    moved since verification are left untouched (run.rebase_skipped)."""
+    rebase); each of those got exactly one rebuild grant. A sibling whose _fail_stale
+    raised part-way is still returned as failed with its single rebuild grant. Runs
+    whose branch or worktree moved since verification are left untouched
+    (run.rebase_skipped)."""
     failed: list[Run] = []
     try:
         new_head = _rev_parse(repo, "HEAD")
@@ -577,7 +580,19 @@ def rebase_stale_runs(merged: Run, *, act, orc, runner, settings, repo: str,
             # class name only: a message may carry paths or command output
             _log.warning("rebase_stale.run_failed", run_id=run.id, error=type(e).__name__)
             try:
-                if state["rebased"]:
+                if run.status == RunStatus.failed:
+                    # _fail_stale itself raised part-way (ACT/ORC write): the rebase was
+                    # already aborted or the worktree kept; finish the idempotent
+                    # bookkeeping so the run is never failed without its one rebuild.
+                    # _grant_rebuild counts existing grants, so this cannot add a second
+                    # one when the grant had already been created before the raise. The
+                    # outcome note / run.failed event that were not reached are NOT
+                    # retried (an ACT/ORC that just failed must not be hammered).
+                    _save(act, run)
+                    _emit(act, run, "run.rebuild_scheduled", granted=_grant_rebuild(act, run),
+                          recovered_from=type(e).__name__)
+                    failed.append(run)
+                elif state["rebased"]:
                     _fail_stale(act, orc, run, settings,
                                 summary=f"stale after merge of {merged.id}: rebase bookkeeping failed",
                                 lessons=[f"rebase bookkeeping raised {type(e).__name__}"])
