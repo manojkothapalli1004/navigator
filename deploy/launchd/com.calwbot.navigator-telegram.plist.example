@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<!--
+  Always-on Telegram reader for Navigator: python -m navigator telegram-reader.
+
+  Copy to ~/Library/LaunchAgents/com.calwbot.navigator-telegram.plist, replace every
+  /Users/YOU/... placeholder, then:
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.calwbot.navigator-telegram.plist
+
+  Telegram allows ONE getUpdates consumer per bot token. While this reader runs the
+  daemon plist must not set NAVIGATOR_TELEGRAM_COMMANDS=1; this file deliberately sets
+  no such key (the reader refuses to start, exit 2, if it sees the value 1).
+
+  Placeholders only: never put a bot token or chat id in a plist. Credentials live in
+  the env file named by NAVIGATOR_NOTIFY_ENV_FILE (TELEGRAM_BOT_TOKEN, AUTHORIZED_CHAT_ID).
+
+  `navigator doctor` checks the daemon plist only, not this one.
+  Restart after a code change:  launchctl kickstart -k gui/$(id -u)/com.calwbot.navigator-telegram
+  After editing this plist:     launchctl bootout gui/$(id -u)/com.calwbot.navigator-telegram
+                                launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.calwbot.navigator-telegram.plist
+-->
+<dict>
+  <key>Label</key>
+  <string>com.calwbot.navigator-telegram</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/YOU/calwbot/navigator/.venv/bin/python</string>
+    <string>-m</string>
+    <string>navigator</string>
+    <string>telegram-reader</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/YOU/calwbot/navigator</string>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>NAVIGATOR_NOTIFY_ENV_FILE</key>
+    <string>/Users/YOU/calwbot/manojtest/.env</string>
+    <key>NAVIGATOR_ACT_BASE_URL</key>
+    <string>http://127.0.0.1:8090</string>
+    <!--
+      Optional path overrides, normally left out. The defaults are the absolute DEFAULT_*
+      constants in navigator/observability/telegram_inbox.py (DEFAULT_OFFSET_PATH and
+      DEFAULT_INBOX_PATH; the reader lock defaults to <offset path>.reader.lock) and do not
+      depend on WorkingDirectory. If you override, set the SAME values in the daemon plist
+      and when running `navigator inbox`: daemon, reader and CLI must read one offset file
+      and one inbox file, so override all three together or none.
+
+    <key>NAVIGATOR_TELEGRAM_OFFSET_PATH</key>
+    <string>/Users/YOU/calwbot/logs/navigator/telegram_offset</string>
+    <key>NAVIGATOR_TELEGRAM_INBOX_PATH</key>
+    <string>/Users/YOU/calwbot/logs/navigator/telegram_inbox.jsonl</string>
+    <key>NAVIGATOR_TELEGRAM_READER_LOCK</key>
+    <string>/Users/YOU/calwbot/logs/navigator/telegram_offset.reader.lock</string>
+    -->
+  </dict>
+
+  <key>StandardOutPath</key>
+  <string>/Users/YOU/calwbot/logs/navigator/telegram-reader.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/YOU/calwbot/logs/navigator/telegram-reader.err.log</string>
+</dict>
+</plist>
