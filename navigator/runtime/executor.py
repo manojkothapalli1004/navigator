@@ -19,6 +19,7 @@ from navigator.runtime.phases import reverify, run_build_and_verify, run_dir_for
 from navigator.ids import new_id
 from navigator.safety.approval_engine import require_gate
 from navigator.safety.circuit_breakers import CircuitBreakers
+from navigator.safety.errors import QuotaExhaustedError
 
 # Operator identities whose merge approvals the gate honours: the navigator CLI and
 # the Telegram inbox. Imported from their definitions so a renamed actor cannot
@@ -85,8 +86,36 @@ def code_sha() -> str | None:
             _code_sha_cache = None
     return _code_sha_cache
 
+def _defer_quota(act, orc, run: Run, handle, e: QuotaExhaustedError, settings) -> None:
+    """N16: an account-wide limit means the build did not happen. The run is aborted (not
+    failed), its worktree removed, a 'deferred' outcome written, run.deferred emitted and
+    one rebuild granted. Only the class name and resets_at are recorded: str(e) is the
+    SDK's text and may carry a token-bearing URL."""
+    try:
+        remove_worktree(handle)
+    except Exception:
+        pass
+    run.worktree_path = None
+    run.status = RunStatus.aborted; run.phase = RunPhase.finalizing
+    run.ended_at = datetime.now(timezone.utc); _save(act, run)
+    _write_outcome(orc, run, status="deferred",
+                   summary=f"deferred: quota exhausted until {e.resets_at or 'unknown'}",
+                   lessons=[f"{type(e).__name__}: account-wide limit; rebuild granted"],
+                   settings=settings)
+    _emit(act, run, "run.deferred", Severity.warning, error=type(e).__name__,
+          resets_at=e.resets_at)
+    granted = _grant_rebuild(act, run)
+    _emit(act, run, "run.rebuild_scheduled", granted=granted)
+    _log.warning("execute.quota_deferred", run_id=run.id, error=type(e).__name__,
+                 resets_at=e.resets_at)
+
 def execute_proposal(proposal: Proposal, *, act, orc, driver, runner, settings,
                      workdir: str = ".") -> Run:
+    """Build and verify `proposal` in a fresh worktree; the run parks at the merge gate.
+
+    Raises QuotaExhaustedError after deferring the run (status aborted, outcome deferred,
+    run.deferred event, one rebuild grant) so the caller can pause until resets_at.
+    """
     # Ensure the proposal is registered in ACT so _repo_for can resolve it
     if act.get_proposal(proposal.id) is None:
         proposal = act.create_proposal(proposal)
@@ -128,6 +157,10 @@ def execute_proposal(proposal: Proposal, *, act, orc, driver, runner, settings,
                       "affected_files": list(proposal.affected_files),
                       **_previous_failure(settings, proposal.id)},
             breakers=breakers, started_monotonic=started, workdir=workdir)
+    except QuotaExhaustedError as e:
+        # the run is finalized here; the re-raise lets the loop pause until resets_at
+        _defer_quota(act, orc, run, handle, e, settings)
+        raise
     except Exception as e:
         preserve_failed(handle)
         run.status = RunStatus.failed; run.phase = RunPhase.finalizing
