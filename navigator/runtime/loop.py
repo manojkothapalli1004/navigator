@@ -13,8 +13,12 @@ from navigator.runtime.lock import SingleFlightLock
 from navigator.runtime.outcome_store import OutcomeStore
 from navigator.observability.logging import get_logger
 from navigator.observability.notify import NullNotifier
+from navigator.safety.errors import QuotaExhaustedError
 
 log = get_logger("navigator.loop")
+
+# N16: how long execution pauses after a QuotaExhaustedError that names no reset time
+QUOTA_DEFAULT_PAUSE_S = 3600
 
 class Navigator:
     def __init__(self, *, act, orc, driver, runner, settings, repo: str, lock_path,
@@ -34,6 +38,11 @@ class Navigator:
         self.lock = SingleFlightLock(lock_path)
         self.notifier = NullNotifier()
         self.last_snapshot_chars = 0
+        # N16: set when a build was deferred on an account-wide limit; approval_poll
+        # executes nothing until quota_paused_until. quota_deferral describes the
+        # deferral of the LAST poll only (class name + resets_at, never SDK text).
+        self.quota_paused_until: datetime | None = None
+        self.quota_deferral: dict | None = None
 
     def perceive(self, base_commit_sha: str, open_proposals: list[Proposal] | None = None) -> dict:
         if open_proposals is None:
@@ -152,19 +161,48 @@ class Navigator:
             created.append(self.act.create_proposal(p))
         return created  # dry_run stops here: no worktree/git mutation
 
+    def _quota_pause_from(self, e: QuotaExhaustedError) -> datetime:
+        """When execution may resume after `e`: its resets_at, else the default pause."""
+        if e.resets_at:
+            try:
+                until = datetime.fromisoformat(e.resets_at)
+            except ValueError:
+                until = None
+            if until is not None:
+                return until if until.tzinfo is not None else until.replace(tzinfo=timezone.utc)
+        return datetime.now(timezone.utc) + timedelta(seconds=QUOTA_DEFAULT_PAUSE_S)
+
     def approval_poll(self) -> list:
+        self.quota_deferral = None
         if self.settings.mode != "execute":
             return []
         runs = []
         with self.lock.acquire():
+            if (self.quota_paused_until is not None
+                    and datetime.now(timezone.utc) < self.quota_paused_until):
+                # N16: the account limit has not lifted yet: no build, no SDK call
+                log.info("approval_poll.quota_paused",
+                         until=self.quota_paused_until.isoformat(timespec="seconds"))
+                return runs
+            self.quota_paused_until = None
             for p in self._mine(self.act.list_proposals(status=ProposalStatus.approved)):
                 # Correction 3: dedup guard — skip proposals that already have a run
                 # (any status: a completed run must also block re-execution)
                 if not self._may_run(p.id):
                     continue
-                run = execute_proposal(p, act=self.act, orc=self.orc, driver=self.driver,
-                                       runner=self.runner, settings=self.settings,
-                                       workdir=self.workdir)
+                try:
+                    run = execute_proposal(p, act=self.act, orc=self.orc, driver=self.driver,
+                                           runner=self.runner, settings=self.settings,
+                                           workdir=self.workdir)
+                except QuotaExhaustedError as e:
+                    # N16: the run was deferred (aborted + one rebuild grant); every later
+                    # proposal would fail the same way, so pause until the limit lifts.
+                    # Class name and resets_at only: str(e) may carry a token-bearing URL.
+                    self.quota_paused_until = self._quota_pause_from(e)
+                    self.quota_deferral = {"error": type(e).__name__, "resets_at": e.resets_at}
+                    log.warning("approval_poll.quota_exhausted", error=type(e).__name__,
+                                resets_at=e.resets_at)
+                    break
                 # Correction 3: proposal stays approved; the dedup guard above prevents re-execution
                 runs.append(run)
         return runs
