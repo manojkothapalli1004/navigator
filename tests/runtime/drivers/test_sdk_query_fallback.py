@@ -14,6 +14,7 @@ import pytest
 
 from navigator.runtime.drivers.sdk_query import (_ACCOUNT_KEY, _PROBE_KEY, make_sdk_query_fn,
                                                  model_chain)
+from navigator.safety.errors import QuotaExhaustedError
 
 FABLE, OPUS, SONNET = "claude-fable-5-1", "claude-opus-5-5", "claude-sonnet-5-5"
 CHAIN = (OPUS, SONNET)
@@ -866,3 +867,94 @@ def test_legacy_account_wide_model_entries_still_block_everyone_and_clear_on_pro
     assert fn("x") == GOOD
     assert calls == [FABLE]
     assert cooldowns == {}
+
+
+# --- N16: account-wide limits raise QuotaExhaustedError (class + bounded resets_at) ---
+
+
+def _iso(ts):
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat(timespec="seconds")
+
+
+def test_session_limit_is_quota_exhausted_with_bounded_resets_at(monkeypatch):
+    assert _iso(ONE_AM_ET + 12000) == "2026-10-15T08:20:00+00:00"
+    assert _iso(WALL + 3600) == "1970-01-12T14:46:40+00:00"
+    calls = _install(monkeypatch, {FABLE: [("error", SESSION_RESET)], OPUS: [("ok", GOOD)],
+                                   SONNET: [("ok", GOOD)]})
+    cooldowns = {}
+    log = _Log()
+    fn = _fn(cooldown_s=3600, cooldowns=cooldowns, clock=lambda: 0.0,
+             wall_clock=lambda: ONE_AM_ET, logger=log)
+    with pytest.raises(QuotaExhaustedError) as exc:
+        fn("x")
+    assert isinstance(exc.value, RuntimeError)
+    assert str(exc.value) == f"claude-agent-sdk error result: {SESSION_RESET}"
+    assert exc.value.marker == "session limit"
+    assert exc.value.resets_at == "2026-10-15T08:20:00+00:00"  # 4:20am EDT, as the cooldown
+    assert calls == [FABLE]
+    assert cooldowns == {_ACCOUNT_KEY: 12000.0}
+    assert log.kinds() == ["sdk_query.failed", "sdk_query.account_cooldown"]
+    assert SESSION_RESET not in str(log.events[1][1])
+    # no reset time in the text: resets_at is the cooldown the chain actually entered
+    calls = _install(monkeypatch, {FABLE: [("error", SESSION)], OPUS: [("ok", GOOD)],
+                                   SONNET: [("ok", GOOD)]})
+    with pytest.raises(QuotaExhaustedError) as exc:
+        _fn(cooldown_s=3600, cooldowns={}, clock=lambda: 0.0, wall_clock=lambda: WALL)("x")
+    assert exc.value.resets_at == "1970-01-12T14:46:40+00:00"
+    assert calls == [FABLE]
+
+
+def test_all_cooling_caused_by_an_account_block_is_quota_exhausted(monkeypatch):
+    assert _iso(WALL + 3590) == "1970-01-12T14:46:30+00:00"
+    calls = _install(monkeypatch, {FABLE: [("ok", GOOD)]})
+    cooldowns = {_ACCOUNT_KEY: 3600.0}
+    with pytest.raises(QuotaExhaustedError) as exc:
+        _fn(cooldowns=cooldowns, clock=lambda: 10.0, wall_clock=lambda: WALL)("x")
+    assert calls == []  # zero SDK calls
+    assert str(exc.value) == "claude-agent-sdk: all models cooling down until 1970-01-12T14:46:30+00:00"
+    assert exc.value.resets_at == "1970-01-12T14:46:30+00:00"
+    assert exc.value.marker == "all models cooling"
+    # a legacy (expiry, True) model entry is an account-wide block too
+    legacy = {FABLE: (500.0, False), OPUS: (50.0, False), SONNET: (900.0, True)}
+    with pytest.raises(QuotaExhaustedError):
+        _fn(cooldowns=legacy, clock=lambda: 10.0, wall_clock=lambda: WALL)("x")
+    assert calls == []
+
+
+def test_all_cooling_from_model_only_cooldowns_is_not_quota_exhausted(monkeypatch):
+    calls = _install(monkeypatch, {FABLE: [("ok", GOOD)]})
+    cooldowns = {FABLE: (500.0, False), OPUS: (50.0, False), SONNET: (900.0, False)}
+    with pytest.raises(RuntimeError, match=ALL_COOLING) as exc:
+        _fn(cooldowns=cooldowns, clock=lambda: 10.0, wall_clock=lambda: WALL)("x")
+    assert not isinstance(exc.value, QuotaExhaustedError)
+    assert calls == []
+
+
+def test_failed_probe_raises_quota_exhausted(monkeypatch):
+    # the live _ACCOUNT_KEY leaves no candidates; 400 - 0 >= 300 so the probe fires on
+    # FABLE; SESSION refreshes _ACCOUNT_KEY to 4000 and the all-cooling error is raised
+    calls = _install(monkeypatch, {FABLE: [("error", SESSION)], OPUS: [("ok", GOOD)],
+                                   SONNET: [("ok", GOOD)]})
+    now = {"t": 400.0}
+    cooldowns = {_ACCOUNT_KEY: 3600.0, _PROBE_KEY: 0.0}
+    fn = _fn(cooldown_s=3600, cooldowns=cooldowns, clock=lambda: now["t"], logger=_Log())
+    with pytest.raises(QuotaExhaustedError) as exc:
+        fn("x")
+    assert calls == [FABLE]
+    assert cooldowns == {_ACCOUNT_KEY: 4000.0, _PROBE_KEY: 400.0}
+    assert exc.value.resets_at == "1970-01-12T14:46:40+00:00"  # WALL + (4000 - 400)
+    assert str(exc.value).startswith("claude-agent-sdk: all models cooling down until ")
+    # the cause keeps the text; the class carries none in its attributes
+    assert exc.value.__cause__ is not None and "session limit" in str(exc.value.__cause__)
+    assert SESSION not in exc.value.resets_at
+
+
+def test_credits_errors_are_never_quota_exhausted(monkeypatch):
+    calls = _install(monkeypatch, {FABLE: [("error", CREDITS)], OPUS: [("error", CREDITS)],
+                                   SONNET: [("error", CREDITS)]})
+    cooldowns = {}
+    with pytest.raises(RuntimeError, match="Usage credits") as exc:
+        _fn(cooldowns=cooldowns, clock=lambda: 0.0)("x")
+    assert not isinstance(exc.value, QuotaExhaustedError)
+    assert calls == [FABLE, OPUS, SONNET]
+    assert _ACCOUNT_KEY not in cooldowns
