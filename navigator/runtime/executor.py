@@ -515,6 +515,20 @@ def _recorded_argvs(verification) -> list[list[str]]:
     return out
 
 
+def _stale_operator_ok(act, run: Run) -> bool:
+    """N12g: True if an OPERATOR's approved merge approval for the run was decided
+    before the run's current heartbeat (the _save that re-opened it for review after a
+    rebase): that OK no longer counts (_operator_approved ignores it), so the operator
+    has to approve the fresh pending request."""
+    opened = _as_utc(run.heartbeat_at)
+    for appr in _approved_merge_approvals(act, run):
+        decided = getattr(appr, "decided_at", None)
+        if (appr.actor in _OPERATOR_ACTORS and decided is not None
+                and _as_utc(decided) < opened):
+            return True
+    return False
+
+
 def _rebase_one(run: Run, merged: Run, new_head: str, *, act, orc, runner, settings,
                 workdir: str, state: dict) -> bool:
     """Rebase one parked sibling onto new_head and re-verify it. True if the run is
@@ -559,10 +573,21 @@ def _rebase_one(run: Run, merged: Run, new_head: str, *, act, orc, runner, setti
         act.update_run(run)  # what the operator reviewed is unchanged: keep the heartbeat
     else:
         _save(act, run)      # a new diff: earlier merge decisions no longer count
+    # N12g (live 2026-10-20): an operator OK decided before the rebase moved the
+    # heartbeat is ignored by the merge gate, and the run's only merge request had
+    # already been decided, so `navigator merge` found nothing to approve. Open ONE
+    # fresh pending request (never a second while one is pending) and say so.
+    if not act.list_approvals(target=run.id, gate=ApprovalGate.merge,
+                              decision=ApprovalDecision.pending):
+        act.create_approval(target=run.id, gate=ApprovalGate.merge)
+    reapproval = _stale_operator_ok(act, run)
+    if reapproval:
+        _log.info("rebase_stale.reapproval_needed", run_id=run.id)
     prop = act.get_proposal(run.proposal_id)
     _emit(act, run, "run.awaiting_review", diff=diff_artifact(wt, new_head),
           title=prop.title if prop else run.id, verification=run.verification,
-          verified_sha=run.verified_sha, rebased_from=old_sha, merged_run_id=merged.id)
+          verified_sha=run.verified_sha, rebased_from=old_sha, merged_run_id=merged.id,
+          rebased=True, merge_reapproval_needed=reapproval)
     emitted_at = datetime.now(timezone.utc)
     if identical and was_audited:
         _wait_clock_advance(emitted_at)  # the carried audit must sort strictly later
