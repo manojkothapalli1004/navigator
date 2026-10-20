@@ -16,15 +16,17 @@ forwarded and is less than an hour old (the clock is injectable for tests). A
 shorthand is resolved at apply time against live ACT state with every check the
 full-id form applies; zero or several candidates apply nothing and get a reply.
 
-poll_messages(long_poll_s) is the always-on reader's entry point (N11,
+poll_updates(long_poll_s) is the always-on reader's entry point (N11,
 telegram_reader.py): same filtering, inbox file and offset as poll_once, but
-Telegram holds the request up to long_poll_s and the raw operator messages come
-back for telegram_proposals.handle_operator_message, so status/approve/decline are
-answered at once instead of once per daemon cycle.
+Telegram holds the request up to long_poll_s and (update_id, raw message) pairs
+come back for telegram_proposals.handle_operator_message, so status/approve/
+decline are answered at once instead of once per daemon cycle; the update_id is
+what a merge decision event records. poll_messages(long_poll_s) is the same poll
+without the update ids: the raw authorized text messages only.
 
 Navigator must be the only getUpdates consumer of the bot: Telegram answers a
-second consumer with HTTP 409, which poll_once and poll_messages report as
-TelegramError('another Telegram getUpdates consumer is active'). Every network
+second consumer with HTTP 409, which poll_once, poll_updates and poll_messages
+report as TelegramError('another Telegram getUpdates consumer is active'). Every network
 failure becomes a TelegramError with a fixed message: the URL carries the bot
 token and must never reach a log, a summary or a notification.
 
