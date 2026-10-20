@@ -10,8 +10,12 @@ _METACHARS = set(";|&$`><\n*?!")
 _REJECTED_FLAGS = {"--no-index"}
 # Exact flag allowlist for LLM-issued git commands (trusted runtime git calls
 # bypass the runner). Any other dashed token in a git argv is rejected.
+# status: only the exact value-bearing spellings --untracked-files=no / -uno (hides
+# untracked files; live 2026-10: verifiers copy executor.py). The two-token form
+# `--untracked-files no`, bare `-u`, and any other value (=all, =normal, -uall)
+# stay rejected.
 _GIT_SAFE_FLAGS = {
-    "status": {"--porcelain", "-s", "--short", "-b", "--"},
+    "status": {"--porcelain", "-s", "--short", "-b", "--", "--untracked-files=no", "-uno"},
     "diff": {"--stat", "--name-only", "--name-status", "--cached", "--staged", "--"},
     "log": {"--oneline", "--name-only", "--stat", "-1", "-5", "-10", "-20", "--"},
 }

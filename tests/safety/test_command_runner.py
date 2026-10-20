@@ -250,3 +250,60 @@ def test_git_global_options_rejected_even_with_bare_git_allowlisted(tmp_path, ar
     r = CommandRunner(allowlist=["git"], worktree_root=tmp_path)
     with pytest.raises(CommandRejected, match="global option"):
         r.run(argv, cwd=tmp_path)
+
+
+# --- N14: git status --untracked-files=no / -uno (exact tokens only) ---
+
+def test_git_status_untracked_files_no_accepted(tmp_path):
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
+    (tmp_path / "junk.txt").write_text("untracked\n")
+    r = _runner(tmp_path)
+    # control: without the flag the untracked file is listed
+    ctl = r.run(["git", "status", "--porcelain"], cwd=tmp_path)
+    assert ctl.returncode == 0, ctl.stderr
+    assert "junk.txt" in ctl.stdout
+    res = r.run(["git", "status", "--porcelain", "--untracked-files=no"], cwd=tmp_path)
+    assert res.returncode == 0, res.stderr
+    assert "junk.txt" not in res.stdout  # the value reached git
+    res2 = r.run(["git", "status", "--porcelain", "-uno"], cwd=tmp_path)
+    assert res2.returncode == 0, res2.stderr
+    assert "junk.txt" not in res2.stdout
+
+
+@pytest.mark.parametrize("token", [
+    "--untracked-files=all", "--untracked-files=normal", "--untracked-files=",
+    "--untracked-files", "-u", "-uall", "-unormal", "-u=no",
+])
+def test_git_status_untracked_files_other_values_rejected(tmp_path, token):
+    with pytest.raises(CommandRejected) as exc:
+        _runner(tmp_path).run(["git", "status", "--porcelain", token], cwd=tmp_path)
+    msg = str(exc.value)
+    assert msg.startswith("git flag not on safe list for 'git status'")
+    assert repr(token) in msg
+
+
+def test_git_status_two_token_untracked_form_rejected(tmp_path):
+    with pytest.raises(CommandRejected) as exc:
+        _runner(tmp_path).run(["git", "status", "--untracked-files", "no"], cwd=tmp_path)
+    assert "'--untracked-files'" in str(exc.value)
+
+
+def test_untracked_flag_only_for_git_status(tmp_path):
+    with pytest.raises(CommandRejected, match="'git diff'"):
+        _runner(tmp_path).run(["git", "diff", "--untracked-files=no"], cwd=tmp_path)
+    with pytest.raises(CommandRejected, match="'git log'"):
+        _runner(tmp_path).run(["git", "log", "-uno"], cwd=tmp_path)
+    _repo_with_commits(tmp_path)
+    assert _runner(tmp_path).run(["git", "log", "--oneline"], cwd=tmp_path).returncode == 0
+
+
+def test_git_status_rejection_and_allowlist_text_list_untracked_flags(tmp_path):
+    with pytest.raises(CommandRejected) as exc:
+        _runner(tmp_path).run(["git", "status", "--all"], cwd=tmp_path)
+    msg = str(exc.value)
+    assert "--untracked-files=no" in msg and "-uno" in msg and "'--all'" in msg
+    from navigator.safety.command_runner import git_flag_allowlist_text
+    text = git_flag_allowlist_text()
+    assert "git status: " in text and "--untracked-files=no" in text and "-uno" in text
+    diff_line = text.split("git diff: ")[1].split(";")[0]
+    assert "--untracked-files=no" not in diff_line
