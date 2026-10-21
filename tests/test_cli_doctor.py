@@ -3,13 +3,17 @@ import json
 import os
 import plistlib
 import subprocess
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 
 from navigator import cli
 from navigator.cli import run_cli
+from navigator.clients.act_client import FakeACTClient
 from navigator.config import RepoConfig, Settings, effective_repos
+from navigator.contracts.enums import ApprovalDecision, ApprovalGate
+from navigator.contracts.run import Run
 
 SECRET_KEY = "sk-ant-supersecret-value-123"
 SECRET_AUTH = "auth-hidden-value-456"
@@ -394,3 +398,136 @@ def test_environ_restored_even_if_chdir_back_fails(tmp_path, monkeypatch):
     assert "FAIL settings: OSError" in text
     assert dict(os.environ) == before
     assert "ONLY_IN_PLIST" not in os.environ
+
+
+# ---- stale pending merge approvals -------------------------------------------
+
+STALE_ENV = "NAVIGATOR_STALE_APPROVAL_HOURS"
+
+
+@pytest.fixture
+def _no_stale_env(monkeypatch):
+    monkeypatch.delenv(STALE_ENV, raising=False)
+
+
+def _act_with_pending_merge():
+    act = FakeACTClient()
+    run = act.create_run(Run(proposal_id="p", base_commit_sha="abc", branch="nav/run-x"))
+    approval = act.create_approval(target=run.id, gate=ApprovalGate.merge)
+    return act, run, approval
+
+
+def _doctor_with_act(tmp_path, repo, act):
+    out = io.StringIO()
+    plist = _plist(tmp_path, {"NAVIGATOR_REPO": str(repo)})
+    rc = run_cli(["doctor", "--plist", str(plist)], act=act, out=out)
+    return rc, out.getvalue()
+
+
+def _stale_lines(text):
+    return [line for line in text.splitlines() if line.startswith(cli._STALE_PREFIX)]
+
+
+def _two_days_later():
+    return datetime.now(timezone.utc) + timedelta(hours=48)
+
+
+def test_doctor_without_act_skips_stale_check(tmp_path):
+    repo = _git_repo(tmp_path)
+    rc, text = _doctor(_plist(tmp_path, {"NAVIGATOR_REPO": str(repo)}))
+    assert rc == 0, text
+    assert "skip stale merge approvals (no ACT client)" in text
+    assert _stale_lines(text) == []
+
+
+def test_fresh_pending_approval_is_not_flagged(tmp_path, _no_stale_env):
+    repo = _git_repo(tmp_path)
+    act, run, _ = _act_with_pending_merge()
+    rc, text = _doctor_with_act(tmp_path, repo, act)
+    assert rc == 0, text
+    assert _stale_lines(text) == []
+    assert "no pending merge approval older than 24h" in text
+
+
+def test_stale_pending_approval_warns_once_naming_the_run(tmp_path, monkeypatch, _no_stale_env):
+    repo = _git_repo(tmp_path)
+    act, run, approval = _act_with_pending_merge()
+    monkeypatch.setattr(cli, "_now", _two_days_later)
+    rc, text = _doctor_with_act(tmp_path, repo, act)
+    assert rc == 0, text  # a warning, never a doctor failure
+    lines = _stale_lines(text)
+    assert len(lines) == 1
+    assert run.id in lines[0] and approval.id in lines[0]
+    assert "> 24h" in lines[0]
+    assert "doctor: ok" in text
+
+
+def test_decided_approval_is_not_flagged(tmp_path, monkeypatch, _no_stale_env):
+    repo = _git_repo(tmp_path)
+    act, run, approval = _act_with_pending_merge()
+    act.decide_approval(approval.id, ApprovalDecision.approved, actor=cli.ACTOR)
+    monkeypatch.setattr(cli, "_now", _two_days_later)
+    _, text = _doctor_with_act(tmp_path, repo, act)
+    assert _stale_lines(text) == []
+
+
+def test_stale_threshold_env_override(tmp_path, monkeypatch):
+    repo = _git_repo(tmp_path)
+    act, run, _ = _act_with_pending_merge()
+    monkeypatch.setattr(cli, "_now", _two_days_later)
+    monkeypatch.setenv(STALE_ENV, "100")
+    _, text = _doctor_with_act(tmp_path, repo, act)
+    assert _stale_lines(text) == []
+    assert "older than 100h" in text
+    monkeypatch.setenv(STALE_ENV, "1")
+    _, text = _doctor_with_act(tmp_path, repo, act)
+    lines = _stale_lines(text)
+    assert len(lines) == 1 and run.id in lines[0] and "> 1h" in lines[0]
+
+
+@pytest.mark.parametrize("raw", ["abc", "-3", "0", "inf", "nan"])
+def test_unusable_stale_threshold_warns_and_uses_default(tmp_path, monkeypatch, raw):
+    repo = _git_repo(tmp_path)
+    act, run, _ = _act_with_pending_merge()
+    monkeypatch.setattr(cli, "_now", _two_days_later)
+    monkeypatch.setenv(STALE_ENV, raw)
+    rc, text = _doctor_with_act(tmp_path, repo, act)
+    assert rc == 0, text
+    assert f"WARN {STALE_ENV}: not a positive number, using 24h" in text
+    assert len(_stale_lines(text)) == 1
+
+
+def test_stale_check_is_read_only(tmp_path, monkeypatch, _no_stale_env):
+    repo = _git_repo(tmp_path)
+    act, run, approval = _act_with_pending_merge()
+    monkeypatch.setattr(cli, "_now", _two_days_later)
+    _doctor_with_act(tmp_path, repo, act)
+    pending = act.list_approvals(target=run.id, gate=ApprovalGate.merge,
+                                 decision=ApprovalDecision.pending)
+    assert [a.id for a in pending] == [approval.id]
+    assert pending[0].decision == ApprovalDecision.pending
+
+
+def test_act_failure_in_stale_check_prints_class_name_only(tmp_path, _no_stale_env):
+    repo = _git_repo(tmp_path)
+
+    class Broken:
+        def list_open_runs(self):
+            raise RuntimeError("http://u:SECRETX@act.local")
+
+    rc, text = _doctor_with_act(tmp_path, repo, Broken())
+    assert rc == 0, text
+    assert "WARN stale merge approvals unreadable: RuntimeError" in text
+    assert "SECRETX" not in text
+
+
+def test_approval_created_at_comes_from_ulid_id():
+    act, _, approval = _act_with_pending_merge()
+    created = cli._approval_created_at(approval)
+    assert created is not None and created.tzinfo is not None
+    assert abs((datetime.now(timezone.utc) - created).total_seconds()) < 60
+
+    class NoId:
+        id = "approval-not-a-ulid"
+
+    assert cli._approval_created_at(NoId()) is None
