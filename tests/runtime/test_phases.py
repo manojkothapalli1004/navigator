@@ -6,7 +6,8 @@ from pathlib import Path
 import pytest
 from navigator.runtime.worktree import create_worktree
 from navigator.runtime.phases import (run_build_and_verify, _resolve_write_target, _added_skips, _skip_sites,
-                                      _skip_sites_by_name, _skip_sites_resolved, _skip_growth)
+                                      _skip_sites_by_name, _skip_sites_resolved, _skip_growth,
+                                      _NO_SKIP_INSTRUCTION)
 from navigator.runtime.drivers.base import DriverRequest, DriverResult
 from navigator.runtime.drivers.fake_driver import FakeSubagentDriver
 from navigator.safety.command_runner import CommandRunner
@@ -347,7 +348,9 @@ def test_new_test_file_with_a_skip_fails_verification_without_running_commands(t
     res = run_build_and_verify(driver=drv, worktree=h, run_id="run-sk1", runner=runner,
                                proposal={"affected_files": []})
     assert res.verify_returncode == 1
-    assert res.verify_output == "builder added test skips: test_new.py: 1"
+    assert res.verify_output.startswith("builder added test skips: test_new.py: 1")
+    assert _SKIP_CALL + "'no api')" in res.verify_output
+    assert res.verify_output.endswith(_NO_SKIP_INSTRUCTION)
     assert runner.calls == []
 
 def test_existing_skip_left_unchanged_passes(tmp_path):
@@ -682,6 +685,42 @@ def test_incomplete_analysis_blocks_the_run(tmp_path, monkeypatch):
     res = run_build_and_verify(driver=drv, worktree=h, run_id="run-sk5", runner=runner,
                                proposal={"affected_files": []})
     assert res.verify_returncode == 1
-    assert res.verify_output == ("builder added test skips: "
-                                 "test_chain.py: skip analysis incomplete (budget)")
+    assert res.verify_output.startswith("builder added test skips: "
+                                        "test_chain.py: skip analysis incomplete (budget)")
+    assert res.verify_output.endswith(_NO_SKIP_INSTRUCTION)
     assert runner.calls == []
+
+
+# live 2026-10-19: '<file>: 4' gave a tool-less rebuild nothing to act on; the
+# message now quotes the added skip lines and says what to do instead.
+
+def test_skip_failure_message_lists_the_added_skip_lines(tmp_path):
+    h, _ = _wt(tmp_path, "run-sk6")
+    runner = _RecordingRunner()
+    dec_a = f"@pytest.mark.{SK}(reason='no api')"
+    dec_b = f"@pytest.mark.{SKIF}(True, reason='flaky')"
+    content = (f"import pytest\n\n{dec_a}\ndef test_a():\n    pass\n\n"
+               f"{dec_b}\ndef test_b():\n    pass\n")
+    drv = _ScriptedRoles([("test_two.py", content)], [["git", "status"]])
+    res = run_build_and_verify(driver=drv, worktree=h, run_id="run-sk6", runner=runner,
+                               proposal={"affected_files": []})
+    assert res.verify_returncode == 1
+    assert res.verify_output.startswith("builder added test skips: test_two.py: 2 [")
+    assert dec_a in res.verify_output and dec_b in res.verify_output
+    assert res.verify_output.endswith(". " + _NO_SKIP_INSTRUCTION)
+    assert runner.calls == []
+
+
+def test_skip_lines_omit_existing_sites_and_are_capped(tmp_path):
+    old = f"import pytest\n\ndef test_a():\n    pytest.{SK}('old')\n"
+    new = old + "".join(f"\ndef test_n{i}():\n    pytest.{SK}('new {i}')\n" for i in range(12))
+    p = tmp_path / "tests" / "test_cap.py"
+    p.parent.mkdir(parents=True)
+    p.write_text(old)
+    got = _added_skips(tmp_path, [("tests/test_cap.py", new)], with_lines=True)
+    assert len(got) == 1 and got[0].startswith("tests/test_cap.py: 12 [")
+    assert "'old'" not in got[0]
+    assert got[0].count(" | ") == 9  # capped at 10 quoted lines
+    assert "'new 0'" in got[0] and "'new 9'" in got[0] and "'new 10'" not in got[0]
+    # the plain gate output (no lines) is unchanged
+    assert _added_skips(tmp_path, [("tests/test_cap.py", new)]) == ["tests/test_cap.py: 12"]
