@@ -26,6 +26,14 @@ class ACTClient(Protocol):
     def list_events(self, kinds: set[str] | None = None,
                     since: datetime | None = None) -> list: ...
 
+# The run fields HTTPACTClient.update_run persists (columns status/phase/worktree_path/
+# ended_at/cost_usd plus the _run_payload fields). FakeACTClient.update_run keeps
+# exactly these so the fake can never hide a field the HTTP client drops.
+_RUN_UPDATE_FIELDS = ("status", "phase", "worktree_path", "ended_at", "cost_usd",
+                      "completed_tasks", "target_branch", "verification", "model_calls",
+                      "verified_sha", "checkpoints", "heartbeat_at", "base_commit_sha")
+
+
 class FakeACTClient:
     def __init__(self):
         self.proposals: dict[str, Proposal] = {}
@@ -45,7 +53,15 @@ class FakeACTClient:
     def create_run(self, r: Run) -> Run:
         self.runs[r.id] = r; return r
     def update_run(self, r: Run) -> None:
-        self.runs[r.id] = r
+        # replace-on-write of exactly the fields the HTTP client sends: the stored
+        # object is never mutated in place (callers may hold earlier references)
+        stored = self.runs.get(r.id)
+        fresh = r.model_copy(deep=True)
+        if stored is None:
+            self.runs[r.id] = fresh
+            return
+        self.runs[r.id] = stored.model_copy(
+            update={n: getattr(fresh, n) for n in _RUN_UPDATE_FIELDS}, deep=True)
     def list_open_runs(self) -> list[Run]:
         from navigator.contracts.enums import RunStatus
         return [r.model_copy(deep=True) for r in self.runs.values() if r.status == RunStatus.executing]
@@ -223,7 +239,9 @@ class HTTPACTClient:
                 "verification": r.verification, "model_calls": r.model_calls,
                 "verified_sha": r.verified_sha,
                 "checkpoints": [c.model_dump() for c in r.checkpoints],
-                "heartbeat_at": r.heartbeat_at.isoformat()}
+                "heartbeat_at": r.heartbeat_at.isoformat(),
+                # the ACT column is fixed at creation; a rebase moves the base
+                "base_commit_sha": r.base_commit_sha}
 
     @staticmethod
     def _run_from(d: dict) -> Run:
@@ -232,7 +250,8 @@ class HTTPACTClient:
             id=d["id"], schema_version=d["schema_version"], proposal_id=d["proposal_id"],
             status=d["status"], phase=d["phase"],
             heartbeat_at=pl.get("heartbeat_at") or d["started_at"],
-            worktree_path=d.get("worktree_path"), base_commit_sha=d["base_commit_sha"],
+            worktree_path=d.get("worktree_path"),
+            base_commit_sha=pl.get("base_commit_sha") or d["base_commit_sha"],
             branch=d["branch"], target_branch=pl.get("target_branch"),
             verification=pl.get("verification") or [],
             verified_sha=pl.get("verified_sha") or None,
