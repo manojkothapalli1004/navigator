@@ -350,3 +350,31 @@ def test_env_routed_http_clients_reach_a_local_listener_plainly_but_not_sealed(l
     blocked = _fetch(local_listener, sealed_verifier_env(plain))
     assert blocked.startswith("BLOCKED"), blocked
     assert "REACHED" not in blocked
+
+
+# ---- N15: the interpreter is never picked from the (sealed) PATH -----------------
+
+def _decoy_python3(tmp_path, monkeypatch):
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    decoy = bindir / "python3"
+    decoy.write_text("#!/bin/sh\necho DECOY\nexit 1\n")
+    decoy.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bindir}:{os.environ['PATH']}")
+    return decoy
+
+
+def test_project_interpreter_is_not_picked_from_the_sealed_path(tmp_path, leaky_env, monkeypatch):
+    # the sealed env keeps PATH, so a PATH lookup of 'python3' WOULD hit the decoy
+    _decoy_python3(tmp_path, monkeypatch)
+    (tmp_path / "dump_env.py").write_text(_DUMP_ENV)
+    runner = CommandRunner(allowlist=["python3"], worktree_root=tmp_path)
+    r = _run_sealed(runner, ["python3", "dump_env.py"], tmp_path)
+    assert r.returncode == 0, r.stderr
+    assert "DECOY" not in r.stdout + r.stderr
+    child = json.loads(r.stdout)
+    _assert_sealed(child)
+    # the decoy dir is still first in the child's PATH; the interpreter just was not
+    # chosen from it
+    assert child["PATH"] == os.environ["PATH"]
+    assert r.interpreter == sys.executable
