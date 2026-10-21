@@ -10,7 +10,7 @@ from navigator.contracts.enums import (ProposalStatus, RunStatus, RunPhase, Appr
 from navigator.runtime.executor import (execute_proposal, merge_after_approval, decline_run,
                                         rebase_stale_runs)
 from navigator.runtime.lock import SingleFlightLock
-from navigator.runtime.outcome_store import OutcomeStore
+from navigator.runtime.outcome_store import OutcomeStore, title_lessons
 from navigator.observability.logging import get_logger
 from navigator.observability.notify import NullNotifier
 from navigator.safety.errors import QuotaExhaustedError
@@ -61,8 +61,13 @@ class Navigator:
         snap = {
             "orc_memory": _trim_memory(self.orc.get_canonical_memory(),
                                        self.settings.memory_chars_per_section, Path(self.repo).name),
+            # declined lessons name the proposal title so the planner can see what
+            # was declined and not re-file near-duplicates of it
             "recent_outcomes": [{"proposal_id": o.proposal_id, "status": o.status,
-                                 "summary": o.summary, "lessons": o.lessons} for o in outcomes],
+                                 "summary": o.summary,
+                                 "lessons": title_lessons(
+                                     o.lessons, self._proposal_title(o.proposal_id))}
+                                for o in outcomes],
             "act": {"open_proposals": [{"id": p.id, "title": p.title} for p in open_proposals]},
             # self-learning: propose more of what the operator approves, less of what
             # they decline or triage retired
@@ -77,6 +82,15 @@ class Navigator:
         return snap
 
     _CONTEXT_CHARS = 6000
+
+    def _proposal_title(self, proposal_id: str | None) -> str | None:
+        if not proposal_id:
+            return None
+        try:
+            p = self.act.get_proposal(proposal_id)
+        except Exception:  # ACT lookup failures must never break perceive
+            return None
+        return p.title if p is not None else None
 
     def _recent_decisions(self, n: int = 20) -> list[dict]:
         decided = [p for p in self._mine(self.act.list_proposals())
