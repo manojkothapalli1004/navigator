@@ -8,6 +8,7 @@ from collections import Counter, deque
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 from navigator.safety.circuit_breakers import CircuitBreakers
 from navigator.safety.errors import CommandRejected
 from navigator.runtime.drivers.base import DriverRequest, SubagentDriver
@@ -154,6 +155,10 @@ _DECORATOR_FACTORIES = frozenset(
     if kind in ("skip", "skipif", "skipIf", "skipUnless") and p != "pytest.skip")
 _MAX_BINDING_PATHS = 32
 _REQUEUE_FACTOR = 10
+# Test hook: called once per alias-resolution step (one dequeued alias statement in
+# _resolve_aliases). Production never sets it; tests install a counter so the cost
+# of alias resolution is asserted as an operation count, not wall-clock time.
+_RESOLVE_STEP_HOOK: Callable[[], None] | None = None
 
 def _bind(bindings: dict, name: str, paths) -> bool:
     """Add paths (pruned to target prefixes, capped per set) to name's binding set.
@@ -243,6 +248,8 @@ def _resolve_aliases(aliases: list, bindings: dict) -> bool:
     while queue:
         i = queue.popleft()
         queued.discard(i)
+        if _RESOLVE_STEP_HOOK is not None:
+            _RESOLVE_STEP_HOOK()
         name, value = aliases[i]
         if _bind(bindings, name, _resolve(value, bindings)):
             for j in deps.get(name, ()):
