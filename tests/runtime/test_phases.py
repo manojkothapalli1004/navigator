@@ -1,5 +1,6 @@
 import ast
 import subprocess
+import sys
 import time
 from collections import Counter
 from pathlib import Path
@@ -175,6 +176,21 @@ def test_python_change_in_repo_without_tests_may_use_py_compile(tmp_path):
     res = run_build_and_verify(driver=drv, worktree=h, run_id="run-p", runner=runner,
                                proposal={"affected_files": ["a.py"]})
     assert res.verify_returncode == 0
+
+
+def test_verify_log_records_the_interpreter_for_python_commands(tmp_path):
+    # N15: the recorded argv stays as issued (bare python3); the evidence also names
+    # the interpreter the command actually ran under
+    h, runner = _wt(tmp_path, "run-i")
+    drv = _ScriptedRoles([("a.py", "x = 1\n")],
+                         [["python3", "-m", "py_compile", "a.py"], ["git", "status"]])
+    res = run_build_and_verify(driver=drv, worktree=h, run_id="run-i", runner=runner,
+                               proposal={"affected_files": ["a.py"]})
+    assert res.verify_returncode == 0
+    assert [c["argv"] for c in res.verify_log] == ["python3 -m py_compile a.py", "git status"]
+    assert res.verify_log[0]["argv_list"] == ["python3", "-m", "py_compile", "a.py"]
+    assert res.verify_log[0]["interpreter"] == sys.executable
+    assert "interpreter" not in res.verify_log[1]
 
 
 def test_test_runner_with_uv_flags_counts_as_running_the_suite(tmp_path):
