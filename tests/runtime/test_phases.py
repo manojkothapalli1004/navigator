@@ -760,3 +760,68 @@ def test_skip_lines_omit_existing_sites_and_are_capped(tmp_path):
     assert "'new 0'" in got[0] and "'new 9'" in got[0] and "'new 10'" not in got[0]
     # the plain gate output (no lines) is unchanged
     assert _added_skips(tmp_path, [("tests/test_cap.py", new)]) == ["tests/test_cap.py: 12"]
+
+
+# N17 (live 2026-10-20): a builder returned no file changes, the verifier's commands
+# passed on the unchanged tree and the run parked at the merge gate with an empty
+# diff. An empty change is a verification failure; nothing is verified.
+
+def _wt_with_a(tmp_path, run_id):
+    """Worktree at a commit where a.py == 'x = 1\\n'."""
+    repo, _ = _seed(tmp_path)
+    (repo/"a.py").write_text("x = 1\n")
+    subprocess.run(["git", "add", "a.py"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "a"], cwd=repo, check=True, capture_output=True)
+    sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True).stdout.strip()
+    return create_worktree(repo=repo, base_commit_sha=sha, run_id=run_id, worktree_root=tmp_path/"wt")
+
+
+def test_builder_with_no_file_writes_fails_as_no_change(tmp_path):
+    h, _ = _wt(tmp_path, "run-nc1")
+    runner = _RecordingRunner()
+    drv = _ScriptedRoles([], [["python3", "-m", "py_compile", "a.py"]])
+    res = run_build_and_verify(driver=drv, worktree=h, run_id="run-nc1", runner=runner,
+                               proposal={"affected_files": ["a.py"]})
+    assert res.verify_returncode != 0
+    assert res.no_change is True
+    assert res.verify_output.startswith("builder produced no change")
+    assert runner.calls == []  # nothing was verified
+    assert len(res.checkpoints) == 0  # only the post-build commit exists; not recorded here
+
+
+def test_rewriting_a_file_with_identical_content_is_no_change(tmp_path):
+    h = _wt_with_a(tmp_path, "run-nc2")
+    drv = _ScriptedRoles([("a.py", "x = 1\n")], [["python3", "-m", "py_compile", "a.py"]])
+    runner = _RecordingRunner()
+    res = run_build_and_verify(driver=drv, worktree=h, run_id="run-nc2", runner=runner,
+                               proposal={"affected_files": ["a.py"]})
+    assert res.verify_returncode != 0
+    assert res.no_change is True
+    assert "1 file_writes: a.py" in res.verify_output
+    assert runner.calls == []
+
+
+def test_whitespace_only_change_counts_as_a_change(tmp_path):
+    h = _wt_with_a(tmp_path, "run-ws")
+    drv = _ScriptedRoles([("a.py", "x = 1 \n")], [["python3", "-m", "py_compile", "a.py"]])
+    runner = CommandRunner(allowlist=DEFAULT_ALLOWLIST, worktree_root=tmp_path/"wt")
+    res = run_build_and_verify(driver=drv, worktree=h, run_id="run-ws", runner=runner,
+                               proposal={"affected_files": ["a.py"]})
+    assert res.verify_returncode == 0
+    assert res.no_change is False
+    assert res.verify_log[0]["argv"] == "python3 -m py_compile a.py"
+
+
+def test_reverify_refuses_an_empty_changed_set(tmp_path):
+    from navigator.runtime.phases import reverify
+    runner = _RecordingRunner()
+    res = reverify(runner, tmp_path, [["python3", "-c", "print(1)"]], changed_files=[])
+    assert res.verify_returncode != 0
+    assert res.no_change is True
+    assert res.verify_output.startswith("builder produced no change")
+    assert runner.calls == []
+    # None still means unknown and runs the commands
+    res2 = reverify(runner, tmp_path, [["python3", "-c", "print(1)"]], changed_files=None)
+    assert res2.verify_returncode == 0
+    assert res2.no_change is False
+    assert runner.calls == [["python3", "-c", "print(1)"]]
