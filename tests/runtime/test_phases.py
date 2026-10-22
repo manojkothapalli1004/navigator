@@ -7,7 +7,7 @@ import pytest
 from navigator.runtime.worktree import create_worktree
 from navigator.runtime.phases import (run_build_and_verify, _resolve_write_target, _added_skips, _skip_sites,
                                       _skip_sites_by_name, _skip_sites_resolved, _skip_growth,
-                                      _NO_SKIP_INSTRUCTION)
+                                      _resolved_analysis, _NO_SKIP_INSTRUCTION)
 from navigator.runtime.drivers.base import DriverRequest, DriverResult
 from navigator.runtime.drivers.fake_driver import FakeSubagentDriver
 from navigator.safety.command_runner import CommandRunner
@@ -559,24 +559,44 @@ def test_reverse_alias_chain_resolves_in_any_order():
     assert _skip_sites(src) == Counter({SK: 1})
 
 
-def test_long_reverse_alias_chain_is_fast():
+def _step_counter(monkeypatch):
+    # deterministic cost measure: one hook call per alias-resolution step, instead of
+    # a wall-clock bound that fails spuriously on a loaded machine
+    from navigator.runtime import phases
+    steps = []
+    monkeypatch.setattr(phases, "_RESOLVE_STEP_HOOK", lambda: steps.append(1))
+    return steps
+
+
+def test_long_reverse_alias_chain_is_fast(monkeypatch):
+    steps = _step_counter(monkeypatch)
     src = _reverse_chain(2000)
-    t0 = time.perf_counter()
     got = _skip_sites_resolved(src)
-    elapsed = time.perf_counter() - t0
     assert isinstance(got, Counter)
     assert got == Counter({SK: 1})
-    assert elapsed < 0.5
+    assert len(steps) >= 2000  # the hook fires once per dequeued alias
+    assert len(steps) <= 3 * 2000 + 50  # linear in chain length, not quadratic
+    # the alias budget (_REQUEUE_FACTOR re-queues per alias) is not hit
+    assert _resolved_analysis(src) == (Counter({SK: 1}), None)
 
 
-def test_self_aliases_stay_bounded():
+def test_self_aliases_stay_bounded(monkeypatch):
+    steps = _step_counter(monkeypatch)
     src = ("import pytest\n" + "".join(f"pytest = pytest.a{i}\n" for i in range(50))
            + f"pytest.{SK}('r')\n")
-    t0 = time.perf_counter()
     got = _skip_sites_resolved(src)
-    elapsed = time.perf_counter() - t0
     assert got == Counter({SK: 1})
-    assert elapsed < 0.5
+    assert len(steps) >= 50
+    assert len(steps) <= 3 * 50 + 50
+    assert _resolved_analysis(src) == (Counter({SK: 1}), None)
+
+
+def test_resolve_step_hook_is_noop_when_unset():
+    from navigator.runtime import phases
+    assert phases._RESOLVE_STEP_HOOK is None  # production never installs it
+    src = _reverse_chain(60)
+    assert _skip_sites_resolved(src) == Counter({SK: 1})
+    assert _resolved_analysis(src) == (Counter({SK: 1}), None)
 
 
 def test_suffix_test_files_are_skip_gated_but_do_not_widen_scope(tmp_path):
