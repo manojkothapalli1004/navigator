@@ -43,6 +43,45 @@ def test_execute_reaches_awaiting_review_and_opens_merge_gate(tmp_path):
     assert run.status == RunStatus.executing
     open_merge = d["act"].list_approvals(target=run.id, gate=ApprovalGate.merge)
     assert len(open_merge) == 1
+    # N17: a normal (non-empty) change is unaffected by the empty-diff gate
+    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=run.worktree_path,
+                          capture_output=True, text=True).stdout.strip()
+    assert run.verified_sha == head
+    parked = [e for e in d["act"].events if e.kind == "run.awaiting_review"][0]
+    assert "navigator_touch.py" in parked.payload["diff"]
+
+
+def test_empty_build_fails_the_run_and_never_parks_at_the_merge_gate(tmp_path):
+    # N17, live 2026-10-20: the builder returned no file changes, the verifier passed
+    # on the unchanged tree and the run parked at the merge gate with an empty diff
+    from navigator.contracts.enums import Role
+    from navigator.runtime.drivers.base import DriverResult
+    from navigator.runtime.executor import _previous_failure
+    repo, sha = _seed(tmp_path); d = _deps(tmp_path, repo)
+
+    class _NoWriteDriver:
+        def run_role(self, request):
+            if request.role == Role.builder:
+                return DriverResult(role=Role.builder, file_writes=[], summary="nothing to do")
+            return DriverResult(role=Role.verifier,
+                                commands=[["python3", "-m", "py_compile", "navigator_touch.py"]])
+
+    d["driver"] = _NoWriteDriver()
+    p = _proposal(repo, sha)
+    run = execute_proposal(p, **d)
+    assert run.status == RunStatus.failed and run.phase == RunPhase.finalizing
+    assert run.verified_sha is None
+    assert d["act"].list_approvals(target=run.id, gate=ApprovalGate.merge) == []
+    kinds = [e.kind for e in d["act"].events]
+    assert "run.failed" in kinds and "run.awaiting_review" not in kinds
+    note = [n for sec, n, _ in d["orc"].updates if sec == "known_failures"][-1]
+    assert "builder produced no change" in note
+    stored = OutcomeStore(d["settings"].outcome_path).for_proposal(p.id)
+    assert stored[-1].summary == "builder produced no change"
+    # the lesson reaches the next builder
+    prev = _previous_failure(d["settings"], p.id)["previous_attempt_failure"]
+    assert prev.startswith("builder produced no change")
+    assert Path(run.worktree_path).is_dir()  # preserved for inspection
 
 def test_merge_only_after_approval(tmp_path):
     repo, sha = _seed(tmp_path); d = _deps(tmp_path, repo)
