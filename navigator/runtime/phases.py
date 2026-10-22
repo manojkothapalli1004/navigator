@@ -655,7 +655,10 @@ def _run_sealed(runner, argv: list[str], cwd: Path):
     when the runner accepts `env=`, and replaces os.environ for the duration of the
     call either way (a runner that inherits the process environment - like
     CommandRunner, which derives its child env from os.environ - then inherits the
-    sealed one). CommandRejected propagates unchanged."""
+    sealed one). CommandRejected propagates unchanged. CommandRunner resolves a bare
+    python/python3 program to the project interpreter itself
+    (command_runner.project_python), so the sealed PATH is never used to pick the
+    interpreter."""
     env = sealed_verifier_env()
     with _environ_replaced(env):
         if _accepts_env(runner.run):
@@ -743,9 +746,14 @@ def run_build_and_verify(driver: SubagentDriver, worktree: WorktreeHandle,
             break
         res.verify_returncode = r.returncode
         res.verify_output = r.stdout + r.stderr
-        res.verify_log.append({"argv": " ".join(argv), "argv_list": list(argv),
-                               "returncode": r.returncode,
-                               "output_tail": res.verify_output[-1500:]})
+        # argv/argv_list record the command as issued; 'interpreter' is the program a
+        # bare python/python3 was actually spawned as (absent for other commands)
+        entry = {"argv": " ".join(argv), "argv_list": list(argv),
+                 "returncode": r.returncode,
+                 "output_tail": res.verify_output[-1500:]}
+        if getattr(r, "interpreter", None):
+            entry["interpreter"] = r.interpreter
+        res.verify_log.append(entry)
         if r.returncode != 0:
             if breakers:
                 m = _FAILED_TESTS.search(res.verify_output)
@@ -767,13 +775,18 @@ def _run_full_suite(runner, run_dir: Path, res: PhaseResult, breakers) -> None:
         res.verify_output = "repo has tests but no pytest command is allowlisted"
         return
     argv = entry.split() + ["-q"]
+    interpreter = None
     try:
         r = _run_sealed(runner, argv, run_dir)
         rc, out = r.returncode, r.stdout + r.stderr
+        interpreter = getattr(r, "interpreter", None)
     except CommandRejected as e:
         rc, out = 126, f"full-suite command rejected: {e}"
-    res.verify_log.append({"argv": " ".join(argv), "argv_list": list(argv), "returncode": rc,
-                           "output_tail": out[-1500:]})
+    entry = {"argv": " ".join(argv), "argv_list": list(argv), "returncode": rc,
+             "output_tail": out[-1500:]}
+    if interpreter:
+        entry["interpreter"] = interpreter
+    res.verify_log.append(entry)
     res.verify_returncode, res.verify_output = rc, out
     if rc != 0 and breakers:
         m = _FAILED_TESTS.search(out)
@@ -817,9 +830,12 @@ def reverify(runner, run_dir: Path, argvs: list[list[str]], breakers=None,
             break
         res.verify_returncode = r.returncode
         res.verify_output = r.stdout + r.stderr
-        res.verify_log.append({"argv": " ".join(argv), "argv_list": list(argv),
-                               "returncode": r.returncode,
-                               "output_tail": res.verify_output[-1500:]})
+        entry = {"argv": " ".join(argv), "argv_list": list(argv),
+                 "returncode": r.returncode,
+                 "output_tail": res.verify_output[-1500:]}
+        if getattr(r, "interpreter", None):
+            entry["interpreter"] = r.interpreter
+        res.verify_log.append(entry)
         if r.returncode != 0:
             if breakers:
                 m = _FAILED_TESTS.search(res.verify_output)

@@ -1,5 +1,6 @@
 import os
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from navigator.safety.errors import CommandRejected
@@ -102,6 +103,28 @@ def _check_git_flags(subcommand: str, args: list[str]) -> None:
         i += 1
 
 
+# The verifier may only name the interpreter by its bare name (absolute tokens are
+# rejected in run()); the bare name is resolved to the project interpreter at spawn
+# time, never through PATH (live: the daemon's PATH put Apple's /usr/bin/python3
+# first, so py_compile evidence was about the wrong interpreter).
+_BARE_PYTHON = frozenset({"python", "python3"})
+
+
+def project_python(cwd: Path, worktree_root: Path) -> str:
+    """The interpreter a bare python/python3 verifier command runs under: the nearest
+    .venv/bin/python3 from cwd up to and including worktree_root, else the interpreter
+    Navigator runs under (sys.executable). Never a PATH lookup."""
+    cwd = Path(cwd).resolve()
+    root = Path(worktree_root).resolve()
+    for d in (cwd, *cwd.parents):
+        cand = d / ".venv" / "bin" / "python3"
+        if cand.is_file() and os.access(cand, os.X_OK):
+            return str(cand)
+        if d == root:
+            break
+    return sys.executable
+
+
 def _clean_env() -> dict[str, str]:
     # commands run the target repo's tooling; they must not see Navigator's own
     # configuration (live 2026-10-10: NAVIGATOR_DRIVER leaked into a verifier pytest)
@@ -112,6 +135,8 @@ class CommandResult:
     returncode: int
     stdout: str
     stderr: str
+    # the program actually spawned when argv[0] was a bare interpreter name; None otherwise
+    interpreter: str | None = None
 
 class CommandRunner:
     def __init__(self, allowlist: list[str], worktree_root: Path, timeout_s: float = 60.0):
@@ -145,11 +170,18 @@ class CommandRunner:
         cwd = Path(cwd).resolve()
         if cwd != self.worktree_root and self.worktree_root not in cwd.parents:
             raise CommandRejected(f"cwd outside worktree: {cwd}")
+        # only the program spawned changes; the allowlist match, the recorded argv and
+        # the error messages all keep the command as the verifier issued it
+        spawn = list(argv)
+        interpreter = None
+        if argv[0] in _BARE_PYTHON:
+            interpreter = project_python(cwd, self.worktree_root)
+            spawn[0] = interpreter
         try:
-            proc = subprocess.run(argv, cwd=cwd, capture_output=True, text=True,
+            proc = subprocess.run(spawn, cwd=cwd, capture_output=True, text=True,
                                   shell=False, timeout=self.timeout_s, env=_clean_env())
         except subprocess.TimeoutExpired as e:
             raise CommandRejected(f"command timed out after {self.timeout_s}s: {' '.join(argv)}") from e
         except OSError as e:
             raise CommandRejected(f"command failed to start: {' '.join(argv)} ({e})") from e
-        return CommandResult(proc.returncode, proc.stdout, proc.stderr)
+        return CommandResult(proc.returncode, proc.stdout, proc.stderr, interpreter)

@@ -1,7 +1,9 @@
+import os
 import subprocess
+import sys
 from pathlib import Path
 import pytest
-from navigator.safety.command_runner import CommandRunner
+from navigator.safety.command_runner import CommandRunner, project_python
 from navigator.safety.errors import CommandRejected
 
 def _runner(tmp_path):
@@ -307,3 +309,83 @@ def test_git_status_rejection_and_allowlist_text_list_untracked_flags(tmp_path):
     assert "git status: " in text and "--untracked-files=no" in text and "-uno" in text
     diff_line = text.split("git diff: ")[1].split(";")[0]
     assert "--untracked-files=no" not in diff_line
+
+
+# --- N15: a bare python/python3 runs under the project interpreter, never PATH ---
+
+_SHOW_EXE = "print(__import__('sys').executable)"
+
+
+def _decoy_python3(tmp_path, monkeypatch):
+    """A fake python3 first on PATH: a PATH lookup of 'python3' would run it."""
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    decoy = bindir / "python3"
+    decoy.write_text("#!/bin/sh\necho DECOY\nexit 1\n")
+    decoy.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bindir}:{os.environ['PATH']}")
+    return decoy
+
+
+def test_bare_python3_runs_sys_executable_not_the_path_python3(tmp_path, monkeypatch):
+    # live: the daemon's PATH put Apple's /usr/bin/python3 first, so py_compile
+    # evidence was about the wrong interpreter
+    _decoy_python3(tmp_path, monkeypatch)
+    r = CommandRunner(allowlist=["python3 -c"], worktree_root=tmp_path).run(
+        ["python3", "-c", _SHOW_EXE], cwd=tmp_path)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == sys.executable
+    assert "DECOY" not in r.stdout + r.stderr
+    assert r.interpreter == sys.executable
+    # negative control: a plain PATH lookup WOULD have picked the decoy
+    ctl = subprocess.run(["python3", "-c", _SHOW_EXE], env={"PATH": os.environ["PATH"]},
+                         capture_output=True, text=True)
+    assert ctl.stdout.strip() == "DECOY"
+
+
+def test_py_compile_runs_under_the_project_interpreter(tmp_path, monkeypatch):
+    _decoy_python3(tmp_path, monkeypatch)
+    (tmp_path / "a.py").write_text("type Alias = int\n")  # valid only on Python >= 3.12
+    r = CommandRunner(allowlist=["python3 -m py_compile"], worktree_root=tmp_path).run(
+        ["python3", "-m", "py_compile", "a.py"], cwd=tmp_path)
+    assert r.returncode == 0, r.stderr
+    assert "DECOY" not in r.stdout + r.stderr
+    assert (tmp_path / "__pycache__").is_dir()
+    assert r.interpreter == sys.executable
+
+
+def test_run_dir_venv_python_is_preferred_and_scoped(tmp_path):
+    venv_py = tmp_path / "repo" / ".venv" / "bin" / "python3"
+    venv_py.parent.mkdir(parents=True)
+    venv_py.write_text("#!/bin/sh\necho VENV \"$@\"\n")
+    venv_py.chmod(0o755)
+    (tmp_path / "repo" / "backend").mkdir()
+    (tmp_path / "other").mkdir()
+    runner = CommandRunner(allowlist=["python3 -m py_compile"], worktree_root=tmp_path)
+    r = runner.run(["python3", "-m", "py_compile", "a.py"], cwd=tmp_path / "repo" / "backend")
+    assert r.stdout.strip() == "VENV -m py_compile a.py"
+    assert r.interpreter == str(venv_py)
+    # a sibling directory's venv is never used
+    (tmp_path / "other" / "a.py").write_text("x = 1\n")
+    r2 = runner.run(["python3", "-m", "py_compile", "a.py"], cwd=tmp_path / "other")
+    assert r2.returncode == 0, r2.stderr
+    assert r2.interpreter == sys.executable
+    assert "VENV" not in r2.stdout
+    assert project_python(tmp_path / "repo" / "backend", tmp_path) == str(venv_py)
+    assert project_python(tmp_path / "other", tmp_path) == sys.executable
+
+
+def test_interpreter_substitution_does_not_widen_the_allowlist(tmp_path):
+    runner = CommandRunner(allowlist=["python3 -m py_compile"], worktree_root=tmp_path)
+    for argv in (["python", "-m", "py_compile", "a.py"],
+                 [sys.executable, "-m", "py_compile", "a.py"],
+                 [".venv/bin/python3", "-m", "py_compile", "a.py"],
+                 ["python3", "-m", "pytest"],
+                 ["python3", "-c", "print(1)"]):
+        with pytest.raises(CommandRejected):
+            runner.run(argv, cwd=tmp_path)
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
+    r = CommandRunner(allowlist=["git status"], worktree_root=tmp_path).run(
+        ["git", "status"], cwd=tmp_path)
+    assert r.returncode == 0
+    assert r.interpreter is None
