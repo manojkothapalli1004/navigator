@@ -18,8 +18,12 @@ hour old) and then handles:
                                     run.telegram_decision event carries the update_id
                                     of the originating message (0 only when the
                                     caller has none)
-Targets resolve against one snapshot of the list; if any target is unknown or
-ambiguous nothing is changed. Anything else returns False (ordinary chat). A command
+Numbers refer to the list the operator last received (status/more/all or the daemon's
+top-3 push), stored as triage.json "shown" (N13): the live triage order may change
+between that message and the reply, so a number never decides a proposal the operator
+did not see under it. Short names and full ids resolve against the live proposed list.
+Targets resolve against one snapshot of the list; if any target is unknown, decided
+meanwhile or ambiguous nothing is changed. Anything else returns False (ordinary chat). A command
 whose handling raises is answered with the exception class name only (N11c: never an
 exception's text, which could carry the token-bearing URL); its offset is already
 persisted, so the operator is told to re-send it.
@@ -77,7 +81,9 @@ def triage_path() -> str:
 
 
 def numbered_proposals(act, path: str | None = None) -> list:
-    """Proposals awaiting a decision in triage order; the numbers the operator types."""
+    """Proposals awaiting a decision in the live triage order. Not what typed numbers
+    resolve against (that is the stored snapshot, see _resolve); kept for callers that
+    want the current order."""
     return [p for p, _ in _order(act, path)]
 
 
@@ -98,18 +104,58 @@ def _chunks(lines: list[str]) -> list[str]:
     return out
 
 
+def _open_ids(act) -> set[str]:
+    return {p.id for p in act.list_proposals(ProposalStatus.proposed)}
+
+
+def _empty_list_shown(state: dict) -> bool:
+    """True after a 'status'/'all' that found nothing to decide (a valid, empty list)."""
+    shown = state.get("shown")
+    return isinstance(shown, dict) and shown.get("entries") == []
+
+
+def _no_list_reason(state: dict) -> str:
+    return ("nothing waiting for a decision" if _empty_list_shown(state)
+            else "no numbered list yet - send 'status' or 'all' first")
+
+
 def _page(act, notifier, path: str | None, more: bool) -> None:
     path = path or triage_path()
-    order = _order(act, path)
-    start = 0
-    if more:
-        start = int(triage.load(path).get("cursor") or 0) + triage.TOP_N
-    notifier.send(triage.format_top(order, start=start))
-    triage.set_cursor(path, start)
+    if not more:
+        order = _order(act, path)
+        state = triage.set_shown(path, order, cursor=0)
+        notifier.send(triage.format_shown(triage.shown_entries(state),
+                                          {p.id for p, _ in order}, start=0))
+        return
+    open_ids = _open_ids(act)
+    seen: dict = {}
+
+    def mutate(s):
+        # one locked read-modify-write: the cursor continues the stored snapshot only
+        # when it was taken on it (cursor_for), otherwise paging restarts (a daemon push
+        # replaced the list meanwhile); the new cursor is tied to that snapshot
+        entries = triage.shown_entries(s)
+        shown = s.get("shown")
+        ts = shown.get("ts_epoch") if isinstance(shown, dict) else None
+        same = ts is not None and s.get("cursor_for") == ts
+        start = (triage.cursor_of(s) if same else 0) + triage.TOP_N
+        seen.update(state=s, entries=entries, start=start)
+        if not entries:
+            return s
+        return {**s, "cursor": start, "cursor_for": ts}
+
+    triage.update(path, mutate, rewind_cursor=True)
+    if not seen["entries"] and not _empty_list_shown(seen["state"]):
+        notifier.send("Navigator: no list shown yet - send 'status' first")
+        return
+    notifier.send(triage.format_shown(seen["entries"], open_ids, start=seen["start"]))
 
 
 def _all(act, notifier, path: str | None) -> None:
-    props = numbered_proposals(act, path)
+    path = path or triage_path()
+    order = _order(act, path)
+    triage.set_shown(path, order, cursor=0)
+    props = [p for p, _ in order]
     lines = [f"Navigator: {len(props)} proposal(s) waiting for a decision"]
     lines += [f"{i}. {p.title}" for i, p in enumerate(props, 1)]
     for text in _chunks(lines):
@@ -117,24 +163,37 @@ def _all(act, notifier, path: str | None) -> None:
 
 
 def _resolve(act, targets, path: str | None) -> tuple[list, str | None]:
-    """All targets against one snapshot -> (proposals, None), or ([], reason)."""
-    props = numbered_proposals(act, path)
+    """All targets against one snapshot -> (proposals, None), or ([], reason). Numbers
+    and ranges index the list the operator last saw (triage.json 'shown'); short names
+    and full ids the live proposed list. Any bad target: nothing is changed."""
+    live = act.list_proposals(ProposalStatus.proposed)
+    by_id = {p.id: p for p in live}
+    state = triage.load(path or triage_path())
+    entries = triage.shown_entries(state)
     picked: dict[str, object] = {}
     for t in targets:
         m = RANGE.fullmatch(t)
         if t.isdigit() or m:
+            if not entries:
+                return [], _no_list_reason(state)
             lo, hi = (int(t), int(t)) if t.isdigit() else (int(m[1]), int(m[2]))
-            if lo < 1 or hi < lo or hi > len(props):
-                return [], f"{t} is not in the list of {len(props)}"
-            for p in props[lo - 1:hi]:
+            if lo < 1 or hi < lo or hi > len(entries):
+                return [], f"{t} is not in the list of {len(entries)}"
+            for k in range(lo, hi + 1):
+                e = entries[k - 1]
+                p = by_id.get(e["id"])
+                if p is None:
+                    title = str(e.get("title") or "")[:60]
+                    return [], (f"{k}. {title} is no longer waiting for a decision - "
+                                "send 'status'")
                 picked[p.id] = p
         elif PROPOSAL_ID.fullmatch(t):
-            p = next((p for p in props if p.id == t), None)
+            p = by_id.get(t)
             if p is None:
                 return [], f"{t} is not waiting for a decision"
             picked[p.id] = p
         else:
-            hits = [p for p in props if short_name(p.title).lower() == t.lower()]
+            hits = [p for p in live if short_name(p.title).lower() == t.lower()]
             if len(hits) != 1:
                 return [], (f"no proposal named {t!r}" if not hits
                             else f"{len(hits)} proposals named {t!r} - use numbers")

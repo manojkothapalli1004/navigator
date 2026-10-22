@@ -10,7 +10,10 @@ Each cycle, before planning:
      drop low-value proposals; those are declined. Without a model, or when it fails,
      a deterministic order is used (milestone proposals first, then newest).
 The order is persisted (triage.json) so Telegram 'status' shows the top 3 without a
-model call; a new top 3 is pushed to the operator once.
+model call; a new top 3 is pushed to the operator once. Every numbered list sent to the
+operator (that push, 'status', 'more', 'all') is stored as 'shown' (N13): the numbers
+the operator types resolve against that snapshot, never against the live order at the
+moment the reply arrives.
 
 Every write to triage.json goes through update(): a blocking lock beside the file
 (file_lock) serializes the daemon and the Telegram reader, the file is replaced
@@ -22,6 +25,7 @@ import json
 import os
 import re
 import tempfile
+import time
 from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
@@ -289,8 +293,11 @@ class Triage:
                 lines.append(f"... and {len(retired) + len(dropped) - 15} more")
             self.notifier.send("\n".join(lines))
         if top and top != state.get("top_sent"):
+            # the snapshot is on disk before the message goes out, so a reply to it can
+            # never resolve against the previous list; the cursor is never written here
+            shown = snapshot(order)
+            state = update(self.path, lambda s: {**s, "top_sent": top, "shown": shown})
             self.notifier.send(format_top(order, start=0))
-            state = update(self.path, lambda s: {**s, "top_sent": top})
         return {"triage_retired": len(retired), "triage_dropped": len(dropped),
                 "triage_open": len(order), "triage_source": source}
 
@@ -324,3 +331,53 @@ def advance_cursor(path, start: int) -> int:
     Interleaved advances from two processes end at the highest position."""
     start = max(0, int(start))
     return cursor_of(update(path, lambda s: {**s, "cursor": start}))
+
+
+# ---- the list the operator last saw: what typed numbers refer to (N13) --------------
+
+def snapshot(order: list[tuple], now: float | None = None) -> dict:
+    """The full numbered order as it was sent to the operator: entry k (0-based) is the
+    number k+1 they see. Stored as triage.json 'shown'; ts_epoch identifies the list so
+    the 'more' cursor is only ever applied to the snapshot it was taken on."""
+    return {"ts_epoch": time.time() if now is None else float(now),
+            "entries": [{"id": p.id, "title": p.title, "repo": Path(p.repo).name,
+                         "why": why} for p, why in order]}
+
+
+def set_shown(path, order: list[tuple], cursor: int = 0) -> dict:
+    """Store `order` as the list the operator is looking at and restart paging there:
+    one locked write of the snapshot, the cursor and the snapshot the cursor belongs to.
+    Returns the new state."""
+    shown = snapshot(order)
+    cursor = max(0, int(cursor))
+    return update(path, lambda s: {**s, "shown": shown, "cursor": cursor,
+                                   "cursor_for": shown["ts_epoch"]}, rewind_cursor=True)
+
+
+def shown_entries(state: dict) -> list[dict]:
+    """The entries of the stored snapshot, or [] when there is none or it is malformed."""
+    shown = state.get("shown") if isinstance(state, dict) else None
+    entries = shown.get("entries") if isinstance(shown, dict) else None
+    if not isinstance(entries, list) or not all(
+            isinstance(e, dict) and isinstance(e.get("id"), str) for e in entries):
+        return []
+    return entries
+
+
+def format_shown(entries: list[dict], open_ids: set[str], start: int = 0,
+                 n: int = TOP_N) -> str:
+    """format_top rendered from a snapshot; an entry decided since it was taken (its id
+    no longer among open_ids) is marked so the operator does not pick its number."""
+    chunk = entries[start:start + n]
+    if not chunk:
+        return ("Navigator: nothing waiting for a decision" if not entries
+                else "Navigator: no more proposals - send 'status' for the top 3")
+    lines = [f"Navigator: top {start + 1}-{start + len(chunk)} of {len(entries)} to decide"]
+    for i, e in enumerate(chunk, start + 1):
+        line = f"{i}. [{e.get('repo') or ''}] {e.get('title') or ''}"
+        lines.append(line if e["id"] in open_ids else f"{line} (decided)")
+        if e.get("why"):
+            lines.append(f"   why: {e['why']}")
+    lines.append(f"reply: approve {start + 1} / decline {start + 1}"
+                 + (" / more" if start + n < len(entries) else ""))
+    return "\n".join(lines)

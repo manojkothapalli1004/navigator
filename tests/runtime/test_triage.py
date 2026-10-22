@@ -250,3 +250,84 @@ def test_cursor_written_while_the_daemon_ranks_survives_the_rerank(tmp_path):
     assert state["cursor"] == 6 and len(state["ranked"]) == 2 and state["top_sent"]
     t.run()  # cached pass: the daemon's later saves never lower it either
     assert triage.load(path)["cursor"] == 6
+
+
+# ---- N13: the list the operator saw is stored as 'shown' ------------------------------
+
+def test_snapshot_and_format_shown():
+    act = FakeACTClient()
+    order = [(_prop(act, f"P{i}: x", repo=f"/r/repo{i}"), f"why {i}") for i in range(7)]
+    snap = triage.snapshot(order, now=123.0)
+    assert snap["ts_epoch"] == 123.0
+    assert snap["entries"] == [{"id": p.id, "title": p.title, "repo": f"repo{i}",
+                                "why": f"why {i}"} for i, (p, _) in enumerate(order)]
+    assert triage.snapshot(order)["ts_epoch"] > 1_700_000_000
+    entries = snap["entries"]
+    open_ids = {p.id for p, _ in order} - {order[1][0].id}
+    first = triage.format_shown(entries, open_ids)
+    assert "top 1-3 of 7" in first and "4." not in first and "/ more" in first
+    assert "1. [repo0] P0: x\n" in first and "why: why 0" in first
+    assert "2. [repo1] P1: x (decided)" in first
+    assert "reply: approve 1 / decline 1" in first
+    last = triage.format_shown(entries, open_ids, start=6)
+    assert "top 7-7 of 7" in last and "more" not in last and "7. [repo6] P6: x" in last
+    assert "no more proposals" in triage.format_shown(entries, open_ids, start=9)
+    assert "nothing waiting" in triage.format_shown([], set())
+    assert triage.shown_entries({"shown": snap}) == entries
+    assert triage.shown_entries({}) == []
+    assert triage.shown_entries({"shown": {"entries": [1, 2]}}) == []
+    assert triage.shown_entries({"shown": {"entries": [{"title": "no id"}]}}) == []
+
+
+def test_set_shown_restarts_paging_on_the_new_snapshot(tmp_path):
+    act = FakeACTClient()
+    order = [(_prop(act, f"P{i}: x"), "") for i in range(4)]
+    path = tmp_path / "triage.json"
+    triage.set_cursor(path, 6)
+    state = triage.set_shown(path, order)
+    assert state["cursor"] == 0 and state["cursor_for"] == state["shown"]["ts_epoch"]
+    assert [e["id"] for e in triage.load(path)["shown"]["entries"]] == [p.id for p, _ in order]
+
+
+def test_run_push_stores_shown(tmp_path):
+    act = FakeACTClient()
+    n1, n2, n3, n4 = (_prop(act, t) for t in ("N1: retry", "N2: lessons", "N3: audit",
+                                              "N4: docs"))
+    ranking = [n3.id, n1.id, n4.id, n2.id]  # not triage.ordered's fallback order
+
+    def model(prompt):
+        return json.dumps({"ranked": [{"id": i, "why": "w"} for i in ranking], "drop": []})
+
+    path = tmp_path / "triage.json"
+    triage.set_cursor(path, 6)  # the operator was paging before the push
+    t, rec = _triage(act, tmp_path, model)
+    t.run()
+    state = triage.load(path)
+    assert [e["id"] for e in state["shown"]["entries"]] == ranking
+    assert state["shown"]["entries"][0]["title"] == "N3: audit"
+    assert state["shown"]["entries"][0]["repo"] == "navigator"
+    assert state["shown"]["ts_epoch"] > 0
+    assert state["cursor"] == 6  # the push never writes the cursor
+    assert "N3: audit" in rec.sent[-1] and state["top_sent"] == ranking[:3]
+
+
+def test_push_writes_shown_before_sending(tmp_path):
+    act = FakeACTClient()
+    props = [_prop(act, t) for t in ("N1: retry", "N2: lessons", "N3: audit")]
+    path = tmp_path / "triage.json"
+    expected = [p.id for p in triage.fallback_order(props)]
+
+    class Checking:
+        def __init__(self):
+            self.sent = []
+
+        def send(self, text):
+            ids = [e["id"] for e in triage.shown_entries(triage.load(path))]
+            assert ids == expected, "shown must be on disk before the top 3 goes out"
+            self.sent.append(text)
+
+    rec = Checking()
+    t = Triage(act, query_fn=None, notifier=rec, path=path,
+               now=lambda: T0 + timedelta(days=1))
+    t.run()
+    assert len(rec.sent) == 1 and "top 1-3 of 3" in rec.sent[0]

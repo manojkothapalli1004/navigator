@@ -110,11 +110,12 @@ def test_status_is_answered_in_the_same_iteration(tmp_path):
 def test_approve_from_the_reader_changes_the_proposal(tmp_path):
     act = FakeACTClient()
     p = _prop(act, "N1: a")
-    inbox, _ = _serve(tmp_path, [[_update(1, "approve 1")], []])
+    # numbers refer to the list the operator last saw (N13): 'status' first
+    inbox, _ = _serve(tmp_path, [[_update(1, "status"), _update(2, "approve 1")], []])
     rec = _Recorder()
     run_reader(inbox, act, rec, CHAT, max_iterations=2)
     assert act.get_proposal(p.id).status == ProposalStatus.approved
-    assert len(rec.sent) == 1 and "approved" in rec.sent[0]
+    assert len(rec.sent) == 2 and "N1: a" in rec.sent[0] and "approved" in rec.sent[-1]
 
 
 def _event_field(e, name):
