@@ -546,3 +546,44 @@ def test_cli_merge_works_after_rebase(tmp_path):
     assert [r.id for r in done] == [b.id]
     assert nav.act.runs[b.id].status == RunStatus.completed
     assert "B = 1" in (repo / "wide.py").read_text() and _clean(repo)
+
+
+# ---- N12f: the rebased base is persisted, so a second rebase still carries the audit
+# live 2026-10-20: a run rebased three times carried its audit only the first time
+# because update_run never persisted base_commit_sha and the second rebase diffed
+# against the ORIGINAL base (which by then included the merged commits).
+
+def test_audit_carries_across_two_consecutive_rebases(tmp_path):
+    builds = {**DEFAULT_BUILDS, "S": [("s.py", "S = 1\n")]}
+    nav, repo, a, b = _setup(tmp_path, builds)
+    s = next(r for r in nav.act.list_open_runs() if r.id not in (a.id, b.id))
+    assert _audited(nav.act, [s.id, "--note", "x"], io.StringIO()) == 0
+    assert is_audited(nav.act, s)
+    # first rebase: A lands
+    assert a.id in {r.id for r in _merge(nav, a)}
+    head1 = _head(repo)
+    s1 = nav.act.runs[s.id].model_copy(deep=True)
+    assert s1.phase == RunPhase.awaiting_review and s1.status == RunStatus.executing
+    assert s1.base_commit_sha == head1 and head1 != s.base_commit_sha
+    assert s1.verified_sha != s.verified_sha
+    assert is_audited(nav.act, s1) is True
+    assert _events(nav, s, "run.rebased_needs_audit") == []
+    # the persisted base is what a re-read from ACT sees
+    assert next(r for r in nav.act.list_open_runs() if r.id == s.id).base_commit_sha == head1
+    # second rebase: B (another file) lands; S is re-read from ACT by merge_poll
+    sb = next(r for r in nav.act.list_open_runs() if r.id == b.id)
+    assert b.id in {r.id for r in _merge(nav, sb)}
+    assert nav.act.runs[b.id].status == RunStatus.completed
+    head2 = _head(repo)
+    assert head2 != head1
+    s2 = nav.act.runs[s.id].model_copy(deep=True)
+    assert s2.phase == RunPhase.awaiting_review and s2.status == RunStatus.executing
+    assert s2.base_commit_sha == head2 and s2.verified_sha != s1.verified_sha
+    assert s2.verified_sha == _head(s2.worktree_path)
+    assert is_audited(nav.act, s2) is True
+    assert _events(nav, s, "run.rebased_needs_audit") == []
+    carried = [e for e in _events(nav, s, "run.audited") if e.payload.get("carried_forward")]
+    assert [e.payload["verified_sha"] for e in carried] == [s1.verified_sha, s2.verified_sha]
+    assert [g.actor for g in _audits(nav, s)] == [AUDITOR, AUDITOR, AUDITOR]
+    assert s1.base_commit_sha == head1  # the earlier snapshot was not mutated in place
+    assert _clean(s2.worktree_path) and _clean(repo)

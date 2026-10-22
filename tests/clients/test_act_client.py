@@ -268,3 +268,58 @@ def test_default_client_timeout_is_generous():
     from navigator.clients.act_client import HTTPACTClient
     c = HTTPACTClient("http://x")
     assert c.client.timeout.read >= 30
+
+
+# ---- N12f: base_commit_sha survives update_run (a rebase moves the base) ---------
+
+def test_http_update_run_persists_rebased_base_commit():
+    act, fake = _http_act()
+    r = Run(proposal_id="proposal-x", base_commit_sha="abc", branch="nav/run-1")
+    act.create_run(r)
+    assert fake.runs[r.id]["base_commit_sha"] == "abc"
+    r.base_commit_sha = "def"
+    act.update_run(r)
+    assert fake.runs[r.id]["payload"]["base_commit_sha"] == "def"
+    assert fake.runs[r.id]["base_commit_sha"] == "abc"  # the column is fixed at creation
+    got = act.list_open_runs()
+    assert [x.id for x in got] == [r.id] and got[0].base_commit_sha == "def"
+    assert act.list_runs_for_proposal("proposal-x")[0].base_commit_sha == "def"
+
+
+def test_http_run_without_base_in_payload_uses_the_column():
+    act, fake = _http_act()
+    r = Run(proposal_id="proposal-x", base_commit_sha="abc", branch="nav/run-1")
+    act.create_run(r)
+    fake.runs[r.id]["payload"].pop("base_commit_sha", None)  # row written by older navigator
+    assert act.list_open_runs()[0].base_commit_sha == "abc"
+
+
+def test_fake_update_run_only_keeps_http_fields():
+    act = FakeACTClient()
+    r = Run(proposal_id="proposal-x", base_commit_sha="abc", branch="nav/run-1")
+    act.create_run(r)
+    changed = r.model_copy(deep=True)
+    changed.branch = "x"                      # not sent by HTTPACTClient.update_run
+    changed.phase = RunPhase.awaiting_review  # sent
+    changed.base_commit_sha = "def"           # sent (payload)
+    act.update_run(changed)
+    stored = act.runs[r.id]
+    assert stored.branch == "nav/run-1"
+    assert stored.phase == RunPhase.awaiting_review and stored.base_commit_sha == "def"
+    assert act.list_open_runs()[0].base_commit_sha == "def"
+
+
+def test_fake_update_run_does_not_mutate_earlier_snapshots():
+    act = FakeACTClient()
+    r = Run(proposal_id="proposal-x", base_commit_sha="abc", branch="nav/run-1",
+            verified_sha="old")
+    act.create_run(r)
+    snapshot = act.runs[r.id]
+    changed = r.model_copy(deep=True)
+    changed.verified_sha = "new"
+    act.update_run(changed)
+    assert snapshot.verified_sha == "old"          # replace-on-write, never in place
+    assert act.runs[r.id].verified_sha == "new"
+    assert act.runs[r.id] is not snapshot and act.runs[r.id] is not changed
+    changed.verified_sha = "later"                 # the argument is not aliased either
+    assert act.runs[r.id].verified_sha == "new"
