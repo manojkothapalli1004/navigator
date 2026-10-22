@@ -206,6 +206,26 @@ def test_reverify_failure_fails_run_with_one_grant(tmp_path):
     assert _events(nav, b, "run.rebuild_scheduled")[-1].payload["granted"] is True
 
 
+def test_sibling_whose_change_is_already_merged_fails_as_no_change(tmp_path):
+    # N17 (live 2026-10-20): identical new file in both; git rebase drops B's now-empty
+    # cherry-pick, leaving HEAD = new HEAD + one empty checkpoint. Re-verify must refuse
+    # the empty change instead of re-parking an empty diff at the merge gate.
+    builds = {"A": [("same.py", "S = 1\n")], "B": [("same.py", "S = 1\n")]}
+    nav, repo, a, b = _setup(tmp_path, builds)
+    done = _merge(nav, a)
+    assert {r.id for r in done} == {a.id, b.id}
+    sb = nav.act.runs[b.id]
+    assert sb.status == RunStatus.failed and sb.phase == RunPhase.finalizing
+    # the rebased tree really is empty against the new HEAD
+    assert _git(sb.worktree_path, "diff", "--name-only", f"{_head(repo)}..HEAD").strip() == ""
+    assert any("builder produced no change" in note for _, note, _ in nav.orc.updates)
+    assert not any("re-verify failed" in note for _, note, _ in nav.orc.updates)
+    assert len(_events(nav, b, "run.awaiting_review")) == 1  # only the original parking
+    assert [g.actor for g in _grants(nav, b)] == [ACTOR]
+    assert _events(nav, b, "run.rebuild_scheduled")[-1].payload["granted"] is True
+    assert Path(sb.worktree_path).is_dir()
+
+
 def test_flag_off_leaves_sibling_untouched(tmp_path):
     nav, repo, a, b = _setup(tmp_path)
     nav.settings.rebase_stale_runs = False
