@@ -13,7 +13,13 @@ nav/run-* branches directly (dry run unless --apply).
 `doctor [--plist PATH]` is read-only: it replays the daemon's startup against the
 launchd plist (ONLY its EnvironmentVariables, cwd = its WorkingDirectory):
 Settings.from_env, effective_repos, the driver choice, the SDK version (only for
-driver=claude_sdk) and the navigator git HEAD.
+driver=claude_sdk) and the navigator git HEAD. When an ACT client is available it
+also lists pending merge approvals of open runs that have been waiting longer than
+NAVIGATOR_STALE_APPROVAL_HOURS (default 24; read from the operator's shell env) as
+WARN lines, one per approval, naming the run: such a request may have been
+forgotten, or a rebase since then may have invalidated it. The Approval contract
+records no creation time, so the age is taken from the ULID in the approval id.
+No approval is ever modified.
 
 What doctor prints for env-derived values (all through _safe()):
 - env vars whose key has a sensitive marker, or that are neither NAVIGATOR_* nor
@@ -29,6 +35,7 @@ paragraph separators, ...) are replaced with '?', so a value cannot forge an
 extra output line.
 """
 import json
+import math
 import os
 import plistlib
 import re
@@ -37,6 +44,7 @@ import unicodedata
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TextIO
+from ulid import ULID
 from navigator.clients.act_client import _parse_ts
 from navigator.observability.logging import get_logger
 from navigator.observability.notify import format_verification
@@ -70,7 +78,7 @@ def run_cli(argv: list[str], *, act, out: TextIO, worktree_root: str | None = No
     if cmd == "status":
         return _status(act, out)
     if cmd == "doctor":
-        return _doctor(args, out)
+        return _doctor(args, out, act=act)
     if cmd == "audited":
         return _audited(act, args, out)
     if cmd == "inbox":
@@ -449,7 +457,83 @@ def _settings_with_env(env: dict[str, str], cwd: str):
             os.chdir(saved_cwd)
 
 
-def _doctor(args: list[str], out) -> int:
+# pending merge approvals older than this are reported as stale
+_DEFAULT_STALE_HOURS = 24.0
+_STALE_ENV = "NAVIGATOR_STALE_APPROVAL_HOURS"
+_STALE_PREFIX = "WARN stale merge approval "
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _approval_created_at(approval) -> datetime | None:
+    """When the approval was created: an explicit created_at if ACT ever records one,
+    else the timestamp encoded in its ULID id ('approval-<ULID>'); None if neither
+    is usable."""
+    created = _parse_ts(getattr(approval, "created_at", None))
+    if created is not None:
+        return created
+    try:
+        raw = str(getattr(approval, "id", "")).rsplit("-", 1)[-1]
+        return _parse_ts(ULID.from_str(raw).datetime)
+    except Exception:
+        return None
+
+
+def _stale_threshold(out) -> timedelta:
+    """NAVIGATOR_STALE_APPROVAL_HOURS from the shell env as a timedelta; a missing or
+    empty value means the default, an unusable one prints a WARN and uses the default."""
+    raw = os.environ.get(_STALE_ENV)
+    if raw is None or raw.strip() == "":
+        return timedelta(hours=_DEFAULT_STALE_HOURS)
+    try:
+        hours = float(raw)
+        if not math.isfinite(hours) or hours <= 0:
+            raise ValueError("not a positive finite number")
+        return timedelta(hours=hours)
+    except (ValueError, OverflowError):
+        print(f"WARN {_STALE_ENV}: not a positive number, using {_DEFAULT_STALE_HOURS:g}h",
+              file=out)
+        return timedelta(hours=_DEFAULT_STALE_HOURS)
+
+
+def _check_stale_approvals(act, out) -> None:
+    """Print one WARN line per pending merge approval (of an open run) that is older
+    than the stale threshold. Read-only; a client failure prints a WARN with the
+    exception class name only. Does not affect doctor's exit code."""
+    if act is None:
+        print("skip stale merge approvals (no ACT client)", file=out)
+        return
+    threshold = _stale_threshold(out)
+    hours = threshold.total_seconds() / 3600
+    now = _now()
+    stale = []
+    try:
+        runs = list(act.list_open_runs())
+        for run in runs:
+            for a in act.list_approvals(target=run.id, gate=ApprovalGate.merge,
+                                        decision=ApprovalDecision.pending):
+                created = _approval_created_at(a)
+                if created is None:
+                    continue
+                age = now - created
+                if age > threshold:
+                    stale.append((run, a, age))
+    except Exception as e:
+        print(f"WARN stale merge approvals unreadable: {type(e).__name__}", file=out)
+        return
+    for run, a, age in stale:
+        phase = getattr(getattr(run, "phase", None), "value", "?")
+        print(f"{_STALE_PREFIX}{_printable(a.id)} for {_printable(run.id)}: pending "
+              f"{age.total_seconds() / 3600:.1f}h > {hours:g}h (phase={_printable(phase)}; "
+              f"forgotten, or invalidated by a rebase since)", file=out)
+    if not stale:
+        print(f"ok   no pending merge approval older than {hours:g}h "
+              f"({len(runs)} open run(s))", file=out)
+
+
+def _doctor(args: list[str], out, act=None) -> int:
     if args == []:
         plist_arg = _DEFAULT_PLIST
     elif len(args) == 2 and args[0] == "--plist":
@@ -579,6 +663,9 @@ def _doctor(args: list[str], out) -> int:
             print(f"WARN navigator HEAD unknown ({nav_root})", file=out)
     except Exception as e:
         print(f"WARN navigator HEAD: {type(e).__name__} {nav_root}", file=out)
+
+    # pending merge approvals that have waited too long (informational, read-only)
+    _check_stale_approvals(act, out)
 
     if failures:
         print(f"doctor: {failures} problem(s)", file=out)
