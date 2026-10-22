@@ -15,7 +15,7 @@ from navigator.runtime.worktree import (
     WorktreeHandle, create_worktree, preserve_failed, remove_worktree)
 from navigator.runtime.checkpoint import diff_artifact
 from navigator.runtime.outcome_store import OutcomeStore
-from navigator.runtime.phases import reverify, run_build_and_verify, run_dir_for
+from navigator.runtime.phases import NO_CHANGE_SUMMARY, reverify, run_build_and_verify, run_dir_for
 from navigator.ids import new_id
 from navigator.safety.approval_engine import require_gate
 from navigator.safety.circuit_breakers import CircuitBreakers
@@ -178,8 +178,17 @@ def execute_proposal(proposal: Proposal, *, act, orc, driver, runner, settings,
         preserve_failed(handle)
         run.status = RunStatus.failed; run.phase = RunPhase.finalizing
         run.ended_at = datetime.now(timezone.utc); _save(act, run)
-        _write_outcome(orc, run, status="failed", summary="verification failed",
-                       lessons=[f"verify rc={result.verify_returncode}: {result.verify_output[-300:]}"],
+        if result.no_change:
+            # N17: an empty diff never reaches the merge gate; the lesson names the
+            # fix so the next builder (which sees previous_attempt_failure) acts on it
+            summary = NO_CHANGE_SUMMARY
+            lessons = [f"{NO_CHANGE_SUMMARY}: the diff against base {short_sha(head)} was empty; "
+                       "the next attempt must make real content changes to the affected_files "
+                       "(or state in its summary that the proposal is already done)"]
+        else:
+            summary = "verification failed"
+            lessons = [f"verify rc={result.verify_returncode}: {result.verify_output[-300:]}"]
+        _write_outcome(orc, run, status="failed", summary=summary, lessons=lessons,
                        verification_notes=result.verify_output[-1500:], preserved=handle.path,
                        checkpoints_made=len(result.checkpoints), settings=settings)
         _emit(act, run, "run.failed", Severity.error); return run
@@ -553,14 +562,21 @@ def _rebase_one(run: Run, merged: Run, new_head: str, *, act, orc, runner, setti
         return False
     state["rebased"] = True
     names = _git_run(wt, "diff", "--name-only", f"{new_head}..HEAD")
+    # a git failure stays 'unknown' (None); a genuinely empty name list is refused by
+    # reverify (N17: the sibling's change is already in HEAD, the rebase dropped it)
     changed = ([l.strip() for l in names.stdout.splitlines() if l.strip()]
-               if names.returncode == 0 else [])
+               if names.returncode == 0 else None)
     res = reverify(runner, run_dir_for(Path(wt), workdir), _recorded_argvs(run.verification),
                    changed_files=changed)
     if res.verify_returncode != 0:
-        _fail_stale(act, orc, run, settings,
-                    summary=f"stale after merge of {merged.id}: re-verify failed",
-                    lessons=[f"re-verify rc={res.verify_returncode}: {res.verify_output[-300:]}"],
+        if res.no_change:
+            summary = f"stale after merge of {merged.id}: {NO_CHANGE_SUMMARY}"
+            lessons = [f"{NO_CHANGE_SUMMARY} after rebase: the sibling's change is already in "
+                       f"HEAD (merged by {merged.id}); rebuilt once against the new HEAD"]
+        else:
+            summary = f"stale after merge of {merged.id}: re-verify failed"
+            lessons = [f"re-verify rc={res.verify_returncode}: {res.verify_output[-300:]}"]
+        _fail_stale(act, orc, run, settings, summary=summary, lessons=lessons,
                     notes=res.verify_output[-1500:])
         return False
     old_sha = run.verified_sha
