@@ -1,6 +1,8 @@
 import json
+import os
 import re
 import subprocess
+import tempfile
 from contextlib import ExitStack
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -19,6 +21,58 @@ log = get_logger("navigator.loop")
 
 # N16: how long execution pauses after a QuotaExhaustedError that names no reset time
 QUOTA_DEFAULT_PAUSE_S = 3600
+
+
+def read_quota_pause(path) -> datetime | None:
+    """The shared quota pause file's `until` as a tz-aware datetime (naive = UTC).
+    None when `path` is unset, the file is missing/unreadable/not JSON, has no
+    'until', or its value does not parse."""
+    if not path:
+        return None
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    raw = data.get("until")
+    if not isinstance(raw, str):
+        return None
+    try:
+        until = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    return until if until.tzinfo is not None else until.replace(tzinfo=timezone.utc)
+
+
+def write_quota_pause(path, until: datetime) -> None:
+    """Record `until` in the shared pause file (atomic replace). No-op when `path`
+    is unset; never shortens a pause already on file; OSErrors are logged, not raised."""
+    if not path:
+        return
+    if until.tzinfo is None:
+        until = until.replace(tzinfo=timezone.utc)
+    current = read_quota_pause(path)
+    if current is not None and current > until:
+        return
+    target = Path(path)
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=str(target.parent), prefix=".quota_pause-",
+                                   suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump({"until": until.isoformat(timespec="seconds")}, f)
+            os.replace(tmp, target)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+    except OSError as e:
+        log.warning("quota_pause.write_failed", error=type(e).__name__)
+
 
 class Navigator:
     def __init__(self, *, act, orc, driver, runner, settings, repo: str, lock_path,
@@ -145,11 +199,22 @@ class Navigator:
             return []
         if self._planned_recently():
             return []
+        if self._quota_paused(datetime.now(timezone.utc)):
+            # the account limit has not lifted yet: no planner call
+            log.info("tick.quota_paused",
+                     until=self.quota_paused_until.isoformat(timespec="seconds"))
+            return []
         snap = self.perceive(base_commit_sha, open_proposals)
         self.last_snapshot_chars = len(json.dumps(snap, default=str))
         from navigator.runtime.drivers.base import DriverRequest
         from navigator.contracts.enums import Role
-        plan = self.driver.run_role(DriverRequest(role=Role.planner, context={"repo": self.repo, "snapshot": snap}))
+        try:
+            plan = self.driver.run_role(DriverRequest(role=Role.planner, context={"repo": self.repo, "snapshot": snap}))
+        except QuotaExhaustedError as e:
+            # a planner session limit pauses this process AND the shared file so a
+            # fresh once.sh build does not start into the same limit window
+            self._record_quota_pause(e)
+            raise
         created: list[Proposal] = []
         all_proposals = self._mine(self.act.list_proposals())
         existing_hashes = {p.proposal_origin_hash for p in all_proposals}
@@ -186,14 +251,29 @@ class Navigator:
                 return until if until.tzinfo is not None else until.replace(tzinfo=timezone.utc)
         return datetime.now(timezone.utc) + timedelta(seconds=QUOTA_DEFAULT_PAUSE_S)
 
+    def _pause_path(self):
+        return getattr(self.settings, "quota_pause_path", None)
+
+    def _quota_paused(self, now: datetime) -> bool:
+        """True while a quota pause (in memory or in the shared file) is in the future.
+        A later pause on file is adopted into memory."""
+        file_until = read_quota_pause(self._pause_path())
+        if (file_until and file_until > now
+                and (self.quota_paused_until is None or file_until > self.quota_paused_until)):
+            self.quota_paused_until = file_until
+        return self.quota_paused_until is not None and now < self.quota_paused_until
+
+    def _record_quota_pause(self, e: QuotaExhaustedError) -> None:
+        self.quota_paused_until = self._quota_pause_from(e)
+        write_quota_pause(self._pause_path(), self.quota_paused_until)
+
     def approval_poll(self) -> list:
         self.quota_deferral = None
         if self.settings.mode != "execute":
             return []
         runs = []
         with self.lock.acquire():
-            if (self.quota_paused_until is not None
-                    and datetime.now(timezone.utc) < self.quota_paused_until):
+            if self._quota_paused(datetime.now(timezone.utc)):
                 # N16: the account limit has not lifted yet: no build, no SDK call
                 log.info("approval_poll.quota_paused",
                          until=self.quota_paused_until.isoformat(timespec="seconds"))
@@ -212,7 +292,7 @@ class Navigator:
                     # N16: the run was deferred (aborted + one rebuild grant); every later
                     # proposal would fail the same way, so pause until the limit lifts.
                     # Class name and resets_at only: str(e) may carry a token-bearing URL.
-                    self.quota_paused_until = self._quota_pause_from(e)
+                    self._record_quota_pause(e)
                     self.quota_deferral = {"error": type(e).__name__, "resets_at": e.resets_at}
                     log.warning("approval_poll.quota_exhausted", error=type(e).__name__,
                                 resets_at=e.resets_at)
