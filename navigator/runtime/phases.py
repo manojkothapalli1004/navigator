@@ -13,9 +13,14 @@ from navigator.safety.circuit_breakers import CircuitBreakers
 from navigator.safety.errors import CommandRejected
 from navigator.runtime.drivers.base import DriverRequest, SubagentDriver
 from navigator.runtime.worktree import WorktreeHandle
-from navigator.runtime.checkpoint import checkpoint
+from navigator.runtime.checkpoint import checkpoint, diff_artifact
 from navigator.safety.command_runner import CommandRunner
 from navigator.contracts.enums import Role
+
+# N17 (live 2026-10-20): a builder that returned no file changes was verified on an
+# unchanged tree and parked at the merge gate with an empty diff. An empty change is a
+# verification FAILURE whose lesson the next builder sees, never a merge candidate.
+NO_CHANGE_SUMMARY = "builder produced no change"
 
 @dataclass
 class PhaseResult:
@@ -24,6 +29,13 @@ class PhaseResult:
     verify_returncode: int = 0
     verify_output: str = ""
     verify_log: list[dict] = field(default_factory=list)
+    no_change: bool = False
+
+def _is_empty_change(wt: Path, base: str) -> bool:
+    """True when `git diff <base>..HEAD` is empty. Deliberately the plain diff form (no
+    -w / --ignore-* flags): a whitespace-only edit IS a change. A CalledProcessError
+    (bad sha) propagates; the caller already turns an exception into a failed run."""
+    return diff_artifact(wt, base).strip() == ""
 
 def _resolve_write_target(wt: Path, relpath: str) -> Path:
     """Resolve a builder write target, rejecting escapes and the worktree root itself.
@@ -673,6 +685,10 @@ def run_build_and_verify(driver: SubagentDriver, worktree: WorktreeHandle,
                          workdir: str = ".") -> PhaseResult:
     res = PhaseResult()
     wt = Path(worktree.path)
+    # the worktree is created at the run's base commit and nothing has been committed
+    # yet: this HEAD is the base the finished build is diffed against (N17)
+    base = subprocess.run(["git", "rev-parse", "HEAD"], cwd=wt, capture_output=True,
+                          text=True).stdout.strip()
     run_dir = run_dir_for(wt, workdir)
     proposal = dict(proposal or {})
     proposal["affected_files"] = _normalize_affected(wt, proposal.get("affected_files", []), workdir)
@@ -699,6 +715,14 @@ def run_build_and_verify(driver: SubagentDriver, worktree: WorktreeHandle,
         target.write_text(content)
         res.file_writes.append(relpath)
     checkpoint(wt, run_id=run_id, n=len(build.file_writes) + 1, label="post-build")
+    if _is_empty_change(wt, base):
+        # zero writes, or every file rewritten with identical content: nothing to
+        # verify and nothing to merge (the verifier role is never called)
+        res.verify_returncode = 1; res.no_change = True
+        res.verify_output = (f"{NO_CHANGE_SUMMARY}: git diff {base[:12]}..HEAD is empty "
+                             f"({len(build.file_writes)} file_writes: "
+                             f"{', '.join(r for r, _ in build.file_writes) or 'none'})")
+        return res
     if added_skips:
         # a skipped test verifies nothing; don't let the suite "pass" on them
         res.verify_returncode = 1
@@ -808,10 +832,17 @@ def reverify(runner, run_dir: Path, argvs: list[list[str]], breakers=None,
     per-command loop as run_build_and_verify: stop at the first non-zero return code, a
     rejected command is rc 126, and no commands at all is a failure (rc 1). When the
     rebased change (`changed_files`, repo-relative) is a python change in a repo with a
-    test suite, the full suite runs afterwards unless it is already among `argvs`."""
+    test suite, the full suite runs afterwards unless it is already among `argvs`.
+    N17: an explicitly EMPTY `changed_files` (nothing differs from the rebased base) is
+    refused as a no-change failure (rc 1, no_change=True) before any command runs;
+    `changed_files=None` means unknown and keeps today's behaviour."""
     res = PhaseResult()
     run_dir = Path(run_dir)
     argvs = [list(a) for a in argvs if a]
+    if changed_files is not None and not changed_files:
+        res.verify_returncode = 1; res.no_change = True
+        res.verify_output = f"{NO_CHANGE_SUMMARY}: no files differ from the rebased base"
+        return res
     if not argvs:
         res.verify_returncode = 1
         res.verify_output = "no recorded verification commands to re-run"
