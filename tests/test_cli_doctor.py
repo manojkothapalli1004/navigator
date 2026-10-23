@@ -12,7 +12,8 @@ from navigator import cli
 from navigator.cli import run_cli
 from navigator.clients.act_client import FakeACTClient
 from navigator.config import RepoConfig, Settings, effective_repos
-from navigator.contracts.enums import ApprovalDecision, ApprovalGate
+from navigator.contracts.enums import ApprovalDecision, ApprovalGate, ProposalStatus
+from navigator.contracts.proposal import Proposal
 from navigator.contracts.run import Run
 
 SECRET_KEY = "sk-ant-supersecret-value-123"
@@ -531,3 +532,163 @@ def test_approval_created_at_comes_from_ulid_id():
         id = "approval-not-a-ulid"
 
     assert cli._approval_created_at(NoId()) is None
+
+
+# ---- backlog (per repo, like the daemon) + duplicate telegram readers ---------
+
+ACT_URL = "http://act.local:8090"
+
+
+@pytest.fixture(autouse=True)
+def _no_real_launch_agents(monkeypatch, tmp_path):
+    # never read the real ~/Library/LaunchAgents from a test
+    monkeypatch.setattr(cli, "_launch_agents_dir", lambda: tmp_path / "LaunchAgents")
+
+
+def _backlog_env(repo):
+    return {"NAVIGATOR_REPO": str(repo), "NAVIGATOR_ACT_BASE_URL": ACT_URL,
+            "NAVIGATOR_MAX_OPEN_PROPOSALS": "3"}
+
+
+def _doctor_env(tmp_path, env, act):
+    out = io.StringIO()
+    plist = _plist(tmp_path, env)
+    rc = run_cli(["doctor", "--plist", str(plist)], act=act, out=out)
+    return rc, out.getvalue()
+
+
+def _proposal(repo, created_at=None):
+    return Proposal(origin="t", proposal_origin_hash="h", title="t", rationale="r",
+                    repo=repo, base_commit_sha="abc", intended_changes="x",
+                    created_at=created_at or datetime.now(timezone.utc))
+
+
+def _act_with(repo, n_mine, n_other=0, created_at=None):
+    act = FakeACTClient()
+    for _ in range(n_mine):
+        act.create_proposal(_proposal(str(repo), created_at))
+    for _ in range(n_other):
+        act.create_proposal(_proposal("/other/repo", created_at))
+    return act
+
+
+def _backlog_lines(text):
+    return [line for line in text.splitlines() if line.startswith(cli._BACKLOG_PREFIX)]
+
+
+def _duplicate_lines(text):
+    return [line for line in text.splitlines()
+            if line.startswith(cli._DUPLICATE_READERS_PREFIX)]
+
+
+def test_backlog_counts_only_this_repo(tmp_path):
+    repo = _git_repo(tmp_path)
+    rc, text = _doctor_env(tmp_path, _backlog_env(repo), _act_with(repo, 3, 5))
+    assert rc == 0, text
+    lines = _backlog_lines(text)
+    assert len(lines) == 1
+    assert "3 open proposals >= cap 3" in lines[0]
+    rc, text = _doctor_env(tmp_path, _backlog_env(repo), _act_with(repo, 2, 5))
+    assert rc == 0, text
+    assert _backlog_lines(text) == []
+    ok = [line for line in text.splitlines() if line.startswith("ok   backlog")]
+    assert len(ok) == 1 and "2/3 open" in ok[0]
+
+
+def test_backlog_ignores_proposals_older_than_ttl(tmp_path):
+    repo = _git_repo(tmp_path)
+    old = datetime.now(timezone.utc) - timedelta(days=8)  # default TTL is 7 days
+    act = _act_with(repo, 3, created_at=old)
+    rc, text = _doctor_env(tmp_path, _backlog_env(repo), act)
+    assert rc == 0, text
+    assert _backlog_lines(text) == []
+    ok = [line for line in text.splitlines() if line.startswith("ok   backlog")]
+    assert len(ok) == 1 and "0/3 open" in ok[0]
+    # doctor expired nothing
+    assert len(act.proposals) == 3
+    assert all(p.status == ProposalStatus.proposed for p in act.proposals.values())
+
+
+def test_backlog_skipped_without_daemon_act_url(tmp_path):
+    repo = _git_repo(tmp_path)
+    rc, text = _doctor_env(tmp_path, {"NAVIGATOR_REPO": str(repo)}, _act_with(repo, 3))
+    assert rc == 0, text
+    assert "skip backlog (daemon uses an in-memory ACT" in text
+    assert _backlog_lines(text) == []
+
+
+def test_backlog_url_mismatch_warns_and_does_not_count(tmp_path):
+    repo = _git_repo(tmp_path)
+    act = _act_with(repo, 3)
+    act.base_url = "http://elsewhere:9/api/v1/agent"
+    rc, text = _doctor_env(tmp_path, _backlog_env(repo), act)
+    assert rc == 0, text
+    assert "is not the daemon's" in text
+    assert "/3 open" not in text
+    assert _backlog_lines(text) == []
+
+
+def test_backlog_act_error_warns_class_only(tmp_path):
+    repo = _git_repo(tmp_path)
+
+    class Broken(FakeACTClient):
+        def list_proposals(self, status=None):
+            raise RuntimeError("http://u:SECRETY@act.local")
+
+    rc, text = _doctor_env(tmp_path, _backlog_env(repo), Broken())
+    assert rc == 0, text
+    assert "WARN backlog unreadable: RuntimeError" in text
+    assert "SECRETY" not in text
+
+
+def _launch_agents(tmp_path, *names):
+    d = tmp_path / "la"
+    d.mkdir()
+    for i, name in enumerate(names):
+        (d / name).write_text(f"plist {i}\n")
+    return d
+
+
+def test_duplicate_readers_warns_with_real_uid(tmp_path, monkeypatch):
+    repo = _git_repo(tmp_path)
+    d = _launch_agents(tmp_path, cli._LEGACY_READER_PLIST, cli._ONEBOT_PLIST)
+    monkeypatch.setattr(cli, "_launch_agents_dir", lambda: d)
+    rc, text = _doctor(_plist(tmp_path, {"NAVIGATOR_REPO": str(repo)}))
+    assert rc == 0, text
+    lines = _duplicate_lines(text)
+    assert len(lines) == 1
+    assert f"gui/{os.getuid()}/com.calwbot.navigator-telegram" in lines[0]
+    if os.getuid() != 501:
+        assert "gui/501/" not in lines[0]
+    assert "doctor: ok" in text
+
+
+def test_renamed_legacy_plist_is_not_counted(tmp_path):
+    d = _launch_agents(tmp_path, "com.calwbot.navigator-telegram.plist.disabled-20261021-onebot",
+                       "com.calwbot.telegram-bot.plist")
+    out = io.StringIO()
+    cli._check_duplicate_telegram_readers(out, d)
+    text = out.getvalue()
+    assert "ok   telegram reader com.calwbot.telegram-bot.plist only" in text
+    assert _duplicate_lines(text) == []
+
+
+def test_duplicate_readers_check_is_read_only(tmp_path):
+    d = _launch_agents(tmp_path, cli._LEGACY_READER_PLIST, cli._ONEBOT_PLIST)
+
+    def snapshot():
+        return [(p.name, p.read_bytes()) for p in sorted(d.iterdir())]
+
+    before = snapshot()
+    out = io.StringIO()
+    cli._check_duplicate_telegram_readers(out, d)
+    assert len(_duplicate_lines(out.getvalue())) == 1
+    assert snapshot() == before
+
+
+def test_missing_launch_agents_dir_is_ok(tmp_path):
+    out = io.StringIO()
+    cli._check_duplicate_telegram_readers(out, tmp_path / "nope")
+    text = out.getvalue()
+    assert "ok   telegram readers: no LaunchAgents dir" in text
+    assert _duplicate_lines(text) == []
