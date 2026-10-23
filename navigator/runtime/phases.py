@@ -30,6 +30,12 @@ class PhaseResult:
     verify_output: str = ""
     verify_log: list[dict] = field(default_factory=list)
     no_change: bool = False
+    # repair turns (run_build_and_verify repair_turns=N): how many extra builder attempts
+    # this result used, whether its failure is one a builder can fix in the same worktree
+    # (tests, skip gate, missing tests) and the tail of each failure that was repaired
+    repair_turns_used: int = 0
+    repairable: bool = False
+    repair_failures: list[str] = field(default_factory=list)
 
 def _is_empty_change(wt: Path, base: str) -> bool:
     """True when `git diff <base>..HEAD` is empty. Deliberately the plain diff form (no
@@ -457,19 +463,32 @@ def _added_skip_lines(new: str, old: str, cap: int = _SKIP_LINES_CAP) -> list[st
             break
     return out
 
-def _added_skips(wt: Path, writes: list[tuple[str, str]], with_lines: bool = False) -> list[str]:
+def _base_text(wt: Path, base: str, rel: str) -> str:
+    """Content of `rel` at commit `base` (`git show <base>:<rel>`), or '' when the file
+    did not exist there."""
+    proc = subprocess.run(["git", "show", f"{base}:{Path(rel).as_posix()}"], cwd=wt,
+                          capture_output=True, text=True)
+    return proc.stdout if proc.returncode == 0 else ""
+
+def _added_skips(wt: Path, writes: list[tuple[str, str]], with_lines: bool = False,
+                 baseline: str | None = None) -> list[str]:
     """'<file>: <n>' for each written test file (or conftest.py) where any kind of
     skip site grew versus the file on disk before the write (empty for new files),
     or '<file>: skip analysis incomplete (<reason>)' when the new content could not
     be fully analysed (fail closed). With with_lines, a grown entry also quotes the
     added skip lines: '<file>: <n> [<line> | <line> ...]' (at most _SKIP_LINES_CAP).
-    Must run before writing."""
+    Must run before writing - unless `baseline` (a commit sha) is given: then the
+    original is the file at that commit, independent of what is on disk (repair
+    turns, where the disk already holds earlier attempts' edits)."""
     out = []
     for rel, content in writes:
         if not _skip_gated(rel):
             continue
         target = _resolve_write_target(wt, rel)
-        original = target.read_text(errors="replace") if target.is_file() else ""
+        if baseline is not None:
+            original = _base_text(wt, baseline, rel)
+        else:
+            original = target.read_text(errors="replace") if target.is_file() else ""
         grown, incomplete = _skip_gate(content, original)
         if incomplete:
             out.append(f"{rel}: skip analysis incomplete ({incomplete})")
@@ -682,8 +701,12 @@ def run_build_and_verify(driver: SubagentDriver, worktree: WorktreeHandle,
                          proposal: dict | None = None,
                          breakers: CircuitBreakers | None = None,
                          started_monotonic: float | None = None,
-                         workdir: str = ".") -> PhaseResult:
-    res = PhaseResult()
+                         workdir: str = ".", repair_turns: int = 0) -> PhaseResult:
+    """Build and verify `proposal` in `worktree`. With repair_turns > 0, a repairable
+    verify failure (PhaseResult.repairable: a test/skip-gate/missing-tests failure) is fed
+    back to the builder up to that many more times in the SAME worktree. The returned
+    result accumulates every attempt's file_writes and checkpoints and carries the LAST
+    attempt's verify_* and no_change."""
     wt = Path(worktree.path)
     # the worktree is created at the run's base commit and nothing has been committed
     # yet: this HEAD is the base the finished build is diffed against (N17)
@@ -694,8 +717,49 @@ def run_build_and_verify(driver: SubagentDriver, worktree: WorktreeHandle,
     proposal["affected_files"] = _normalize_affected(wt, proposal.get("affected_files", []), workdir)
     started = time.monotonic() if started_monotonic is None else started_monotonic
     tracked = subprocess.run(["git", "ls-files"], cwd=wt, capture_output=True, text=True).stdout.split()
+    res = _attempt(driver, wt, base, run_id, runner, proposal, breakers, started, workdir,
+                   run_dir, tracked, PhaseResult(), cp_start=1, baseline=None)
+    if repair_turns <= 0:
+        return res
+    # Repair turns (outcomes 2026-10-09..23: 69 of 182 non-merged builds failed on builder
+    # quality, each costing a whole new run). A repairable failure goes back to the SAME
+    # builder in the SAME worktree: its edits stay applied, it sees the failure output and
+    # the current file text, and every gate judges the cumulative change since `base`.
+    file_writes, checkpoints, failures = list(res.file_writes), list(res.checkpoints), []
+    used = 0
+    while res.verify_returncode != 0 and res.repairable and used < repair_turns:
+        failures.append(res.verify_output[-500:])
+        repair = dict(proposal)
+        repair["previous_attempt_failure"] = (
+            f"repair turn {used + 1} of {repair_turns} in the same worktree; your previous "
+            "edits are already applied (context.files shows the current text). Failure: "
+            + res.verify_output[-2000:])
+        res = _attempt(driver, wt, base, run_id, runner, repair, breakers, started, workdir,
+                       run_dir, tracked, PhaseResult(), cp_start=1 + len(checkpoints),
+                       baseline=base, prior_writes=tuple(file_writes))
+        used += 1
+        file_writes = list(dict.fromkeys(file_writes + res.file_writes))
+        checkpoints.extend(res.checkpoints)
+    if used:
+        # verify_*, verify_log and no_change stay the LAST attempt's: the executor replays
+        # run.verification on rebase, so earlier attempts' commands must not merge in
+        res.file_writes, res.checkpoints = file_writes, checkpoints
+        res.repair_turns_used, res.repair_failures = used, failures
+    return res
+
+
+def _attempt(driver: SubagentDriver, wt: Path, base: str, run_id: str, runner: CommandRunner,
+             proposal: dict, breakers: CircuitBreakers | None, started: float, workdir: str,
+             run_dir: Path, tracked: list[str], res: PhaseResult, cp_start: int,
+             baseline: str | None, prior_writes: tuple[str, ...] = ()) -> PhaseResult:
+    """One builder + verifier pass, filling and returning `res`. Checkpoint numbers start
+    at cp_start. baseline=None is the first attempt (today's behaviour exactly);
+    baseline=<base sha> is a repair turn: prior_writes (paths earlier attempts wrote) are
+    shown to the builder and every gate judges prior_writes + this attempt's writes
+    against the base commit."""
     failing = _failing_test_files(proposal.get("previous_attempt_failure", ""), wt, workdir)
-    files = _read_affected(wt, list(dict.fromkeys(proposal.get("affected_files", []) + failing)))
+    files = _read_affected(wt, list(dict.fromkeys(proposal.get("affected_files", [])
+                                                   + list(prior_writes) + failing)))
     mention_text = f"{proposal.get('intended_changes') or ''} {proposal.get('rationale') or ''}"
     build_ctx = {"proposal": proposal, "files": files,
                  "test_files": [f for f in tracked if _is_test_file(f)][:200],
@@ -706,15 +770,30 @@ def run_build_and_verify(driver: SubagentDriver, worktree: WorktreeHandle,
     _check_scope([rel for rel, _ in build.file_writes], proposal.get("affected_files", []))
     if breakers:
         breakers.check_duration(started)
-    # compare against the originals before they are overwritten
-    added_skips = _added_skips(wt, build.file_writes, with_lines=True)
-    for n, (relpath, content) in enumerate(build.file_writes, start=1):
+    if baseline is None:
+        # compare against the originals before they are overwritten
+        added_skips = _added_skips(wt, build.file_writes, with_lines=True)
+    n = cp_start
+    for relpath, content in build.file_writes:
         target = _resolve_write_target(wt, relpath)
         cp_before = checkpoint(wt, run_id=run_id, n=n, label=f"pre-write-{relpath}")
         res.checkpoints.append(cp_before)
         target.write_text(content)
         res.file_writes.append(relpath)
-    checkpoint(wt, run_id=run_id, n=len(build.file_writes) + 1, label="post-build")
+        n += 1
+    checkpoint(wt, run_id=run_id, n=n, label="post-build")
+    # CUMULATIVE gates: the worktree holds every attempt's edits, so on a repair turn each
+    # gate below judges prior_writes + this attempt's writes, never this attempt alone
+    gate_writes = list(dict.fromkeys(list(prior_writes) + res.file_writes))
+    if baseline is not None:
+        # repair turn: the files as they are now versus the base commit, so a skip an
+        # earlier attempt added still fails when this turn leaves that test file alone
+        current = []
+        for rel in gate_writes:
+            target = _resolve_write_target(wt, rel)
+            if target.is_file():
+                current.append((rel, target.read_text(errors="replace")))
+        added_skips = _added_skips(wt, current, with_lines=True, baseline=baseline)
     if _is_empty_change(wt, base):
         # zero writes, or every file rewritten with identical content: nothing to
         # verify and nothing to merge (the verifier role is never called)
@@ -725,14 +804,14 @@ def run_build_and_verify(driver: SubagentDriver, worktree: WorktreeHandle,
         return res
     if added_skips:
         # a skipped test verifies nothing; don't let the suite "pass" on them
-        res.verify_returncode = 1
+        res.verify_returncode = 1; res.repairable = True
         res.verify_output = ("builder added test skips: " + "; ".join(added_skips)
                              + ". " + _NO_SKIP_INSTRUCTION)
         return res
     # verifier - a verify phase with no commands is a failure, not a silent pass
     # commands run in the workdir, so hand the verifier paths relative to it
     rel_changed = [str(Path(f).relative_to(workdir)) if workdir not in (".", "")
-                   and Path(f).is_relative_to(workdir) else f for f in res.file_writes]
+                   and Path(f).is_relative_to(workdir) else f for f in gate_writes]
     verify_ctx = {"proposal": proposal, "changed_files": rel_changed,
                   "allowed_commands": list(runner.allowlist),
                   "workdir": workdir or "."}
@@ -741,14 +820,14 @@ def run_build_and_verify(driver: SubagentDriver, worktree: WorktreeHandle,
         res.verify_returncode = 1
         res.verify_output = "verifier produced no commands"
         return res
-    code_changed = [f for f in res.file_writes if f.endswith(".py") and not _is_test_file(f)]
-    if (_requires_tests(run_dir, res.file_writes) and code_changed
-            and not any(_is_test_file(f) for f in res.file_writes)):
-        res.verify_returncode = 1
+    code_changed = [f for f in gate_writes if f.endswith(".py") and not _is_test_file(f)]
+    if (_requires_tests(run_dir, gate_writes) and code_changed
+            and not any(_is_test_file(f) for f in gate_writes)):
+        res.verify_returncode = 1; res.repairable = True
         res.verify_output = ("builder changed code but made no test changes: "
                              + ", ".join(code_changed))
         return res
-    if _requires_tests(run_dir, res.file_writes) and not _runs_tests(verify.commands):
+    if _requires_tests(run_dir, gate_writes) and not _runs_tests(verify.commands):
         res.verify_returncode = 1
         res.verify_output = ("verifier did not run the test suite for a python change: "
                              + "; ".join(" ".join(c) for c in verify.commands))
@@ -779,13 +858,17 @@ def run_build_and_verify(driver: SubagentDriver, worktree: WorktreeHandle,
             entry["interpreter"] = r.interpreter
         res.verify_log.append(entry)
         if r.returncode != 0:
+            # a command that ran and failed is something a builder can fix; a rejected
+            # or timed-out one (rc 126) is not
+            if r.returncode != 126:
+                res.repairable = True
             if breakers:
                 m = _FAILED_TESTS.search(res.verify_output)
                 if m:
                     breakers.check_failed_tests(int(m.group(1)))
                 breakers.record_failure(" ".join(argv))
             break
-    if res.verify_returncode == 0 and _requires_tests(run_dir, res.file_writes):
+    if res.verify_returncode == 0 and _requires_tests(run_dir, gate_writes):
         _run_full_suite(runner, run_dir, res, breakers)
     return res
 
@@ -812,6 +895,8 @@ def _run_full_suite(runner, run_dir: Path, res: PhaseResult, breakers) -> None:
         entry["interpreter"] = interpreter
     res.verify_log.append(entry)
     res.verify_returncode, res.verify_output = rc, out
+    if rc not in (0, 126):
+        res.repairable = True  # the suite ran and failed: a builder can act on that
     if rc != 0 and breakers:
         m = _FAILED_TESTS.search(out)
         if m:
