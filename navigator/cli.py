@@ -5,6 +5,9 @@ Every decision here is recorded in ACT; the daemon acts on it next cycle.
 'run.audited' event carrying the run's verified_sha plus an approved review-gate
 approval targeting the run); only audited runs accept a merge decision from
 Telegram. The CLI `merge` does not need it.
+`reject <run-id> [--reason CODE]` declines the merge; the optional CODE (one of
+REASON_CODES) is stored as the approval note `reason=CODE` and recorded by the
+daemon as the declined outcome's reason_code.
 `inbox [--since UPDATE_ID]` prints the Telegram inbox file (JSON lines, newest
 last) so other tools read operator messages from the file instead of calling
 getUpdates themselves.
@@ -61,6 +64,9 @@ COMMANDS = ("status", "approve", "decline", "diff", "merge", "reject", "retry", 
             "doctor", "audited", "inbox")
 ACTOR = "operator"
 AUDITOR = "auditor"
+# merge-gate decline reasons accepted by `navigator reject <run> --reason CODE`
+REASON_CODES = ("wrong_behavior", "unsafe", "scope_creep", "docs_wrong", "tests_weak",
+                "low_value", "duplicate", "rebuild_rev2", "other")
 _log = get_logger("navigator.cli")
 
 # run statuses whose worktree/branch can go regardless of age
@@ -77,6 +83,7 @@ def run_cli(argv: list[str], *, act, out: TextIO, worktree_root: str | None = No
               f"(cleanup takes no id: navigator cleanup [--apply]; "
               f"navigator doctor [--plist PATH]; "
               f"navigator audited <run-id> [--note TEXT]; "
+              f"navigator reject <run-id> [--reason CODE]; "
               f"navigator inbox [--since UPDATE_ID])", file=out)
         return 2
     cmd, args = argv[0], argv[1:]
@@ -93,6 +100,12 @@ def run_cli(argv: list[str], *, act, out: TextIO, worktree_root: str | None = No
             print("usage: navigator cleanup [--apply]", file=out)
             return 2
         return _cleanup(act, apply=bool(args), out=out, worktree_root=worktree_root)
+    if cmd == "reject" and len(args) == 3 and args[1] == "--reason":
+        if args[2] not in REASON_CODES:
+            print(f"unknown reason {args[2]!r}; one of: " + ", ".join(REASON_CODES), file=out)
+            return 2
+        return _decide_merge(act, args[0], out, ApprovalDecision.declined,
+                             note=f"reason={args[2]}")
     if len(args) != 1:
         print(f"navigator {cmd} needs exactly one id", file=out)
         return 2
@@ -130,13 +143,18 @@ def _set_proposal(act, pid, out, status: ProposalStatus) -> int:
     return 0
 
 
-def _decide_merge(act, run_id, out, decision: ApprovalDecision) -> int:
+def _decide_merge(act, run_id, out, decision: ApprovalDecision,
+                  note: str | None = None) -> int:
     pending = act.list_approvals(target=run_id, gate=ApprovalGate.merge,
                                  decision=ApprovalDecision.pending)
     if not pending:
         print(f"no pending merge approval for {run_id}", file=out)
         return 1
-    act.decide_approval(pending[0].id, decision, actor=ACTOR)
+    # note is passed only when given: some client wrappers take no note argument
+    if note is not None:
+        act.decide_approval(pending[0].id, decision, actor=ACTOR, note=note)
+    else:
+        act.decide_approval(pending[0].id, decision, actor=ACTOR)
     print(f"{run_id} merge -> {decision.value} (applied on the daemon's next cycle)", file=out)
     return 0
 
