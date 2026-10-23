@@ -19,7 +19,8 @@ class ACTClient(Protocol):
     def list_all_runs(self) -> list[Run]: ...
     def list_runs_for_proposal(self, proposal_id: str) -> list[Run]: ...
     def create_approval(self, target: str, gate: ApprovalGate) -> Approval: ...
-    def decide_approval(self, approval_id: str, decision: ApprovalDecision, actor: str) -> None: ...
+    def decide_approval(self, approval_id: str, decision: ApprovalDecision, actor: str,
+                        note: str | None = None) -> None: ...
     def list_approvals(self, target: str, gate: ApprovalGate,
                        decision: ApprovalDecision | None = None) -> list[Approval]: ...
     def emit_event(self, event: Event) -> None: ...
@@ -71,9 +72,12 @@ class FakeACTClient:
         return [r.model_copy(deep=True) for r in self.runs.values() if r.proposal_id == proposal_id]
     def create_approval(self, target: str, gate: ApprovalGate) -> Approval:
         a = Approval(target=target, gate=gate); self.approvals[a.id] = a; return a
-    def decide_approval(self, approval_id: str, decision: ApprovalDecision, actor: str) -> None:
+    def decide_approval(self, approval_id: str, decision: ApprovalDecision, actor: str,
+                        note: str | None = None) -> None:
         a = self.approvals[approval_id]
         a.decision = decision; a.actor = actor; a.decided_at = datetime.now(timezone.utc)
+        if note is not None:
+            a.note = note
     def list_approvals(self, target: str, gate: ApprovalGate,
                        decision: ApprovalDecision | None = None) -> list[Approval]:
         return [a.model_copy(deep=True) for a in self.approvals.values()
@@ -269,9 +273,13 @@ class HTTPACTClient:
         r.raise_for_status()
         return self._approval_from(r.json())
 
-    def decide_approval(self, approval_id: str, decision: ApprovalDecision, actor: str) -> None:
+    def decide_approval(self, approval_id: str, decision: ApprovalDecision, actor: str,
+                        note: str | None = None) -> None:
+        body: dict = {"decision": decision.value, "actor": actor}
+        if note is not None:
+            body["note"] = note  # ACT stores it (ApprovalDecideRequest.note)
         self.client.post(f"{self.base_url}/approvals/{approval_id}/decide",
-                         json={"decision": decision.value, "actor": actor}).raise_for_status()
+                         json=body).raise_for_status()
 
     def list_approvals(self, target: str, gate: ApprovalGate,
                        decision: ApprovalDecision | None = None) -> list[Approval]:
