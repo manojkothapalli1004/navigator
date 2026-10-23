@@ -61,6 +61,7 @@ max_cost_usd = 2.0              # NAVIGATOR_MAX_COST_USD: per-run budget (> 0)
 max_tool_failures = 5           # NAVIGATOR_MAX_TOOL_FAILURES (>= 1)
 max_identical_failures = 3      # NAVIGATOR_MAX_IDENTICAL_FAILURES
 max_run_duration_s = 1800       # NAVIGATOR_MAX_RUN_DURATION_S
+builder_repair_turns = 1          # NAVIGATOR_BUILDER_REPAIR_TURNS: extra builder attempts in the same run after a test/skip-gate failure; 0 = off
 max_failed_tests = 50           # NAVIGATOR_MAX_FAILED_TESTS
 command_timeout_s = 60          # NAVIGATOR_COMMAND_TIMEOUT_S: per verifier command; a fresh
                                 # worktree's `uv run pytest` builds a venv first (~3 min)
