@@ -56,6 +56,9 @@ class Settings:
     repos: list[RepoConfig] = field(default_factory=list)
     lock_path: str = "/tmp/navigator.lock"
     outcome_path: str = "/tmp/navigator-outcomes.jsonl"
+    # quota pause file shared by the daemon and once.sh: JSON {"until": ISO}; while
+    # `until` is in the future no planner call and no build starts. None = off
+    quota_pause_path: str | None = None
     sdk_model: str | None = None
     sdk_role_models: dict[str, str] = field(default_factory=dict)
     sdk_timeout_s: float = 300.0
@@ -90,6 +93,7 @@ class Settings:
             repos=_repos_env(),
             lock_path=os.getenv("NAVIGATOR_LOCK_PATH", "/tmp/navigator.lock"),
             outcome_path=os.getenv("NAVIGATOR_OUTCOME_PATH", "/tmp/navigator-outcomes.jsonl"),
+            quota_pause_path=os.getenv("NAVIGATOR_QUOTA_PAUSE_PATH") or None,
             sdk_model=os.getenv("NAVIGATOR_SDK_MODEL"),
             sdk_role_models={role: os.environ[f"NAVIGATOR_SDK_MODEL_{role.upper()}"]
                              for role in ("planner", "builder", "verifier")
