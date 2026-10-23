@@ -22,3 +22,6 @@ class Outcome(BaseModel):
     # git HEAD of the navigator code that produced this outcome; None when unknown
     # (old JSONL lines, or git unavailable)
     code_sha: str | None = None
+    # operator's merge-gate decline reason (`navigator reject <run> --reason CODE`);
+    # None when no reason was given or for lines written before the field existed
+    reason_code: str | None = None
