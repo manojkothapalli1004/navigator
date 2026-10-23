@@ -156,7 +156,8 @@ def execute_proposal(proposal: Proposal, *, act, orc, driver, runner, settings,
                       "intended_changes": proposal.intended_changes,
                       "affected_files": list(proposal.affected_files),
                       **_previous_failure(settings, proposal.id)},
-            breakers=breakers, started_monotonic=started, workdir=workdir)
+            breakers=breakers, started_monotonic=started, workdir=workdir,
+            repair_turns=getattr(settings, "builder_repair_turns", 0))
     except QuotaExhaustedError as e:
         # the run is finalized here; the re-raise lets the loop pause until resets_at
         _defer_quota(act, orc, run, handle, e, settings)
@@ -168,6 +169,10 @@ def execute_proposal(proposal: Proposal, *, act, orc, driver, runner, settings,
         _write_outcome(orc, run, status="failed", summary=f"exception: {e}",
                        lessons=[f"build/verify raised: {e}"], preserved=handle.path, settings=settings)
         _emit(act, run, "run.failed", Severity.error, error=str(e)); return run
+    repair_used = getattr(result, "repair_turns_used", 0)
+    if repair_used > 0:
+        _emit(act, run, "run.repair_turn", used=repair_used,
+              failures=list(getattr(result, "repair_failures", [])))
     # Correction 2: normal top-level import of Checkpoint (not dynamic __import__)
     run.checkpoints = [Checkpoint(sha=c, label="cp") for c in result.checkpoints]
     run.verification = result.verify_log
@@ -188,6 +193,8 @@ def execute_proposal(proposal: Proposal, *, act, orc, driver, runner, settings,
         else:
             summary = "verification failed"
             lessons = [f"verify rc={result.verify_returncode}: {result.verify_output[-300:]}"]
+        if repair_used > 0:
+            lessons.append(f"repair turns used: {repair_used}")
         _write_outcome(orc, run, status="failed", summary=summary, lessons=lessons,
                        verification_notes=result.verify_output[-1500:], preserved=handle.path,
                        checkpoints_made=len(result.checkpoints), settings=settings)
@@ -199,7 +206,8 @@ def execute_proposal(proposal: Proposal, *, act, orc, driver, runner, settings,
     # Correction 1: store diff in event payload, not as a transient Run attribute
     diff = diff_artifact(handle.path, head)
     _emit(act, run, "run.awaiting_review", diff=diff, title=proposal.title,
-          verification=run.verification, verified_sha=run.verified_sha)
+          verification=run.verification, verified_sha=run.verified_sha,
+          repair_turns_used=repair_used)
     return run
 
 def _as_utc(dt: datetime) -> datetime:

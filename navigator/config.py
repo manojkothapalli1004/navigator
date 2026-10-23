@@ -42,6 +42,9 @@ class Settings:
     max_tool_failures: int = 5
     max_identical_failures: int = 3
     max_run_duration_s: int = 1800
+    # extra builder attempts in the same run (same worktree) after a repairable verify
+    # failure (tests, skip gate, missing tests); 0 = off
+    builder_repair_turns: int = 1
     max_cost_usd: float = 2.0
     max_proposals_per_tick: int = 3
     max_open_proposals: int = 10
@@ -75,6 +78,7 @@ class Settings:
             max_tool_failures=_positive_int_env("NAVIGATOR_MAX_TOOL_FAILURES", "5"),
             max_identical_failures=_int_env("NAVIGATOR_MAX_IDENTICAL_FAILURES", "3"),
             max_run_duration_s=_int_env("NAVIGATOR_MAX_RUN_DURATION_S", "1800"),
+            builder_repair_turns=_non_negative_int_env("NAVIGATOR_BUILDER_REPAIR_TURNS", "1"),
             max_cost_usd=_positive_float_env("NAVIGATOR_MAX_COST_USD", "2.0"),
             max_proposals_per_tick=_int_env("NAVIGATOR_MAX_PROPOSALS_PER_TICK", "3"),
             max_open_proposals=_positive_int_env("NAVIGATOR_MAX_OPEN_PROPOSALS", "10"),
@@ -128,6 +132,13 @@ def _positive_int_env(name: str, default: str) -> int:
     v = _int_env(name, default)
     if v < 1:
         raise ValueError(f"{name} must be >= 1, got {v}")
+    return v
+
+
+def _non_negative_int_env(name: str, default: str) -> int:
+    v = _int_env(name, default)
+    if v < 0:
+        raise ValueError(f"{name} must be >= 0, got {v}")
     return v
 
 
