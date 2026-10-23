@@ -21,6 +21,8 @@ log = get_logger("navigator.loop")
 
 # N16: how long execution pauses after a QuotaExhaustedError that names no reset time
 QUOTA_DEFAULT_PAUSE_S = 3600
+# no pause, from the SDK or the shared file, lasts longer than this; a bad resets_at must not stop the loop for days
+QUOTA_MAX_PAUSE_S = 24 * 3600
 
 
 def read_quota_pause(path) -> datetime | None:
@@ -42,19 +44,29 @@ def read_quota_pause(path) -> datetime | None:
         until = datetime.fromisoformat(raw)
     except ValueError:
         return None
-    return until if until.tzinfo is not None else until.replace(tzinfo=timezone.utc)
+    if until.tzinfo is None:
+        until = until.replace(tzinfo=timezone.utc)
+    # cap against the file's mtime (the same for every check and every process), never
+    # against datetime.now(): a cap that slides with the clock would never expire
+    try:
+        written = datetime.fromtimestamp(Path(path).stat().st_mtime, timezone.utc)
+    except OSError:
+        return None
+    return min(until, written + timedelta(seconds=QUOTA_MAX_PAUSE_S))
 
 
-def write_quota_pause(path, until: datetime) -> None:
-    """Record `until` in the shared pause file (atomic replace). No-op when `path`
-    is unset; never shortens a pause already on file; OSErrors are logged, not raised."""
+def write_quota_pause(path, until: datetime) -> bool:
+    """Record `until` in the shared pause file (atomic replace). Never shortens a pause
+    already on file; OSErrors are logged, not raised. True when the file now holds a
+    pause >= `until` (written, or an existing later one kept); False when `path` is
+    unset or the write failed."""
     if not path:
-        return
+        return False
     if until.tzinfo is None:
         until = until.replace(tzinfo=timezone.utc)
     current = read_quota_pause(path)
     if current is not None and current > until:
-        return
+        return True
     target = Path(path)
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -72,6 +84,8 @@ def write_quota_pause(path, until: datetime) -> None:
             raise
     except OSError as e:
         log.warning("quota_pause.write_failed", error=type(e).__name__)
+        return False
+    return True
 
 
 class Navigator:
@@ -96,6 +110,9 @@ class Navigator:
         # executes nothing until quota_paused_until. quota_deferral describes the
         # deferral of the LAST poll only (class name + resets_at, never SDK text).
         self.quota_paused_until: datetime | None = None
+        # True while the in-memory pause is backed by the shared pause file: removing
+        # the file then clears it (a pause never written stays until it expires)
+        self._pause_on_file = False
         self.quota_deferral: dict | None = None
 
     def perceive(self, base_commit_sha: str, open_proposals: list[Proposal] | None = None) -> dict:
@@ -254,18 +271,37 @@ class Navigator:
     def _pause_path(self):
         return getattr(self.settings, "quota_pause_path", None)
 
+    def _cap(self, until: datetime, now: datetime) -> datetime:
+        """`until`, but never more than QUOTA_MAX_PAUSE_S past `now`."""
+        limit = now + timedelta(seconds=QUOTA_MAX_PAUSE_S)
+        if until > limit:
+            log.warning("quota_pause.capped", until=until.isoformat(timespec="seconds"))
+            return limit
+        return until
+
     def _quota_paused(self, now: datetime) -> bool:
         """True while a quota pause (in memory or in the shared file) is in the future.
-        A later pause on file is adopted into memory."""
-        file_until = read_quota_pause(self._pause_path())
-        if (file_until and file_until > now
-                and (self.quota_paused_until is None or file_until > self.quota_paused_until)):
-            self.quota_paused_until = file_until
+        A later pause on file is adopted into memory; removing (or emptying) the file
+        clears a pause the file backs, so 'delete the file to unpause' works on a
+        running daemon."""
+        path = self._pause_path()
+        file_until = read_quota_pause(path)  # already capped by the file's mtime
+        if file_until is None:
+            if path and self._pause_on_file:
+                self.quota_paused_until = None
+                self._pause_on_file = False
+                log.info("quota_pause.cleared")
+                return False
+        elif file_until > now:
+            if self.quota_paused_until is None or file_until > self.quota_paused_until:
+                self.quota_paused_until = file_until
+                self._pause_on_file = True
         return self.quota_paused_until is not None and now < self.quota_paused_until
 
     def _record_quota_pause(self, e: QuotaExhaustedError) -> None:
-        self.quota_paused_until = self._quota_pause_from(e)
-        write_quota_pause(self._pause_path(), self.quota_paused_until)
+        now = datetime.now(timezone.utc)
+        self.quota_paused_until = self._cap(self._quota_pause_from(e), now)
+        self._pause_on_file = write_quota_pause(self._pause_path(), self.quota_paused_until)
 
     def approval_poll(self) -> list:
         self.quota_deferral = None
@@ -279,6 +315,7 @@ class Navigator:
                          until=self.quota_paused_until.isoformat(timespec="seconds"))
                 return runs
             self.quota_paused_until = None
+            self._pause_on_file = False
             for p in self._mine(self.act.list_proposals(status=ProposalStatus.approved)):
                 # Correction 3: dedup guard — skip proposals that already have a run
                 # (any status: a completed run must also block re-execution)
