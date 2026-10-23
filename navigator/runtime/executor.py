@@ -364,13 +364,40 @@ def merge_after_approval(run: Run, *, act, orc, driver, runner, settings, squash
     _emit(act, run, "run.completed")
     return run
 
+_REASON_PREFIX = "reason="
+
+def _decline_reason(act, run) -> str | None:
+    """The operator's decline reason code recorded by `navigator reject --reason`: the
+    first declined merge approval of the run whose note reads 'reason=<code>' yields
+    <code> (up to the first ';' or whitespace). None when no reason was given or the
+    approvals cannot be read."""
+    try:
+        for a in act.list_approvals(target=run.id, gate=ApprovalGate.merge,
+                                    decision=ApprovalDecision.declined):
+            note = getattr(a, "note", None)
+            if isinstance(note, str) and note.startswith(_REASON_PREFIX):
+                rest = note[len(_REASON_PREFIX):]
+                end = len(rest)
+                for i, ch in enumerate(rest):
+                    if ch == ";" or ch.isspace():
+                        end = i
+                        break
+                return rest[:end].strip() or None
+    except Exception:
+        return None
+    return None
+
 def decline_run(run: Run, *, act, orc, settings) -> Run:
     run.status = RunStatus.aborted; run.phase = RunPhase.finalizing
     run.ended_at = datetime.now(timezone.utc); _save(act, run)
+    code = _decline_reason(act, run)
+    # lessons[0] must stay the exact DECLINED_LESSON text: title_lessons matches it
+    lessons = (["operator declined the change at the merge gate"]
+               + ([f"decline reason: {code}"] if code else []))
     _write_outcome(orc, run, status="declined", summary="merge declined by operator",
-                   lessons=["operator declined the change at the merge gate"],
-                   preserved=run.worktree_path, section="decisions", settings=settings)
-    _emit(act, run, "run.declined")
+                   lessons=lessons, preserved=run.worktree_path, section="decisions",
+                   settings=settings, reason_code=code)
+    _emit(act, run, "run.declined", reason_code=code)
     return run
 
 def _cleanup_worktree(run: Run, repo: str) -> None:
@@ -392,14 +419,15 @@ def _repo_for(run, act) -> str:
     return prop.repo
 
 def _write_outcome(orc, run, *, status, summary, lessons, verification_notes=None,
-                   preserved=None, checkpoints_made=0, section=None, settings=None):
+                   preserved=None, checkpoints_made=0, section=None, settings=None,
+                   reason_code=None):
     out = Outcome(run_id=run.id, proposal_id=run.proposal_id, status=status, summary=summary,
                   lessons=lessons, verification_notes=verification_notes,
                   provenance=f"navigator {run.id}",
                   rollback=Rollback(checkpoints_made=checkpoints_made,
                                     worktree_preserved=preserved is not None,
                                     preserved_path=str(preserved) if preserved else None),
-                  code_sha=code_sha())
+                  code_sha=code_sha(), reason_code=reason_code)
     target_section = section or ("known_failures" if status == "failed" else "status")
     note = f"[{run.id}] {summary} | lessons: {'; '.join(lessons)}"
     orc.apply_memory_update(section=target_section, note=note, replace=False)
