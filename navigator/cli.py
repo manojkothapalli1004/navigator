@@ -19,7 +19,12 @@ NAVIGATOR_STALE_APPROVAL_HOURS (default 24; read from the operator's shell env) 
 WARN lines, one per approval, naming the run: such a request may have been
 forgotten, or a rebase since then may have invalidated it. The Approval contract
 records no creation time, so the age is taken from the ULID in the approval id.
-No approval is ever modified.
+No approval is ever modified. It also reports, per configured repo, whether the
+daemon's open-proposal backlog has reached NAVIGATOR_MAX_OPEN_PROPOSALS (counted
+like the daemon: that repo only, proposals older than NAVIGATOR_PROPOSAL_TTL_DAYS
+ignored, nothing is expired), and warns when both the legacy navigator-telegram
+and the one-bot telegram-bot launchd plists are installed; this is file presence
+only, so a job that is still loaded after its plist was renamed is not detected.
 
 What doctor prints for env-derived values (all through _safe()):
 - env vars whose key has a sensitive marker, or that are neither NAVIGATOR_* nor
@@ -533,6 +538,91 @@ def _check_stale_approvals(act, out) -> None:
               f"({len(runs)} open run(s))", file=out)
 
 
+# the daemon's planner backpressure (runtime/loop.py periodic_tick), mirrored read-only
+_BACKLOG_PREFIX = "WARN backlog "
+# launchd plists that each poll Telegram's getUpdates; Telegram allows one reader
+_DUPLICATE_READERS_PREFIX = "WARN duplicate telegram readers"
+_LEGACY_READER_PLIST = "com.calwbot.navigator-telegram.plist"
+_ONEBOT_PLIST = "com.calwbot.telegram-bot.plist"
+
+
+def _check_backlog(act, settings, repos, out) -> None:
+    """Per configured repo, print whether the daemon's open-proposal backlog has
+    reached settings.max_open_proposals, counted exactly like periodic_tick: only
+    that repo's proposed proposals, those older than proposal_ttl_days ignored.
+    Read-only: nothing is expired, no proposal status is changed. Only counts when
+    this shell's ACT is the daemon's (NAVIGATOR_ACT_BASE_URL from the plist). A
+    client failure prints a WARN with the exception class name only. Never affects
+    doctor's exit code."""
+    if act is None:
+        print("skip backlog (no ACT client)", file=out)
+        return
+    if settings is None or repos is None:
+        print("skip backlog (settings unavailable)", file=out)
+        return
+    if not settings.act_base_url:
+        print("skip backlog (daemon uses an in-memory ACT: NAVIGATOR_ACT_BASE_URL unset "
+              "in plist)", file=out)
+        return
+    client_url = getattr(act, "base_url", None)
+    expected = f"{settings.act_base_url.rstrip('/')}/api/v1/agent"
+    if client_url is not None and client_url != expected:
+        print(f"WARN backlog: this shell's ACT ({_safe(client_url)}) is not the daemon's "
+              f"({_safe(expected)}); not counted", file=out)
+        return
+    try:
+        proposals = list(act.list_proposals(ProposalStatus.proposed))
+    except Exception as e:
+        print(f"WARN backlog unreadable: {type(e).__name__}", file=out)
+        return
+    cutoff = _now() - timedelta(days=settings.proposal_ttl_days)
+    cap = settings.max_open_proposals
+    for r in repos:
+        path = str(getattr(r, "path", r))
+        live = [p for p in proposals if p.repo == path
+                and (created := _parse_ts(getattr(p, "created_at", None))) is not None
+                and created >= cutoff]
+        n = len(live)
+        if n >= cap:
+            print(f"{_BACKLOG_PREFIX}{_safe(path)}: {n} open proposals >= cap {cap}; "
+                  f"planner paused until you triage", file=out)
+        else:
+            print(f"ok   backlog {_safe(path)}: {n}/{cap} open", file=out)
+
+
+def _launch_agents_dir() -> Path:
+    # evaluated at call time so tests can redirect it; never at import
+    return Path.home() / "Library" / "LaunchAgents"
+
+
+def _check_duplicate_telegram_readers(out, launch_agents_dir: Path | None = None) -> None:
+    """Warn when both the legacy navigator-telegram plist and the one-bot
+    telegram-bot plist are installed (exact file names only; a renamed
+    '<name>.disabled-<date>' does not count). File presence only: no launchctl, no
+    subprocess, nothing written. Never affects doctor's exit code."""
+    d = launch_agents_dir if launch_agents_dir is not None else _launch_agents_dir()
+    try:
+        if not d.is_dir():
+            print(f"ok   telegram readers: no LaunchAgents dir ({_printable(d)})", file=out)
+            return
+        legacy = (d / _LEGACY_READER_PLIST).exists()
+        onebot = (d / _ONEBOT_PLIST).exists()
+    except Exception as e:
+        print(f"WARN telegram readers unreadable: {type(e).__name__}", file=out)
+        return
+    if legacy and onebot:
+        # the uid comes from the running process: launchd domains are per user
+        print(f"{_DUPLICATE_READERS_PREFIX}: both {_LEGACY_READER_PLIST} and {_ONEBOT_PLIST} "
+              f"are in {_printable(d)}; Telegram allows one getUpdates reader. Fix: "
+              f"launchctl bootout gui/{os.getuid()}/com.calwbot.navigator-telegram && "
+              f"mv the legacy plist to <name>.disabled-<date>", file=out)
+    elif legacy or onebot:
+        name = _LEGACY_READER_PLIST if legacy else _ONEBOT_PLIST
+        print(f"ok   telegram reader {name} only", file=out)
+    else:
+        print("ok   telegram readers: none installed", file=out)
+
+
 def _doctor(args: list[str], out, act=None) -> int:
     if args == []:
         plist_arg = _DEFAULT_PLIST
@@ -666,6 +756,10 @@ def _doctor(args: list[str], out, act=None) -> int:
 
     # pending merge approvals that have waited too long (informational, read-only)
     _check_stale_approvals(act, out)
+    # planner backpressure per repo, counted like the daemon (read-only)
+    _check_backlog(act, settings, repos, out)
+    # two launchd jobs polling Telegram's getUpdates (file presence only)
+    _check_duplicate_telegram_readers(out)
 
     if failures:
         print(f"doctor: {failures} problem(s)", file=out)
