@@ -13,6 +13,7 @@ from navigator.cli import COMMANDS, run_cli
 from navigator.config import RepoConfig, Settings, effective_repos
 from navigator.runtime.fleet import Fleet
 from navigator.contracts.enums import Role
+from navigator.observability import decisions
 from navigator.observability.notify import NotifyingACT, make_notifier
 from navigator.observability.telegram_inbox import (TelegramError, apply_commands,
                                                     make_telegram_inbox)
@@ -134,6 +135,20 @@ def _triage_step(nav, summary: dict) -> None:
     except Exception as e:
         summary["triage_error"] = f"{type(e).__name__}: {e}"[:300]
 
+def _decisions_step(nav, summary: dict) -> None:
+    """The decisions inbox tick (observability/decisions.py): the 4h nudge and the 8am
+    digest for everything waiting on the operator. Never breaks the cycle: an exception
+    goes into the summary as its class name ONLY (a notifier's error text can carry the
+    token-bearing URL); a tick that could not write its state file is reported too."""
+    try:
+        act = getattr(nav, "telegram_act", None) or nav.act
+        result = decisions.decisions_tick(act, nav.notifier)
+        summary["decisions"] = result
+        if isinstance(result, dict) and result.get("state_write_failed"):
+            summary["decisions_error"] = "state_write_failed"
+    except Exception as e:
+        summary["decisions_error"] = type(e).__name__
+
 def _cycle(nav: Navigator, settings: Settings) -> dict:
     summary: dict = {"mode": settings.mode, "driver": settings.driver}
     _triage_step(nav, summary)
@@ -156,6 +171,7 @@ def _cycle(nav: Navigator, settings: Settings) -> dict:
     if paused:
         summary["quota_paused_until"] = paused.isoformat(timespec="seconds")
     _telegram_step(nav, summary)
+    _decisions_step(nav, summary)
     summary["runs_finalized"] = len(nav.merge_poll())
     summary["snapshot_chars"] = nav.last_snapshot_chars
     return summary
