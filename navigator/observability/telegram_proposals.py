@@ -14,6 +14,9 @@ hour old) and then handles:
                                     the proposal status is set in ACT and the
                                     builder starts on the next daemon cycle
   'help'                         -> the command list
+  'decisions'                    -> everything waiting on the operator: audited merges,
+                                    proposals, tracked manual steps (decisions.py; read
+                                    only, the daemon tick owns the nudge/digest state)
   merge/reject forms             -> telegram_inbox.apply_commands, unchanged; the
                                     run.telegram_decision event carries the update_id
                                     of the originating message (0 only when the
@@ -32,8 +35,10 @@ import os
 import re
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 from navigator.contracts.enums import ProposalStatus
+from navigator.observability import decisions
 from navigator.observability.logging import get_logger
 from navigator.runtime import triage
 from navigator.observability.telegram_inbox import (TelegramInbox, apply_commands,
@@ -50,12 +55,13 @@ RANGE = re.compile(r"(\d{1,4})-(\d{1,4})")
 HELP = ("Navigator commands:\n"
         "status - the top 3 proposals to decide / more - the next 3 / all - every one\n"
         "approve 1 3 / approve N1 / decline 4-33 - decide proposals\n"
-        "merge / merge N5b / reject N5b - runs waiting at the merge gate")
+        "merge / merge N5b / reject N5b - runs waiting at the merge gate\n"
+        "decisions - everything waiting on you (merges, proposals, manual steps)")
 
 
 @dataclass(frozen=True)
 class ProposalCommand:
-    action: str  # "status" | "more" | "all" | "help" | "approve" | "decline"
+    action: str  # "status" | "more" | "all" | "help" | "decisions" | "approve" | "decline"
     targets: tuple[str, ...] = ()
 
 
@@ -67,7 +73,7 @@ def parse_proposal_command(text) -> ProposalCommand | None:
         return None
     word = parts[0].lower().lstrip("/")
     args = tuple(parts[1:])
-    if word in ("status", "help", "more", "all"):
+    if word in ("status", "help", "more", "all", "decisions"):
         return ProposalCommand(word) if not args else None
     if word not in ("approve", "decline") or not args or len(args) > MAX_TARGETS:
         return None
@@ -243,6 +249,12 @@ def handle_operator_message(msg: dict, act, notifier, chat_id: str,
             _all(act, notifier, triage_file)
         elif prop_cmd.action == "help":
             notifier.send(HELP)
+        elif prop_cmd.action == "decisions":
+            # read-only: the state file belongs to the daemon's decisions_tick
+            first_seen = decisions.read_state(decisions.state_path())["first_seen"]
+            for chunk in decisions.format_decisions(decisions.collect(act),
+                                                    datetime.now(timezone.utc), first_seen):
+                notifier.send(chunk)
         else:
             _decide(act, prop_cmd, notifier, triage_file)
     except Exception as e:
