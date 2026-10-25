@@ -17,6 +17,9 @@ hour old) and then handles:
   'decisions'                    -> everything waiting on the operator: audited merges,
                                     proposals, tracked manual steps (decisions.py; read
                                     only, the daemon tick owns the nudge/digest state)
+  'run <id>' / 'show <id>'       -> run (or print) the ONE pinned script of a tracked
+                                    manual step (actions.py: pinned path + sha256, no
+                                    arguments, nothing typed reaches the script)
   merge/reject forms             -> telegram_inbox.apply_commands, unchanged; the
                                     run.telegram_decision event carries the update_id
                                     of the originating message (0 only when the
@@ -38,7 +41,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from navigator.contracts.enums import ProposalStatus
-from navigator.observability import decisions
+from navigator.observability import actions, decisions
 from navigator.observability.logging import get_logger
 from navigator.runtime import triage
 from navigator.observability.telegram_inbox import (TelegramInbox, apply_commands,
@@ -56,12 +59,14 @@ HELP = ("Navigator commands:\n"
         "status - the top 3 proposals to decide / more - the next 3 / all - every one\n"
         "approve 1 3 / approve N1 / decline 4-33 - decide proposals\n"
         "merge / merge N5b / reject N5b - runs waiting at the merge gate\n"
-        "decisions - everything waiting on you (merges, proposals, manual steps)")
+        "decisions - everything waiting on you (merges, proposals, manual steps)\n"
+        "run <id> / show <id> - run or read a pinned manual-step script")
 
 
 @dataclass(frozen=True)
 class ProposalCommand:
     action: str  # "status" | "more" | "all" | "help" | "decisions" | "approve" | "decline"
+                 # | "run" | "show" (targets = (manual item id,))
     targets: tuple[str, ...] = ()
 
 
@@ -75,6 +80,11 @@ def parse_proposal_command(text) -> ProposalCommand | None:
     args = tuple(parts[1:])
     if word in ("status", "help", "more", "all", "decisions"):
         return ProposalCommand(word) if not args else None
+    if word in ("run", "show"):
+        # exactly one manual item id; nothing else from the message reaches actions
+        if len(args) != 1 or not decisions.MANUAL_ID.fullmatch(args[0]):
+            return None
+        return ProposalCommand(word, args)
     if word not in ("approve", "decline") or not args or len(args) > MAX_TARGETS:
         return None
     if not all(TARGET.fullmatch(a) and not a.lower().startswith("run-") for a in args):
@@ -254,6 +264,14 @@ def handle_operator_message(msg: dict, act, notifier, chat_id: str,
             first_seen = decisions.read_state(decisions.state_path())["first_seen"]
             for chunk in decisions.format_decisions(decisions.collect(act),
                                                     datetime.now(timezone.utc), first_seen):
+                notifier.send(chunk)
+        elif prop_cmd.action == "run":
+            text = actions.run_action(prop_cmd.targets[0], update_id=update_id)
+            for chunk in _chunks(text.split("\n")):
+                notifier.send(chunk)
+        elif prop_cmd.action == "show":
+            text = actions.show_action(prop_cmd.targets[0])
+            for chunk in _chunks(text.split("\n")):
                 notifier.send(chunk)
         else:
             _decide(act, prop_cmd, notifier, triage_file)
