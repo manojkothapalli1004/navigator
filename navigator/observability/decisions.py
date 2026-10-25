@@ -223,7 +223,7 @@ def _manual_decisions(items: list[dict]) -> list[Decision]:
         if len(how) > MAX_HOW_CHARS:
             how = how[:MAX_HOW_CHARS] + "..."
         reply = (f"run {it['id']} (send 'show {it['id']}' to read the script)"
-                 if it.get("script") else f"in terminal: {how}")
+                 if it.get("script") else f"do yourself: {how}")
         out.append(Decision("manual", f"manual:{it['id']}", _flat(it["title"]) or it["id"],
                             reply, _parse_time(it.get("added"))))
     return _by_age(out)
