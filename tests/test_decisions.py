@@ -100,7 +100,7 @@ def test_collect_lists_merge_manual_proposal_in_order(tmp_path):
     assert items[0].key == f"merge:{run.id}" and items[0].reply == "merge Quota"
     assert items[0].title == "Quota: pause builds" and items[0].since is None
     assert items[1].key == "manual:plist"
-    assert items[1].reply.startswith("in terminal: ") and "launchctl" in items[1].reply
+    assert items[1].reply.startswith("do yourself: ") and "launchctl" in items[1].reply
     assert items[2].key == f"proposal:{prop.id}" and "approve N20" in items[2].reply
     assert items[2].since is not None and items[2].since.tzinfo is not None
     assert not any("not audited" in d.title for d in items)
@@ -151,7 +151,21 @@ def test_long_how_is_cut(tmp_path):
     path = tmp_path / "m.json"
     decisions.add_manual(path, "long", "t", "x" * 400)
     (item,) = decisions.collect(FakeACTClient(), manual_file=str(path))
-    assert item.reply == "in terminal: " + "x" * 300 + "..."
+    assert item.reply == "do yourself: " + "x" * 300 + "..."
+
+
+def test_manual_label_is_do_yourself_without_script_and_run_with_script():
+    items = decisions._manual_decisions([
+        {"id": "a", "title": "T", "how": "plug in", "added": None},
+        {"id": "b", "title": "U", "how": "h", "added": None,
+         "script": "/x/b.sh", "sha256": "0" * 64},
+    ])
+    by_key = {d.key: d for d in items}
+    assert set(by_key) == {"manual:a", "manual:b"}
+    assert by_key["manual:a"].reply == "do yourself: plug in"
+    assert "in terminal" not in by_key["manual:a"].reply
+    assert by_key["manual:a"].kind == "manual" and by_key["manual:a"].title == "T"
+    assert by_key["manual:b"].reply == "run b (send 'show b' to read the script)"
 
 
 # ---- c, d) nudge ----------------------------------------------------------------
@@ -376,7 +390,7 @@ def test_format_folds_extra_proposals_and_chunks():
     assert "5. proposal: P4: t - waiting 4h - approve P4 / decline P4" in text
     assert "P5:" not in text and "P6:" not in text
     assert "1. proposal: P0: t - waiting <1h" in text
-    big = [decisions.Decision("manual", f"manual:{i}", "t" * 500, "in terminal: " + "h" * 300, None)
+    big = [decisions.Decision("manual", f"manual:{i}", "t" * 500, "do yourself: " + "h" * 300, None)
            for i in range(200)]
     chunks = decisions.format_decisions(big, now)
     assert len(chunks) > 1 and all(len(c) <= 3900 for c in chunks)

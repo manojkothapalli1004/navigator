@@ -175,7 +175,7 @@ def run_action(item_id, update_id=0, manual_file=None, actions_dir=None, log_pat
         return refused("no such item", f"no manual step {item_id}")
     script = item.get("script")
     if not script or not pinned:
-        return refused("no script", f"no script - do it in terminal: {item['how']}")
+        return refused("no script", f"no script - do it yourself: {item['how']}")
     reason = check_script(script, adir)
     if reason is not None:
         return refused(reason, f"not run: {reason}")
@@ -228,7 +228,7 @@ def show_action(item_id, manual_file=None) -> str:
         return f"no manual step {item_id}"
     script = item.get("script")
     if not script:
-        return f"no script - do it in terminal: {item['how']}"
+        return f"no script - do it yourself: {item['how']}"
     pinned = item.get("sha256") or ""
     try:
         with open(script, "r", encoding="utf-8", errors="replace") as f:
