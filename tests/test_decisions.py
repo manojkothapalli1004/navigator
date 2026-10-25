@@ -537,6 +537,37 @@ def test_digest_waits_on_partial_failure_then_lists_and_names_the_gap(tmp_path, 
     assert decisions.read_state(state)["digest"] == "2026-10-25"
 
 
+# ---- q) no reminder while the digest is held ----------------------------------
+
+def test_no_reminder_while_digest_is_held_so_item_is_not_sent_twice(tmp_path, monkeypatch):
+    act, rec, state = FakeACTClient(), _Recorder(), tmp_path / "s.json"
+    run = _merge_run(act, "Quota: pause builds")
+    _seed(state, {f"merge:{run.id}": _ny(25, 8, 5) - timedelta(hours=5)}, "2026-10-24")
+
+    def raiser(*args, **kwargs):
+        raise RuntimeError("ACT hiccup")
+
+    monkeypatch.setattr(act, "list_proposals", raiser)
+    out = decisions.decisions_tick(act, rec, now=_ny(25, 8, 5), state_file=state)
+    assert rec.sent == [] and out["nudged"] == 0
+    decisions.decisions_tick(act, rec, now=_ny(25, 10, 5), state_file=state)
+    assert len(rec.sent) == 2
+    assert rec.sent[0].startswith("Morning digest") and "merge Quota" in rec.sent[0]
+    assert rec.sent[1] == "(could not list: proposal)"
+    assert not any("Reminder" in t for t in rec.sent)
+    decisions.decisions_tick(act, rec, now=_ny(25, 10, 20), state_file=state)
+    assert len(rec.sent) == 2
+
+
+def test_reminder_still_sent_when_digest_already_out_and_nothing_failed(tmp_path):
+    act, rec, state = FakeACTClient(), _Recorder(), tmp_path / "s.json"
+    run = _merge_run(act, "Quota: pause builds")
+    _seed(state, {f"merge:{run.id}": _ny(25, 8, 5) - timedelta(hours=5)}, "2026-10-25")
+    decisions.decisions_tick(act, rec, now=_ny(25, 8, 30), state_file=state)
+    assert len(rec.sent) == 1
+    assert rec.sent[0].startswith("Reminder") and "merge Quota" in rec.sent[0]
+
+
 # ---- the module CLI -------------------------------------------------------------
 
 def test_module_cli_add_done_list(capsys):
