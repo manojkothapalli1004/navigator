@@ -6,7 +6,9 @@ can do (plist installs, the charger) lived only in terminal chat. This module ke
 list of three kinds of item:
   merge     audited runs at the merge gate (telegram_inbox._candidates) - reply 'merge <name>'
   manual    steps tracked in a small JSON file (add/done via this module's CLI:
-            `python -m navigator.observability.decisions add <id> <title> <how>`)
+            `python -m navigator.observability.decisions add <id> <title> <how>`;
+            with `--script <path>` the step carries ONE pinned script the operator
+            runs from Telegram with 'run <id>' - see actions.py)
   proposal  proposals waiting for approve/decline
 and three ways to see it:
   'decisions' in Telegram (telegram_proposals.handle_operator_message): the list, read-only
@@ -42,6 +44,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from navigator.contracts.enums import ProposalStatus
+from navigator.observability import actions
 from navigator.observability.logging import get_logger
 from navigator.observability.telegram_inbox import _candidates, _reply_arg, short_name
 
@@ -136,7 +139,8 @@ def _write_json(path, data) -> None:
 # ---- manual items file ----------------------------------------------------------
 
 def read_manual(path=None) -> list[dict]:
-    """The tracked manual steps: [{'id', 'title', 'how', 'added'}]. A missing, unreadable
+    """The tracked manual steps: [{'id', 'title', 'how', 'added'}], plus 'script' and
+    'sha256' (the pinned action, actions.py) when present as str. A missing, unreadable
     or garbage file, or one of the wrong shape, is []; entries without a str id/title/how
     are skipped ('added' is kept when it is a str, else None)."""
     data = _read_json(path or manual_path())
@@ -149,18 +153,36 @@ def read_manual(path=None) -> list[dict]:
         if not all(isinstance(it.get(k), str) for k in ("id", "title", "how")):
             continue
         added = it.get("added")
-        out.append({"id": it["id"], "title": it["title"], "how": it["how"],
-                    "added": added if isinstance(added, str) else None})
+        entry = {"id": it["id"], "title": it["title"], "how": it["how"],
+                 "added": added if isinstance(added, str) else None}
+        for k in ("script", "sha256"):  # the pinned action; absent when not pinned
+            if isinstance(it.get(k), str):
+                entry[k] = it[k]
+        out.append(entry)
     return out
 
 
-def add_manual(path, item_id: str, title: str, how: str, now=None) -> None:
-    """Track a manual step; an item with the same id is replaced in place. Atomic write."""
+def add_manual(path, item_id: str, title: str, how: str, now=None, script=None) -> None:
+    """Track a manual step; an item with the same id is replaced in place. Atomic write.
+    With `script` (a path) the step carries ONE pinned action: its absolute path and
+    sha256 are stored once actions.check_script accepts it (ValueError carrying the
+    fixed reason otherwise); the operator runs it with 'run <id>' in Telegram."""
     if not isinstance(item_id, str) or not MANUAL_ID.fullmatch(item_id):
         raise ValueError(f"bad manual item id {item_id!r}")
     now = _aware(now) or datetime.now(timezone.utc)
     entry = {"id": item_id, "title": str(title), "how": str(how),
              "added": now.isoformat(timespec="seconds")}
+    if script is not None:
+        abs_path = os.path.abspath(script)
+        reason = actions.check_script(abs_path, actions.actions_dir())
+        if reason is not None:
+            raise ValueError(reason)
+        try:
+            digest = actions.sha256_file(abs_path)
+        except OSError:
+            raise ValueError("missing")
+        entry["script"] = abs_path
+        entry["sha256"] = digest
     items = read_manual(path)
     for i, it in enumerate(items):
         if it["id"] == item_id:
@@ -200,8 +222,10 @@ def _manual_decisions(items: list[dict]) -> list[Decision]:
         how = _flat(it["how"])
         if len(how) > MAX_HOW_CHARS:
             how = how[:MAX_HOW_CHARS] + "..."
+        reply = (f"run {it['id']} (send 'show {it['id']}' to read the script)"
+                 if it.get("script") else f"in terminal: {how}")
         out.append(Decision("manual", f"manual:{it['id']}", _flat(it["title"]) or it["id"],
-                            f"in terminal: {how}", _parse_time(it.get("added"))))
+                            reply, _parse_time(it.get("added"))))
     return _by_age(out)
 
 
@@ -396,13 +420,15 @@ def decisions_tick(act, notifier, now: datetime | None = None, state_file=None,
 # ---- CLI: track manual steps ----------------------------------------------------
 
 USAGE = ("usage: python -m navigator.observability.decisions "
-         "add <id> <title> <how> | done <id> | list")
+         "add <id> <title> <how> [--script <path>] | done <id> | list")
 
 
 def _cli(argv: list[str]) -> int:
-    if len(argv) == 4 and argv[0] == "add":
+    scripted = len(argv) == 6 and argv[0] == "add" and argv[4] == "--script"
+    if scripted or (len(argv) == 4 and argv[0] == "add"):
         try:
-            add_manual(manual_path(), argv[1], argv[2], argv[3])
+            add_manual(manual_path(), argv[1], argv[2], argv[3],
+                       script=argv[5] if scripted else None)
         except ValueError as e:
             print(str(e), file=sys.stderr)
             return 2
