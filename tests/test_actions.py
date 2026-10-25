@@ -190,11 +190,11 @@ def test_script_sees_only_the_safe_environment(adir, monkeypatch):
 def test_unknown_or_unscripted_items_run_nothing(adir):
     decisions.add_manual(decisions.manual_path(), "plain", "Plug the charger", "walk over")
     assert actions.run_action("nope", now=NOW) == "no manual step nope"
-    assert actions.run_action("plain", now=NOW).startswith("no script - do it in terminal:")
+    assert actions.run_action("plain", now=NOW).startswith("no script - do it yourself:")
     assert [r["outcome"] for r in _log()] == ["refused", "refused"]
     assert not any(p.name.endswith(".marker") for p in adir.parent.iterdir())
     assert actions.show_action("nope") == "no manual step nope"
-    assert actions.show_action("plain").startswith("no script - do it in terminal:")
+    assert actions.show_action("plain").startswith("no script - do it yourself:")
 
 
 # ---- i) from Telegram ------------------------------------------------------------
@@ -260,7 +260,7 @@ def test_collect_lists_scripted_and_plain_steps(adir):
     items = {d.key: d for d in decisions.collect(FakeACTClient())}
     assert items["manual:step1"].reply.startswith("run step1")
     assert "show step1" in items["manual:step1"].reply
-    assert items["manual:plain"].reply.startswith("in terminal:")
+    assert items["manual:plain"].reply.startswith("do yourself:")
 
 
 # ---- k) output is capped and never logged ----------------------------------------
