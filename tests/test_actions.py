@@ -413,6 +413,34 @@ def test_an_escaped_process_does_not_hang_the_bot(adir, tmp_path, monkeypatch):
             _kill(pid)
 
 
+def test_an_unsignalable_child_does_not_hang_the_bot(adir, tmp_path, monkeypatch):
+    # v1.2: os.killpg fails (the child exec'd a setuid program), so nothing is killed;
+    # the pipes are closed after REAP_TIMEOUT_S and the last wait is bounded too
+    pidfile = tmp_path / "child.pid"
+    _add(adir, body=f"echo $$ > {pidfile}; exec sleep 30")
+    monkeypatch.setattr(actions, "RUN_TIMEOUT_S", 1)
+    monkeypatch.setattr(actions, "REAP_TIMEOUT_S", 1)
+
+    def raiser(pgid, sig):
+        raise PermissionError
+
+    monkeypatch.setattr(actions.os, "killpg", raiser)
+    try:
+        t0 = time.monotonic()
+        reply = actions.run_action("step1", now=NOW)
+        assert time.monotonic() - t0 < 10
+        assert reply.startswith("ran step1: timed out after 1s")
+        assert reply.endswith("(process still running)")
+        assert _log()[-1]["outcome"] == "timeout"
+    finally:
+        try:
+            pid = int(pidfile.read_text().strip())
+        except (OSError, ValueError):
+            pid = None
+        if pid is not None:
+            _kill(pid)  # the real os.kill: only os.killpg was patched
+
+
 def test_relative_script_path_is_refused(adir):
     _, marker = _add(adir)
     _rewrite_script("step1", "step1.sh")

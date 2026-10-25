@@ -1,4 +1,4 @@
-"""Actions v1.1 (operator 2026-10-24, follow-up 2026-10-25): one pinned script per manual
+"""Actions v1.2 (operator 2026-10-24, follow-ups 2026-10-25): one pinned script per manual
 step, run from Telegram.
 
 Operator-only steps (launchctl bootstrap of the backup and caffeinate plists, ...) need
@@ -25,8 +25,11 @@ Safety rules, all enforced here:
     'ran'/'timeout' line is written before the lock is released, so a crash mid-run
     still leaves a 'started' record, and that record counts for the rate limit
   the script runs in its own session (start_new_session) and on timeout the WHOLE
-    process group is killed; the pipes are closed after a bounded reap, so a process
-    that escaped the group (setsid) cannot hang the bot
+    process group is killed; the pipes are closed after a bounded reap and the last
+    wait for the direct child is bounded too, so neither a process that escaped the
+    group (setsid) nor a child that cannot be signalled (it exec'd a setuid program)
+    can hang the bot - when the child was not reaped the reply says so:
+    '(process still running)'
   every attempt - run or refused - is one JSON line in the action log (created 0o600);
     the script's output goes to the Telegram reply only (the last MAX_OUTPUT_CHARS),
     never to the log; replies and log lines carry fixed reasons or exception class
@@ -35,7 +38,7 @@ Safety rules, all enforced here:
     CLI) once the step is really finished
 
 The bot calls run_action synchronously inside its loop, so one run blocks the bot for at
-most RUN_TIMEOUT_S plus the bounded reap (REAP_TIMEOUT_S). decisions.py imports this
+most RUN_TIMEOUT_S plus two bounded reaps (2 * REAP_TIMEOUT_S). decisions.py imports this
 module (add_manual pins through check_script/sha256_file); decisions is imported lazily
 here.
 """
@@ -175,12 +178,13 @@ def _item(item_id, manual_file):
 
 # ---- run / show -------------------------------------------------------------------
 
-def _kill_group(proc) -> None:
+def _kill_group(proc) -> bool:
     """After a timeout: SIGKILL the script's whole process group, then reap with a
     bounded wait. A process that left the group (setsid) may still hold the pipes:
-    after REAP_TIMEOUT_S the pipes are closed and only the (already killed) direct
-    child is waited for. Never an unbounded communicate()/wait() while the pipes are
-    open."""
+    after REAP_TIMEOUT_S the pipes are closed and the direct child is waited for with
+    a second bounded wait (the kill may have failed: a child that exec'd a setuid
+    program cannot be signalled). True when the child was reaped, False when this
+    gave up and the child is still running. Never an unbounded communicate()/wait()."""
     try:
         os.killpg(proc.pid, signal.SIGKILL)
     except (ProcessLookupError, PermissionError):
@@ -194,7 +198,12 @@ def _kill_group(proc) -> None:
                     pipe.close()
                 except OSError:
                     pass
-        proc.wait()  # the direct child is SIGKILLed: this returns
+        try:
+            proc.wait(timeout=REAP_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            log.warning("actions.reap_gave_up")
+            return False
+    return True
 
 
 def run_action(item_id, update_id=0, manual_file=None, actions_dir=None, log_path=None,
@@ -206,7 +215,8 @@ def run_action(item_id, update_id=0, manual_file=None, actions_dir=None, log_pat
     or another action holds the lock; 'not run: action log unwritable' when the
     'started' line cannot be written (nothing can be logged then). Otherwise the reply
     is 'ran <id>: rc=<rc>' plus the last MAX_OUTPUT_CHARS of the output, or
-    'ran <id>: timed out after <N>s'. The manual item is never removed."""
+    'ran <id>: timed out after <N>s' (with ' (process still running)' appended when
+    the child could not be reaped). The manual item is never removed."""
     now = time.time() if now is None else float(now)
     adir = _dir_or_default(actions_dir)
     lpath = log_path or action_log_path()
@@ -262,10 +272,13 @@ def run_action(item_id, update_id=0, manual_file=None, actions_dir=None, log_pat
         try:
             out, err = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
-            _kill_group(proc)
+            reaped = _kill_group(proc)
             rec["outcome"] = "timeout"
             _append_log(lpath, rec)
-            return f"ran {item_id}: timed out after {timeout}s"
+            reply = f"ran {item_id}: timed out after {timeout}s"
+            if not reaped:
+                reply += " (process still running)"
+            return reply
         rec.update(outcome="ran", rc=proc.returncode)
         _append_log(lpath, rec)  # the final line is written while the lock is still held
     finally:
