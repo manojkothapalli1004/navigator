@@ -14,7 +14,10 @@ and three ways to see it:
   'decisions' in Telegram (telegram_proposals.handle_operator_message): the list, read-only
   a nudge once a merge/manual item has waited NUDGE_AFTER_S (at most once per item per
     local day; proposals never nudge, the triage top-3 covers them)
-  one digest at DIGEST_HOUR local, only when something is waiting
+  one digest at DIGEST_HOUR local, only when something is waiting. While a source
+    fails to list, the digest is neither sent nor marked (an incomplete list must not
+    spend the day's digest); from DIGEST_HOUR + 2 it goes out anyway - the items that
+    could be listed, if any, plus one line '(could not list: <kinds>)'
 Nothing is sent in the quiet hours (QUIET_START_HOUR..QUIET_END_HOUR local).
 
 Only decisions_tick (the daemon cycle, __main__._decisions_step) writes the state file:
@@ -23,7 +26,11 @@ the last digest. The refreshed state (new keys, vanished keys pruned) is written
 any send and the advanced marks again after; when the file cannot be written nothing is
 sent at all - a state that never advances would otherwise repeat the digest every cycle.
 Keys of a kind whose source failed to list (an ACT hiccup) are kept as they were, so a
-blip never resets an item's age or lets it be nudged twice.
+blip never resets an item's age or lets it be nudged twice. A merge key whose run is
+still open at awaiting_review (act.list_open_runs) is kept too: cli.is_audited fails
+closed WITHOUT raising when ACT events cannot be listed, so the run merely vanishes
+from the candidates for a tick; when list_open_runs itself fails, 'merge' counts as a
+failed source.
 
 Retries: a notifier whose send raises makes decisions_tick raise before the digest/nudge
 marks are advanced, so the next cycle sends again. The production TelegramNotifier.send
@@ -43,7 +50,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from navigator.contracts.enums import ProposalStatus
+from navigator.contracts.enums import ProposalStatus, RunPhase
 from navigator.observability import actions
 from navigator.observability.logging import get_logger
 from navigator.observability.telegram_inbox import _candidates, _reply_arg, short_name
@@ -354,10 +361,15 @@ def _due(first_seen_iso, now: datetime) -> bool:
 def decisions_tick(act, notifier, now: datetime | None = None, state_file=None,
                    manual_file=None, candidates=None) -> dict:
     """One daemon-cycle pass over the decisions list: record first_seen for new items,
-    prune vanished ones (keeping every key of a kind whose source failed), then - outside
-    the quiet hours - send the day's digest once (from DIGEST_HOUR local, only when
-    something waits) and nudge merge/manual items that have waited NUDGE_AFTER_S and were
-    not nudged today (never right after a digest). The refreshed state is written BEFORE
+    prune vanished ones (keeping every key of a kind whose source failed, and every merge
+    key whose run is still open at awaiting_review - an audit-check hiccup drops the run
+    from the candidates without raising), then - outside the quiet hours - send the day's
+    digest once (from DIGEST_HOUR local, only when something waits) and nudge merge/manual
+    items that have waited NUDGE_AFTER_S and were not nudged today (never right after a
+    digest). While a source fails to list, the digest is neither sent nor marked before
+    DIGEST_HOUR + 2; from then on it is marked and sent (the listed items, if any) with
+    one extra message '(could not list: <kinds>)' naming the failed kinds. A failing
+    act.list_open_runs counts 'merge' as a failed source. The refreshed state is written BEFORE
     any send: when that write fails nothing is sent and {'items', 'state_write_failed':
     True} is returned, so an unwritable state file never turns into a digest every cycle.
     After the sends the advanced marks are written; a failure there is reported the same
@@ -375,11 +387,23 @@ def decisions_tick(act, notifier, now: datetime | None = None, state_file=None,
     today = local.date().isoformat()
     path = state_file or state_path()
     items, failed = collect_with_status(act, manual_file, candidates)
+    failed = set(failed)  # a local copy: never mutate what collect_with_status returned
+    try:
+        open_review = {r.id for r in act.list_open_runs()
+                       if r.phase == RunPhase.awaiting_review}
+    except Exception as e:
+        log.warning("decisions.open_runs_failed", error=type(e).__name__)
+        open_review = set()
+        failed.add("merge")
     live = {d.key for d in items}
 
     def keep(key: str) -> bool:
         # a kind that failed to list contributes no items this tick; its keys stay
-        return key in live or key.split(":", 1)[0] in failed
+        if key in live or key.split(":", 1)[0] in failed:
+            return True
+        # a merge item whose run is still at the gate: cli.is_audited failed closed
+        # (no raise) on an events hiccup, so the run merely vanished from the candidates
+        return key.startswith("merge:") and key[len("merge:"):] in open_review
 
     old = read_state(path)
     first_seen = {k: v for k, v in old["first_seen"].items() if keep(k)}
@@ -393,7 +417,11 @@ def decisions_tick(act, notifier, now: datetime | None = None, state_file=None,
     if _quiet(local):
         return {"quiet": True, "items": n}
     digest_sent = False
-    if local.hour >= DIGEST_HOUR and state["digest"] != today:
+    # with a failed source the digest waits (unsent, unmarked) until DIGEST_HOUR + 2,
+    # then goes out naming the kinds it could not list
+    digest_due = (local.hour >= DIGEST_HOUR and state["digest"] != today
+                  and (not failed or local.hour >= DIGEST_HOUR + 2))
+    if digest_due:
         state["digest"] = today
         if items:
             for text in format_decisions(items, now, first_seen,
@@ -403,6 +431,8 @@ def decisions_tick(act, notifier, now: datetime | None = None, state_file=None,
             for d in items:  # the digest already named them: no nudge right after it
                 if d.kind in NUDGE_KINDS:
                     nudged[d.key] = today
+        if failed:
+            notifier.send("(could not list: " + ", ".join(sorted(failed)) + ")")
     due = [d for d in items if d.kind in NUDGE_KINDS and nudged.get(d.key) != today
            and _due(first_seen.get(d.key), now)]
     if due:

@@ -438,6 +438,105 @@ def test_source_failure_keeps_first_seen(tmp_path):
     assert "merge Quota" in rec.sent[0] and "waiting 5h" in rec.sent[0]
 
 
+# ---- o) an audit-check hiccup never resets a merge item's age -----------------
+
+def test_audit_hiccup_keeps_merge_key_while_run_is_at_the_gate(tmp_path):
+    act, rec, state = FakeACTClient(), _Recorder(), tmp_path / "s.json"
+    run = _merge_run(act, "Quota: pause builds")
+    now = _ny(24, 10)
+    seen = now - timedelta(hours=5)
+    _seed(state, {f"merge:{run.id}": seen}, "2026-10-24")
+    # cli.is_audited fails closed without raising: the run vanishes from _candidates
+    out = decisions.decisions_tick(act, rec, now=now, state_file=state,
+                                   candidates=lambda act: [])
+    assert rec.sent == [] and out["items"] == 0
+    assert decisions.read_state(state)["first_seen"] == {f"merge:{run.id}": seen.isoformat()}
+    rec2 = _Recorder()
+    decisions.decisions_tick(act, rec2, now=now + timedelta(minutes=15), state_file=state)
+    assert len(rec2.sent) == 1
+    assert "Reminder" in rec2.sent[0] and "merge Quota" in rec2.sent[0]
+    assert "waiting 5h" in rec2.sent[0]
+
+
+def test_audit_hiccup_still_prunes_a_closed_run(tmp_path):
+    act, rec, state = FakeACTClient(), _Recorder(), tmp_path / "s.json"
+    run = _merge_run(act, "Quota: pause builds")
+    now = _ny(24, 10)
+    _seed(state, {f"merge:{run.id}": now - timedelta(hours=5)}, "2026-10-24")
+    stored = act.runs[run.id]
+    stored.status = RunStatus.completed  # merged
+    act.update_run(stored)
+    decisions.decisions_tick(act, rec, now=now, state_file=state, candidates=lambda act: [])
+    assert decisions.read_state(state)["first_seen"] == {}
+    assert rec.sent == []
+
+
+def test_list_open_runs_failure_keeps_merge_keys(tmp_path, monkeypatch):
+    act, rec, state = FakeACTClient(), _Recorder(), tmp_path / "s.json"
+    run = _merge_run(act, "Quota: pause builds")
+    now = _ny(24, 10)
+    seen = now - timedelta(hours=5)
+    _seed(state, {f"merge:{run.id}": seen}, "2026-10-24")
+
+    def raiser(*args, **kwargs):
+        raise RuntimeError("ACT hiccup")
+
+    monkeypatch.setattr(act, "list_open_runs", raiser)
+    out = decisions.decisions_tick(act, rec, now=now, state_file=state,
+                                   candidates=lambda act: [])
+    assert out["items"] == 0 and rec.sent == []
+    assert decisions.read_state(state)["first_seen"] == {f"merge:{run.id}": seen.isoformat()}
+
+
+# ---- p) the digest while a source fails ----------------------------------------
+
+def test_digest_waits_when_every_source_fails_then_reports_the_gap(tmp_path, monkeypatch):
+    act, rec, state = FakeACTClient(), _Recorder(), tmp_path / "s.json"
+    _seed(state, {}, "2026-10-24")
+
+    def broken(*args, **kwargs):
+        raise RuntimeError("ACT hiccup")
+
+    monkeypatch.setattr(act, "list_proposals", broken)
+    missing = str(tmp_path / "none.json")
+    decisions.decisions_tick(act, rec, now=_ny(25, 8, 5), state_file=state,
+                             manual_file=missing, candidates=broken)
+    assert rec.sent == []
+    assert decisions.read_state(state)["digest"] == "2026-10-24"
+    out = decisions.decisions_tick(act, rec, now=_ny(25, 10, 5), state_file=state,
+                                   manual_file=missing, candidates=broken)
+    assert rec.sent == ["(could not list: merge, proposal)"]
+    assert out == {"items": 0, "digest_sent": False, "nudged": 0}
+    assert decisions.read_state(state)["digest"] == "2026-10-25"
+    decisions.decisions_tick(act, rec, now=_ny(25, 10, 20), state_file=state,
+                             manual_file=missing, candidates=broken)
+    assert rec.sent == ["(could not list: merge, proposal)"]
+
+
+def test_digest_waits_on_partial_failure_then_lists_and_names_the_gap(tmp_path, monkeypatch):
+    act, rec, state = FakeACTClient(), _Recorder(), tmp_path / "s.json"
+    manual = tmp_path / "m.json"
+    decisions.add_manual(manual, "plist", "install", "do x")
+    _seed(state, {}, "2026-10-24")
+
+    def broken(*args, **kwargs):
+        raise RuntimeError("ACT hiccup")
+
+    monkeypatch.setattr(act, "list_proposals", broken)
+    decisions.decisions_tick(act, rec, now=_ny(25, 8, 5), state_file=state,
+                             manual_file=str(manual))
+    assert not any(t.startswith("Morning digest") for t in rec.sent)
+    assert rec.sent == []
+    assert decisions.read_state(state)["digest"] == "2026-10-24"
+    out = decisions.decisions_tick(act, rec, now=_ny(25, 10, 5), state_file=state,
+                                   manual_file=str(manual))
+    assert out == {"items": 1, "digest_sent": True, "nudged": 0}
+    assert len(rec.sent) == 2
+    assert rec.sent[0].startswith("Morning digest") and "manual: install" in rec.sent[0]
+    assert rec.sent[-1] == "(could not list: proposal)"
+    assert decisions.read_state(state)["digest"] == "2026-10-25"
+
+
 # ---- the module CLI -------------------------------------------------------------
 
 def test_module_cli_add_done_list(capsys):
