@@ -4,6 +4,10 @@ changed, every attempt logged, nothing else runnable."""
 import fcntl
 import json
 import os
+import shutil
+import signal
+import time
+from pathlib import Path
 
 import pytest
 
@@ -80,9 +84,11 @@ def test_run_executes_the_pinned_script_and_logs_it(adir):
     assert reply.startswith("ran step1: rc=0")
     assert marker.exists()
     log = _log()
-    assert len(log) == 1
-    assert log[0]["outcome"] == "ran" and log[0]["rc"] == 0 and log[0]["id"] == "step1"
+    assert len(log) == 2
+    assert log[0]["outcome"] == "started" and log[0]["rc"] is None and log[0]["id"] == "step1"
     assert log[0]["sha256"] == item["sha256"] and log[0]["update_id"] == 7
+    assert log[1]["outcome"] == "ran" and log[1]["rc"] == 0 and log[1]["id"] == "step1"
+    assert log[1]["sha256"] == item["sha256"] and log[1]["update_id"] == 7
     assert os.stat(actions.action_log_path()).st_mode & 0o777 == 0o600
     # the item stays until the operator says 'done'
     assert decisions.read_manual(decisions.manual_path())[0]["id"] == "step1"
@@ -151,7 +157,7 @@ def test_one_run_per_minute(adir):
     assert actions.run_action("step1", now=NOW).startswith("ran step1")
     assert "ran less than 60s ago" in actions.run_action("step1", now=NOW + 10)
     assert actions.run_action("step1", now=NOW + 61).startswith("ran step1")
-    assert [r["outcome"] for r in _log()] == ["ran", "refused", "ran"]
+    assert [r["outcome"] for r in _log()] == ["started", "ran", "refused", "started", "ran"]
 
 
 def test_a_held_lock_refuses_the_run(adir):
@@ -276,3 +282,197 @@ def test_output_is_tailed_in_the_reply_and_absent_from_the_log(adir):
         raw = f.read()
     assert "0123456789" not in raw
     assert "output" not in _log()[-1]
+
+
+# ---- l) v1.1: started line, binary output, process group, guarded show -------------
+
+def _rewrite_script(item_id, new_path):
+    """Point the manual item's 'script' at new_path behind decisions' back (the pin stays)."""
+    mp = decisions.manual_path()
+    with open(mp, encoding="utf-8") as f:
+        data = json.load(f)
+
+    def walk(o):
+        if isinstance(o, dict):
+            if o.get("id") == item_id and "script" in o:
+                o["script"] = new_path
+            for v in o.values():
+                walk(v)
+        elif isinstance(o, list):
+            for v in o:
+                walk(v)
+
+    walk(data)
+    with open(mp, "w", encoding="utf-8") as f:
+        json.dump(data, f)
+    assert decisions.read_manual(mp)[0]["script"] == new_path
+
+
+def test_binary_output_is_survived_and_logged(adir):
+    _add(adir, body="printf '\\377\\376ok'")
+    assert actions.run_action("step1", now=NOW).startswith("ran step1: rc=0")
+    assert [r["outcome"] for r in _log()] == ["started", "ran"]
+    assert "ran less than 60s ago" in actions.run_action("step1", now=NOW + 1)
+
+
+def test_unwritable_log_refuses_the_run(adir, tmp_path, monkeypatch):
+    _, marker = _add(adir)
+    ro = tmp_path / "ro"
+    ro.mkdir()
+    ro.chmod(0o500)
+    monkeypatch.setenv("NAVIGATOR_ACTION_LOG_PATH", str(ro / "log.jsonl"))
+    try:
+        reply = actions.run_action("step1", now=NOW)
+    finally:
+        ro.chmod(0o700)
+    assert reply == "not run: action log unwritable"
+    assert not marker.exists()
+
+
+def test_a_started_line_counts_for_the_rate_limit(adir):
+    _, marker = _add(adir)
+    lp = Path(actions.action_log_path())
+    lp.parent.mkdir(parents=True, exist_ok=True)
+    lp.write_text(json.dumps({"ts": NOW - 5, "id": "step1", "outcome": "started"}) + "\n",
+                  encoding="utf-8")
+    assert "ran less than 60s ago" in actions.run_action("step1", now=NOW)
+    assert not marker.exists()
+
+
+def test_garbled_future_and_infinite_log_lines_do_not_block(adir):
+    _, marker = _add(adir)
+    lp = Path(actions.action_log_path())
+    lp.parent.mkdir(parents=True, exist_ok=True)
+    lines = [json.dumps({"ts": NOW - 3600, "id": "step1", "outcome": "ran"}),
+             json.dumps({"ts": NOW + 10000, "id": "step1", "outcome": "ran"}),
+             '{"id": "step1", "outcome": "ran", "ts": Infinity}']
+    lp.write_bytes(b"\xff\xfe garbage\n" + ("\n".join(lines) + "\n").encode("utf-8"))
+    assert actions.run_action("step1", now=NOW).startswith("ran step1")
+    assert marker.exists()
+
+
+def _wait_gone(pid, seconds=2.0) -> bool:
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def _kill(pid):
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
+def test_timeout_kills_the_whole_process_group(adir, tmp_path, monkeypatch):
+    pidfile = tmp_path / "gc.pid"
+    _add(adir, body=f"sleep 30 & echo $! > {pidfile}; wait")
+    monkeypatch.setattr(actions, "RUN_TIMEOUT_S", 1)
+    reply = actions.run_action("step1", now=NOW)
+    assert "timed out" in reply
+    pid = int(pidfile.read_text().strip())
+    gone = _wait_gone(pid)
+    if not gone:
+        _kill(pid)
+    assert gone
+
+
+def test_an_escaped_process_does_not_hang_the_bot(adir, tmp_path, monkeypatch):
+    pidfile = tmp_path / "esc.pid"
+    # the setsid child inherits stdout and leaves the process group
+    body = ("/usr/bin/perl -MPOSIX -e 'if (fork() == 0) { POSIX::setsid(); "
+            f'open(F, ">", "{pidfile}"); print F $$; close F; sleep 30; exit 0 }}'
+            "'; echo parent-done")
+    _add(adir, body=body)
+    monkeypatch.setattr(actions, "RUN_TIMEOUT_S", 1)
+    pids = []
+
+    def note_pid():
+        try:
+            pids.append(int(pidfile.read_text().strip()))
+        except (OSError, ValueError):
+            pass
+
+    try:
+        start = time.monotonic()
+        reply = actions.run_action("step1", now=NOW)
+        assert time.monotonic() - start < 15
+        assert "timed out" in reply
+        assert _log()[-1]["outcome"] == "timeout"
+        note_pid()
+        reply = actions.run_action("step1", now=NOW + 61)
+        assert "another action is running" not in reply
+    finally:
+        note_pid()
+        for pid in set(pids):
+            _kill(pid)
+
+
+def test_relative_script_path_is_refused(adir):
+    _, marker = _add(adir)
+    _rewrite_script("step1", "step1.sh")
+    assert actions.run_action("step1", now=NOW) == "not run: not absolute"
+    assert not marker.exists()
+    assert actions.show_action("step1") == "not shown: not absolute"
+
+
+def test_symlinked_script_is_refused_at_run_time(adir):
+    p, marker = _add(adir)
+    real = adir.parent / "real.sh"
+    shutil.copy2(p, real)
+    real.chmod(0o700)
+    p.unlink()
+    os.symlink(real, p)
+    assert actions.run_action("step1", now=NOW) == "not run: symlink"
+    assert not marker.exists()
+
+
+def test_script_moved_outside_the_actions_dir_is_refused(adir):
+    p, marker = _add(adir)
+    out = adir.parent / "out.sh"
+    shutil.copy2(p, out)
+    out.chmod(0o700)
+    assert actions.sha256_file(out) == actions.sha256_file(p)
+    _rewrite_script("step1", str(out))
+    assert actions.run_action("step1", now=NOW) == "not run: outside actions dir"
+    assert not marker.exists()
+
+
+def test_script_made_non_executable_is_refused(adir):
+    p, marker = _add(adir)
+    p.chmod(0o600)
+    assert actions.run_action("step1", now=NOW) == "not run: not executable"
+    assert not marker.exists()
+
+
+def test_script_not_owned_by_the_user_is_refused(adir, monkeypatch):
+    _, marker = _add(adir)
+    real_uid = os.getuid()
+    monkeypatch.setattr(actions.os, "getuid", lambda: real_uid + 1)
+    reply = actions.run_action("step1", now=NOW)
+    assert reply.startswith("not run: ")
+    assert reply in ("not run: actions dir unsafe", "not run: not owned by you")
+    assert not marker.exists()
+
+
+def test_show_refuses_paths_that_fail_the_checks(adir):
+    _add(adir)
+    _rewrite_script("step1", "/etc/hosts")
+    out = actions.show_action("step1")
+    assert out.startswith("not shown: ")
+    assert "localhost" not in out
+
+
+def test_show_warns_when_the_script_changed_since_approval(adir):
+    p, _ = _add(adir)
+    assert "WARNING: changed since approval" not in actions.show_action("step1")
+    p.write_text(p.read_text() + "echo tampered\n", encoding="utf-8")
+    p.chmod(0o700)
+    out = actions.show_action("step1")
+    assert "WARNING: changed since approval - 'run' will refuse it" in out
+    assert "echo tampered" in out
