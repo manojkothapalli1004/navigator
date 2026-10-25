@@ -17,7 +17,9 @@ and three ways to see it:
   one digest at DIGEST_HOUR local, only when something is waiting. While a source
     fails to list, the digest is neither sent nor marked (an incomplete list must not
     spend the day's digest); from DIGEST_HOUR + 2 it goes out anyway - the items that
-    could be listed, if any, plus one line '(could not list: <kinds>)'
+    could be listed, if any, plus one line '(could not list: <kinds>)'. While the digest
+    is held no reminder is sent either (the held digest names those items at
+    DIGEST_HOUR + 2), so an item is never sent twice in one morning.
 Nothing is sent in the quiet hours (QUIET_START_HOUR..QUIET_END_HOUR local).
 
 Only decisions_tick (the daemon cycle, __main__._decisions_step) writes the state file:
@@ -368,7 +370,9 @@ def decisions_tick(act, notifier, now: datetime | None = None, state_file=None,
     items that have waited NUDGE_AFTER_S and were not nudged today (never right after a
     digest). While a source fails to list, the digest is neither sent nor marked before
     DIGEST_HOUR + 2; from then on it is marked and sent (the listed items, if any) with
-    one extra message '(could not list: <kinds>)' naming the failed kinds. A failing
+    one extra message '(could not list: <kinds>)' naming the failed kinds. While the
+    digest is held no reminder is sent either: the held digest names those items at
+    DIGEST_HOUR + 2, so an item is not sent twice. A failing
     act.list_open_runs counts 'merge' as a failed source. The refreshed state is written BEFORE
     any send: when that write fails nothing is sent and {'items', 'state_write_failed':
     True} is returned, so an unwritable state file never turns into a digest every cycle.
@@ -421,6 +425,10 @@ def decisions_tick(act, notifier, now: datetime | None = None, state_file=None,
     # then goes out naming the kinds it could not list
     digest_due = (local.hour >= DIGEST_HOUR and state["digest"] != today
                   and (not failed or local.hour >= DIGEST_HOUR + 2))
+    # while the digest is held (a failed source, DIGEST_HOUR..DIGEST_HOUR + 2, not yet
+    # sent today) no reminder goes out either: the held digest will name those items
+    held = (bool(failed) and DIGEST_HOUR <= local.hour < DIGEST_HOUR + 2
+            and state["digest"] != today)
     if digest_due:
         state["digest"] = today
         if items:
@@ -433,8 +441,9 @@ def decisions_tick(act, notifier, now: datetime | None = None, state_file=None,
                     nudged[d.key] = today
         if failed:
             notifier.send("(could not list: " + ", ".join(sorted(failed)) + ")")
-    due = [d for d in items if d.kind in NUDGE_KINDS and nudged.get(d.key) != today
-           and _due(first_seen.get(d.key), now)]
+    due = [] if held else [d for d in items if d.kind in NUDGE_KINDS
+                           and nudged.get(d.key) != today
+                           and _due(first_seen.get(d.key), now)]
     if due:
         for text in format_decisions(due, now, first_seen,
                                      header="Reminder - still waiting on you"):
