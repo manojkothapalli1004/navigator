@@ -216,7 +216,10 @@ def run_action(item_id, update_id=0, manual_file=None, actions_dir=None, log_pat
     'started' line cannot be written (nothing can be logged then). Otherwise the reply
     is 'ran <id>: rc=<rc>' plus the last MAX_OUTPUT_CHARS of the output, or
     'ran <id>: timed out after <N>s' (with ' (process still running)' appended when
-    the child could not be reaped). The manual item is never removed."""
+    the child could not be reaped). The manual item is never removed. The rate limit
+    is checked again, at the current time, after the lock is taken (the lock is
+    non-blocking, so this catches a run that started and finished between the early
+    check and the lock); this is the authoritative check."""
     now = time.time() if now is None else float(now)
     adir = _dir_or_default(actions_dir)
     lpath = log_path or action_log_path()
@@ -257,6 +260,11 @@ def run_action(item_id, update_id=0, manual_file=None, actions_dir=None, log_pat
             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             return refused("another action is running", "not run: another action is running")
+        # the authoritative rate-limit check: under the lock and at the CURRENT time (a
+        # run that entered after this request logged ts > now, which the early check
+        # skips as a future ts)
+        if _recent_run(lpath, item_id, max(now, time.time())):
+            return refused("ran recently", f"not run: ran less than {MIN_INTERVAL_S}s ago")
         # the record that survives a crash mid-run: written before exec, and required
         if not _append_log(lpath, dict(rec, outcome="started", rc=None, reason=None)):
             return "not run: action log unwritable"

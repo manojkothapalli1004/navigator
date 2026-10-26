@@ -504,3 +504,69 @@ def test_show_warns_when_the_script_changed_since_approval(adir):
     out = actions.show_action("step1")
     assert "WARNING: changed since approval - 'run' will refuse it" in out
     assert "echo tampered" in out
+
+
+# ---- m) v1.3: the rate limit is re-checked under the lock ---------------------------
+
+def _inject_started(ts):
+    lp = Path(actions.action_log_path())
+    lp.parent.mkdir(parents=True, exist_ok=True)
+    with open(lp, "a", encoding="utf-8") as f:
+        f.write(json.dumps({"ts": ts, "id": "step1", "outcome": "started"}) + "\n")
+
+
+def test_a_run_that_lands_while_waiting_for_the_lock_is_honoured(adir, monkeypatch):
+    _, marker = _add(adir)
+    real = fcntl.flock  # saved BEFORE patching: actions.fcntl is the same module
+    calls = []
+    monkeypatch.setattr(actions.time, "time", lambda: NOW)
+
+    def fake(fd, op):
+        calls.append(1)
+        if len(calls) == 1:
+            # another process ran between the early check and the lock
+            _inject_started(NOW - 1)
+        return real(fd, op)
+
+    monkeypatch.setattr(actions.fcntl, "flock", fake)
+    reply = actions.run_action("step1", now=NOW)
+    assert "ran less than 60s ago" in reply
+    assert not marker.exists()
+    log = _log()
+    assert log[0]["outcome"] == "started" and log[0]["ts"] == NOW - 1  # the simulated line
+    assert log[-1]["outcome"] == "refused" and log[-1]["reason"] == "ran recently"
+    assert not any(r["outcome"] == "started" for r in log[1:])
+
+
+def test_a_run_that_started_after_this_request_is_honoured(adir, monkeypatch):
+    _, marker = _add(adir)
+    real = fcntl.flock
+    calls = []
+    monkeypatch.setattr(actions.time, "time", lambda: NOW)
+
+    def fake(fd, op):
+        calls.append(1)
+        if len(calls) == 1:
+            # the other request entered AFTER this one (ts > now) and the clock moved on
+            _inject_started(NOW + 1)
+            monkeypatch.setattr(actions.time, "time", lambda: NOW + 2)
+        return real(fd, op)
+
+    monkeypatch.setattr(actions.fcntl, "flock", fake)
+    reply = actions.run_action("step1", now=NOW)
+    assert "ran less than 60s ago" in reply
+    assert not marker.exists()
+    log = _log()
+    assert log[-1]["outcome"] == "refused" and log[-1]["reason"] == "ran recently"
+    assert log[-1]["ts"] == NOW  # the entry-time ts is kept
+    assert not any(r["outcome"] == "started" for r in log[1:])
+
+
+def test_a_huge_integer_ts_does_not_crash_or_block(adir):
+    _, marker = _add(adir)
+    lp = Path(actions.action_log_path())
+    lp.parent.mkdir(parents=True, exist_ok=True)
+    lp.write_text('{"id": "step1", "outcome": "ran", "ts": ' + "9" * 400 + '}\n',
+                  encoding="utf-8")
+    assert actions.run_action("step1", now=NOW).startswith("ran step1")
+    assert marker.exists()
