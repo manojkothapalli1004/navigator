@@ -94,6 +94,22 @@ def test_verification_summary_understands_quiet_progress_only_output():
     assert "tests passed (100%)" in out and "Installed" not in out
 
 
+def test_completed_message_carries_revert_and_auto_marker():
+    rec = _Recorder()
+    act = NotifyingACT(FakeACTClient(), rec)
+    act.emit_event(_ev("run.completed", run_id="run-1", merge_sha="abc", auto=True,
+                       revert="git -C /r revert -m 1 abc"))
+    assert rec.sent[0].startswith("Navigator: run-1 merged")
+    assert "automatically" in rec.sent[0]
+    assert "revert: git -C /r revert -m 1 abc" in rec.sent[0]
+    act.emit_event(_ev("run.completed", run_id="run-1", merge_sha="abc", auto=False,
+                       revert="git -C /r revert -m 1 abc"))
+    assert "automatically" not in rec.sent[1]
+    assert "revert: git -C /r revert -m 1 abc" in rec.sent[1]
+    act.emit_event(_ev("run.completed", run_id="run-1"))
+    assert rec.sent[2] == "Navigator: run-1 merged"
+
+
 def test_review_message_shows_the_tier():
     rec = _Recorder()
     act = NotifyingACT(FakeACTClient(), rec)
