@@ -229,6 +229,39 @@ def test_operator_preapprove_env_wiring(monkeypatch):
         with pytest.raises(ValueError, match="NAVIGATOR_OPERATOR_PREAPPROVE"):
             cfg.Settings.from_env()
 
+def test_planner_throttle_env_wiring(monkeypatch):
+    # planner throttle v1: gate the periodic planner on its own merge rate; off by default
+    import pytest
+    for k in ("NAVIGATOR_PLANNER_MIN_MERGE_RATE", "NAVIGATOR_PLANNER_MERGE_WINDOW",
+              "NAVIGATOR_PLANNER_THROTTLE_HOURS"):
+        monkeypatch.delenv(k, raising=False)
+    assert cfg.Settings().planner_min_merge_rate == 0.0
+    assert cfg.Settings().planner_merge_window == 20
+    assert cfg.Settings().planner_throttle_hours == 24.0
+    s = cfg.Settings.from_env()
+    assert s.planner_min_merge_rate == 0.0
+    assert s.planner_merge_window == 20
+    assert s.planner_throttle_hours == 24.0
+    monkeypatch.setenv("NAVIGATOR_PLANNER_MIN_MERGE_RATE", "0.35")
+    monkeypatch.setenv("NAVIGATOR_PLANNER_MERGE_WINDOW", "7")
+    monkeypatch.setenv("NAVIGATOR_PLANNER_THROTTLE_HOURS", "12")
+    s = cfg.Settings.from_env()
+    assert s.planner_min_merge_rate == 0.35
+    assert s.planner_merge_window == 7
+    assert s.planner_throttle_hours == 12.0
+    for bad in ("1.5", "-0.1"):
+        monkeypatch.setenv("NAVIGATOR_PLANNER_MIN_MERGE_RATE", bad)
+        with pytest.raises(ValueError, match="NAVIGATOR_PLANNER_MIN_MERGE_RATE"):
+            cfg.Settings.from_env()
+    monkeypatch.setenv("NAVIGATOR_PLANNER_MIN_MERGE_RATE", "0.35")
+    monkeypatch.setenv("NAVIGATOR_PLANNER_MERGE_WINDOW", "0")
+    with pytest.raises(ValueError, match="NAVIGATOR_PLANNER_MERGE_WINDOW"):
+        cfg.Settings.from_env()
+    monkeypatch.setenv("NAVIGATOR_PLANNER_MERGE_WINDOW", "7")
+    monkeypatch.setenv("NAVIGATOR_PLANNER_THROTTLE_HOURS", "0")
+    with pytest.raises(ValueError, match="NAVIGATOR_PLANNER_THROTTLE_HOURS"):
+        cfg.Settings.from_env()
+
 def test_repos_file_tier_fields(tmp_path, monkeypatch):
     # merge tiers 3a: per-repo tier_c_paths / tier_floor from NAVIGATOR_REPOS_FILE
     import json
