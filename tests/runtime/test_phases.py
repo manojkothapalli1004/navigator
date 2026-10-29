@@ -895,8 +895,10 @@ def test_builder_request_carries_runner_run_dir_and_allowed_commands(tmp_path):
     assert b.run_dir == str(Path(h.path))  # workdir ".": run_dir_for returns the worktree
     assert b.allowed_commands == tuple(DEFAULT_ALLOWLIST)
     assert b.worktree_path == str(Path(h.path))
+    assert b.test_budget == {"used": 0}  # 2b: the per-build run_tests counter
     v = drv.requests[Role.verifier]
     assert v.runner is None and v.run_dir is None and v.allowed_commands == ()
+    assert v.test_budget is None
     assert v.worktree_path == str(Path(h.path))
     assert v.context["allowed_commands"] == list(DEFAULT_ALLOWLIST)
 
@@ -913,3 +915,38 @@ def test_builder_request_run_dir_is_the_workdir_inside_the_worktree(tmp_path):
     assert b.allowed_commands == tuple(DEFAULT_ALLOWLIST)
     v = drv.requests[Role.verifier]
     assert v.runner is None and v.run_dir is None and v.allowed_commands == ()
+
+
+def test_run_tests_budget_is_one_dict_per_build_across_repair_turns(tmp_path):
+    # build 2b: the run_tests bound is per BUILD: the first attempt and every repair turn share
+    # ONE counter, so a proposal can never run more than NAVIGATOR_BUILDER_TEST_RUNS suites
+    from navigator.safety.command_runner import CommandResult
+    h, _ = _wt(tmp_path, "run-tb")
+    (Path(h.path)/"tests").mkdir()
+
+    class _Runner:
+        allowlist = ["uv run pytest"]
+        def run(self, argv, cwd):
+            return CommandResult(1, "1 failed", "")  # repairable: the suite ran and failed
+
+    class _Driver:
+        def __init__(self):
+            self.seen = []
+        def run_role(self, request):
+            self.seen.append((request.role, request.test_budget))
+            if request.role == Role.builder:
+                return DriverResult(role=Role.builder,
+                                    file_writes=[("a.py", "x = 1\n"),
+                                                 ("tests/test_a.py", "def test_a(): pass\n")])
+            return DriverResult(role=Role.verifier, commands=[["uv", "run", "pytest", "-q"]])
+
+    drv = _Driver()
+    res = run_build_and_verify(driver=drv, worktree=h, run_id="run-tb", runner=_Runner(),
+                               proposal={"affected_files": ["a.py"]}, repair_turns=1)
+    assert res.repair_turns_used == 1 and res.verify_returncode != 0
+    builder = [b for role, b in drv.seen if role == Role.builder]
+    verifier = [b for role, b in drv.seen if role == Role.verifier]
+    assert len(builder) == 2 and len(verifier) == 2
+    assert builder[0] is builder[1]  # the SAME dict on the first attempt and the repair turn
+    assert builder[0] == {"used": 0}  # the fake driver never ran the tool
+    assert verifier == [None, None]  # the verifier never gets a tool, nor its budget
