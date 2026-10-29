@@ -336,3 +336,32 @@ def test_builder_tools_flag_reaches_the_daemon_driver(tmp_path, monkeypatch):
     assert len(others) == 3
     for _, t, kw in others:
         assert "max_turns" not in kw and t == 77.0
+
+def test_builder_tests_flag_reaches_the_daemon_driver(tmp_path, monkeypatch):
+    # build 2: NAVIGATOR_BUILDER_TESTS / _TEST_RUNS reach the driver; the flag needs builder_tools
+    import navigator.__main__ as m
+    monkeypatch.setattr(m, "make_sdk_query_fn",
+                        lambda *, model, timeout_s, **kw: (lambda p, **k: model))
+    repo = _seed_repo(tmp_path)
+    s = _settings(tmp_path, repo, driver="claude_sdk", sdk_model="claude-fable-5-1",
+                  builder_tools=True, builder_tests=True, builder_test_runs=4)
+    drv = build_navigator(s).driver
+    assert drv.builder_tests is True
+    assert drv.builder_test_runs == 4
+    s2 = _settings(tmp_path, repo, driver="claude_sdk", sdk_model="claude-fable-5-1",
+                   builder_tools=True)
+    drv2 = build_navigator(s2).driver
+    assert drv2.builder_tests is False and drv2.builder_test_runs == 5
+    s3 = _settings(tmp_path, repo, driver="claude_sdk", sdk_model="claude-fable-5-1",
+                   builder_tests=True)
+    with pytest.raises(ValueError, match="NAVIGATOR_BUILDER_TESTS"):
+        build_navigator(s3)
+
+def test_runner_timeout_is_capped_at_300s(tmp_path):
+    # build 2: NAVIGATOR_COMMAND_TIMEOUT_S above 300 is clamped for the per-repo runner (the
+    # run_tests worker must not outlive a cancelled builder query with os.environ sealed);
+    # the verifier shares that runner, so its per-command bound drops too
+    repo = _seed_repo(tmp_path)
+    assert build_navigator(_settings(tmp_path, repo, command_timeout_s=900.0)).runner.timeout_s == 300.0
+    assert build_navigator(_settings(tmp_path, repo, command_timeout_s=120.0)).runner.timeout_s == 120.0
+    assert build_navigator(_settings(tmp_path, repo, command_timeout_s=300.0)).runner.timeout_s == 300.0
