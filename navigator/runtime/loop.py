@@ -7,6 +7,7 @@ from contextlib import ExitStack
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from navigator.contracts.proposal import Proposal, compute_origin_hash
+from navigator.contracts.event import Event
 from navigator.contracts.enums import (ProposalStatus, RunStatus, RunPhase, ApprovalGate,
                                        ApprovalDecision)
 from navigator.runtime.executor import (execute_proposal, merge_after_approval, decline_run,
@@ -23,6 +24,10 @@ log = get_logger("navigator.loop")
 QUOTA_DEFAULT_PAUSE_S = 3600
 # no pause, from the SDK or the shared file, lasts longer than this; a bad resets_at must not stop the loop for days
 QUOTA_MAX_PAUSE_S = 24 * 3600
+# proposals filed by the operator's own scripts; the daemon's planner uses "periodic"
+OPERATOR_ORIGIN = "operator"
+# title prefix that opts an operator proposal out of preapproval (file now, approve by hand later)
+DRAFT_PREFIX = "[draft]"
 
 
 def read_quota_pause(path) -> datetime | None:
@@ -303,7 +308,37 @@ class Navigator:
         self.quota_paused_until = self._cap(self._quota_pause_from(e), now)
         self._pause_on_file = write_quota_pause(self._pause_path(), self.quota_paused_until)
 
+    def preapprove_operator_proposals(self) -> list:
+        """Operator-filed proposals (origin == OPERATOR_ORIGIN) of this repo that are still
+        'proposed' become 'approved' when settings.operator_preapprove is on. Periodic
+        proposals are untouched. Idempotent: an approved proposal is no longer 'proposed'.
+        Returns the proposals it approved."""
+        if not getattr(self.settings, "operator_preapprove", False):
+            return []
+        done = []
+        for p in self._mine(self.act.list_proposals(ProposalStatus.proposed)):
+            if p.origin != OPERATOR_ORIGIN or p.title.lower().startswith(DRAFT_PREFIX):
+                continue  # "[draft] ..." titles are the opt-out: file now, audit, approve by hand later
+            self.act.set_proposal_status(p.id, ProposalStatus.approved)
+            log.info("approval_poll.preapproved", proposal_id=p.id)
+            done.append(p)
+            try:  # best-effort, like triage._event: the status change is the fact, the event is a trace
+                self.act.emit_event(Event(kind="proposal.preapproved",
+                                          payload={"proposal_id": p.id, "title": p.title[:120],
+                                                   "origin": p.origin, "repo": self.repo}))
+            except Exception as e:
+                log.warning("approval_poll.preapproved_event_failed", proposal_id=p.id,
+                            error=str(e)[:200])
+        return done
+
     def approval_poll(self) -> list:
+        # runs in every mode: a dry_run daemon approves operator proposals so the next
+        # once.sh execute cycle builds them; an ACT blip here must not skip the rest of
+        # the cycle (_cycle does not guard approval_poll the way it guards periodic_tick)
+        try:
+            self.preapprove_operator_proposals()
+        except Exception as e:
+            log.warning("approval_poll.preapprove_failed", error=str(e)[:200])
         self.quota_deferral = None
         if self.settings.mode != "execute":
             return []
