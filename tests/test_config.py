@@ -110,7 +110,8 @@ def test_allowed_commands_rejects_dangerous_entries(monkeypatch):
 def test_command_timeout_is_env_wired_and_reaches_the_runner(tmp_path, monkeypatch):
     # a fresh worktree's `uv run pytest` builds a venv first: ~3 min live, past the 60s default
     monkeypatch.setenv("NAVIGATOR_COMMAND_TIMEOUT_S", "600")
-    for k in ("NAVIGATOR_DRIVER", "NAVIGATOR_ACT_BASE_URL", "NAVIGATOR_ORC_BASE_URL"):
+    for k in ("NAVIGATOR_DRIVER", "NAVIGATOR_ACT_BASE_URL", "NAVIGATOR_ORC_BASE_URL",
+              "NAVIGATOR_BUILDER_TOOLS", "NAVIGATOR_BUILDER_TESTS"):
         monkeypatch.delenv(k, raising=False)  # hermetic: the daemon's env must not leak in
     s = cfg.Settings.from_env()
     assert s.command_timeout_s == 600
@@ -118,8 +119,11 @@ def test_command_timeout_is_env_wired_and_reaches_the_runner(tmp_path, monkeypat
     import subprocess
     repo = tmp_path/"r"; repo.mkdir(); subprocess.run(["git", "init"], cwd=repo, capture_output=True)
     s.repo = str(repo); s.lock_path = str(tmp_path/"l"); s.worktree_root = str(tmp_path/"wt")
-    # build 2: the runner's per-command bound is clamped to 300s in build_navigator (a run_tests
-    # worker must not outlive a cancelled builder query with os.environ sealed); the setting is kept
+    # build 2b: the runner's per-command bound is clamped to 300s in build_navigator ONLY while
+    # builder_tests is on (a run_tests worker must not outlive a cancelled builder query with
+    # os.environ sealed); with the tool off the verifier keeps the configured bound
+    assert build_navigator(s).runner.timeout_s == 600
+    s.builder_tools = True; s.builder_tests = True
     assert build_navigator(s).runner.timeout_s == 300
     s.command_timeout_s = 120
     assert build_navigator(s).runner.timeout_s == 120
