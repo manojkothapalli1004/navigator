@@ -4,7 +4,8 @@ import sys
 import types
 from datetime import datetime, timezone
 import pytest
-from navigator.runtime.drivers.sdk_query import make_sdk_query_fn
+from navigator.runtime.drivers.sdk_query import (DEFAULT_SYSTEM_PROMPT, TESTS_SYSTEM_PROMPT_SUFFIX,
+                                                 TOOLED_SYSTEM_PROMPT_SUFFIX, make_sdk_query_fn)
 from navigator.safety.errors import QuotaExhaustedError
 from navigator.runtime.drivers.claude_sdk_driver import ClaudeSDKDriver
 from navigator.runtime.drivers.base import DriverRequest
@@ -435,3 +436,39 @@ def test_mcp_kwargs_are_keyword_only(monkeypatch):
     _stub_sdk(monkeypatch, captured)
     with pytest.raises(TypeError):
         make_sdk_query_fn()("hello", "/tmp/wt", {})
+
+
+# --- build 2b: the tooled builder's prompt names run_tests when the server is passed ---------
+
+def test_tooled_options_with_mcp_servers_mention_run_tests(monkeypatch):
+    captured = {}
+    _stub_sdk(monkeypatch, captured)
+    fn = make_sdk_query_fn(tools=("Read", "Grep", "Glob"), max_turns=30)
+    fn("hello", cwd="/private/tmp/navigator-worktrees/run-x", mcp_servers={"navigator": "SRV"},
+       mcp_tools=("mcp__navigator__run_tests",))
+    prompt = captured["options"]["system_prompt"]
+    assert "run_tests" in prompt
+    assert prompt.startswith("You are a Navigator subagent")
+    assert prompt.endswith("not to validate edits you have not made yet.")
+    assert prompt == DEFAULT_SYSTEM_PROMPT + TOOLED_SYSTEM_PROMPT_SUFFIX + TESTS_SYSTEM_PROMPT_SUFFIX
+    assert "applied AFTER you reply" in prompt and "bounded per build" in prompt
+    # the rest of the tooled options are build 2a's
+    assert captured["options"]["allowed_tools"] == ["Read", "Grep", "Glob", "mcp__navigator__run_tests"]
+    assert captured["options"]["mcp_servers"] == {"navigator": "SRV"}
+
+
+def test_tooled_options_without_mcp_servers_never_mention_run_tests(monkeypatch):
+    # NEGATIVE: cwd alone keeps build 1's tooled prompt; the tool-less prompt is untouched
+    captured = {}
+    _stub_sdk(monkeypatch, captured)
+    fn = make_sdk_query_fn(tools=("Read", "Grep", "Glob"), max_turns=30)
+    fn("hello", cwd="/private/tmp/navigator-worktrees/run-x")
+    prompt = captured["options"]["system_prompt"]
+    assert "run_tests" not in prompt
+    assert prompt == DEFAULT_SYSTEM_PROMPT + TOOLED_SYSTEM_PROMPT_SUFFIX
+    make_sdk_query_fn()("hello")
+    assert captured["options"]["system_prompt"] == DEFAULT_SYSTEM_PROMPT
+    # tool-less fn: mcp kwargs are ignored, the prompt stays exactly the default
+    make_sdk_query_fn()("hello", cwd="/tmp/wt", mcp_servers={"navigator": "SRV"},
+                        mcp_tools=("mcp__navigator__run_tests",))
+    assert captured["options"]["system_prompt"] == DEFAULT_SYSTEM_PROMPT
