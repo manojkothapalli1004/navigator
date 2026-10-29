@@ -778,6 +778,9 @@ def _attempt(driver: SubagentDriver, wt: Path, base: str, run_id: str, runner: C
         target = _resolve_write_target(wt, relpath)
         cp_before = checkpoint(wt, run_id=run_id, n=n, label=f"pre-write-{relpath}")
         res.checkpoints.append(cp_before)
+        # run-01M5ZHSAPV1P2HBETB86S1FJEN: a new file in a new directory raised FileNotFoundError
+        # after the checkpoints and lost the build; target is already guarded to be inside wt
+        target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content)
         res.file_writes.append(relpath)
         n += 1

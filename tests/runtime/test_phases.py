@@ -825,3 +825,57 @@ def test_reverify_refuses_an_empty_changed_set(tmp_path):
     assert res2.verify_returncode == 0
     assert res2.no_change is False
     assert runner.calls == [["python3", "-c", "print(1)"]]
+
+
+# run-01M5ZHSAPV1P2HBETB86S1FJEN (Vent build 1, fresh repo): the first write into a
+# directory that did not exist yet raised FileNotFoundError out of the phase after the
+# checkpoints were taken, so any proposal creating a file in a new directory was
+# unbuildable. The build phase now creates the parent directories inside the worktree.
+
+def _log_subjects(path, n):
+    return subprocess.run(["git", "log", "--format=%s", f"-{n}"], cwd=path,
+                         capture_output=True, text=True).stdout.split("\n")
+
+
+def test_builder_write_into_a_new_directory_succeeds(tmp_path):
+    h, runner = _wt(tmp_path, "run-md")
+    drv = _ScriptedRoles([("new_dir/sub/file.py", "x = 1\n")],
+                         [["python3", "-m", "py_compile", "new_dir/sub/file.py"]])
+    res = run_build_and_verify(driver=drv, worktree=h, run_id="run-md", runner=runner,
+                               proposal={"affected_files": ["new_dir/sub/file.py"]})
+    assert (Path(h.path) / "new_dir" / "sub" / "file.py").read_text() == "x = 1\n"
+    assert res.file_writes == ["new_dir/sub/file.py"]
+    assert len(res.checkpoints) == 1  # one pre-write checkpoint
+    # numbering unchanged: pre-write is n=1, post-build is n=2
+    assert _log_subjects(h.path, 3)[:3] == ["navigator-checkpoint:run-md:2",
+                                            "navigator-checkpoint:run-md:1", "base"]
+    tracked = subprocess.run(["git", "ls-files"], cwd=h.path, capture_output=True,
+                             text=True).stdout.split()
+    assert "new_dir/sub/file.py" in tracked  # the post-build checkpoint committed it
+
+
+def test_builder_writes_into_new_and_existing_directories_keep_checkpoint_order(tmp_path):
+    h, runner = _wt(tmp_path, "run-md2")
+    writes = [("a.py", "x = 1\n"), ("pkg/mod.py", "y = 2\n"), ("pkg/deep/er/z.py", "z = 3\n")]
+    drv = _ScriptedRoles(writes, [["python3", "-m", "py_compile", "a.py"]])
+    res = run_build_and_verify(driver=drv, worktree=h, run_id="run-md2", runner=runner,
+                               proposal={"affected_files": [rel for rel, _ in writes]})
+    for rel, content in writes:
+        assert (Path(h.path) / rel).read_text() == content
+    assert res.file_writes == ["a.py", "pkg/mod.py", "pkg/deep/er/z.py"]
+    assert len(res.checkpoints) == 3
+    assert _log_subjects(h.path, 5)[:5] == ["navigator-checkpoint:run-md2:4",
+                                            "navigator-checkpoint:run-md2:3",
+                                            "navigator-checkpoint:run-md2:2",
+                                            "navigator-checkpoint:run-md2:1", "base"]
+
+
+def test_mkdir_never_escapes_the_worktree(tmp_path):
+    h, runner = _wt(tmp_path, "run-esc")
+    drv = _ScriptedRoles([("../escape/x.py", "boom\n")], [["git", "status"]])
+    with pytest.raises(ValueError, match="write outside worktree"):
+        run_build_and_verify(driver=drv, worktree=h, run_id="run-esc", runner=runner,
+                             proposal={"affected_files": ["../escape/x.py"]})
+    # the mkdir runs only after _resolve_write_target has accepted the path
+    assert not (tmp_path / "escape").exists()
+    assert not (tmp_path / "wt" / "escape").exists()
