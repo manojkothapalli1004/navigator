@@ -229,3 +229,118 @@ def test_from_settings_requires_sdk_extra(monkeypatch):
     monkeypatch.setitem(sys.modules, "claude_agent_sdk", None)
     with pytest.raises(ValueError, match="claude-agent-sdk"):
         ClaudeSDKDriver.from_settings(Settings(sdk_model="m"), budget_guard=BudgetGuard(1.0))
+
+
+# --- builder tools (operator decision 2026-10-28): eyes, never hands ----------------------
+
+def _recording_make(built):
+    def fake_make(*, model, **kw):
+        built.append(dict(kw, model=model))
+        return lambda prompt: model
+    return fake_make
+
+
+def test_from_settings_builder_tools_on_wires_only_the_builder():
+    built = []
+    s = Settings(sdk_model="claude-fable-5-1",
+                 sdk_role_models={"planner": "claude-sonnet-5-5", "verifier": "claude-sonnet-5-5"},
+                 sdk_model_fallbacks=["claude-opus-5-5", "claude-sonnet-5-5"],
+                 sdk_model_cooldown_s=120, sdk_timeout_s=42.0, builder_tools=True,
+                 sdk_builder_max_turns=25, sdk_builder_timeout_s=901.0)
+    drv = ClaudeSDKDriver.from_settings(s, budget_guard=BudgetGuard(1.5),
+                                        make_query_fn=_recording_make(built))
+    assert Role.builder in drv.role_query_fns
+    assert drv.role_query_fns[Role.builder]("x") == "claude-fable-5-1"
+    tooled = [b for b in built if "tools" in b]
+    assert len(tooled) == 1
+    assert tooled[0]["tools"] == ("Read", "Grep", "Glob")
+    assert tooled[0]["max_turns"] == 25
+    assert tooled[0]["timeout_s"] == 901.0
+    assert tooled[0]["model"] == "claude-fable-5-1"
+    assert tooled[0]["fallbacks"] == ("claude-opus-5-5", "claude-sonnet-5-5")
+    assert tooled[0]["cooldown_s"] == 120
+    others = [b for b in built if "tools" not in b]
+    assert len(others) == 3  # planner, verifier, default
+    assert all("max_turns" not in b and b["timeout_s"] == 42.0 for b in others)
+    assert all(b["cooldowns"] is built[0]["cooldowns"] for b in built)  # ONE shared dict
+
+
+def test_from_settings_builder_tools_use_the_builder_role_model_and_the_larger_timeout():
+    built = []
+    s = Settings(sdk_model="claude-fable-5-1", sdk_role_models={"builder": "claude-opus-5-5"},
+                 builder_tools=True, sdk_timeout_s=1500.0, sdk_builder_timeout_s=900.0)
+    drv = ClaudeSDKDriver.from_settings(s, budget_guard=BudgetGuard(1.5),
+                                        make_query_fn=_recording_make(built))
+    tooled = [b for b in built if "tools" in b]
+    assert len(tooled) == 1
+    assert tooled[0]["model"] == "claude-opus-5-5"
+    assert tooled[0]["timeout_s"] == 1500.0  # never less than the tool-less cap
+    assert drv.role_query_fns[Role.builder]("x") == "claude-opus-5-5"
+
+
+def test_from_settings_flag_off_never_passes_tools():
+    # NEGATIVE: with the flag off the wiring is exactly today's
+    built = []
+    s = Settings(sdk_model="m", sdk_role_models={"planner": "p", "verifier": "v"},
+                 builder_tools=False)
+    drv = ClaudeSDKDriver.from_settings(s, budget_guard=BudgetGuard(1.0),
+                                        make_query_fn=_recording_make(built))
+    assert Role.builder not in drv.role_query_fns
+    assert all("tools" not in b and "max_turns" not in b for b in built)
+    assert len(built) == 3
+
+
+def test_run_role_passes_the_worktree_as_cwd_to_a_builder_fn_that_accepts_it():
+    seen = {}
+    def builder_fn(prompt, *, cwd=None):
+        seen["cwd"] = cwd
+        return json.dumps({"file_writes": [["a.py", "x\n"]], "commands": [], "summary": "b"})
+    def plain_fn(prompt):
+        return json.dumps({"commands": [], "summary": "v"})
+    d = ClaudeSDKDriver(query_fn=plain_fn, budget_guard=BudgetGuard(2.0),
+                        role_query_fns={Role.builder: builder_fn})
+    res = d.run_role(DriverRequest(role=Role.builder, context={}, worktree_path="/tmp/w7"))
+    assert seen["cwd"] == "/tmp/w7"
+    assert res.file_writes == [("a.py", "x\n")]
+    # plain_fn takes no cwd: the verifier call must not raise
+    d.run_role(DriverRequest(role=Role.verifier, context={}, worktree_path="/tmp/w7"))
+
+
+def test_run_role_never_passes_cwd_to_planner_or_verifier_even_if_they_accept_it():
+    # NEGATIVE: cwd reaches the builder only
+    seen = []
+    def fn(prompt, *, cwd="unset"):
+        seen.append(cwd)
+        return json.dumps({"proposals": [], "commands": [], "summary": "s"})
+    d = ClaudeSDKDriver(query_fn=fn, budget_guard=BudgetGuard(2.0))
+    d.run_role(DriverRequest(role=Role.verifier, context={}, worktree_path="/tmp/w"))
+    d.run_role(DriverRequest(role=Role.planner, context={}))
+    assert seen == ["unset", "unset"]
+    # a builder request without a worktree: no worktree, no cwd
+    d.run_role(DriverRequest(role=Role.builder, context={}))
+    assert seen[-1] == "unset"
+
+
+def test_run_role_builder_with_a_plain_query_fn_still_works():
+    # the (prompt)-only fake is called without cwd
+    d = make_driver({"file_writes": [["a.py", "1\n"]], "commands": [], "summary": "ok"})
+    res = d.run_role(DriverRequest(role=Role.builder, context={}, worktree_path="/tmp/w"))
+    assert res.file_writes == [("a.py", "1\n")]
+
+
+def test_from_settings_builder_tools_refuse_a_worktree_root_under_users():
+    built = []
+    with pytest.raises(ValueError, match="NAVIGATOR_WORKTREE_ROOT"):
+        ClaudeSDKDriver.from_settings(
+            Settings(sdk_model="m", builder_tools=True, worktree_root="/Users/someone/wt"),
+            budget_guard=BudgetGuard(1.0), make_query_fn=_recording_make(built))
+    assert built == []  # refused before any query fn is built
+    ClaudeSDKDriver.from_settings(
+        Settings(sdk_model="m", builder_tools=False, worktree_root="/Users/someone/wt"),
+        budget_guard=BudgetGuard(1.0), make_query_fn=_recording_make(built))
+    assert all("tools" not in b for b in built)
+    built.clear()
+    ClaudeSDKDriver.from_settings(
+        Settings(sdk_model="m", builder_tools=True, worktree_root="/tmp/navigator-worktrees"),
+        budget_guard=BudgetGuard(1.0), make_query_fn=_recording_make(built))
+    assert len([b for b in built if "tools" in b]) == 1
