@@ -608,3 +608,35 @@ def test_audit_carries_across_two_consecutive_rebases(tmp_path):
     assert [g.actor for g in _audits(nav, s)] == [AUDITOR, AUDITOR, AUDITOR]
     assert s1.base_commit_sha == head1  # the earlier snapshot was not mutated in place
     assert _clean(s2.worktree_path) and _clean(repo)
+
+
+# ---- merge tiers 3a2: the rebased sibling's tier uses -z names and a guarded git call -----
+
+def test_rebased_sibling_tier_sees_a_double_quote_name_unquoted(tmp_path):
+    # NEGATIVE: on main the tier after the rebase was "B" (git printed the name C-quoted)
+    builds = {"A": [("a.py", "A = 1\n")], "B": [('docs/b"q.md', "# b\n")]}
+    nav, repo, a, b = _setup(tmp_path, builds=builds, verifies={"B": [["git", "status"]]})
+    assert [r.id for r in _merge(nav, a)] == [a.id]
+    sb = nav.act.runs[b.id]
+    assert sb.phase == RunPhase.awaiting_review
+    ev = _events(nav, b, "run.awaiting_review")[-1].payload
+    assert ev["rebased"] is True and ev["merge_tier"] == "A"
+
+
+def test_rebased_sibling_tier_git_failure_never_loses_the_awaiting_review_event(tmp_path, monkeypatch):
+    # NEGATIVE: on main rebase_stale_runs' per-run guard caught the OSError from the tier git
+    # call, logged rebase_stale.run_failed and FAILED the correctly rebased, re-verified sibling
+    nav, repo, a, b = _setup(tmp_path)
+    real = ex._git_run
+
+    def flaky(cwd, *args):
+        if "--no-renames" in args and "--name-only" in args:
+            raise OSError("git vanished")
+        return real(cwd, *args)
+
+    monkeypatch.setattr(ex, "_git_run", flaky)
+    assert [r.id for r in _merge(nav, a)] == [a.id]
+    sb = nav.act.runs[b.id]
+    assert sb.phase == RunPhase.awaiting_review and sb.base_commit_sha == _head(repo)
+    ev = _events(nav, b, "run.awaiting_review")[-1].payload
+    assert ev["rebased"] is True and ev["merge_tier"] is None
