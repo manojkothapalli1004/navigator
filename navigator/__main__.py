@@ -55,7 +55,13 @@ def build_navigator(settings: Settings):
     for rc in repos:
         runner = CommandRunner(allowlist=rc.allowed_commands or settings.allowed_commands,
                                worktree_root=settings.worktree_root,
-                               timeout_s=settings.command_timeout_s)
+                               # capped at 300s (build 2): when asyncio.wait_for cancels the builder
+                               # query, a run_tests to_thread worker keeps running and asyncio.run
+                               # waits at most 300s for the default executor on Python 3.12; a longer
+                               # runner timeout would let pytest outlive the query with os.environ
+                               # still sealed. The verifier shares this runner, so its per-command
+                               # bound is capped too (only bites when NAVIGATOR_COMMAND_TIMEOUT_S > 300)
+                               timeout_s=min(settings.command_timeout_s, 300.0))
         nav = Navigator(act=act, orc=orc, driver=driver, runner=runner, settings=settings,
                         repo=rc.path, lock_path=settings.lock_path, workdir=rc.workdir,
                         squash=rc.squash, brief=rc.brief, context_files=rc.context_files,
