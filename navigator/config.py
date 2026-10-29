@@ -84,6 +84,10 @@ class Settings:
     builder_tools: bool = False
     sdk_builder_max_turns: int = 30
     sdk_builder_timeout_s: float = 900.0
+    # builder test runner (build 2): when on, the tooled builder may run the repo's
+    # allowlisted pytest entry inside its worktree at most builder_test_runs times per turn; requires builder_tools
+    builder_tests: bool = False
+    builder_test_runs: int = 5
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -131,6 +135,8 @@ class Settings:
             builder_tools=_bool_env("NAVIGATOR_BUILDER_TOOLS", "0"),
             sdk_builder_max_turns=_positive_int_env("NAVIGATOR_SDK_BUILDER_MAX_TURNS", "30"),
             sdk_builder_timeout_s=_positive_float_env("NAVIGATOR_SDK_BUILDER_TIMEOUT_S", "900.0"),
+            builder_tests=_bool_env("NAVIGATOR_BUILDER_TESTS", "0"),
+            builder_test_runs=_positive_int_env("NAVIGATOR_BUILDER_TEST_RUNS", "5"),
         )
 
 

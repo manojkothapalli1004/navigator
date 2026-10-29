@@ -380,3 +380,58 @@ def test_cwd_is_keyword_only(monkeypatch):
     _stub_sdk(monkeypatch, captured)
     with pytest.raises(TypeError):
         make_sdk_query_fn()("hello", "/tmp/wt")
+
+
+# --- builder tests (build 2): in-process MCP servers join the tooled builder session only --
+
+def test_tooled_options_pass_mcp_servers_and_extend_allowed_tools(monkeypatch):
+    captured = {}
+    _stub_sdk(monkeypatch, captured)
+    fn = make_sdk_query_fn(tools=("Read", "Grep", "Glob"), max_turns=30)
+    fn("hello", cwd="/private/tmp/navigator-worktrees/run-x", mcp_servers={"navigator": "SRV"},
+       mcp_tools=("mcp__navigator__run_tests",))
+    opts = captured["options"]
+    assert opts["mcp_servers"] == {"navigator": "SRV"}
+    assert opts["tools"] == ["Read", "Grep", "Glob"]
+    assert opts["allowed_tools"] == ["Read", "Grep", "Glob", "mcp__navigator__run_tests"]
+    assert opts["cwd"] == "/private/tmp/navigator-worktrees/run-x"
+    assert opts["max_turns"] == 30
+    assert opts["setting_sources"] == []
+    assert json.loads(opts["settings"]) == {"disableClaudeAiConnectors": True,
+                                            "permissions": {"deny": DENY}}
+    assert opts["system_prompt"].startswith("You are a Navigator subagent")
+
+
+def test_tooled_options_without_mcp_kwargs_are_build_1_options(monkeypatch):
+    # NEGATIVE: cwd alone never adds an MCP server or an extra allowed tool
+    captured = {}
+    _stub_sdk(monkeypatch, captured)
+    fn = make_sdk_query_fn(tools=("Read", "Grep", "Glob"), max_turns=30)
+    fn("hello", cwd="/private/tmp/navigator-worktrees/run-x")
+    opts = captured["options"]
+    assert "mcp_servers" not in opts
+    assert opts["allowed_tools"] == ["Read", "Grep", "Glob"]
+    assert opts["tools"] == ["Read", "Grep", "Glob"] and opts["max_turns"] == 30
+    assert opts["cwd"] == "/private/tmp/navigator-worktrees/run-x"
+    assert json.loads(opts["settings"]) == {"disableClaudeAiConnectors": True,
+                                            "permissions": {"deny": DENY}}
+
+
+def test_tool_less_options_ignore_mcp_kwargs(monkeypatch):
+    # NEGATIVE: no tools means no session tools at all, whatever the call passes
+    captured = {}
+    _stub_sdk(monkeypatch, captured)
+    fn = make_sdk_query_fn()
+    fn("hello", cwd="/tmp/wt", mcp_servers={"navigator": "SRV"},
+       mcp_tools=("mcp__navigator__run_tests",))
+    opts = captured["options"]
+    assert "cwd" not in opts and "mcp_servers" not in opts
+    assert opts["tools"] == [] and opts["allowed_tools"] == [] and opts["max_turns"] == 4
+    assert json.loads(opts["settings"]) == {"disableClaudeAiConnectors": True}
+
+
+def test_mcp_kwargs_are_keyword_only(monkeypatch):
+    captured = {}
+    _stub_sdk(monkeypatch, captured)
+    with pytest.raises(TypeError):
+        make_sdk_query_fn()("hello", "/tmp/wt", {})

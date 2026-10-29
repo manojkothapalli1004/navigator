@@ -118,7 +118,11 @@ def test_command_timeout_is_env_wired_and_reaches_the_runner(tmp_path, monkeypat
     import subprocess
     repo = tmp_path/"r"; repo.mkdir(); subprocess.run(["git", "init"], cwd=repo, capture_output=True)
     s.repo = str(repo); s.lock_path = str(tmp_path/"l"); s.worktree_root = str(tmp_path/"wt")
-    assert build_navigator(s).runner.timeout_s == 600
+    # build 2: the runner's per-command bound is clamped to 300s in build_navigator (a run_tests
+    # worker must not outlive a cancelled builder query with os.environ sealed); the setting is kept
+    assert build_navigator(s).runner.timeout_s == 300
+    s.command_timeout_s = 120
+    assert build_navigator(s).runner.timeout_s == 120
 
 def test_per_role_sdk_models_from_env(monkeypatch):
     monkeypatch.setenv("NAVIGATOR_SDK_MODEL_PLANNER", "claude-sonnet-5-5")
@@ -211,6 +215,32 @@ def test_builder_tools_env_wiring(monkeypatch):
     monkeypatch.setenv("NAVIGATOR_SDK_BUILDER_TIMEOUT_S", "0")
     with pytest.raises(ValueError, match="NAVIGATOR_SDK_BUILDER_TIMEOUT_S"):
         cfg.Settings.from_env()
+
+def test_builder_tests_env_wiring(monkeypatch):
+    # build 2: the builder test runner rides on builder_tools; off by default, 5 runs per turn
+    import pytest
+    for k in ("NAVIGATOR_BUILDER_TESTS", "NAVIGATOR_BUILDER_TEST_RUNS"):
+        monkeypatch.delenv(k, raising=False)
+    assert cfg.Settings().builder_tests is False
+    assert cfg.Settings().builder_test_runs == 5
+    s = cfg.Settings.from_env()
+    assert s.builder_tests is False
+    assert s.builder_test_runs == 5
+    for v in ("1", "true"):
+        monkeypatch.setenv("NAVIGATOR_BUILDER_TESTS", v)
+        assert cfg.Settings.from_env().builder_tests is True, v
+    monkeypatch.setenv("NAVIGATOR_BUILDER_TESTS", "0")
+    assert cfg.Settings.from_env().builder_tests is False
+    monkeypatch.setenv("NAVIGATOR_BUILDER_TESTS", "maybe")
+    with pytest.raises(ValueError, match="NAVIGATOR_BUILDER_TESTS"):
+        cfg.Settings.from_env()
+    monkeypatch.setenv("NAVIGATOR_BUILDER_TESTS", "0")
+    monkeypatch.setenv("NAVIGATOR_BUILDER_TEST_RUNS", "3")
+    assert cfg.Settings.from_env().builder_test_runs == 3
+    for bad in ("0", "abc"):
+        monkeypatch.setenv("NAVIGATOR_BUILDER_TEST_RUNS", bad)
+        with pytest.raises(ValueError, match="NAVIGATOR_BUILDER_TEST_RUNS"):
+            cfg.Settings.from_env()
 
 def test_operator_preapprove_env_wiring(monkeypatch):
     # operator decision 2026-10-28 ('ask me less'): operator-filed proposals start approved; off by default

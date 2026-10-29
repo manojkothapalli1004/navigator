@@ -879,3 +879,37 @@ def test_mkdir_never_escapes_the_worktree(tmp_path):
     # the mkdir runs only after _resolve_write_target has accepted the path
     assert not (tmp_path / "escape").exists()
     assert not (tmp_path / "wt" / "escape").exists()
+
+
+# build 2 (builder tests): the builder request carries the per-repo runner, the run dir and
+# the allowlist so the tooled builder's run_tests tool runs through the same sealed path as
+# the verifier; the verifier request itself is unchanged.
+
+def test_builder_request_carries_runner_run_dir_and_allowed_commands(tmp_path):
+    h, runner = _wt(tmp_path, "run-bt")
+    drv = _RecordingDriver()
+    run_build_and_verify(driver=drv, worktree=h, run_id="run-bt", runner=runner,
+                         proposal={"affected_files": ["a.py"]})
+    b = drv.requests[Role.builder]
+    assert b.runner is runner
+    assert b.run_dir == str(Path(h.path))  # workdir ".": run_dir_for returns the worktree
+    assert b.allowed_commands == tuple(DEFAULT_ALLOWLIST)
+    assert b.worktree_path == str(Path(h.path))
+    v = drv.requests[Role.verifier]
+    assert v.runner is None and v.run_dir is None and v.allowed_commands == ()
+    assert v.worktree_path == str(Path(h.path))
+    assert v.context["allowed_commands"] == list(DEFAULT_ALLOWLIST)
+
+
+def test_builder_request_run_dir_is_the_workdir_inside_the_worktree(tmp_path):
+    h, runner = _wt(tmp_path, "run-bt2")
+    (Path(h.path) / "backend").mkdir()
+    drv = _RecordingDriver()
+    run_build_and_verify(driver=drv, worktree=h, run_id="run-bt2", runner=runner,
+                         proposal={"affected_files": ["a.py"]}, workdir="backend")
+    b = drv.requests[Role.builder]
+    assert b.run_dir == str((Path(h.path) / "backend").resolve())
+    assert b.runner is runner
+    assert b.allowed_commands == tuple(DEFAULT_ALLOWLIST)
+    v = drv.requests[Role.verifier]
+    assert v.runner is None and v.run_dir is None and v.allowed_commands == ()

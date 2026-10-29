@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Callable
 from navigator.config import Settings
 from navigator.runtime.drivers.base import ROLE_PERMISSIONS, DriverRequest, DriverResult
+from navigator.runtime.drivers.builder_tools import QUALIFIED_TOOL, make_run_tests_server
 # N9b: phases._read_affected cuts context.files at this many chars with no marker; an
 # edit resolved against such a base would silently drop the rest of the file
 from navigator.runtime.phases import _MAX_FILE_CHARS
@@ -66,6 +67,16 @@ def _accepts_cwd(fn) -> bool:
     return any(p.name == "cwd" or p.kind is p.VAR_KEYWORD for p in params)
 
 
+def _accepts_mcp_servers(fn) -> bool:
+    # True if fn takes an `mcp_servers` keyword (or **kwargs): only then is the run_tests
+    # server built for a builder call
+    try:
+        params = inspect.signature(fn).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(p.name == "mcp_servers" or p.kind is p.VAR_KEYWORD for p in params)
+
+
 def git_flags_prompt_line() -> str:
     return ("git flag allowlist per subcommand (applies to context.allowed_commands entries "
             "starting with git; any other dashed git flag is rejected): "
@@ -89,11 +100,18 @@ class ClaudeSDKDriver:
     """
     def __init__(self, *, query_fn: Callable[[str], str], budget_guard: BudgetGuard,
                  role_query_fns: dict[Role, Callable[[str], str]] | None = None,
-                 estimated_cost_per_call_usd: float = 0.25):
+                 estimated_cost_per_call_usd: float = 0.25,
+                 builder_tests: bool = False, builder_test_runs: int = 5):
         self.query_fn = query_fn
         self.role_query_fns = role_query_fns or {}
         self.budget_guard = budget_guard
         self.estimated_cost_per_call_usd = estimated_cost_per_call_usd
+        # build 2: when on, a builder request that carries a runner and run_dir gets the
+        # run_tests MCP tool (builder_tools.make_run_tests_server), at most builder_test_runs
+        # calls per turn; last_test_runs is the calls record of the most recent builder call
+        self.builder_tests = builder_tests
+        self.builder_test_runs = builder_test_runs
+        self.last_test_runs: list = []
 
     @classmethod
     def from_settings(cls, settings: Settings, *, budget_guard: BudgetGuard,
@@ -133,9 +151,16 @@ class ClaudeSDKDriver:
                 model=builder_model, tools=BUILDER_TOOLS, max_turns=settings.sdk_builder_max_turns,
                 timeout_s=max(settings.sdk_timeout_s, settings.sdk_builder_timeout_s),
                 fallbacks=common["fallbacks"], cooldown_s=common["cooldown_s"], cooldowns=cooldowns)
+        if settings.builder_tests and not settings.builder_tools:
+            # the /Users guard above ran first: builder_tests is never wired for a worktree root
+            # under /Users, and never without the tooled session it rides on
+            raise ValueError("NAVIGATOR_BUILDER_TESTS needs NAVIGATOR_BUILDER_TOOLS=1 (the run_tests tool rides on "
+                             "the tooled builder session)")
         return cls(query_fn=make_query_fn(model=settings.sdk_model, **common),
                    role_query_fns=role_fns, budget_guard=budget_guard,
-                   estimated_cost_per_call_usd=estimated_cost_per_call_usd)
+                   estimated_cost_per_call_usd=estimated_cost_per_call_usd,
+                   builder_tests=settings.builder_tests,
+                   builder_test_runs=settings.builder_test_runs)
 
     def run_role(self, request: DriverRequest) -> DriverResult:
         self.budget_guard.check_before_call(self.estimated_cost_per_call_usd)
@@ -143,7 +168,18 @@ class ClaudeSDKDriver:
         prompt = self._build_prompt(request)
         if request.role == Role.builder and request.worktree_path is not None and _accepts_cwd(query_fn):
             # tooled builder: the SDK session's cwd is the run worktree (read-only tools stay inside it)
-            raw = query_fn(prompt, cwd=request.worktree_path)
+            if (self.builder_tests and request.runner is not None and request.run_dir
+                    and _accepts_mcp_servers(query_fn)):
+                # build 2: one in-process MCP tool, run_tests, bounded per turn; it runs the
+                # allowlisted pytest entry through phases._run_sealed and the repo's runner
+                server, calls = make_run_tests_server(request.runner, request.run_dir,
+                                                      request.allowed_commands,
+                                                      max_runs=self.builder_test_runs)
+                self.last_test_runs = calls
+                raw = query_fn(prompt, cwd=request.worktree_path, mcp_servers={"navigator": server},
+                               mcp_tools=(QUALIFIED_TOOL,))
+            else:
+                raw = query_fn(prompt, cwd=request.worktree_path)
         else:
             raw = query_fn(prompt)
         self.budget_guard.record_spend(self.estimated_cost_per_call_usd)

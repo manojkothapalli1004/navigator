@@ -766,7 +766,9 @@ def _attempt(driver: SubagentDriver, wt: Path, base: str, run_id: str, runner: C
                  "related_files": _related_files(wt, tracked, set(files),
                                                  mention_text=mention_text,
                                                  workdir=workdir or ".")}
-    build = driver.run_role(DriverRequest(role=Role.builder, context=build_ctx, worktree_path=str(wt)))
+    build = driver.run_role(DriverRequest(role=Role.builder, context=build_ctx, worktree_path=str(wt),
+                                          runner=runner, run_dir=str(run_dir),
+                                          allowed_commands=tuple(runner.allowlist)))
     _check_scope([rel for rel, _ in build.file_writes], proposal.get("affected_files", []))
     if breakers:
         breakers.check_duration(started)

@@ -119,7 +119,10 @@ def make_sdk_query_fn(*, model: str | None = None,
     Builder tools (off unless `tools` is non-empty AND the call passes cwd): the query
     runs with those tools allowed, cwd set to the worktree, max_turns=`max_turns` and
     _TOOLED_SETTINGS; with `tools` empty, or cwd None, the options are exactly the
-    tool-less ones (max_turns 4, tools=[], _LOCKED_SETTINGS, no cwd).
+    tool-less ones (max_turns 4, tools=[], _LOCKED_SETTINGS, no cwd). A call may also
+    pass mcp_servers (ClaudeAgentOptions.mcp_servers, e.g. the builder's run_tests
+    server) and mcp_tools (their qualified names, appended to allowed_tools); both take
+    effect in that tooled branch only and are ignored by the tool-less one.
     """
     try:
         from claude_agent_sdk import ClaudeAgentOptions, ResultMessage, query
@@ -165,7 +168,8 @@ def make_sdk_query_fn(*, model: str | None = None,
         except Exception:
             pass
 
-    def _run_query(prompt: str, meta: dict, use_model, *, cwd: str | None = None) -> str:
+    def _run_query(prompt: str, meta: dict, use_model, *, cwd: str | None = None,
+                   mcp_servers: dict | None = None, mcp_tools: tuple[str, ...] = ()) -> str:
         # max_turns=4 not 1: the CLI occasionally burns turns before the
         # final reply (observed live 2026-07-08, and again 2026-07-18 at 2).
         # Tools are disabled, so unused headroom costs nothing.
@@ -174,11 +178,15 @@ def make_sdk_query_fn(*, model: str | None = None,
         # model into tool calls until max_turns errors (observed same day).
         if tools and cwd:
             # tooled builder: read-only tools inside the worktree, more turns (reads cost turns),
-            # deny list from _TOOLED_SETTINGS; the reply contract is unchanged
+            # deny list from _TOOLED_SETTINGS; the reply contract is unchanged. Build 2: in-process
+            # MCP servers (mcp_servers) and their qualified tool names (mcp_tools) join this
+            # session only; `tools` stays the built-in set
+            allowed = list(tools) + [t for t in mcp_tools if t not in tools]
+            extra = {"mcp_servers": mcp_servers} if mcp_servers else {}
             options = ClaudeAgentOptions(system_prompt=system_prompt + TOOLED_SYSTEM_PROMPT_SUFFIX,
                                          model=use_model, max_turns=max_turns, tools=list(tools),
-                                         allowed_tools=list(tools), cwd=cwd, setting_sources=[],
-                                         settings=_TOOLED_SETTINGS)
+                                         allowed_tools=allowed, cwd=cwd, setting_sources=[],
+                                         settings=_TOOLED_SETTINGS, **extra)
         else:
             options = ClaudeAgentOptions(system_prompt=system_prompt, model=use_model,
                                          max_turns=4, tools=[], allowed_tools=[],
@@ -220,7 +228,8 @@ def make_sdk_query_fn(*, model: str | None = None,
             raise RuntimeError("claude-agent-sdk returned no result message")
         return _strip_fences(results[-1])
 
-    def _query_once(prompt: str, use_model, *, cwd: str | None = None) -> str:
+    def _query_once(prompt: str, use_model, *, cwd: str | None = None,
+                    mcp_servers: dict | None = None, mcp_tools: tuple[str, ...] = ()) -> str:
         meta: dict = {"num_turns": None, "subtype": None}
         start = time.monotonic()
 
@@ -231,7 +240,8 @@ def make_sdk_query_fn(*, model: str | None = None,
                     "reply_chars": reply_chars}
 
         try:
-            text = _run_query(prompt, meta, use_model, cwd=cwd)
+            text = _run_query(prompt, meta, use_model, cwd=cwd, mcp_servers=mcp_servers,
+                              mcp_tools=mcp_tools)
         except TimeoutError as e:
             fields = _fields(0)
             fields["timeout_s"] = timeout_s
@@ -268,14 +278,16 @@ def make_sdk_query_fn(*, model: str | None = None,
             raise classified from e
         raise e
 
-    def _attempt(prompt: str, use_model, *, cwd: str | None = None) -> str:
+    def _attempt(prompt: str, use_model, *, cwd: str | None = None,
+                 mcp_servers: dict | None = None, mcp_tools: tuple[str, ...] = ()) -> str:
         # one bounded retry for model-side flakes (max-turns error results,
         # missing result message, truncated/non-JSON output \u2014 all observed
         # live on fable-5 through 2026-07-18). Wall-clock timeouts are NOT
         # retried: doubling a 300s wait starves the tick cadence.
         # With fallback disabled this is byte-for-byte the historical behaviour.
         try:
-            text = _query_once(prompt, use_model, cwd=cwd)
+            text = _query_once(prompt, use_model, cwd=cwd, mcp_servers=mcp_servers,
+                               mcp_tools=mcp_tools)
         except TimeoutError:
             raise
         except Exception as e:
@@ -285,12 +297,14 @@ def make_sdk_query_fn(*, model: str | None = None,
             if not _is_retryable(e):
                 _raise_classified(e)
             try:
-                return _query_once(prompt, use_model, cwd=cwd)
+                return _query_once(prompt, use_model, cwd=cwd, mcp_servers=mcp_servers,
+                                   mcp_tools=mcp_tools)
             except Exception as e2:
                 _raise_classified(e2)
         if _is_valid_json_object(text):
             return text
-        retry = _query_once(prompt, use_model, cwd=cwd)
+        retry = _query_once(prompt, use_model, cwd=cwd, mcp_servers=mcp_servers,
+                            mcp_tools=mcp_tools)
         # still bad after the retry: hand it to the driver's strict parser so
         # the failure surfaces with head/tail detail \u2014 never invent structure
         return retry
@@ -370,7 +384,8 @@ def make_sdk_query_fn(*, model: str | None = None,
             # never have a live one, so this is a guard, not a path
             cooldowns[use_model] = (until, False)
 
-    def _probe_or_fail(prompt: str, now: float, *, cwd: str | None = None) -> str:
+    def _probe_or_fail(prompt: str, now: float, *, cwd: str | None = None,
+                       mcp_servers: dict | None = None, mcp_tools: tuple[str, ...] = ()) -> str:
         # every model is cooling: at most one probe call per interval (per shared dict);
         # between probes fail fast with zero SDK calls. The gate is reset by a successful
         # probe, or by the first call that finds candidates once the block lapsed (N7e F2).
@@ -387,7 +402,8 @@ def make_sdk_query_fn(*, model: str | None = None,
             raise _all_cooling_error(now)
         cooldowns[_PROBE_KEY] = now
         try:
-            text = _attempt(prompt, probe_model, cwd=cwd)
+            text = _attempt(prompt, probe_model, cwd=cwd, mcp_servers=mcp_servers,
+                            mcp_tools=mcp_tools)
         except TimeoutError:
             raise
         except Exception as e:
@@ -401,9 +417,10 @@ def make_sdk_query_fn(*, model: str | None = None,
         cooldowns.pop(_PROBE_KEY, None)
         return text
 
-    def query_fn(prompt: str, *, cwd: str | None = None) -> str:
+    def query_fn(prompt: str, *, cwd: str | None = None, mcp_servers: dict | None = None,
+                 mcp_tools: tuple[str, ...] = ()) -> str:
         if not fallback_enabled:
-            return _attempt(prompt, model, cwd=cwd)
+            return _attempt(prompt, model, cwd=cwd, mcp_servers=mcp_servers, mcp_tools=mcp_tools)
         now = clock()
         # a model still cooling down from a recent account error is skipped; any live
         # account-wide entry in the shared dict blocks every model; when every model is
@@ -411,7 +428,8 @@ def make_sdk_query_fn(*, model: str | None = None,
         account_until = _account_until(now)
         candidates = [m for m in chain if _blocked_until(m, account_until) <= now]
         if not candidates:
-            return _probe_or_fail(prompt, now, cwd=cwd)
+            return _probe_or_fail(prompt, now, cwd=cwd, mcp_servers=mcp_servers,
+                                  mcp_tools=mcp_tools)
         # N7e F2: candidates exist, so no account-wide block is live (one blocks every
         # model of every chain) and the outage the gate belonged to is over. Dropping it
         # here makes the next outage start with a zero-call failure and probe only after
@@ -419,7 +437,8 @@ def make_sdk_query_fn(*, model: str | None = None,
         cooldowns.pop(_PROBE_KEY, None)
         for i, use_model in enumerate(candidates):
             try:
-                return _attempt(prompt, use_model, cwd=cwd)
+                return _attempt(prompt, use_model, cwd=cwd, mcp_servers=mcp_servers,
+                                mcp_tools=mcp_tools)
             except TimeoutError:
                 raise  # never fallen back: a second full wait starves the tick
             except Exception as e:

@@ -28,6 +28,10 @@ builder_tools = false           # NAVIGATOR_BUILDER_TOOLS: "1"/"true" on; "0"/"f
 sdk_builder_max_turns = 30      # NAVIGATOR_SDK_BUILDER_MAX_TURNS: turn cap of the tooled builder session (>= 1)
 sdk_builder_timeout_s = 900.0   # NAVIGATOR_SDK_BUILDER_TIMEOUT_S: wall-clock cap per tooled builder query (> 0);
                                 # the effective cap is max(NAVIGATOR_SDK_TIMEOUT_S, this)
+# Builder test runner (build 2): the tooled builder may call run_tests, which runs the repo's allowlisted pytest
+# entry (+ -q, optional paths inside the run dir) through the sealed verifier runner; requires builder_tools.
+builder_tests = false           # NAVIGATOR_BUILDER_TESTS: "1"/"true" on; "0"/"false"/unset off
+builder_test_runs = 5           # NAVIGATOR_BUILDER_TEST_RUNS: run_tests calls per builder turn (>= 1)
 
 [mode]
 mode = "dry_run"                # NAVIGATOR_MODE: "dry_run" proposes only; "execute" runs approved
