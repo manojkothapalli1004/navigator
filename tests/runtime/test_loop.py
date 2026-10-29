@@ -2,6 +2,8 @@ import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from navigator.runtime.loop import Navigator, QUOTA_DEFAULT_PAUSE_S, OPERATOR_ORIGIN
+from navigator.runtime.outcome_store import OutcomeStore
+from navigator.contracts.outcome import Outcome
 from navigator.contracts.proposal import Proposal, compute_origin_hash
 from navigator.safety.errors import QuotaExhaustedError
 from navigator.clients.act_client import FakeACTClient
@@ -510,3 +512,111 @@ def test_preapprove_event_failure_does_not_block(tmp_path, monkeypatch):
     # the status change is kept; the lost event is only logged
     assert nav.act.get_proposal(op.id).status == ProposalStatus.approved
     assert nav.approval_poll() == []  # dry_run, and nothing raised
+
+
+# --- planner throttle v1 (operator decision 2026-10-28: gate the planner on its merge rate) ---
+
+_outcome_seq = [0]
+
+
+def _outcome(nav, proposal_id, status, summary="s"):
+    _outcome_seq[0] += 1
+    OutcomeStore(nav.settings.outcome_path).append(
+        Outcome(run_id=f"run-{_outcome_seq[0]}", proposal_id=proposal_id, status=status,
+                summary=summary))
+
+
+def _periodic(nav, repo, sha, n, repo_path=None):
+    # distinct hashes AND distinct titles (never the fake driver's "fake: touch file":
+    # the title dedup against open proposals would otherwise swallow the planner's item)
+    created = []
+    for i in range(n):
+        k = len(nav.act.list_proposals())
+        created.append(nav.act.create_proposal(Proposal(
+            origin="periodic", proposal_origin_hash=f"h-periodic-{k}",
+            title=f"periodic item {k}", rationale="r", repo=repo_path or str(repo),
+            base_commit_sha=sha, intended_changes=f"x{k}", affected_files=["a.py"])))
+    return created
+
+
+def test_planner_throttled_when_merge_rate_below_threshold(tmp_path, monkeypatch):
+    repo, sha = _seed(tmp_path)
+    nav = _nav(tmp_path, repo, "dry_run")
+    nav.settings.planner_min_merge_rate = 0.5
+    nav.settings.planner_merge_window = 4
+    ps = _periodic(nav, repo, sha, 4)
+    for p, status in zip(ps, ("failed", "declined", "failed", "completed")):
+        _outcome(nav, p.id, status)  # rate 0.25
+    assert nav._planner_throttled() is True
+    before = len(nav.act.list_proposals())
+    # NEGATIVE: the periodic proposals were created just now, so the probe interval has not passed
+    assert nav.periodic_tick(base_commit_sha=sha) == []
+    assert len(nav.act.list_proposals()) == before
+    # the probe interval passed: the throttled planner still plans once
+    monkeypatch.setattr(nav, "_planned_recently", lambda hours=None: False)
+    created = nav.periodic_tick(base_commit_sha=sha)
+    assert [p.title for p in created] == ["fake: touch file"]
+    assert len(nav.act.list_proposals()) == before + 1
+
+
+def test_throttle_off_by_default_and_window_not_full(tmp_path):
+    # NEGATIVE: the default threshold 0.0 never throttles, however bad the rate
+    repo, sha = _seed(tmp_path)
+    nav = _nav(tmp_path, repo, "dry_run")
+    assert nav.settings.planner_min_merge_rate == 0.0
+    nav.settings.planner_merge_window = 4
+    for p in _periodic(nav, repo, sha, 4):
+        _outcome(nav, p.id, "failed")
+    assert nav._planner_throttled() is False
+    created = nav.periodic_tick(base_commit_sha=sha)
+    assert [p.title for p in created] == ["fake: touch file"]
+    # NEGATIVE: a window that is not yet full never throttles
+    (tmp_path / "two").mkdir()
+    repo2, sha2 = _seed(tmp_path / "two")
+    nav2 = _nav(tmp_path / "two", repo2, "dry_run")
+    nav2.settings.planner_min_merge_rate = 0.5
+    nav2.settings.planner_merge_window = 4
+    for p in _periodic(nav2, repo2, sha2, 3):
+        _outcome(nav2, p.id, "failed")
+    assert nav2._planner_throttled() is False
+    assert len(nav2.periodic_tick(base_commit_sha=sha2)) == 1
+
+
+def test_throttle_ignores_operator_stale_and_deferred_outcomes(tmp_path):
+    repo, sha = _seed(tmp_path)
+    nav = _nav(tmp_path, repo, "dry_run")
+    nav.settings.planner_min_merge_rate = 0.5
+    nav.settings.planner_merge_window = 2
+    op = _op_proposal(nav, repo, sha)
+    _outcome(nav, op.id, "failed")  # operator-origin: never counted
+    deferred, stale, done = _periodic(nav, repo, sha, 3)
+    _outcome(nav, deferred.id, "deferred")  # quota deferral: not an outcome of the plan
+    _outcome(nav, stale.id, "failed", summary="stale after merge of run-x: rebase conflict")
+    _outcome(nav, done.id, "completed")
+    assert nav._planner_throttled() is False  # one eligible outcome: window not full
+    failed1, failed2 = _periodic(nav, repo, sha, 2)
+    _outcome(nav, failed1.id, "failed")
+    assert nav._planner_throttled() is False  # [failed, completed] -> 0.5, not below 0.5
+    _outcome(nav, failed2.id, "failed")
+    assert nav._planner_throttled() is True  # [failed, failed] -> 0.0
+
+
+def test_throttle_only_counts_this_repo(tmp_path):
+    repo, sha = _seed(tmp_path)
+    nav = _nav(tmp_path, repo, "dry_run")
+    nav.settings.planner_min_merge_rate = 0.5
+    nav.settings.planner_merge_window = 4
+    for p in _periodic(nav, repo, sha, 4, repo_path=str(repo) + "-other"):
+        _outcome(nav, p.id, "failed")
+    assert nav._planner_throttled() is False  # another repo's planner, not ours
+    assert len(nav.periodic_tick(base_commit_sha=sha)) == 1
+
+
+def test_planned_recently_hours_parameter(tmp_path):
+    repo, sha = _seed(tmp_path)
+    nav = _nav(tmp_path, repo, "dry_run")
+    nav.min_plan_interval_hours = None
+    _periodic(nav, repo, sha, 1)
+    assert nav._planned_recently() is False
+    assert nav._planned_recently(hours=1) is True
+    assert nav._planned_recently(hours=0) is False

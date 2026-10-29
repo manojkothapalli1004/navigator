@@ -184,10 +184,11 @@ class Navigator:
             return None
         return target.read_text(errors="replace")[-self._CONTEXT_CHARS:]
 
-    def _planned_recently(self) -> bool:
-        if not self.min_plan_interval_hours:
+    def _planned_recently(self, hours: float | None = None) -> bool:
+        hours = self.min_plan_interval_hours if hours is None else hours
+        if not hours:
             return False
-        cutoff = datetime.now(timezone.utc) - timedelta(hours=self.min_plan_interval_hours)
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
         for p in self._mine(self.act.list_proposals()):
             created = p.created_at if p.created_at.tzinfo else p.created_at.replace(tzinfo=timezone.utc)
             if created >= cutoff:
@@ -209,6 +210,34 @@ class Navigator:
         # several Navigators (one per repo) share one ACT; each owns only its repo's work
         return [p for p in proposals if p.repo == self.repo]
 
+    def _planner_throttled(self) -> bool:
+        """True when the last settings.planner_merge_window outcomes of THIS repo's periodic proposals (statuses
+        completed/declined/failed; deferred and stale-after-merge failures excluded) exist in full and merged
+        (status == "completed") at a rate below settings.planner_min_merge_rate. Off while the rate is 0.0 or the
+        window is not yet full."""
+        rate_min = float(getattr(self.settings, "planner_min_merge_rate", 0.0) or 0.0)
+        if rate_min <= 0.0:
+            return False
+        window = int(getattr(self.settings, "planner_merge_window", 20))
+        origin = {p.id: p.origin for p in self._mine(self.act.list_proposals())}
+        recent = []
+        for o in OutcomeStore(self.settings.outcome_path).latest(window * 10):
+            if origin.get(o.proposal_id) != "periodic" or o.status not in ("completed", "declined", "failed"):
+                continue
+            if o.status == "failed" and (o.summary or "").startswith("stale after merge of"):
+                continue
+            recent.append(o)
+            if len(recent) == window:
+                break
+        if len(recent) < window:
+            return False
+        merged = sum(1 for o in recent if o.status == "completed")
+        rate = merged / len(recent)
+        if rate < rate_min:
+            log.info("tick.planner_throttled", rate=round(rate, 3), threshold=rate_min, window=window)
+            return True
+        return False
+
     def periodic_tick(self, base_commit_sha: str | None = None) -> list[Proposal]:
         if base_commit_sha is None:
             base_commit_sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=self.repo,
@@ -220,6 +249,10 @@ class Navigator:
             log.info("tick.backlog_full", open=len(open_proposals))
             return []
         if self._planned_recently():
+            return []
+        if self._planner_throttled() and self._planned_recently(
+                hours=getattr(self.settings, "planner_throttle_hours", 24.0)):
+            # a throttled planner still probes once every planner_throttle_hours so the rate can recover
             return []
         if self._quota_paused(datetime.now(timezone.utc)):
             # the account limit has not lifted yet: no planner call

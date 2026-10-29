@@ -66,6 +66,10 @@ rebase_stale_runs = true        # NAVIGATOR_REBASE_STALE_RUNS: after a merge, re
 [planner]
 max_proposals_per_tick = 3      # NAVIGATOR_MAX_PROPOSALS_PER_TICK
 max_open_proposals = 10         # NAVIGATOR_MAX_OPEN_PROPOSALS: planner pauses at this backlog
+planner_min_merge_rate = 0.0    # NAVIGATOR_PLANNER_MIN_MERGE_RATE: 0..1; below this merge rate over the last window of
+                                # this repo's periodic outcomes the planner only probes once per throttle_hours; 0 = off
+planner_merge_window = 20       # NAVIGATOR_PLANNER_MERGE_WINDOW: outcomes in the window (>= 1)
+planner_throttle_hours = 24.0   # NAVIGATOR_PLANNER_THROTTLE_HOURS: probe interval while throttled (> 0)
 proposal_ttl_days = 7           # NAVIGATOR_PROPOSAL_TTL_DAYS: unreviewed proposals expire
 memory_chars_per_section = 3000 # NAVIGATOR_MEMORY_CHARS_PER_SECTION: ORC memory budget
 

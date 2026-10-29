@@ -53,6 +53,11 @@ class Settings:
     max_cost_usd: float = 2.0
     max_proposals_per_tick: int = 3
     max_open_proposals: int = 10
+    # planner throttle (loop._planner_throttled): below this merge rate over the last window of this repo's periodic
+    # outcomes the planner only probes once per throttle_hours; 0.0 = off
+    planner_min_merge_rate: float = 0.0
+    planner_merge_window: int = 20
+    planner_throttle_hours: float = 24.0
     memory_chars_per_section: int = 3000
     proposal_ttl_days: int = 7
     command_timeout_s: float = 60.0
@@ -100,6 +105,9 @@ class Settings:
             max_cost_usd=_positive_float_env("NAVIGATOR_MAX_COST_USD", "2.0"),
             max_proposals_per_tick=_int_env("NAVIGATOR_MAX_PROPOSALS_PER_TICK", "3"),
             max_open_proposals=_positive_int_env("NAVIGATOR_MAX_OPEN_PROPOSALS", "10"),
+            planner_min_merge_rate=_ratio_env("NAVIGATOR_PLANNER_MIN_MERGE_RATE", "0"),
+            planner_merge_window=_positive_int_env("NAVIGATOR_PLANNER_MERGE_WINDOW", "20"),
+            planner_throttle_hours=_positive_float_env("NAVIGATOR_PLANNER_THROTTLE_HOURS", "24"),
             memory_chars_per_section=_positive_int_env("NAVIGATOR_MEMORY_CHARS_PER_SECTION", "3000"),
             proposal_ttl_days=_positive_int_env("NAVIGATOR_PROPOSAL_TTL_DAYS", "7"),
             command_timeout_s=_positive_float_env("NAVIGATOR_COMMAND_TIMEOUT_S", "60"),
@@ -170,6 +178,13 @@ def _positive_float_env(name: str, default: str) -> float:
     v = _float_env(name, default)
     if v <= 0:
         raise ValueError(f"{name} must be > 0, got {v}")
+    return v
+
+
+def _ratio_env(name: str, default: str) -> float:
+    v = _float_env(name, default)
+    if not 0.0 <= v <= 1.0:
+        raise ValueError(f"{name} must be between 0 and 1, got {v}")
     return v
 
 
