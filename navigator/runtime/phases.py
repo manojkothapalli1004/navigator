@@ -713,12 +713,16 @@ def run_build_and_verify(driver: SubagentDriver, worktree: WorktreeHandle,
     base = subprocess.run(["git", "rev-parse", "HEAD"], cwd=wt, capture_output=True,
                           text=True).stdout.strip()
     run_dir = run_dir_for(wt, workdir)
+    # build 2b: ONE run_tests counter for the whole build (first attempt + every repair turn),
+    # handed to each builder request; the driver's run_tests server counts against it
+    test_budget = {"used": 0}
     proposal = dict(proposal or {})
     proposal["affected_files"] = _normalize_affected(wt, proposal.get("affected_files", []), workdir)
     started = time.monotonic() if started_monotonic is None else started_monotonic
     tracked = subprocess.run(["git", "ls-files"], cwd=wt, capture_output=True, text=True).stdout.split()
     res = _attempt(driver, wt, base, run_id, runner, proposal, breakers, started, workdir,
-                   run_dir, tracked, PhaseResult(), cp_start=1, baseline=None)
+                   run_dir, tracked, PhaseResult(), cp_start=1, baseline=None,
+                   test_budget=test_budget)
     if repair_turns <= 0:
         return res
     # Repair turns (outcomes 2026-10-09..23: 69 of 182 non-merged builds failed on builder
@@ -736,7 +740,7 @@ def run_build_and_verify(driver: SubagentDriver, worktree: WorktreeHandle,
             + res.verify_output[-2000:])
         res = _attempt(driver, wt, base, run_id, runner, repair, breakers, started, workdir,
                        run_dir, tracked, PhaseResult(), cp_start=1 + len(checkpoints),
-                       baseline=base, prior_writes=tuple(file_writes))
+                       baseline=base, prior_writes=tuple(file_writes), test_budget=test_budget)
         used += 1
         file_writes = list(dict.fromkeys(file_writes + res.file_writes))
         checkpoints.extend(res.checkpoints)
@@ -751,7 +755,8 @@ def run_build_and_verify(driver: SubagentDriver, worktree: WorktreeHandle,
 def _attempt(driver: SubagentDriver, wt: Path, base: str, run_id: str, runner: CommandRunner,
              proposal: dict, breakers: CircuitBreakers | None, started: float, workdir: str,
              run_dir: Path, tracked: list[str], res: PhaseResult, cp_start: int,
-             baseline: str | None, prior_writes: tuple[str, ...] = ()) -> PhaseResult:
+             baseline: str | None, prior_writes: tuple[str, ...] = (),
+             test_budget: dict | None = None) -> PhaseResult:
     """One builder + verifier pass, filling and returning `res`. Checkpoint numbers start
     at cp_start. baseline=None is the first attempt (today's behaviour exactly);
     baseline=<base sha> is a repair turn: prior_writes (paths earlier attempts wrote) are
@@ -768,7 +773,8 @@ def _attempt(driver: SubagentDriver, wt: Path, base: str, run_id: str, runner: C
                                                  workdir=workdir or ".")}
     build = driver.run_role(DriverRequest(role=Role.builder, context=build_ctx, worktree_path=str(wt),
                                           runner=runner, run_dir=str(run_dir),
-                                          allowed_commands=tuple(runner.allowlist)))
+                                          allowed_commands=tuple(runner.allowlist),
+                                          test_budget=test_budget))
     _check_scope([rel for rel, _ in build.file_writes], proposal.get("affected_files", []))
     if breakers:
         breakers.check_duration(started)
