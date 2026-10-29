@@ -213,10 +213,11 @@ def execute_proposal(proposal: Proposal, *, act, orc, driver, runner, settings,
     act.create_approval(target=run.id, gate=ApprovalGate.merge)
     # merge tier (3a): classified from the run's own commits and recorded on the event;
     # None means unknown (a later build treats it exactly like C)
-    names = _git_run(handle.path, "-c", "core.quotePath=false", "diff", "--no-renames", "--name-only",
-                     f"{head}..HEAD")
-    changed = [l.strip() for l in names.stdout.splitlines() if l.strip()] if names.returncode == 0 else None
     try:
+        # -z: NUL-separated and never quoted (core.quotePath=false still quoted a name holding '"' or '\\');
+        # the git call sits inside the guard so an OSError is 'tier unknown', not a lost event (3a2)
+        names = _git_run(handle.path, "diff", "--no-renames", "--name-only", "-z", f"{head}..HEAD")
+        changed = [n for n in names.stdout.split("\x00") if n] if names.returncode == 0 else None
         tier = (classify_for_repo(changed, proposal.repo, repo_config_for(settings, proposal.repo))
                 if changed is not None else None)
     except Exception as e:
@@ -738,11 +739,12 @@ def _rebase_one(run: Run, merged: Run, new_head: str, *, act, orc, runner, setti
     if reapproval:
         _log.info("rebase_stale.reapproval_needed", run_id=run.id)
     prop = act.get_proposal(run.proposal_id)
-    tier_names = _git_run(wt, "-c", "core.quotePath=false", "diff", "--no-renames", "--name-only",
-                          f"{new_head}..HEAD")
-    tier_changed = ([l.strip() for l in tier_names.stdout.splitlines() if l.strip()]
-                    if tier_names.returncode == 0 else None)
     try:
+        # -z + inside the guard, as in execute_proposal (3a2); the `names`/`changed` lines above feed
+        # reverify and stay as they are
+        tier_names = _git_run(wt, "diff", "--no-renames", "--name-only", "-z", f"{new_head}..HEAD")
+        tier_changed = ([n for n in tier_names.stdout.split("\x00") if n]
+                        if tier_names.returncode == 0 else None)
         tier = (classify_for_repo(tier_changed, prop.repo, repo_config_for(settings, prop.repo))
                 if (tier_changed is not None and prop is not None) else None)
     except Exception as e:
