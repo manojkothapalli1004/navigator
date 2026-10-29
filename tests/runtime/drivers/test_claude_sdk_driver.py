@@ -344,3 +344,129 @@ def test_from_settings_builder_tools_refuse_a_worktree_root_under_users():
         Settings(sdk_model="m", builder_tools=True, worktree_root="/tmp/navigator-worktrees"),
         budget_guard=BudgetGuard(1.0), make_query_fn=_recording_make(built))
     assert len([b for b in built if "tools" in b]) == 1
+
+
+# --- builder tests (build 2): one bounded run_tests tool on the tooled builder session -----
+
+def test_from_settings_builder_tests_requires_builder_tools():
+    built = []
+    with pytest.raises(ValueError, match="NAVIGATOR_BUILDER_TESTS"):
+        ClaudeSDKDriver.from_settings(Settings(sdk_model="m", builder_tools=False, builder_tests=True),
+                                      budget_guard=BudgetGuard(1.0),
+                                      make_query_fn=_recording_make(built))
+    assert built == []  # nothing wired
+
+
+def test_from_settings_builder_tests_still_refuse_a_worktree_root_under_users():
+    built = []
+    with pytest.raises(ValueError, match="NAVIGATOR_WORKTREE_ROOT"):
+        ClaudeSDKDriver.from_settings(
+            Settings(sdk_model="m", builder_tools=True, builder_tests=True,
+                     worktree_root="/Users/someone/wt"),
+            budget_guard=BudgetGuard(1.0), make_query_fn=_recording_make(built))
+    assert built == []
+
+
+def test_from_settings_builder_tests_on_stores_the_bound_and_wires_the_same_tooled_fn():
+    built = []
+    drv = ClaudeSDKDriver.from_settings(
+        Settings(sdk_model="m", builder_tools=True, builder_tests=True, builder_test_runs=3,
+                 worktree_root="/tmp/navigator-worktrees"),
+        budget_guard=BudgetGuard(1.0), make_query_fn=_recording_make(built))
+    assert drv.builder_tests is True
+    assert drv.builder_test_runs == 3
+    assert drv.last_test_runs == []
+    tooled = [b for b in built if "tools" in b]
+    assert len(tooled) == 1 and tooled[0]["tools"] == ("Read", "Grep", "Glob")  # 2a adds no query fn
+    # flag off: the driver carries the defaults
+    off = ClaudeSDKDriver.from_settings(
+        Settings(sdk_model="m", builder_tools=True, worktree_root="/tmp/navigator-worktrees"),
+        budget_guard=BudgetGuard(1.0), make_query_fn=_recording_make([]))
+    assert off.builder_tests is False and off.builder_test_runs == 5
+
+
+def test_run_role_builder_with_tests_passes_an_mcp_server_and_the_tool_name(monkeypatch):
+    from navigator.runtime.drivers import claude_sdk_driver as csd
+    seen, server_args = {}, {}
+    def builder_fn(prompt, *, cwd=None, mcp_servers=None, mcp_tools=()):
+        seen.update(cwd=cwd, mcp_servers=mcp_servers, mcp_tools=mcp_tools)
+        return json.dumps({"file_writes": [["a.py", "x\n"]], "commands": [], "summary": "b"})
+    def plain_fn(prompt):
+        return json.dumps({"commands": [], "summary": "v"})
+    def fake_server(runner, run_dir, allowed_commands, *, max_runs):
+        server_args.update(args=(runner, run_dir, allowed_commands), max_runs=max_runs)
+        return "SERVER", ["c1"]
+    monkeypatch.setattr(csd, "make_run_tests_server", fake_server)
+    d = ClaudeSDKDriver(query_fn=plain_fn, budget_guard=BudgetGuard(2.0),
+                        role_query_fns={Role.builder: builder_fn}, builder_tests=True,
+                        builder_test_runs=2)
+    assert d.last_test_runs == []
+    res = d.run_role(DriverRequest(role=Role.builder, context={}, worktree_path="/tmp/w7",
+                                   runner="RUNNER", run_dir="/tmp/w7",
+                                   allowed_commands=("uv run pytest",)))
+    assert server_args == {"args": ("RUNNER", "/tmp/w7", ("uv run pytest",)), "max_runs": 2}
+    assert seen == {"cwd": "/tmp/w7", "mcp_servers": {"navigator": "SERVER"},
+                    "mcp_tools": ("mcp__navigator__run_tests",)}
+    assert d.last_test_runs == ["c1"]
+    assert res.file_writes == [("a.py", "x\n")]
+
+
+def test_run_role_never_builds_a_test_server_for_planner_or_verifier(monkeypatch):
+    # NEGATIVE: the role check comes first, exactly as in build 1
+    from navigator.runtime.drivers import claude_sdk_driver as csd
+    seen, called = [], []
+    def fn(prompt, **kw):
+        seen.append(kw)
+        return json.dumps({"proposals": [], "commands": [], "summary": "s"})
+    monkeypatch.setattr(csd, "make_run_tests_server",
+                        lambda *a, **k: called.append((a, k)) or ("S", []))
+    d = ClaudeSDKDriver(query_fn=fn, budget_guard=BudgetGuard(2.0), builder_tests=True,
+                        builder_test_runs=2)
+    d.run_role(DriverRequest(role=Role.verifier, context={}, worktree_path="/tmp/w",
+                             runner="RUNNER", run_dir="/tmp/w", allowed_commands=("uv run pytest",)))
+    d.run_role(DriverRequest(role=Role.planner, context={}, runner="RUNNER", run_dir="/tmp/w",
+                             allowed_commands=("uv run pytest",)))
+    assert called == []
+    assert seen == [{}, {}]  # no cwd, no mcp_servers
+    assert d.last_test_runs == []
+
+
+def test_run_role_without_runner_or_with_tests_off_is_build_1_behaviour(monkeypatch):
+    # NEGATIVE: the tool needs the flag, a runner, a run_dir AND a fn that accepts mcp_servers
+    from navigator.runtime.drivers import claude_sdk_driver as csd
+    called = []
+    monkeypatch.setattr(csd, "make_run_tests_server",
+                        lambda *a, **k: called.append((a, k)) or ("S", []))
+    reply = json.dumps({"file_writes": [["a.py", "x\n"]], "commands": [], "summary": "b"})
+    seen = []
+    def builder_fn(prompt, *, cwd=None, mcp_servers=None, mcp_tools=()):
+        seen.append({"cwd": cwd, "mcp_servers": mcp_servers, "mcp_tools": mcp_tools})
+        return reply
+    def cwd_only_fn(prompt, *, cwd=None):
+        seen.append({"cwd": cwd})
+        return reply
+    def plain_fn(prompt):
+        return json.dumps({"commands": [], "summary": "v"})
+    cwd_only = {"cwd": "/tmp/w7", "mcp_servers": None, "mcp_tools": ()}
+    # builder_tests on, but no runner on the request
+    d = ClaudeSDKDriver(query_fn=plain_fn, budget_guard=BudgetGuard(10.0),
+                        role_query_fns={Role.builder: builder_fn}, builder_tests=True)
+    d.run_role(DriverRequest(role=Role.builder, context={}, worktree_path="/tmp/w7"))
+    assert seen[-1] == cwd_only and called == []
+    # builder_tests on, runner set, but no run_dir
+    d.run_role(DriverRequest(role=Role.builder, context={}, worktree_path="/tmp/w7",
+                             runner="RUNNER", allowed_commands=("uv run pytest",)))
+    assert seen[-1] == cwd_only and called == []
+    # builder_tests off, runner and run_dir set
+    d_off = ClaudeSDKDriver(query_fn=plain_fn, budget_guard=BudgetGuard(10.0),
+                            role_query_fns={Role.builder: builder_fn}, builder_tests=False)
+    d_off.run_role(DriverRequest(role=Role.builder, context={}, worktree_path="/tmp/w7",
+                                 runner="RUNNER", run_dir="/tmp/w7", allowed_commands=("uv run pytest",)))
+    assert seen[-1] == cwd_only and called == []
+    # a builder fn that accepts cwd but not mcp_servers: cwd only, no server built
+    d_cwd = ClaudeSDKDriver(query_fn=plain_fn, budget_guard=BudgetGuard(10.0),
+                            role_query_fns={Role.builder: cwd_only_fn}, builder_tests=True)
+    d_cwd.run_role(DriverRequest(role=Role.builder, context={}, worktree_path="/tmp/w7",
+                                 runner="RUNNER", run_dir="/tmp/w7", allowed_commands=("uv run pytest",)))
+    assert seen[-1] == {"cwd": "/tmp/w7"} and called == []
+    assert d.last_test_runs == [] and d_off.last_test_runs == [] and d_cwd.last_test_runs == []
