@@ -256,6 +256,36 @@ def is_audited(act, run) -> bool:
                for a in grants)
 
 
+def merge_tier_of(act, run) -> str | None:
+    """The merge tier recorded on the run's LATEST run.awaiting_review event payload
+    ("merge_tier"), or None when the events cannot be listed, no such event exists or
+    the value is not "A"/"B"/"C". `run` is a Run or an open run's id (same as
+    is_audited). On an exact timestamp tie the last event in list order wins."""
+    if isinstance(run, str):
+        run = _find_run(act, run)
+    if run is None:
+        return None
+    events = _events(act, since=_audit_since(run))
+    if events is None:
+        return None
+    best, best_ts = None, None
+    for e in events:
+        if getattr(e, "kind", None) != "run.awaiting_review":
+            continue
+        payload = _payload(e)
+        if payload.get("run_id") != run.id:
+            continue
+        ts = _parse_ts(getattr(e, "ts", None))
+        if ts is None:
+            continue
+        if best_ts is None or ts >= best_ts:
+            best, best_ts = payload, ts
+    if best is None:
+        return None
+    tier = best.get("merge_tier")
+    return tier if tier in ("A", "B", "C") else None
+
+
 def _audited(act, args: list[str], out) -> int:
     if len(args) == 1:
         note = None
