@@ -92,3 +92,19 @@ def test_verification_summary_understands_quiet_progress_only_output():
             "output_tail": "........   [100%]\nCreating virtual environment at: .venv\nInstalled 19 packages in 98ms\n"}]
     out = format_verification(log)
     assert "tests passed (100%)" in out and "Installed" not in out
+
+
+def test_review_message_shows_the_tier():
+    rec = _Recorder()
+    act = NotifyingACT(FakeACTClient(), rec)
+    act.emit_event(_ev("run.awaiting_review", run_id="run-1", title="t", diff="", verification=[],
+                       verified_sha="0123456789abcdef", merge_tier="A"))
+    assert "tier: A" in rec.sent[0]
+    assert rec.sent[0].index("verified 0123456789ab") < rec.sent[0].index("tier: A")
+    act.emit_event(_ev("run.awaiting_review", run_id="run-2", title="t", diff="", verification=[],
+                       verified_sha="0123456789abcdef"))
+    assert "tier:" not in rec.sent[1]
+    # an unknown tier (None, or anything outside A/B/C) prints no tier line
+    act.emit_event(_ev("run.awaiting_review", run_id="run-3", title="t", diff="", verification=[],
+                       merge_tier=None))
+    assert "tier:" not in rec.sent[2]
