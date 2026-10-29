@@ -23,6 +23,8 @@ class RepoConfig:
     context_files: list[str] | None = None  # extra files (from the live checkout) shown to the planner
     min_plan_interval_hours: float | None = None
     max_proposals_per_tick: int | None = None
+    tier_c_paths: list[str] | None = None   # extra merge-tier C patterns (merge_tiers.classify)
+    tier_floor: str = "A"                    # lowest merge tier for this repo: "A" | "B" | "C"
 
 
 @dataclass
@@ -55,6 +57,9 @@ class Settings:
     proposal_ttl_days: int = 7
     command_timeout_s: float = 60.0
     max_failed_tests: int = 50
+    # merge tiers (merge_tiers.py): A auto-merges, B merges on 'merge all', C always needs its own word
+    merge_tier_a_auto: bool = False
+    merge_tier_b_batch: bool = False
     repo: str | None = None
     repos: list[RepoConfig] = field(default_factory=list)
     lock_path: str = "/tmp/navigator.lock"
@@ -99,6 +104,8 @@ class Settings:
             proposal_ttl_days=_positive_int_env("NAVIGATOR_PROPOSAL_TTL_DAYS", "7"),
             command_timeout_s=_positive_float_env("NAVIGATOR_COMMAND_TIMEOUT_S", "60"),
             max_failed_tests=_int_env("NAVIGATOR_MAX_FAILED_TESTS", "50"),
+            merge_tier_a_auto=_bool_env("NAVIGATOR_MERGE_TIER_A_AUTO", "0"),
+            merge_tier_b_batch=_bool_env("NAVIGATOR_MERGE_TIER_B_BATCH", "0"),
             repo=os.getenv("NAVIGATOR_REPO"),
             repos=_repos_env(),
             lock_path=os.getenv("NAVIGATOR_LOCK_PATH", "/tmp/navigator.lock"),
@@ -208,12 +215,21 @@ def _repos_env() -> list[RepoConfig]:
         if workdir.startswith("/") or ".." in workdir.split("/"):
             raise ValueError(f"NAVIGATOR_REPOS_FILE workdir must stay inside the repo: {workdir!r}")
         cmds = entry.get("allowed_commands")
+        tier_c_paths = entry.get("tier_c_paths")
+        if tier_c_paths is not None and (not isinstance(tier_c_paths, list)
+                                         or not all(isinstance(p, str) for p in tier_c_paths)):
+            raise ValueError("NAVIGATOR_REPOS_FILE tier_c_paths must be a list of strings")
+        tier_floor = entry.get("tier_floor", "A")
+        if tier_floor not in ("A", "B", "C"):
+            raise ValueError(f"NAVIGATOR_REPOS_FILE tier_floor must be A, B or C, got {tier_floor!r}")
         repos.append(RepoConfig(path=entry["path"], workdir=workdir,
                                 squash=bool(entry.get("squash", False)),
                                 brief=entry.get("brief"),
                                 context_files=entry.get("context_files"),
                                 min_plan_interval_hours=entry.get("min_plan_interval_hours"),
                                 max_proposals_per_tick=entry.get("max_proposals_per_tick"),
+                                tier_c_paths=tier_c_paths,
+                                tier_floor=tier_floor,
                                 allowed_commands=_check_allowlist("NAVIGATOR_REPOS_FILE", cmds)
                                 if cmds is not None else None))
     return repos

@@ -14,6 +14,7 @@ from navigator.contracts.enums import RunPhase, RunStatus, ApprovalGate, Approva
 from navigator.runtime.worktree import (
     WorktreeHandle, create_worktree, preserve_failed, remove_worktree)
 from navigator.runtime.checkpoint import diff_artifact
+from navigator.runtime.merge_tiers import classify_for_repo, repo_config_for
 from navigator.runtime.outcome_store import OutcomeStore
 from navigator.runtime.phases import NO_CHANGE_SUMMARY, reverify, run_build_and_verify, run_dir_for
 from navigator.ids import new_id
@@ -203,11 +204,22 @@ def execute_proposal(proposal: Proposal, *, act, orc, driver, runner, settings,
     run.verified_sha = _rev_parse(handle.path, "HEAD") or None
     run.phase = RunPhase.awaiting_review; _save(act, run)
     act.create_approval(target=run.id, gate=ApprovalGate.merge)
+    # merge tier (3a): classified from the run's own commits and recorded on the event;
+    # None means unknown (a later build treats it exactly like C)
+    names = _git_run(handle.path, "-c", "core.quotePath=false", "diff", "--no-renames", "--name-only",
+                     f"{head}..HEAD")
+    changed = [l.strip() for l in names.stdout.splitlines() if l.strip()] if names.returncode == 0 else None
+    try:
+        tier = (classify_for_repo(changed, proposal.repo, repo_config_for(settings, proposal.repo))
+                if changed is not None else None)
+    except Exception as e:
+        tier = None  # a tier failure must never lose the run.awaiting_review event or its Telegram message
+        _log.warning("merge_tier.failed", run_id=run.id, error=type(e).__name__)
     # Correction 1: store diff in event payload, not as a transient Run attribute
     diff = diff_artifact(handle.path, head)
     _emit(act, run, "run.awaiting_review", diff=diff, title=proposal.title,
           verification=run.verification, verified_sha=run.verified_sha,
-          repair_turns_used=repair_used)
+          repair_turns_used=repair_used, merge_tier=tier)
     return run
 
 def _as_utc(dt: datetime) -> datetime:
@@ -636,10 +648,20 @@ def _rebase_one(run: Run, merged: Run, new_head: str, *, act, orc, runner, setti
     if reapproval:
         _log.info("rebase_stale.reapproval_needed", run_id=run.id)
     prop = act.get_proposal(run.proposal_id)
+    tier_names = _git_run(wt, "-c", "core.quotePath=false", "diff", "--no-renames", "--name-only",
+                          f"{new_head}..HEAD")
+    tier_changed = ([l.strip() for l in tier_names.stdout.splitlines() if l.strip()]
+                    if tier_names.returncode == 0 else None)
+    try:
+        tier = (classify_for_repo(tier_changed, prop.repo, repo_config_for(settings, prop.repo))
+                if (tier_changed is not None and prop is not None) else None)
+    except Exception as e:
+        tier = None
+        _log.warning("merge_tier.failed", run_id=run.id, error=type(e).__name__)
     _emit(act, run, "run.awaiting_review", diff=diff_artifact(wt, new_head),
           title=prop.title if prop else run.id, verification=run.verification,
           verified_sha=run.verified_sha, rebased_from=old_sha, merged_run_id=merged.id,
-          rebased=True, merge_reapproval_needed=reapproval)
+          rebased=True, merge_reapproval_needed=reapproval, merge_tier=tier)
     emitted_at = datetime.now(timezone.utc)
     if identical and was_audited:
         _wait_clock_advance(emitted_at)  # the carried audit must sort strictly later

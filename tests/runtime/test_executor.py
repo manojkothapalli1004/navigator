@@ -417,3 +417,38 @@ def test_quota_deferral_never_records_the_sdk_text(tmp_path, capsys):
     assert len(sent) == 1 and "deferred" in sent[0] and RESETS in sent[0]
     assert "QuotaExhaustedError" in sent[0]
     assert "QuotaExhaustedError" in corpus[0]
+
+
+# --- merge tiers 3a: the tier is recorded on every run.awaiting_review event -----------
+
+def test_awaiting_review_event_records_the_merge_tier(tmp_path):
+    # navigator_touch.py is a code file in a repo named "repo" (not trader/navigator): tier B
+    repo, sha = _seed(tmp_path); d = _deps(tmp_path, repo)
+    run = execute_proposal(_proposal(repo, sha), **d)
+    ev = [e for e in d["act"].events
+          if e.kind == "run.awaiting_review" and e.payload["run_id"] == run.id][0]
+    assert ev.payload["merge_tier"] == "B"
+
+
+def test_awaiting_review_event_merge_tier_follows_the_repo_floor(tmp_path):
+    from navigator.config import RepoConfig
+    repo, sha = _seed(tmp_path); d = _deps(tmp_path, repo)
+    d["settings"].repos = [RepoConfig(path=str(repo), tier_floor="C")]
+    run = execute_proposal(_proposal(repo, sha), **d)
+    ev = [e for e in d["act"].events
+          if e.kind == "run.awaiting_review" and e.payload["run_id"] == run.id][0]
+    assert ev.payload["merge_tier"] == "C"
+
+
+def test_tier_failure_never_loses_the_awaiting_review_event(tmp_path, monkeypatch):
+    repo, sha = _seed(tmp_path); d = _deps(tmp_path, repo)
+
+    def boom(*a, **k):
+        raise RuntimeError("tier broke")
+
+    monkeypatch.setattr("navigator.runtime.executor.classify_for_repo", boom)
+    run = execute_proposal(_proposal(repo, sha), **d)  # must NOT raise
+    assert run.phase == RunPhase.awaiting_review
+    ev = [e for e in d["act"].events
+          if e.kind == "run.awaiting_review" and e.payload["run_id"] == run.id][0]
+    assert ev.payload["merge_tier"] is None

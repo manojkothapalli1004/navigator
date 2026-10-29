@@ -87,3 +87,14 @@ allowed_commands = ["git status", "git diff", "git log", "pytest", "python3 -m p
 #   NAVIGATOR_TELEGRAM_BOT_TOKEN, NAVIGATOR_TELEGRAM_CHAT_ID
 # or point at an existing bot .env holding TELEGRAM_BOT_TOKEN and AUTHORIZED_CHAT_ID:
 notify_env_file = ""            # NAVIGATOR_NOTIFY_ENV_FILE
+
+[merge]
+# Merge tiers (operator decision 2026-10-28, 'ask me less'): every run parked at the merge gate is
+# classified A (tests/docs only), B (other code) or C (money/auth/secret/migration/dependency paths,
+# Navigator's own safety code, the trader repo) and the tier is recorded on its run.awaiting_review
+# event and shown in the review message. Both toggles are parsed now and read by nothing yet.
+merge_tier_a_auto = false       # NAVIGATOR_MERGE_TIER_A_AUTO: "1"/"true" = tier A runs (tests/docs only, audited,
+                                # suite green) merge without an operator word (wired in 3b). Off by default.
+merge_tier_b_batch = false      # NAVIGATOR_MERGE_TIER_B_BATCH: "1"/"true" = Telegram 'merge all' approves every
+                                # audited tier A/B run (wired in 3c). Tier C always needs 'merge <name>'.
+# Per repo in NAVIGATOR_REPOS_FILE: "tier_c_paths": [fnmatch patterns] and "tier_floor": "A"|"B"|"C".

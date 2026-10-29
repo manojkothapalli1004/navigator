@@ -108,8 +108,10 @@ class NotifyingACT:
         if kind == "run.awaiting_review":
             verified = p.get("verified_sha")
             verified_line = f"verified {verified[:12]}\n" if verified else ""
+            tier_line = f"tier: {p.get('merge_tier')}\n" if p.get("merge_tier") in ("A", "B", "C") else ""
             return (f"Navigator: {run_id} is ready for review\n{p.get('title', '')}\n"
                     f"{verified_line}"
+                    f"{tier_line}"
                     f"{_diff_summary(p.get('diff', ''))}\n"
                     f"{format_verification(p.get('verification') or [])}\n"
                     f"review: python -m navigator diff {run_id}\n"

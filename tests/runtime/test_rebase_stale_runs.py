@@ -130,6 +130,7 @@ def test_sibling_is_rebased_and_reverified_after_merge(tmp_path):
     ev = _events(nav, b, "run.awaiting_review")[-1].payload
     assert ev["rebased_from"] == old_sha and ev["merged_run_id"] == a.id
     assert ev["verified_sha"] == sb.verified_sha and "b.py" in ev["diff"]
+    assert ev["merge_tier"] == "B"  # b.py is code in a repo named "repo": tier B after the rebase too
     assert _clean(sb.worktree_path) and _clean(repo)
     assert [r.id for r in _merge(nav, sb)] == [b.id]  # a later merge of B succeeds
     assert nav.act.runs[b.id].status == RunStatus.completed

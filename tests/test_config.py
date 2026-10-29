@@ -228,3 +228,48 @@ def test_operator_preapprove_env_wiring(monkeypatch):
         monkeypatch.setenv("NAVIGATOR_OPERATOR_PREAPPROVE", v)
         with pytest.raises(ValueError, match="NAVIGATOR_OPERATOR_PREAPPROVE"):
             cfg.Settings.from_env()
+
+def test_repos_file_tier_fields(tmp_path, monkeypatch):
+    # merge tiers 3a: per-repo tier_c_paths / tier_floor from NAVIGATOR_REPOS_FILE
+    import json
+    import pytest
+    f = tmp_path/"repos.json"
+    f.write_text(json.dumps([{"path": "/r/waker", "tier_c_paths": ["app/pay*"], "tier_floor": "B"},
+                             {"path": "/r/vent"}]))
+    monkeypatch.setenv("NAVIGATOR_REPOS_FILE", str(f))
+    repos = cfg.Settings.from_env().repos
+    assert repos[0] == cfg.RepoConfig(path="/r/waker", tier_c_paths=["app/pay*"], tier_floor="B")
+    assert repos[0].tier_c_paths == ["app/pay*"] and repos[0].tier_floor == "B"
+    assert repos[1].tier_c_paths is None and repos[1].tier_floor == "A"
+    f.write_text(json.dumps([{"path": "/r/waker", "tier_floor": "D"}]))
+    with pytest.raises(ValueError, match="tier_floor"):
+        cfg.Settings.from_env()
+    f.write_text(json.dumps([{"path": "/r/waker", "tier_c_paths": "x"}]))
+    with pytest.raises(ValueError, match="tier_c_paths"):
+        cfg.Settings.from_env()
+    f.write_text(json.dumps([{"path": "/r/waker", "tier_c_paths": ["ok", 3]}]))
+    with pytest.raises(ValueError, match="tier_c_paths"):
+        cfg.Settings.from_env()
+
+def test_merge_tier_toggles_env_wiring(monkeypatch):
+    # merge tiers 3a: both toggles are parsed (off by default) and read by nothing yet
+    import pytest
+    for k in ("NAVIGATOR_MERGE_TIER_A_AUTO", "NAVIGATOR_MERGE_TIER_B_BATCH"):
+        monkeypatch.delenv(k, raising=False)
+    assert cfg.Settings().merge_tier_a_auto is False
+    assert cfg.Settings().merge_tier_b_batch is False
+    s = cfg.Settings.from_env()
+    assert s.merge_tier_a_auto is False and s.merge_tier_b_batch is False
+    for name, attr in (("NAVIGATOR_MERGE_TIER_A_AUTO", "merge_tier_a_auto"),
+                       ("NAVIGATOR_MERGE_TIER_B_BATCH", "merge_tier_b_batch")):
+        for v in ("1", "true", "True", " TRUE "):
+            monkeypatch.setenv(name, v)
+            assert getattr(cfg.Settings.from_env(), attr) is True, (name, v)
+        for v in ("0", "false", "False"):
+            monkeypatch.setenv(name, v)
+            assert getattr(cfg.Settings.from_env(), attr) is False, (name, v)
+        for v in ("yes", "2", "on"):
+            monkeypatch.setenv(name, v)
+            with pytest.raises(ValueError, match=name):
+                cfg.Settings.from_env()
+        monkeypatch.delenv(name, raising=False)

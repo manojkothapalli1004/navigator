@@ -1,0 +1,107 @@
+"""Merge tiers (operator decision 2026-10-28, 'ask me less').
+
+A pure classifier: A = tests/docs only, C = money/auth/secret/migration/dependency paths,
+Navigator's own safety code (only when the repo is named navigator) or the trader repo,
+else B. Nothing here merges anything; the executor records the tier on every
+run.awaiting_review event and later builds act on it. classify() never calls git.
+"""
+import fnmatch
+import subprocess
+from pathlib import Path
+
+TIERS = ("A", "B", "C")
+
+# matched with fnmatch.fnmatchcase against BOTH the posix relpath and its basename; '*' crosses '/'
+UNIVERSAL_C = ("*.env", "*.env.*", "*.pem", "*.key", "*secret*", "*credential*", "*token*", "*password*",
+               "*migrations/*", "*alembic/*", "*.sql", "pyproject.toml", "uv.lock", "requirements*.txt",
+               "auth*", "*security*", "deps.py", "*routes/*", "models.py", "db.py", "config.py", "settings.py",
+               ".github/*", "deploy/*", "*.plist*", "*.sh", "legal.py")
+NAVIGATOR_C = ("navigator/safety/*", "navigator/runtime/phases.py", "navigator/runtime/executor.py",
+               "navigator/runtime/loop.py", "navigator/runtime/merge_tiers.py", "navigator/runtime/worktree.py",
+               "navigator/runtime/checkpoint.py", "navigator/runtime/drivers/*", "navigator/observability/telegram_*",
+               "navigator/observability/actions.py", "navigator/cli.py", "navigator/config.py", "navigator/__main__.py",
+               "navigator/runtime/fleet.py", "navigator/clients/act_client.py", "navigator/runtime/lock.py",
+               "navigator/contracts/*")
+TEST_A = ("tests/*", "*/tests/*", "test_*.py", "*_test.py", "conftest.py")
+DOC_A = ("*.md", "*.rst", "docs/*", "*.txt")
+ALWAYS_C_REPOS = ("trader",)
+CODE_SUFFIXES = (".py", ".sh", ".toml", ".cfg", ".ini", ".yml", ".yaml", ".json", ".js", ".ts")
+
+
+def _match(path: str, patterns) -> bool:
+    posix = Path(path).as_posix()
+    if posix.startswith("./"):
+        posix = posix[2:]
+    # NOT str.lstrip("./"): that strips CHARACTERS, turning ".env" into "env" and ".github/x" into "github/x"
+    posix = posix.lstrip("/")
+    posix = posix.lower()  # docs/SECRETS.md, API_TOKEN.txt must still hit *secret* / *token*; all patterns are lowercase
+    name = Path(posix).name
+    return any(fnmatch.fnmatchcase(posix, pat) or fnmatch.fnmatchcase(name, pat) for pat in patterns)
+
+
+def _is_c(path: str, extra) -> bool:
+    return _match(path, UNIVERSAL_C) or _match(path, extra)
+
+
+def _is_a(path: str) -> bool:
+    if _match(path, TEST_A):
+        return True
+    # docs/conf.py is code, not a doc; requirements*.txt is a dependency file, not a doc
+    return (_match(path, DOC_A) and Path(path).suffix.lower() not in CODE_SUFFIXES
+            and not fnmatch.fnmatchcase(Path(path).name.lower(), "requirements*.txt"))
+
+
+def classify(changed, *, repo_name: str, tier_c_paths=(), tier_floor: str = "A") -> str:
+    """A: every path is a test or doc file; C: trader repo, floor C, an empty/None change list, or any path
+    matching a C pattern (universal, navigator's own safety modules when repo_name == "navigator", or
+    tier_c_paths); else B. tier_floor raises the result (A < B < C)."""
+    if tier_floor not in TIERS:
+        raise ValueError(f"tier_floor must be one of {TIERS}, got {tier_floor!r}")
+    if repo_name in ALWAYS_C_REPOS or tier_floor == "C" or not changed:
+        return "C"
+    extra = tuple(tier_c_paths or ()) + (NAVIGATOR_C if repo_name == "navigator" else ())
+    if any(_is_c(p, extra) for p in changed):
+        return "C"
+    tier = "A" if all(_is_a(p) for p in changed) else "B"
+    return tier if TIERS.index(tier) >= TIERS.index(tier_floor) else tier_floor
+
+
+def repo_config_for(settings, repo_path: str):
+    """The RepoConfig of effective_repos(settings) whose resolved path equals the resolved repo_path, else None."""
+    from navigator.config import effective_repos  # inside the body: keeps the module import-light
+    target = Path(repo_path).resolve()
+    for cfg in effective_repos(settings):
+        if cfg.path and Path(cfg.path).resolve() == target:
+            return cfg
+    return None
+
+
+def classify_for_repo(changed, repo_path: str, cfg) -> str:
+    return classify(changed, repo_name=Path(repo_path).name,
+                    tier_c_paths=(cfg.tier_c_paths if cfg else None) or (),
+                    tier_floor=cfg.tier_floor if cfg else "A")
+
+
+def changed_files_for_run(repo: str, run) -> list | None:
+    """`git -c core.quotePath=false diff --no-renames --name-only <run.base_commit_sha>..<run.verified_sha>` in
+    repo (core.quotePath=false so a non-ASCII path is not printed quoted, which would stop every pattern
+    matching it; --no-renames so a file moved out of a C path into tests/ or docs/ still lists its old path;
+    the run's own commits; _rebase_one moves base_commit_sha, so this is right after a sibling merge). None
+    when verified_sha is missing or git fails (a TimeoutExpired or OSError is also None)."""
+    base = getattr(run, "base_commit_sha", None)
+    verified = getattr(run, "verified_sha", None)
+    if not verified or not base:
+        return None
+    try:
+        proc = subprocess.run(["git", "-c", "core.quotePath=false", "diff", "--no-renames", "--name-only",
+                               f"{base}..{verified}"], cwd=repo, capture_output=True, text=True, timeout=60)
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if proc.returncode != 0:
+        return None
+    return [l.strip() for l in proc.stdout.splitlines() if l.strip()]
+
+
+def tier_for_run(repo: str, run, cfg) -> str | None:
+    changed = changed_files_for_run(repo, run)
+    return None if changed is None else classify_for_repo(changed, repo, cfg)
