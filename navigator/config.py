@@ -34,6 +34,9 @@ class Settings:
     # N12d: after a merge, rebase the repo's other runs parked at the merge gate onto the
     # new HEAD and re-verify them with their recorded commands (no model call)
     rebase_stale_runs: bool = True
+    # operator decision 2026-10-28 ('ask me less'): operator-origin proposals start approved;
+    # periodic ones still need approve
+    operator_preapprove: bool = False
     act_base_url: str | None = None
     orc_base_url: str | None = None
     worktree_root: str = "/tmp/navigator-worktrees"
@@ -79,6 +82,7 @@ class Settings:
             mode=os.getenv("NAVIGATOR_MODE", "dry_run"),
             merge_in_dry_run=_bool_env("NAVIGATOR_MERGE_IN_DRY_RUN", "0"),
             rebase_stale_runs=_bool_env("NAVIGATOR_REBASE_STALE_RUNS", "1"),
+            operator_preapprove=_bool_env("NAVIGATOR_OPERATOR_PREAPPROVE", "0"),
             act_base_url=os.getenv("NAVIGATOR_ACT_BASE_URL"),
             orc_base_url=os.getenv("NAVIGATOR_ORC_BASE_URL"),
             worktree_root=os.getenv("NAVIGATOR_WORKTREE_ROOT", "/tmp/navigator-worktrees"),
