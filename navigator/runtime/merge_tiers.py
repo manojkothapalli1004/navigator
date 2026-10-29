@@ -105,3 +105,13 @@ def changed_files_for_run(repo: str, run) -> list | None:
 def tier_for_run(repo: str, run, cfg) -> str | None:
     changed = changed_files_for_run(repo, run)
     return None if changed is None else classify_for_repo(changed, repo, cfg)
+
+
+def batch_enabled() -> bool:
+    """NAVIGATOR_MERGE_TIER_B_BATCH as the Telegram-handling process sees it (it has no
+    Settings). A malformed value is off."""
+    from navigator.config import _bool_env
+    try:
+        return _bool_env("NAVIGATOR_MERGE_TIER_B_BATCH", "0")
+    except ValueError:
+        return False
