@@ -13,6 +13,12 @@ class DriverRequest:
     role: Role
     context: dict
     worktree_path: str | None = None
+    # build 2 (builder tests): the per-repo CommandRunner, the run directory inside the
+    # worktree and the repo's allowlist, so the tooled builder's run_tests tool can run the
+    # allowlisted pytest entry through phases._run_sealed; only the builder request sets them
+    runner: object | None = None
+    run_dir: str | None = None
+    allowed_commands: tuple[str, ...] = ()
 
 @dataclass
 class DriverResult:
