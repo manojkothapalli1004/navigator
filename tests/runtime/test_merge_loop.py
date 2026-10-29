@@ -1,15 +1,21 @@
+import io
 import subprocess
+import time
+from datetime import datetime, timezone
 from pathlib import Path
-from navigator.cli import ACTOR
+from navigator.cli import ACTOR, is_audited, run_cli
 from navigator.contracts.proposal import Proposal
 from navigator.runtime.loop import Navigator
+from navigator.runtime.executor import (AUTO_ACTOR, _AUTO_RECHECK_REASON, _NOT_OPERATOR_REASON,
+                                        suite_green, base_on_head)
+from navigator.runtime.drivers.base import DriverResult
 from navigator.clients.act_client import FakeACTClient
 from navigator.clients.orc_client import FakeORCClient
 from navigator.runtime.drivers.fake_driver import FakeSubagentDriver
 from navigator.safety.command_runner import CommandRunner
 from navigator.config import Settings
 from navigator.contracts.enums import (ProposalStatus, ApprovalGate, ApprovalDecision,
-                                       RunStatus, RunPhase)
+                                       RunStatus, RunPhase, Role)
 
 
 def _git(repo, *args):
@@ -36,9 +42,9 @@ def _setup(tmp_path):
     return nav, repo, run
 
 
-def _decide(nav, run, decision):
+def _decide(nav, run, decision, actor=ACTOR):
     appr = nav.act.list_approvals(target=run.id, gate=ApprovalGate.merge)[0]
-    nav.act.decide_approval(appr.id, decision, actor=ACTOR)
+    nav.act.decide_approval(appr.id, decision, actor=actor)
 
 
 def test_merge_poll_merges_after_operator_approval(tmp_path):
@@ -242,3 +248,334 @@ def test_merge_poll_still_raises_unrelated_lock_errors(tmp_path):
     with pytest.raises(RuntimeError, match="disk on fire"):
         nav.merge_poll()
     assert nav.act.runs[run.id].phase == RunPhase.awaiting_review
+
+
+# ---- 3b: tier A auto-merge (NAVIGATOR_MERGE_TIER_A_AUTO) --------------------------------
+
+class _DocsDriver:
+    """Scripted driver: one docs-only file, verified with `git status` (tier A)."""
+
+    def __init__(self, path="docs/notes.md"):
+        self.path = path
+
+    def run_role(self, request):
+        if request.role == Role.builder:
+            return DriverResult(role=Role.builder, file_writes=[(self.path, "# notes\n")])
+        return DriverResult(role=Role.verifier, commands=[["git", "status"]])
+
+
+def _docs_setup(tmp_path, path="docs/notes.md", extra_commit=False):
+    # exactly _setup, but a scripted docs-only run instead of the fake navigator_touch.py one
+    repo = tmp_path/"repo"; repo.mkdir()
+    _git(repo, "init", "-b", "main")
+    _git(repo, "config", "user.email", "t@t")
+    _git(repo, "config", "user.name", "t")
+    _git(repo, "commit", "--allow-empty", "-m", "base")
+    if extra_commit:
+        _git(repo, "commit", "--allow-empty", "-m", "extra")
+    sha = _git(repo, "rev-parse", "HEAD").strip()
+    s = Settings(mode="execute", worktree_root=str(tmp_path/"wt"),
+                 outcome_path=str(tmp_path/"outcomes.jsonl"))
+    nav = Navigator(act=FakeACTClient(), orc=FakeORCClient(), driver=_DocsDriver(path),
+                    runner=CommandRunner(allowlist=s.allowed_commands, worktree_root=tmp_path/"wt"),
+                    settings=s, repo=str(repo), lock_path=tmp_path/"nav.lock")
+    p = nav.act.create_proposal(Proposal(
+        origin="periodic", proposal_origin_hash="h-docs", title="Docs: notes", rationale="r",
+        repo=str(repo), base_commit_sha=sha, intended_changes="x", affected_files=[path]))
+    nav.act.set_proposal_status(p.id, ProposalStatus.approved)
+    run = nav.approval_poll()[0]
+    assert run.phase == RunPhase.awaiting_review
+    assert run.base_commit_sha == sha
+    return nav, repo, run
+
+
+def _audit(nav, run):
+    assert run_cli(["audited", run.id], act=nav.act, out=io.StringIO()) == 0
+    assert is_audited(nav.act, run.id)
+
+
+def _merge_approvals(nav, run):
+    return nav.act.list_approvals(target=run.id, gate=ApprovalGate.merge)
+
+
+def _auto_approvals(nav, run):
+    return [a for a in _merge_approvals(nav, run) if a.actor == AUTO_ACTOR]
+
+
+def _events(nav, kind):
+    return [e for e in nav.act.events if e.kind == kind]
+
+
+def _dirty_checkout(repo):
+    # the same way test_merge_blocked_while_main_checkout_dirty blocks the preflight
+    (repo/"tracked.txt").write_text("a")
+    _git(repo, "add", "tracked.txt"); _git(repo, "commit", "-m", "t")
+    (repo/"tracked.txt").write_text("operator's uncommitted edit")
+
+
+def _clean_checkout(repo):
+    _git(repo, "checkout", "--", "tracked.txt")
+    assert _git(repo, "status", "--porcelain", "--untracked-files=no").strip() == ""
+
+
+def test_tier_a_docs_only_run_auto_merges_when_flag_on(tmp_path):
+    nav, repo, run = _docs_setup(tmp_path)
+    nav.settings.merge_tier_a_auto = True
+    # NEGATIVE: not audited yet - nothing happens, no auto approval
+    assert nav.merge_poll() == []
+    assert nav.act.runs[run.id].phase == RunPhase.awaiting_review
+    assert _auto_approvals(nav, run) == []
+    assert "docs/notes.md" not in _git(repo, "ls-files")
+    _audit(nav, run)
+    done = nav.merge_poll()
+    assert [r.id for r in done] == [run.id]
+    assert nav.act.runs[run.id].status == RunStatus.completed
+    assert "docs/notes.md" in _git(repo, "ls-files")
+    approvals = _merge_approvals(nav, run)
+    approved = [a for a in approvals if a.decision == ApprovalDecision.approved]
+    assert approved and all(a.actor == AUTO_ACTOR for a in approved)
+    # the original request (closed by the post-merge leftover close) plus the auto one
+    assert len(approvals) == 2
+    assert len(_events(nav, "run.auto_merge_approved")) == 1
+    completed = _events(nav, "run.completed")
+    assert len(completed) == 1
+    assert completed[0].payload["auto"] is True
+    assert completed[0].payload["revert"].startswith(f"git -C {repo} revert -m 1 ")
+    assert completed[0].payload["merge_sha"] == _git(repo, "rev-parse", "HEAD").strip()
+
+
+def test_leftover_operator_approval_is_closed_after_auto_merge(tmp_path):
+    nav, repo, run = _docs_setup(tmp_path)
+    nav.settings.merge_tier_a_auto = True
+    _audit(nav, run)
+    assert [r.id for r in nav.merge_poll()] == [run.id]
+    approvals = _merge_approvals(nav, run)
+    assert approvals and all(a.decision != ApprovalDecision.pending for a in approvals)
+    out = io.StringIO()
+    rc = run_cli(["reject", run.id, "--reason", "other"], act=nav.act, out=out)
+    assert rc == 1
+    assert f"no pending merge approval for {run.id}" in out.getvalue()
+    assert "applied on the daemon's next cycle" not in out.getvalue()
+    assert nav.act.runs[run.id].status == RunStatus.completed
+
+
+def test_rewound_main_blocks_auto_merge(tmp_path):
+    # NEGATIVE: the operator reset main past the run's base; a tier A classification of
+    # base..verified would otherwise merge the dropped commit back in
+    nav, repo, run = _docs_setup(tmp_path, extra_commit=True)
+    _audit(nav, run)
+    _git(repo, "reset", "--hard", "HEAD~1")
+    assert _git(repo, "rev-parse", "HEAD").strip() != run.base_commit_sha
+    nav.settings.merge_tier_a_auto = True
+    assert base_on_head(str(repo), run) is False
+    assert nav.merge_poll() == []
+    assert nav.act.runs[run.id].phase == RunPhase.awaiting_review
+    assert _events(nav, "run.auto_merge_approved") == []
+    assert _auto_approvals(nav, run) == []
+    assert "docs/notes.md" not in _git(repo, "ls-files")
+
+
+def test_reject_after_auto_approval_still_declines(tmp_path):
+    # NEGATIVE: the auto approval is a NEW record; the operator's pending one survives and
+    # a decline on it still wins
+    nav, repo, run = _docs_setup(tmp_path)
+    _audit(nav, run)
+    nav.settings.merge_tier_a_auto = True
+    _dirty_checkout(repo)
+    assert nav.merge_poll() == []  # auto-approved, but the preflight blocked the merge
+    assert nav.act.runs[run.id].phase == RunPhase.awaiting_review
+    approvals = _merge_approvals(nav, run)
+    assert [a.actor for a in approvals if a.decision == ApprovalDecision.approved] == [AUTO_ACTOR]
+    assert [a.decision for a in approvals if a.actor != AUTO_ACTOR] == [ApprovalDecision.pending]
+    _decide(nav, run, ApprovalDecision.declined)
+    _clean_checkout(repo)
+    assert [r.id for r in nav.merge_poll()] == [run.id]
+    stored = nav.act.runs[run.id]
+    assert stored.status == RunStatus.aborted and stored.phase == RunPhase.finalizing
+    assert stored.status != RunStatus.completed
+    assert _events(nav, "run.completed") == []
+    assert "docs/notes.md" not in _git(repo, "ls-files")
+
+
+def test_orc_failure_after_merge_keeps_the_note(tmp_path, monkeypatch):
+    nav, repo, run = _docs_setup(tmp_path)
+    _audit(nav, run)
+    nav.settings.merge_tier_a_auto = True
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("ORC ReadTimeout")
+    monkeypatch.setattr(nav.orc, "apply_memory_update", boom)
+    done = nav.merge_poll()  # must not raise
+    assert [r.id for r in done] == [run.id]
+    assert done[0].status == RunStatus.completed
+    assert nav.act.runs[run.id].status == RunStatus.completed
+    completed = _events(nav, "run.completed")
+    assert len(completed) == 1
+    assert completed[0].payload["revert"].startswith(f"git -C {repo} revert -m 1 ")
+    assert completed[0].payload["merge_sha"] == _git(repo, "rev-parse", "HEAD").strip()
+    assert "docs/notes.md" in _git(repo, "ls-files")
+
+
+def test_tier_b_run_never_auto_merges(tmp_path):
+    # NEGATIVE: navigator_touch.py is tier B even when audited and green
+    nav, repo, run = _setup(tmp_path)
+    nav.settings.merge_tier_a_auto = True
+    _audit(nav, run)
+    assert nav.merge_poll() == []
+    assert nav.act.runs[run.id].phase == RunPhase.awaiting_review
+    assert _events(nav, "run.auto_merge_approved") == []
+    assert _auto_approvals(nav, run) == []
+    assert "navigator_touch.py" not in _git(repo, "ls-files")
+
+
+def test_c_pattern_docs_run_never_auto_merges(tmp_path):
+    # NEGATIVE: audited and green, so ONLY the tier check (docs/SECRETS.md matches *secret*) stops it
+    nav, repo, run = _docs_setup(tmp_path, path="docs/SECRETS.md")
+    _audit(nav, run)
+    assert suite_green(run.verification, ["docs/SECRETS.md"])
+    nav.settings.merge_tier_a_auto = True
+    assert nav.merge_poll() == []
+    assert nav.act.runs[run.id].phase == RunPhase.awaiting_review
+    assert _auto_approvals(nav, run) == []
+    assert _events(nav, "run.auto_merge_approved") == []
+    assert "docs/SECRETS.md" not in _git(repo, "ls-files")
+
+
+def test_flag_off_never_auto_merges(tmp_path):
+    # NEGATIVE: the flag check in _auto_approve_tier_a itself, not just the merge-time one
+    nav, repo, run = _docs_setup(tmp_path)
+    _audit(nav, run)
+    assert nav.settings.merge_tier_a_auto is False
+    assert nav.merge_poll() == []
+    assert nav.act.runs[run.id].phase == RunPhase.awaiting_review
+    assert _auto_approvals(nav, run) == []
+    assert _events(nav, "run.auto_merge_approved") == []
+    assert "docs/notes.md" not in _git(repo, "ls-files")
+
+
+def test_stale_auto_approval_does_not_block_reapproval(tmp_path):
+    nav, repo, run = _docs_setup(tmp_path)
+    _audit(nav, run)
+    nav.settings.merge_tier_a_auto = True
+    _dirty_checkout(repo)
+    assert nav.merge_poll() == []  # auto-approved without merging (preflight blocked)
+    assert len(_auto_approvals(nav, run)) == 1
+    # simulate a rebase: the run re-opened for review after that auto approval was decided
+    time.sleep(0.01)
+    run.heartbeat_at = datetime.now(timezone.utc)
+    nav.act.update_run(run)
+    assert run_cli(["audited", run.id], act=nav.act, out=io.StringIO()) == 0
+    _clean_checkout(repo)
+    assert [r.id for r in nav.merge_poll()] == [run.id]
+    assert nav.act.runs[run.id].status == RunStatus.completed
+    approvals = _merge_approvals(nav, run)
+    # the stale auto one, the fresh auto one, and the operator's original pending one that
+    # the post-merge leftover-close decided
+    assert len(approvals) == 3
+    assert [a.actor for a in approvals].count(AUTO_ACTOR) == 3
+    assert not any(a.decision == ApprovalDecision.pending for a in approvals)
+    assert "docs/notes.md" in _git(repo, "ls-files")
+
+
+def test_auto_approve_failure_does_not_escape(tmp_path, monkeypatch):
+    nav, repo, run = _docs_setup(tmp_path)
+    _audit(nav, run)  # FIRST: the audit itself calls decide_approval
+    nav.settings.merge_tier_a_auto = True
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("ACT down")
+    monkeypatch.setattr(nav.act, "decide_approval", boom)
+    assert nav.merge_poll() == []  # must not raise
+    assert nav.act.runs[run.id].phase == RunPhase.awaiting_review
+    pending = [a for a in _merge_approvals(nav, run) if a.decision == ApprovalDecision.pending]
+    assert len(pending) == 2  # the operator's plus exactly one orphan
+    assert _events(nav, "run.auto_merge_approved") == []
+    # orphan guard: a second poll (decide still raising) does not add another
+    assert nav.merge_poll() == []
+    assert len(_merge_approvals(nav, run)) == 2
+    assert len([a for a in _merge_approvals(nav, run)
+                if a.decision == ApprovalDecision.pending]) == 2
+    assert "docs/notes.md" not in _git(repo, "ls-files")
+
+
+def test_forged_auto_approval_on_tier_b_is_ignored(tmp_path):
+    # NEGATIVE: code that writes the auto actor's approval for its own tier B run merges nothing
+    nav, repo, run = _setup(tmp_path)
+    nav.settings.merge_tier_a_auto = True
+    _decide(nav, run, ApprovalDecision.approved, actor=AUTO_ACTOR)
+    assert nav.merge_poll() == []
+    assert nav.act.runs[run.id].phase == RunPhase.awaiting_review
+    assert "navigator_touch.py" not in _git(repo, "ls-files")
+    blocked = _events(nav, "run.merge_blocked")
+    assert [e.payload["reason"] for e in blocked] == [_AUTO_RECHECK_REASON]
+    assert blocked[0].payload["actors"] == [AUTO_ACTOR]
+    assert _events(nav, "run.auto_merge_approved") == []
+
+
+def test_forged_stranger_approval_on_tier_b_is_ignored(tmp_path):
+    nav, repo, run = _setup(tmp_path)
+    nav.settings.merge_tier_a_auto = True
+    _decide(nav, run, ApprovalDecision.approved, actor="stranger")
+    assert nav.merge_poll() == []
+    assert nav.act.runs[run.id].phase == RunPhase.awaiting_review
+    assert "navigator_touch.py" not in _git(repo, "ls-files")
+    blocked = _events(nav, "run.merge_blocked")
+    assert [e.payload["reason"] for e in blocked] == ["approval not from an operator after review"]
+    assert _NOT_OPERATOR_REASON == "approval not from an operator after review"
+
+
+def test_forged_auto_approval_on_unaudited_tier_a_is_ignored(tmp_path):
+    # NEGATIVE: auto_merge_ok re-checks is_audited at merge time
+    nav, repo, run = _docs_setup(tmp_path)
+    nav.settings.merge_tier_a_auto = True
+    _decide(nav, run, ApprovalDecision.approved, actor=AUTO_ACTOR)
+    assert nav.merge_poll() == []
+    assert nav.act.runs[run.id].phase == RunPhase.awaiting_review
+    assert "docs/notes.md" not in _git(repo, "ls-files")
+    blocked = _events(nav, "run.merge_blocked")
+    assert len(blocked) == 1
+    assert blocked[0].payload["reason"] == _AUTO_RECHECK_REASON
+    assert _events(nav, "run.completed") == []
+
+
+def test_operator_merge_still_works_and_reports_revert(tmp_path):
+    nav, repo, run = _setup(tmp_path)
+    _decide(nav, run, ApprovalDecision.approved)
+    assert [r.id for r in nav.merge_poll()] == [run.id]
+    assert nav.act.runs[run.id].status == RunStatus.completed
+    completed = _events(nav, "run.completed")
+    assert len(completed) == 1
+    payload = completed[0].payload
+    assert payload["auto"] is False
+    prefix = f"git -C {repo} revert -m 1 "
+    assert payload["revert"].startswith(prefix)
+    assert payload["revert"][len(prefix):] == _git(repo, "rev-parse", "HEAD").strip()
+    assert payload["merge_sha"] == _git(repo, "rev-parse", "HEAD").strip()
+
+
+def test_squash_merge_reports_plain_revert(tmp_path):
+    nav, repo, run = _setup_squash(tmp_path)
+    _decide(nav, run, ApprovalDecision.approved)
+    assert [r.id for r in nav.merge_poll()] == [run.id]
+    payload = _events(nav, "run.completed")[0].payload
+    head = _git(repo, "rev-parse", "HEAD").strip()
+    assert payload["revert"] == f"git -C {repo} revert {head}"
+    assert "-m 1" not in payload["revert"]
+
+
+def test_suite_green_rules():
+    assert suite_green([], ["a.py"]) is False
+    assert suite_green([], ["docs/x.md"]) is False
+    git_only = [{"argv": "git status", "argv_list": ["git", "status"], "returncode": 0}]
+    assert suite_green(git_only, ["docs/x.md"]) is True
+    assert suite_green(git_only, ["a.py"]) is False  # no pytest for a .py change
+    uv = [{"argv_list": ["uv", "run", "pytest", "-q"], "returncode": 0}]
+    assert suite_green(uv, ["tests/test_a.py"]) is True
+    assert suite_green([{"argv_list": ["uv", "run", "pytest", "-q"], "returncode": 1}],
+                       ["tests/test_a.py"]) is False
+    assert suite_green([{"argv_list": ["uv", "run", "pytest", "-q"], "returncode": 0},
+                        {"argv_list": ["git", "status"], "returncode": 1}],
+                       ["tests/test_a.py"]) is False  # last entry failed
+    assert suite_green([{"argv": "pytest -q", "returncode": 0}], ["tests/test_a.py"]) is True
+    assert suite_green([{"argv": "uv run pytest -q", "returncode": 0}], ["a.py"]) is True
+    assert suite_green([{"argv": "python3 -m py_compile a.py", "returncode": 0}], ["a.py"]) is False
