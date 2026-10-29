@@ -1,7 +1,7 @@
 import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from navigator.runtime.loop import Navigator, QUOTA_DEFAULT_PAUSE_S
+from navigator.runtime.loop import Navigator, QUOTA_DEFAULT_PAUSE_S, OPERATOR_ORIGIN
 from navigator.contracts.proposal import Proposal, compute_origin_hash
 from navigator.safety.errors import QuotaExhaustedError
 from navigator.clients.act_client import FakeACTClient
@@ -415,3 +415,98 @@ def test_quota_deferral_pauses_execution_until_resets_at(tmp_path):
     assert nav2.quota_deferral == {"error": "QuotaExhaustedError", "resets_at": None}
     remaining = (nav2.quota_paused_until - datetime.now(timezone.utc)).total_seconds()
     assert 3500 < remaining <= QUOTA_DEFAULT_PAUSE_S
+
+
+# --- operator preapprove (operator decision 2026-10-28: 'ask me less') ------------------
+
+def _op_proposal(nav, repo, sha, title="Op: spec", origin=OPERATOR_ORIGIN, h="h-op",
+                 repo_path=None):
+    return nav.act.create_proposal(Proposal(
+        origin=origin, proposal_origin_hash=h, title=title, rationale="r",
+        repo=repo_path or str(repo), base_commit_sha=sha, intended_changes="x",
+        affected_files=["navigator_touch.py"]))
+
+
+def _preapproved_events(nav):
+    return [e for e in nav.act.events if e.kind == "proposal.preapproved"]
+
+
+def test_operator_proposal_is_preapproved_in_dry_run_when_flag_on(tmp_path):
+    repo, sha = _seed(tmp_path)
+    nav = _nav(tmp_path, repo, mode="dry_run")
+    nav.settings.operator_preapprove = True
+    op = _op_proposal(nav, repo, sha)
+    per = _op_proposal(nav, repo, sha, title="Per: idea", origin="periodic", h="h-per")
+    assert nav.approval_poll() == []  # dry_run builds nothing
+    assert nav.act.get_proposal(op.id).status == ProposalStatus.approved
+    # NEGATIVE: the daemon's own proposals still need the operator's approve
+    assert nav.act.get_proposal(per.id).status == ProposalStatus.proposed
+    events = _preapproved_events(nav)
+    assert len(events) == 1
+    assert events[0].payload["proposal_id"] == op.id
+
+
+def test_operator_proposal_is_built_in_execute_mode_without_an_approve(tmp_path):
+    repo, sha = _seed(tmp_path)
+    nav = _nav(tmp_path, repo, mode="execute")
+    nav.settings.operator_preapprove = True
+    op = _op_proposal(nav, repo, sha)
+    runs = nav.approval_poll()
+    assert len(runs) == 1 and runs[0].proposal_id == op.id
+
+
+def test_flag_off_leaves_operator_proposals_proposed(tmp_path):
+    # NEGATIVE: the Settings default is off; the default path is byte-identical to before
+    repo, sha = _seed(tmp_path)
+    nav = _nav(tmp_path, repo, mode="dry_run")
+    assert nav.settings.operator_preapprove is False
+    op = _op_proposal(nav, repo, sha)
+    assert nav.approval_poll() == []
+    assert nav.act.get_proposal(op.id).status == ProposalStatus.proposed
+    assert _preapproved_events(nav) == []
+
+
+def test_preapprove_is_idempotent_and_only_touches_this_repo(tmp_path):
+    repo, sha = _seed(tmp_path)
+    nav = _nav(tmp_path, repo, mode="dry_run")
+    nav.settings.operator_preapprove = True
+    own = _op_proposal(nav, repo, sha)
+    other = _op_proposal(nav, repo, sha, title="Op: elsewhere", h="h-other",
+                         repo_path=str(repo) + "-other")
+    first = nav.preapprove_operator_proposals()
+    assert [p.id for p in first] == [own.id]
+    assert nav.preapprove_operator_proposals() == []
+    assert nav.act.get_proposal(own.id).status == ProposalStatus.approved
+    assert nav.act.get_proposal(other.id).status == ProposalStatus.proposed
+    assert len(_preapproved_events(nav)) == 1
+
+
+def test_draft_titles_are_not_preapproved(tmp_path):
+    # NEGATIVE: "[draft] ..." is the opt-out: file now, audit, approve by hand later
+    repo, sha = _seed(tmp_path)
+    nav = _nav(tmp_path, repo, mode="dry_run")
+    nav.settings.operator_preapprove = True
+    draft = _op_proposal(nav, repo, sha, title="[draft] Op: hold me", h="h-draft")
+    go = _op_proposal(nav, repo, sha, title="Op: go", h="h-go")
+    done = nav.preapprove_operator_proposals()
+    assert [p.id for p in done] == [go.id]
+    assert nav.act.get_proposal(draft.id).status == ProposalStatus.proposed
+    assert nav.act.get_proposal(go.id).status == ProposalStatus.approved
+    assert len(_preapproved_events(nav)) == 1
+
+
+def test_preapprove_event_failure_does_not_block(tmp_path, monkeypatch):
+    repo, sha = _seed(tmp_path)
+    nav = _nav(tmp_path, repo, mode="dry_run")
+    nav.settings.operator_preapprove = True
+    op = _op_proposal(nav, repo, sha)
+
+    def boom(event):
+        raise RuntimeError("act down")
+
+    monkeypatch.setattr(nav.act, "emit_event", boom)
+    done = nav.preapprove_operator_proposals()
+    assert [p.id for p in done] == [op.id]
+    # the status change is kept; the lost event is only logged
+    assert nav.act.get_proposal(op.id).status == ProposalStatus.approved
+    assert nav.approval_poll() == []  # dry_run, and nothing raised

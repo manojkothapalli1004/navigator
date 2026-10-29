@@ -211,3 +211,20 @@ def test_builder_tools_env_wiring(monkeypatch):
     monkeypatch.setenv("NAVIGATOR_SDK_BUILDER_TIMEOUT_S", "0")
     with pytest.raises(ValueError, match="NAVIGATOR_SDK_BUILDER_TIMEOUT_S"):
         cfg.Settings.from_env()
+
+def test_operator_preapprove_env_wiring(monkeypatch):
+    # operator decision 2026-10-28 ('ask me less'): operator-filed proposals start approved; off by default
+    import pytest
+    monkeypatch.delenv("NAVIGATOR_OPERATOR_PREAPPROVE", raising=False)
+    assert cfg.Settings().operator_preapprove is False
+    assert cfg.Settings.from_env().operator_preapprove is False
+    for v in ("1", "true", "True", " TRUE "):
+        monkeypatch.setenv("NAVIGATOR_OPERATOR_PREAPPROVE", v)
+        assert cfg.Settings.from_env().operator_preapprove is True, v
+    for v in ("0", "false", "False"):
+        monkeypatch.setenv("NAVIGATOR_OPERATOR_PREAPPROVE", v)
+        assert cfg.Settings.from_env().operator_preapprove is False, v
+    for v in ("yes", "2", "on"):
+        monkeypatch.setenv("NAVIGATOR_OPERATOR_PREAPPROVE", v)
+        with pytest.raises(ValueError, match="NAVIGATOR_OPERATOR_PREAPPROVE"):
+            cfg.Settings.from_env()

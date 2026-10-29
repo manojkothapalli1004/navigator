@@ -35,6 +35,9 @@ mode = "dry_run"                # NAVIGATOR_MODE: "dry_run" proposes only; "exec
 merge_in_dry_run = false        # NAVIGATOR_MERGE_IN_DRY_RUN: "1"/"true" lets merge_poll act on
                                 # operator merge decisions (merge/decline) while mode is dry_run;
                                 # builds stay off. "0"/"false"/unset = off; anything else is an error
+operator_preapprove = false     # NAVIGATOR_OPERATOR_PREAPPROVE: "1"/"true" = proposals with origin "operator"
+                                # (the operator's own filing scripts) start approved; periodic proposals still need
+                                # approve. "0"/"false"/unset = off; anything else is an error
 
 [services]
 act_base_url = ""               # NAVIGATOR_ACT_BASE_URL: unset = in-memory FakeACTClient
