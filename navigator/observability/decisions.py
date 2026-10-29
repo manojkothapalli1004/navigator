@@ -13,14 +13,22 @@ list of three kinds of item:
 and three ways to see it:
   'decisions' in Telegram (telegram_proposals.handle_operator_message): the list, read-only
   a nudge once a merge/manual item has waited NUDGE_AFTER_S (at most once per item per
-    local day; proposals never nudge, the triage top-3 covers them)
-  one digest at DIGEST_HOUR local, only when something is waiting. While a source
-    fails to list, the digest is neither sent nor marked (an incomplete list must not
-    spend the day's digest); from DIGEST_HOUR + 2 it goes out anyway - the items that
-    could be listed, if any, plus one line '(could not list: <kinds>)'. While the digest
-    is held no reminder is sent either (the held digest names those items at
-    DIGEST_HOUR + 2), so an item is never sent twice in one morning.
-Nothing is sent in the quiet hours (QUIET_START_HOUR..QUIET_END_HOUR local).
+    local day; proposals never nudge, the triage top-3 covers them). Operator decision
+    2026-10-28 (ask me less): NAVIGATOR_DECISIONS_NUDGES=0/false turns these reminders
+    off (digest only); unset/1/true keeps them.
+  one digest at the digest hour local (NAVIGATOR_DIGEST_HOUR, 0-23; default DIGEST_HOUR),
+    only when something is waiting. While a source fails to list, the digest is neither
+    sent nor marked (an incomplete list must not spend the day's digest); from the
+    fallback hour - digest hour + 2, capped at 22 so a late digest hour never pushes the
+    fallback into the quiet hours - it goes out anyway: the items that could be listed,
+    if any, plus one line '(could not list: <kinds>)'. While the digest is held no
+    reminder is sent either (the held digest names those items at the fallback hour),
+    so an item is never sent twice in one morning.
+Nothing is sent in the quiet hours (QUIET_START_HOUR..QUIET_END_HOUR local) EXCEPT at
+the digest hour, which is never quiet (a 7am digest must get through QUIET_END_HOUR=8).
+A NAVIGATOR_DIGEST_HOUR / NAVIGATOR_DECISIONS_NUDGES value that does not parse raises
+ValueError naming the variable (reported per cycle as decisions_error) before any state
+write. Neither is a Settings key, so they are documented here, not in navigator.toml.example.
 
 Only decisions_tick (the daemon cycle, __main__._decisions_step) writes the state file:
 first_seen per item key, the local day each item was last nudged, and the local day of
@@ -85,6 +93,44 @@ def manual_path() -> str:
 
 def local_tz():
     return zoneinfo.ZoneInfo(os.getenv("NAVIGATOR_DECISIONS_TZ") or DEFAULT_TZ)
+
+
+def _bad_env(name: str, raw: str, expected: str) -> None:
+    """Log the full message, then raise: _decisions_step in __main__.py reports only
+    type(e).__name__, so without this line the operator would see
+    `decisions_error: ValueError` every cycle and never learn which variable."""
+    msg = f"{name} must be {expected}, got {raw!r}"
+    log.warning("decisions.bad_env", var=name, error=msg)
+    raise ValueError(msg)
+
+
+def digest_hour() -> int:
+    """NAVIGATOR_DIGEST_HOUR (local hour 0-23 of the morning digest; default DIGEST_HOUR).
+    A value that is not an integer in 0..23 raises ValueError naming the variable
+    (reported per cycle as decisions_error)."""
+    raw = os.getenv("NAVIGATOR_DIGEST_HOUR")
+    if raw is None or not raw.strip():
+        return DIGEST_HOUR
+    try:
+        hour = int(raw.strip())
+    except ValueError:
+        _bad_env("NAVIGATOR_DIGEST_HOUR", raw, "an integer hour 0-23")
+    if not 0 <= hour <= 23:
+        _bad_env("NAVIGATOR_DIGEST_HOUR", raw, "an integer hour 0-23")
+    return hour
+
+
+def nudges_enabled() -> bool:
+    """NAVIGATOR_DECISIONS_NUDGES: '1'/'true'/unset = the 4h reminders are sent;
+    '0'/'false' = digest only. Anything else raises ValueError naming the variable."""
+    raw = (os.getenv("NAVIGATOR_DECISIONS_NUDGES") or "1").strip().lower()
+    if raw in ("1", "true"):
+        return True
+    if raw in ("0", "false"):
+        return False
+    _bad_env("NAVIGATOR_DECISIONS_NUDGES", os.getenv("NAVIGATOR_DECISIONS_NUDGES") or "",
+             "1/true or 0/false")
+    return True  # unreachable: _bad_env raises
 
 
 @dataclass(frozen=True)
@@ -351,7 +397,11 @@ def format_decisions(items: list[Decision], now: datetime, first_seen: dict | No
 
 # ---- the daemon tick ------------------------------------------------------------
 
-def _quiet(local: datetime) -> bool:
+def _quiet(local: datetime, digest_at: int | None = None) -> bool:
+    """True in the quiet hours; the digest hour itself is never quiet."""
+    hour = DIGEST_HOUR if digest_at is None else digest_at
+    if local.hour == hour:
+        return False
     return local.hour >= QUIET_START_HOUR or local.hour < QUIET_END_HOUR
 
 
@@ -366,13 +416,16 @@ def decisions_tick(act, notifier, now: datetime | None = None, state_file=None,
     prune vanished ones (keeping every key of a kind whose source failed, and every merge
     key whose run is still open at awaiting_review - an audit-check hiccup drops the run
     from the candidates without raising), then - outside the quiet hours - send the day's
-    digest once (from DIGEST_HOUR local, only when something waits) and nudge merge/manual
-    items that have waited NUDGE_AFTER_S and were not nudged today (never right after a
-    digest). While a source fails to list, the digest is neither sent nor marked before
-    DIGEST_HOUR + 2; from then on it is marked and sent (the listed items, if any) with
-    one extra message '(could not list: <kinds>)' naming the failed kinds. While the
-    digest is held no reminder is sent either: the held digest names those items at
-    DIGEST_HOUR + 2, so an item is not sent twice. A failing
+    digest once (from the digest hour local - NAVIGATOR_DIGEST_HOUR, default DIGEST_HOUR,
+    an hour that is never quiet - only when something waits) and, unless
+    NAVIGATOR_DECISIONS_NUDGES is 0/false, nudge merge/manual items that have waited
+    NUDGE_AFTER_S and were not nudged today (never right after a digest). While a source
+    fails to list, the digest is neither sent nor marked before the fallback hour
+    (digest hour + 2, capped at 22); from then on it is marked and sent (the listed
+    items, if any) with one extra message '(could not list: <kinds>)' naming the failed
+    kinds. While the digest is held no reminder is sent either: the held digest names
+    those items at the fallback hour, so an item is not sent twice. A bad value of
+    either variable raises ValueError naming it before any state write. A failing
     act.list_open_runs counts 'merge' as a failed source. The refreshed state is written BEFORE
     any send: when that write fails nothing is sent and {'items', 'state_write_failed':
     True} is returned, so an unwritable state file never turns into a digest every cycle.
@@ -387,6 +440,11 @@ def decisions_tick(act, notifier, now: datetime | None = None, state_file=None,
     now = datetime.now(timezone.utc) if now is None else now
     if now.tzinfo is None:
         raise ValueError("now must be tz-aware")
+    # a bad value raises here, before any state write
+    digest_at = digest_hour()
+    nudges = nudges_enabled()
+    # a digest hour of 21-23 would put +2 at 23-25 (quiet / never): cap the fallback
+    fallback_at = min(digest_at + 2, 22)
     local = now.astimezone(local_tz())
     today = local.date().isoformat()
     path = state_file or state_path()
@@ -418,16 +476,16 @@ def decisions_tick(act, notifier, now: datetime | None = None, state_file=None,
     n = len(items)
     if not write_state(path, state):
         return {"items": n, "state_write_failed": True}
-    if _quiet(local):
+    if _quiet(local, digest_at):
         return {"quiet": True, "items": n}
     digest_sent = False
-    # with a failed source the digest waits (unsent, unmarked) until DIGEST_HOUR + 2,
+    # with a failed source the digest waits (unsent, unmarked) until the fallback hour,
     # then goes out naming the kinds it could not list
-    digest_due = (local.hour >= DIGEST_HOUR and state["digest"] != today
-                  and (not failed or local.hour >= DIGEST_HOUR + 2))
-    # while the digest is held (a failed source, DIGEST_HOUR..DIGEST_HOUR + 2, not yet
-    # sent today) no reminder goes out either: the held digest will name those items
-    held = (bool(failed) and DIGEST_HOUR <= local.hour < DIGEST_HOUR + 2
+    digest_due = (local.hour >= digest_at and state["digest"] != today
+                  and (not failed or local.hour >= fallback_at))
+    # while the digest is held (a failed source, digest_at..fallback_at, not yet sent
+    # today) no reminder goes out either: the held digest will name those items
+    held = (bool(failed) and digest_at <= local.hour < fallback_at
             and state["digest"] != today)
     if digest_due:
         state["digest"] = today
@@ -441,9 +499,11 @@ def decisions_tick(act, notifier, now: datetime | None = None, state_file=None,
                     nudged[d.key] = today
         if failed:
             notifier.send("(could not list: " + ", ".join(sorted(failed)) + ")")
-    due = [] if held else [d for d in items if d.kind in NUDGE_KINDS
-                           and nudged.get(d.key) != today
-                           and _due(first_seen.get(d.key), now)]
+    # NAVIGATOR_DECISIONS_NUDGES=0: digest only (the digest's own nudged marks still
+    # happened above, so turning reminders back on never repeats a digested item)
+    due = [] if held or not nudges else [d for d in items if d.kind in NUDGE_KINDS
+                                          and nudged.get(d.key) != today
+                                          and _due(first_seen.get(d.key), now)]
     if due:
         for text in format_decisions(due, now, first_seen,
                                      header="Reminder - still waiting on you"):
