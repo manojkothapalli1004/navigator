@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 import httpx
 from structlog.testing import capture_logs
 
-from navigator.cli import is_audited, run_cli
+from navigator.cli import is_audited, merge_tier_of, run_cli
 from navigator.clients.act_client import ACTEventsTooLarge, FakeACTClient, HTTPACTClient
 from navigator.contracts.enums import ApprovalDecision, ApprovalGate, RunPhase
 from navigator.contracts.event import Event
@@ -467,3 +467,50 @@ def test_too_many_event_pages_fails_closed_and_logs_the_class_only():
     import pytest
     with pytest.raises(ACTEventsTooLarge):
         act.list_events(kinds={"run.audited"})
+
+
+# ---- merge_tier_of (3c) ------------------------------------------------------------
+
+def _review_with_tier(act, run, tier, ts):
+    act.emit_event(Event(kind="run.awaiting_review", correlation_id="corr-x", ts=ts,
+                         payload={"run_id": run.id, "verified_sha": VERIFIED_SHA,
+                                  "merge_tier": tier}))
+
+
+def test_merge_tier_of_reads_latest_awaiting_review_event():
+    act = FakeACTClient()
+    run = _run(act)                      # its awaiting_review event records no tier
+    assert merge_tier_of(act, run) is None
+    assert merge_tier_of(act, run.id) is None
+    base = datetime.now(timezone.utc)   # explicit, strictly increasing timestamps
+    _review_with_tier(act, run, "B", base + timedelta(seconds=1))
+    assert merge_tier_of(act, run) == "B"
+    assert merge_tier_of(act, run.id) == "B"
+    # another run's tier never bleeds over
+    act.emit_event(Event(kind="run.awaiting_review", correlation_id="corr-y",
+                         ts=base + timedelta(seconds=10),
+                         payload={"run_id": "run-other", "verified_sha": VERIFIED_SHA,
+                                  "merge_tier": "A"}))
+    assert merge_tier_of(act, run) == "B"
+    _review_with_tier(act, run, "C", base + timedelta(seconds=2))
+    assert merge_tier_of(act, run) == "C"
+    _review_with_tier(act, run, "Z", base + timedelta(seconds=3))
+    assert merge_tier_of(act, run) is None
+    assert merge_tier_of(act, "run-missing") is None
+    assert merge_tier_of(act, None) is None
+
+
+def test_merge_tier_of_unwraps_notifying_act_and_fails_closed_without_events():
+    class _Rec:
+        def __init__(self):
+            self.sent = []
+
+        def send(self, text):
+            self.sent.append(text)
+    inner = FakeACTClient()
+    run = _run(inner)
+    _review_with_tier(inner, run, "B", datetime.now(timezone.utc) + timedelta(seconds=1))
+    assert merge_tier_of(NotifyingACT(inner, _Rec()), run) == "B"
+    assert merge_tier_of(NotifyingACT(inner, _Rec()), run.id) == "B"
+    # no list_events, no .inner: the tier is unknown (fail closed), never guessed
+    assert merge_tier_of(ProtocolOnlyACT(inner), run) is None
