@@ -85,7 +85,8 @@ class Settings:
     sdk_builder_max_turns: int = 30
     sdk_builder_timeout_s: float = 900.0
     # builder test runner (build 2): when on, the tooled builder may run the repo's
-    # allowlisted pytest entry inside its worktree at most builder_test_runs times per turn; requires builder_tools
+    # allowlisted pytest entry inside its worktree at most builder_test_runs times per build (first attempt +
+    # repair turns share one budget); requires builder_tools
     builder_tests: bool = False
     builder_test_runs: int = 5
 
