@@ -14,7 +14,7 @@ from navigator.contracts.enums import RunPhase, RunStatus, ApprovalGate, Approva
 from navigator.runtime.worktree import (
     WorktreeHandle, create_worktree, preserve_failed, remove_worktree)
 from navigator.runtime.checkpoint import diff_artifact
-from navigator.runtime.merge_tiers import classify_for_repo, repo_config_for
+from navigator.runtime.merge_tiers import changed_files_for_run, classify_for_repo, repo_config_for
 from navigator.runtime.outcome_store import OutcomeStore
 from navigator.runtime.phases import NO_CHANGE_SUMMARY, reverify, run_build_and_verify, run_dir_for
 from navigator.ids import new_id
@@ -26,10 +26,17 @@ from navigator.safety.errors import QuotaExhaustedError
 # the Telegram inbox. Imported from their definitions so a renamed actor cannot
 # silently lock the operator out of the merge gate.
 _OPERATOR_ACTORS = frozenset({ACTOR, TELEGRAM_ACTOR})
+# 3b: the actor merge_poll records when it auto-approves an audited, green tier A run.
+# NEVER in _OPERATOR_ACTORS: the gate honours it only when it re-proves tier A itself
+# (auto_merge_ok) in the same call, so a forged auto approval merges nothing.
+AUTO_ACTOR = "navigator-auto-tier-a"
 
 # S3c: an approved merge approval that no operator gave after review would otherwise
 # park the run silently forever; the operator sees this reason once per run.
 _NOT_OPERATOR_REASON = "approval not from an operator after review"
+# 3b: a run whose only approvals are the auto actor's failed the merge-time re-check
+_AUTO_RECHECK_REASON = ("auto-merge re-check failed (stale after a rebase, not audited, or not tier A); "
+                        "waiting for a fresh audit or an operator word")
 # (run_id, reason) pairs already announced, the same per-run, per-reason dedupe
 # NotifyingACT (N4b) applies to its notifications - here so ACT also records the
 # block once rather than on every poll.
@@ -231,12 +238,14 @@ def _approved_merge_approvals(act, run) -> list:
     return list(act.list_approvals(target=run.id, gate=ApprovalGate.merge,
                                    decision=ApprovalDecision.approved))
 
-def _operator_approved(approvals, run) -> bool:
+def _operator_approved(approvals, run, allow_auto: bool = False) -> bool:
     """True only if one of `approvals` was given by an OPERATOR AFTER the run opened
-    for review (see _merge_approved for the rationale)."""
+    for review (see _merge_approved for the rationale). With allow_auto the AUTO_ACTOR
+    counts too, under the same decided_at rule; only merge_after_approval passes it, and
+    only after it re-proved tier A itself."""
     opened = getattr(run, "heartbeat_at", None)
     for appr in approvals:
-        if appr.actor not in _OPERATOR_ACTORS:
+        if appr.actor not in _OPERATOR_ACTORS and not (allow_auto and appr.actor == AUTO_ACTOR):
             continue
         decided = getattr(appr, "decided_at", None)
         if decided is not None and opened is not None and _as_utc(decided) < _as_utc(opened):
@@ -329,15 +338,23 @@ def _previous_failure(settings, proposal_id: str) -> dict:
     detail = (last.verification_notes or "; ".join(last.lessons) or last.summary)[-2000:]
     return {"previous_attempt_failure": f"{last.summary}: {detail}"}
 
-def merge_after_approval(run: Run, *, act, orc, driver, runner, settings, squash: bool = False) -> Run:
+def merge_after_approval(run: Run, *, act, orc, driver, runner, settings, squash: bool = False,
+                         allow_auto: bool = False) -> Run:
     approvals = _approved_merge_approvals(act, run)
-    if not _operator_approved(approvals, run):
+    by_operator = _operator_approved(approvals, run)
+    auto_ok = False
+    if (not by_operator and allow_auto and getattr(settings, "merge_tier_a_auto", False)
+            and _operator_approved(approvals, run, allow_auto=True)):
+        # the auto actor's word is accepted only when the gate itself re-proves tier A now
+        auto_ok = auto_merge_ok(act, run, _repo_for(run, act), settings)
+    if not (by_operator or auto_ok):
         if approvals:
             # approved, but by nobody the gate trusts (or before the run was reviewable):
             # the run stays parked, and the operator is told why - once per run
-            _emit_blocked_once(act, run, _NOT_OPERATOR_REASON,
+            only_auto = all(str(a.actor) == AUTO_ACTOR for a in approvals)
+            _emit_blocked_once(act, run, _AUTO_RECHECK_REASON if only_auto else _NOT_OPERATOR_REASON,
                                actors=sorted({str(a.actor) for a in approvals}))
-        return run  # never auto-merge
+        return run  # never merge on a non-operator approval unless the gate itself re-proved tier A right now
     repo = _repo_for(run, act)
     missing = _missing_branch(repo, run)
     if missing:
@@ -368,12 +385,32 @@ def merge_after_approval(run: Run, *, act, orc, driver, runner, settings, squash
         return run
     run.phase = RunPhase.finalizing; run.status = RunStatus.completed
     run.ended_at = datetime.now(timezone.utc); _save(act, run)
-    _write_outcome(orc, run, status="completed", summary="merged after approval",
-                   lessons=["change merged"], section="decisions", settings=settings)
+    auto = not by_operator
+    merged = _git_run(repo, "rev-parse", "HEAD")
+    merged_sha = merged.stdout.strip() if merged.returncode == 0 else ""
+    revert = ((f"git -C {repo} revert {merged_sha}" if squash else f"git -C {repo} revert -m 1 {merged_sha}")
+              if merged_sha else f"merge sha unknown - run: git -C {repo} log -1")
+    try:  # FIRST: the operator's note (Telegram goes through the ACT emit) must survive an ORC failure
+        _emit(act, run, "run.completed", merge_sha=merged_sha, auto=auto, revert=revert)
+    except Exception as e:
+        _log.warning("merge.completed_event_failed", run_id=run.id, error=type(e).__name__)
+    if auto:  # close the operator's leftover pending approval: the merge is done, so `navigator reject` must not
+        try:  # be able to "decline" it afterwards and print "applied on the daemon's next cycle"
+            for a in act.list_approvals(target=run.id, gate=ApprovalGate.merge,
+                                        decision=ApprovalDecision.pending):
+                act.decide_approval(a.id, ApprovalDecision.approved, actor=AUTO_ACTOR)
+        except Exception as e:
+            _log.warning("merge.leftover_approval_close_failed", run_id=run.id, error=type(e).__name__)
+    try:
+        _write_outcome(orc, run, status="completed",
+                       summary="merged automatically (tier A)" if auto else "merged after approval",
+                       lessons=["change merged (tier A auto-merge)" if auto else "change merged"],
+                       section="decisions", settings=settings)
+    except Exception as e:  # HTTPORCClient raises on ReadTimeout (seen live); the merge is already done
+        _log.warning("merge.outcome_write_failed", run_id=run.id, error=type(e).__name__)
     _cleanup_worktree(run, repo)
     if squash:
         subprocess.run(["git", "branch", "-D", run.branch], cwd=repo, capture_output=True, text=True)
-    _emit(act, run, "run.completed")
     return run
 
 _REASON_PREFIX = "reason="
@@ -474,6 +511,59 @@ def _git_run(cwd, *args) -> subprocess.CompletedProcess:
     except subprocess.TimeoutExpired:
         return subprocess.CompletedProcess(argv, 124, stdout="",
                                            stderr=f"git timed out after {_GIT_TIMEOUT_S}s")
+
+
+# ---- 3b: tier A auto-merge checks (recomputed from git and ACT at the moment of use) ----
+
+def base_on_head(repo, run) -> bool:
+    """run.base_commit_sha is an ancestor of the repo's current HEAD (bounded git call). False
+    when the operator rewound main past the run's base: the run's own base..verified diff
+    would then hide the dropped commits, and merging it would silently put them back."""
+    base = getattr(run, "base_commit_sha", None)
+    if not base:
+        return False
+    return _git_run(repo, "merge-base", "--is-ancestor", base, "HEAD").returncode == 0
+
+
+def _ran_pytest(entry: dict) -> bool:
+    argv = entry.get("argv_list") or str(entry.get("argv") or "").split()
+    argv = [str(a) for a in argv]
+    return bool(argv) and (argv[0] == "pytest" or (argv[:2] == ["uv", "run"] and "pytest" in argv))
+
+
+def suite_green(verification: list, changed: list) -> bool:
+    """The recorded verification proves the change: a non-empty log whose LAST entry has
+    returncode 0 and, when any changed path is a .py file, at least one entry ran pytest
+    (argv_list[0] == "pytest", or argv_list[:2] == ["uv", "run"] with "pytest" in argv_list;
+    argv_list falls back to argv.split())."""
+    entries = [e for e in (verification or []) if isinstance(e, dict)]
+    if not entries:
+        return False
+    if entries[-1].get("returncode") != 0:
+        return False
+    if any(str(p).endswith(".py") for p in (changed or [])):
+        return any(_ran_pytest(e) for e in entries)
+    return True
+
+
+def auto_merge_ok(act, run, repo, settings) -> bool:
+    """Every tier A auto-merge condition, recomputed from git and ACT at the moment of use
+    (defence in depth: an approval record, an audit record or a tier payload can all be
+    forged or go stale): the run is audited (is_audited), its base is on HEAD (base_on_head),
+    its own commits classify as tier A, and its recorded verification is green. Any
+    exception is False and logged by class name only."""
+    try:
+        if not is_audited(act, run) or not base_on_head(repo, run):
+            return False
+        changed = changed_files_for_run(repo, run)
+        if changed is None:
+            return False
+        if classify_for_repo(changed, repo, repo_config_for(settings, repo)) != "A":
+            return False
+        return suite_green(run.verification, changed)
+    except Exception as e:
+        _log.warning("merge.auto_check_failed", run_id=run.id, error=type(e).__name__)
+        return False
 
 
 def _head(wt) -> str:
