@@ -53,11 +53,12 @@ from pathlib import Path
 
 import httpx
 
-from navigator.cli import is_audited
+from navigator.cli import is_audited, merge_tier_of
 from navigator.contracts.enums import ApprovalDecision, ApprovalGate, RunPhase
 from navigator.contracts.event import Event
 from navigator.observability.logging import get_logger
 from navigator.observability.notify import load_telegram_credentials
+from navigator.runtime.merge_tiers import batch_enabled
 
 log = get_logger("navigator.telegram_inbox")
 
@@ -91,6 +92,8 @@ class TelegramCommand:
     run_id: str | None  # full run id; None for the shorthand forms (resolved at apply time)
     update_id: int
     name: str | None = None  # 'merge <name>': proposal short name; None for bare 'merge'
+    batch: bool = False  # 'merge all [except ...]' (3c)
+    exclude: tuple[str, ...] = ()  # names/run ids left out of 'merge all'
 
 
 def short_name(title: str) -> str:
@@ -105,15 +108,40 @@ def parse_command(text, update_id: int) -> TelegramCommand | None:
       '/merge <run-id>' / '/reject <run-id>'  -> full run id (must match RUN_ID)
       'merge' / 'reject'                      -> the one run waiting for merge
       'merge <name>' / 'reject <name>'        -> the run whose proposal short name is <name>
-    Anything else is not a command ('merge looks good?' is ordinary chat)."""
+      'merge all' / 'merge all except a,b'    -> every audited tier A/B run at the gate
+                                                 (3c; excluded names are short names or
+                                                 FULL run ids, comma or space separated)
+    Anything else is not a command ('merge looks good?' is ordinary chat). Consequence:
+    a proposal short-named 'all' can no longer be merged by name; use its run id."""
     if not isinstance(text, str) or "\n" in text or "\r" in text:
         return None
     parts = text.strip().split()
-    if not parts or len(parts) > 2:
+    if not parts:
         return None
     word = parts[0].lower()
     action = _ACTIONS.get(word if word.startswith("/") else "/" + word)
     if action is None:
+        return None
+    if len(parts) >= 2 and parts[1].lower() == "all":
+        if action != "merge":
+            return None
+        if len(parts) == 2:
+            return TelegramCommand(action="merge", run_id=None, update_id=update_id, batch=True)
+        if parts[2].lower() != "except" or len(parts) < 4:
+            return None
+        # commas only inside the except list
+        names = tuple(n for chunk in parts[3:] for n in chunk.split(",") if n)
+        # each excluded name is a short name OR a FULL run id (SHORT_NAME alone would
+        # accept a truncated "run-01ABC"; the single-run path refuses those too). A
+        # candidate whose proposal vanished has its run id as its short name and must
+        # still be excludable.
+        if not names or any((n.lower().startswith("run-") and not RUN_ID.fullmatch(n))
+                            or not (RUN_ID.fullmatch(n) or SHORT_NAME.fullmatch(n))
+                            for n in names):
+            return None
+        return TelegramCommand(action="merge", run_id=None, update_id=update_id, batch=True,
+                               exclude=names)
+    if len(parts) > 2:
         return None
     if len(parts) == 1:
         return TelegramCommand(action=action, run_id=None, update_id=update_id)
@@ -325,7 +353,10 @@ def _apply_wording() -> str:
 
 
 def _label(cmd: TelegramCommand) -> str:
-    """How the operator typed it, for replies: '/merge <run-id>', '/merge N5b' or '/merge'."""
+    """How the operator typed it, for replies: '/merge <run-id>', '/merge N5b', '/merge',
+    '/merge all' or '/merge all except a,b'."""
+    if cmd.batch:
+        return "/merge all" + (f" except {','.join(cmd.exclude)}" if cmd.exclude else "")
     arg = cmd.run_id or cmd.name
     return f"/{cmd.action} {arg}" if arg else f"/{cmd.action}"
 
@@ -398,7 +429,98 @@ def _reply(notifier, text: str) -> None:
         log.warning("telegram.reply_failed", error=type(e).__name__)
 
 
+def _apply_batch(act, cmd: TelegramCommand, notifier) -> dict:
+    """'merge all [except names]': approve the pending merge approval of every candidate
+    (audited, pending, awaiting review) whose recorded tier is A or B. Tier C and
+    unknown tiers are listed and left alone (they need 'merge <name>'); excluded names
+    are listed. One reply, one run.telegram_decision event per approved run. Only a
+    raise BEFORE the loop propagates to apply_commands; per-run failures are reported
+    in the summary so a re-sent 'merge all' cannot lose the runs already approved."""
+    if not batch_enabled():
+        notifier.send("Navigator: merge all is off - set NAVIGATOR_MERGE_TIER_B_BATCH=1 "
+                      "for the Telegram process")
+        return {"run_id": None, "action": "merge", "applied": False, "reason": "batch off"}
+    cands = _candidates(act)
+    if not cands:
+        notifier.send("Navigator: merge all - nothing waiting for merge")
+        return {"run_id": None, "action": "merge", "applied": False,
+                "reason": "nothing waiting for merge"}
+    excluded = {e.lower() for e in cmd.exclude}
+    known = ({short.lower() for _, short, _ in cands}
+             | {run.id.lower() for run, _, _ in cands})
+    # operator's own spelling in the reply
+    unmatched = sorted(e for e in cmd.exclude if e.lower() not in known)
+    if unmatched:
+        # a typo in the except list must never merge the run the operator meant to hold back
+        notifier.send("Navigator: merge all NOT applied - unknown name(s) in except: "
+                      + ", ".join(unmatched) + "\nwaiting: "
+                      + ", ".join(_reply_arg(run, short) for run, short, _ in cands))
+        return {"run_id": None, "action": "merge", "applied": False,
+                "reason": "unknown excluded name"}
+    approved, tier_c, unknown, left_out, failed, already = [], [], [], [], [], []
+    event_failed = False
+    for run, short, title in cands:
+        if short.lower() in excluded or run.id.lower() in excluded:
+            left_out.append(short)
+            continue
+        tier = merge_tier_of(act, run)
+        if tier is None:
+            unknown.append(f"merge {_reply_arg(run, short)}")
+            continue
+        if tier == "C":
+            tier_c.append(f"merge {_reply_arg(run, short)}")
+            continue
+        try:
+            pending = act.list_approvals(target=run.id, gate=ApprovalGate.merge,
+                                         decision=ApprovalDecision.pending)
+            if not pending:
+                already.append(short)  # decided between _candidates and this re-read
+                continue
+            act.decide_approval(pending[0].id, ApprovalDecision.approved, actor=TELEGRAM_ACTOR)
+        except Exception as e:
+            # one run's ACT failure must not hide the runs already approved
+            log.warning("telegram.batch_run_failed", run_id=run.id, error=type(e).__name__)
+            failed.append(f"{short} ({type(e).__name__})")
+            continue
+        try:
+            act.emit_event(Event(kind="run.telegram_decision", correlation_id=run.correlation_id,
+                                 payload={"run_id": run.id, "decision": "approved",
+                                          "update_id": cmd.update_id, "batch": True}))
+        except Exception as e:
+            log.warning("telegram.decision_event_failed", run_id=run.id,
+                        error=type(e).__name__)
+            event_failed = True
+        approved.append((run.id, f"{short} - {title} (tier {tier})"))
+    # fixed wording (not _apply_wording()): after the first batch merge lands, merge_poll
+    # rebases the siblings and a sibling whose diff changed goes stale and needs a fresh
+    # audit + word
+    lines = [f"Navigator: merge all - {len(approved)} merge(s) approved from Telegram; "
+             "merges apply as each sibling rebase stays clean"
+             + (" (event log failed)" if event_failed else "")]
+    lines += [f"- {text}" for _, text in approved]
+    if tier_c:
+        lines.append("tier C, needs its own word: " + ", ".join(tier_c))
+    if unknown:
+        lines.append("tier unknown, needs its own word: " + ", ".join(unknown))
+    if left_out:
+        lines.append("excluded: " + ", ".join(left_out))
+    if failed:
+        lines.append("failed, re-send 'merge <name>' for: " + ", ".join(failed))
+    if already:
+        lines.append("already decided meanwhile: " + ", ".join(already))
+    try:
+        notifier.send("\n".join(lines))
+    except Exception as e:
+        # approvals stand; the log is the record
+        log.warning("telegram.batch_reply_failed", error=type(e).__name__)
+    return {"run_id": None, "action": "merge", "applied": bool(approved),
+            "reason": None if approved else "nothing applicable",
+            "approved": [rid for rid, _ in approved]}
+
+
 def _apply_one(act, cmd: TelegramCommand, notifier) -> dict:
+    if cmd.batch:
+        return _apply_batch(act, cmd, notifier)
     run_id = cmd.run_id
     resolved = None
     if run_id is None:
