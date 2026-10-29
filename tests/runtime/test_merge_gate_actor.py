@@ -8,7 +8,8 @@ from datetime import datetime, timedelta, timezone
 from navigator import cli
 from navigator.observability import telegram_inbox
 from navigator.runtime import executor
-from navigator.runtime.executor import execute_proposal, merge_after_approval, _merge_approved
+from navigator.runtime.executor import (execute_proposal, merge_after_approval, _merge_approved,
+                                        _operator_approved, AUTO_ACTOR)
 from navigator.contracts.approval import Approval
 from navigator.contracts.run import Run
 from navigator.contracts.enums import (RunPhase, RunStatus, ApprovalGate, ApprovalDecision,
@@ -202,3 +203,36 @@ def test_one_valid_operator_approval_among_forged_ones_suffices():
                     _approval(run, cli.ACTOR, opened - timedelta(minutes=5)),
                     _approval(run, cli.ACTOR, opened + timedelta(minutes=5))])
     assert _merge_approved(act, run)
+
+
+def test_auto_actor_is_ignored_without_allow_auto(tmp_path):
+    # 3b: the auto actor is never an operator; only merge_poll's allow_auto path (which
+    # re-proves tier A itself) may honour it
+    assert AUTO_ACTOR not in executor._OPERATOR_ACTORS
+    opened = datetime(2026, 10, 16, 12, 0, 0, tzinfo=timezone.utc)
+    parked = _parked_run(opened)
+    auto = [_approval(parked, AUTO_ACTOR, opened + timedelta(minutes=1))]
+    assert _operator_approved(auto, parked) is False
+    assert _operator_approved(auto, parked, allow_auto=True) is True
+    # the decided_at-after-heartbeat rule applies to the auto actor too
+    stale = [_approval(parked, AUTO_ACTOR, opened - timedelta(minutes=1))]
+    assert _operator_approved(stale, parked, allow_auto=True) is False
+    assert not _merge_approved(_StubACT(auto), parked)
+    # a real merge call without allow_auto, flag on: the run stays unmerged, one notice
+    repo, sha = _seed(tmp_path); d = _deps(tmp_path, repo)
+    d["settings"].merge_tier_a_auto = True
+    run = execute_proposal(_proposal(repo, sha), **d)
+    _decide(d, run, AUTO_ACTOR)
+    out = merge_after_approval(run, **d)
+    assert out is run
+    stored = d["act"].runs[run.id]
+    assert stored.status == RunStatus.executing
+    assert stored.phase == RunPhase.awaiting_review
+    assert "navigator_touch.py" not in _tracked(repo)
+    assert not [e for e in d["act"].events if e.kind == "run.completed"]
+    blocked = _blocked_events(d["act"].events)
+    assert len(blocked) == 1
+    assert blocked[0].payload["reason"] == executor._AUTO_RECHECK_REASON
+    assert blocked[0].payload["actors"] == [AUTO_ACTOR]
+    merge_after_approval(run, **d)
+    assert len(_blocked_events(d["act"].events)) == 1

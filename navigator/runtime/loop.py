@@ -11,7 +11,7 @@ from navigator.contracts.event import Event
 from navigator.contracts.enums import (ProposalStatus, RunStatus, RunPhase, ApprovalGate,
                                        ApprovalDecision)
 from navigator.runtime.executor import (execute_proposal, merge_after_approval, decline_run,
-                                        rebase_stale_runs)
+                                        rebase_stale_runs, AUTO_ACTOR, auto_merge_ok, _as_utc)
 from navigator.runtime.lock import SingleFlightLock
 from navigator.runtime.outcome_store import OutcomeStore, title_lessons
 from navigator.observability.logging import get_logger
@@ -391,6 +391,54 @@ class Navigator:
         return s.mode == "execute" or (s.mode == "dry_run"
                                        and bool(getattr(s, "merge_in_dry_run", False)))
 
+    def _auto_approve_tier_a(self, run, approvals) -> bool:
+        """Tier A auto-approval (settings.merge_tier_a_auto): no operator decision and no FRESH
+        auto decision exists (a stale auto approval, decided before the run's last rebase moved
+        heartbeat_at, does not count) and auto_merge_ok (audited, base on HEAD, own commits
+        tier A, verification green) holds. Records a NEW approved merge approval by AUTO_ACTOR
+        - the operator's pending approval is left untouched, so `navigator reject` / Telegram
+        reject still find it and a decline still wins in merge_poll - plus a
+        run.auto_merge_approved event. True when it approved. Idempotent: on the next poll
+        the auto approval is decided, so this returns False."""
+        if not getattr(self.settings, "merge_tier_a_auto", False):
+            return False
+        if not approvals:
+            return False
+        hb = getattr(run, "heartbeat_at", None)
+        opened = _as_utc(hb) if hb is not None else None
+        for a in approvals:
+            if a.decision == ApprovalDecision.pending:
+                continue
+            if str(a.actor) != AUTO_ACTOR:
+                return False  # any operator decision: never touch
+            decided = _as_utc(a.decided_at) if a.decided_at is not None else None  # _as_utc does NOT accept None
+            if opened is None or decided is None or decided >= opened:
+                return False  # a FRESH auto approval already exists
+            # a STALE one (decided before the run's last rebase moved heartbeat_at) is ignored
+            # by _operator_approved anyway, so it must not block a new one once the run is re-audited
+        if sum(1 for a in approvals if a.decision == ApprovalDecision.pending) >= 2:
+            # a half-done earlier attempt left an extra pending approval; do not pile up
+            # more - the operator's word still works
+            log.warning("merge_poll.auto_orphan_pending", run_id=run.id)
+            return False
+        if not auto_merge_ok(self.act, run, self.repo, self.settings):
+            return False
+        try:
+            auto = self.act.create_approval(target=run.id, gate=ApprovalGate.merge)
+            # no note= kwarg: the tests/support.py decide_approval wrapper has none
+            self.act.decide_approval(auto.id, ApprovalDecision.approved, actor=AUTO_ACTOR)
+        except Exception as e:  # ACT down between the two calls: never let it escape merge_poll
+            log.warning("merge_poll.auto_approve_failed", run_id=run.id, error=type(e).__name__)
+            return False
+        try:
+            self.act.emit_event(Event(kind="run.auto_merge_approved", correlation_id=run.correlation_id,
+                                      payload={"run_id": run.id, "proposal_id": run.proposal_id,
+                                               "tier": "A"}))
+        except Exception as e:
+            log.warning("merge_poll.auto_event_failed", run_id=run.id, error=type(e).__name__)
+        log.info("merge_poll.auto_approved_tier_a", run_id=run.id)
+        return True
+
     def merge_poll(self) -> list:
         """Act on operator decisions at the merge gate; returns runs that finished.
         Runs in execute mode, or in dry_run when settings.merge_in_dry_run is set."""
@@ -415,14 +463,16 @@ class Navigator:
                 prop = self.act.get_proposal(run.proposal_id)
                 if prop is None or prop.repo != self.repo:
                     continue
-                decisions = {a.decision for a in
-                             self.act.list_approvals(target=run.id, gate=ApprovalGate.merge)}
+                approvals = self.act.list_approvals(target=run.id, gate=ApprovalGate.merge)
+                if self._auto_approve_tier_a(run, approvals):
+                    approvals = self.act.list_approvals(target=run.id, gate=ApprovalGate.merge)
+                decisions = {a.decision for a in approvals}
                 if ApprovalDecision.declined in decisions:
                     done.append(decline_run(run, act=self.act, orc=self.orc, settings=self.settings))
                 elif ApprovalDecision.approved in decisions:
                     run = merge_after_approval(run, act=self.act, orc=self.orc, driver=self.driver,
                                                runner=self.runner, settings=self.settings,
-                                               squash=self.squash)
+                                               squash=self.squash, allow_auto=True)
                     if run.status != RunStatus.executing:
                         done.append(run)
                     if (run.status == RunStatus.completed

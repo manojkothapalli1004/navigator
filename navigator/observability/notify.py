@@ -130,7 +130,12 @@ class NotifyingACT:
         if kind == "run.declined":
             return f"Navigator: {run_id} declined; worktree kept for inspection"
         if kind == "run.completed":
-            return f"Navigator: {run_id} merged"
+            text = f"Navigator: {run_id} merged"
+            if p.get("auto"):
+                text += " automatically (tier A: tests/docs only, audited, verification green)"
+            if p.get("revert"):
+                text += f"\nrevert: {p['revert']}"
+            return text
         if kind == "run.deferred":
             # N16: the payload carries the error CLASS and a reset time, never SDK text
             return (f"Navigator: {run_id} deferred - {p.get('error') or 'quota exhausted'}; "
