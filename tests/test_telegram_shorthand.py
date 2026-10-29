@@ -12,13 +12,13 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from navigator.cli import is_audited, run_cli
+from navigator.cli import is_audited, merge_tier_of, run_cli
 from navigator.clients.act_client import FakeACTClient
 from navigator.contracts.enums import ApprovalDecision, ApprovalGate, RunPhase
 from navigator.contracts.event import Event
 from navigator.contracts.proposal import Proposal
 from navigator.contracts.run import Run
-from navigator.observability.telegram_inbox import (TELEGRAM_ACTOR, TelegramCommand,
+from navigator.observability.telegram_inbox import (TELEGRAM_ACTOR, TelegramCommand, _label,
                                                     apply_commands, parse_command, short_name)
 from tests.test_telegram_inbox import (VERIFIED_SHA, _Recorder, _decisions, _inbox, _merge,
                                        _update)
@@ -30,6 +30,8 @@ _seq = itertools.count(1)
 def _execute_mode(monkeypatch):
     monkeypatch.setenv("NAVIGATOR_MODE", "execute")
     monkeypatch.delenv("NAVIGATOR_MERGE_IN_DRY_RUN", raising=False)
+    # an exported value must not leak into the 'flag unset' merge-all cases
+    monkeypatch.delenv("NAVIGATOR_MERGE_TIER_B_BATCH", raising=False)
 
 
 def _run(act, title, audited=True, pending=True, phase=RunPhase.awaiting_review):
@@ -384,3 +386,234 @@ def test_run_like_short_name_lists_run_id_to_reply_with():
     apply_commands(act, [TelegramCommand("merge", None, 1)], rec)
     lines = rec.sent[0].splitlines()
     assert f"run-01 - run-01 fix the thing - reply: merge {a.id}" in lines
+
+
+# ---- 3c: merge all / merge all except ... ---------------------------------------
+
+BATCH_OFF = ("Navigator: merge all is off - set NAVIGATOR_MERGE_TIER_B_BATCH=1 for the "
+             "Telegram process")
+FULL_ID = "run-01ARZ3NDEKTSV4RRFFQ69G5FAV"
+
+
+def _tiered(act, title, tier):
+    """An audited candidate whose LATEST run.awaiting_review event records merge_tier.
+    The tier event is emitted before `navigator audited` (is_audited needs the audit
+    strictly after the latest awaiting_review event)."""
+    run = _run(act, title, audited=False)
+    act.emit_event(Event(kind="run.awaiting_review", correlation_id=run.correlation_id,
+                         ts=datetime.now(timezone.utc) - timedelta(seconds=0.5),
+                         payload={"run_id": run.id, "verified_sha": VERIFIED_SHA,
+                                  "merge_tier": tier}))
+    assert run_cli(["audited", run.id], act=act, out=io.StringIO()) == 0
+    assert is_audited(act, run.id)
+    assert merge_tier_of(act, run) == tier
+    return run
+
+
+def test_merge_all_parses():
+    assert parse_command("merge all", 1) == TelegramCommand("merge", None, 1, batch=True)
+    assert parse_command("/merge ALL", 1) == TelegramCommand("merge", None, 1, batch=True)
+    assert parse_command("MERGE ALL except N5b,S3a", 2) == TelegramCommand(
+        "merge", None, 2, batch=True, exclude=("N5b", "S3a"))
+    assert parse_command("merge all except N5b S3a", 2) == TelegramCommand(
+        "merge", None, 2, batch=True, exclude=("N5b", "S3a"))
+    assert parse_command("merge all except N5b, S3a", 2) == TelegramCommand(
+        "merge", None, 2, batch=True, exclude=("N5b", "S3a"))
+    assert parse_command(f"merge all except {FULL_ID}", 2) == TelegramCommand(
+        "merge", None, 2, batch=True, exclude=(FULL_ID,))
+    for text in ("reject all", "/reject all except N5b", "merge all except", "merge,",
+                 "merge,N5b", "merge all except run-01ABC", "merge all now",
+                 "merge all except ,", "merge all except N5b?", f"{FULL_ID},"):
+        assert parse_command(text, 3) is None, text
+    # the single-run forms are unchanged
+    assert parse_command("merge N5b", 1) == TelegramCommand("merge", None, 1, name="N5b")
+    assert parse_command("merge", 1) == TelegramCommand("merge", None, 1)
+    assert parse_command(f"merge {FULL_ID}", 1) == TelegramCommand("merge", FULL_ID, 1)
+
+
+def test_label_for_batch():
+    assert _label(TelegramCommand("merge", None, 1, batch=True)) == "/merge all"
+    assert _label(TelegramCommand("merge", None, 1, batch=True,
+                                  exclude=("a", "b"))) == "/merge all except a,b"
+    assert _label(TelegramCommand("merge", None, 1, name="N5b")) == "/merge N5b"
+
+
+def test_merge_all_approves_tier_a_and_b_and_lists_c(tmp_path, monkeypatch):
+    monkeypatch.setenv("NAVIGATOR_MERGE_TIER_B_BATCH", "1")
+    act = FakeACTClient()
+    a = _tiered(act, "N5b: inbox", "B")
+    b = _tiered(act, "D1: docs", "A")
+    c = _tiered(act, "T9: trader exp", "C")
+    u = _run(act, "U1: untiered")  # audited, but no tier recorded
+    rec = _Recorder()
+    cmds = _inbox(tmp_path, [_update(7, "merge all")]).poll_once()
+    assert cmds == [TelegramCommand("merge", None, 7, batch=True)]
+    results = apply_commands(act, cmds, rec)
+    assert len(results) == 1
+    assert results[0]["applied"] is True and results[0]["reason"] is None
+    assert sorted(results[0]["approved"]) == sorted([a.id, b.id])
+    assert _pending(act, a.id) == 0 and _pending(act, b.id) == 0
+    assert _pending(act, c.id) == 1 and _approved(act, c.id) == []
+    assert _pending(act, u.id) == 1 and _approved(act, u.id) == []
+    assert len(_approved(act, a.id)) == 1 and len(_approved(act, b.id)) == 1
+    assert all(ap.actor == TELEGRAM_ACTOR for ap in _approved(act, a.id) + _approved(act, b.id))
+    ev = _decisions(act)
+    assert len(ev) == 2
+    assert sorted(e.payload["run_id"] for e in ev) == sorted([a.id, b.id])
+    for e in ev:
+        assert e.payload == {"run_id": e.payload["run_id"], "decision": "approved",
+                             "update_id": 7, "batch": True}
+    assert len(rec.sent) == 1
+    text = rec.sent[0]
+    assert "2 merge(s) approved" in text and "approved from Telegram" in text
+    assert "N5b - N5b: inbox (tier B)" in text
+    assert "D1 - D1: docs (tier A)" in text
+    assert "tier C, needs its own word: merge T9" in text
+    assert "tier unknown, needs its own word: merge U1" in text
+    assert "excluded:" not in text and "failed," not in text
+
+
+def test_merge_all_except_skips_named(monkeypatch):
+    monkeypatch.setenv("NAVIGATOR_MERGE_TIER_B_BATCH", "1")
+    act = FakeACTClient()
+    a = _tiered(act, "N5b: inbox", "B")
+    b = _tiered(act, "D1: docs", "A")
+    rec = _Recorder()
+    results = apply_commands(act, [TelegramCommand("merge", None, 8, batch=True,
+                                                   exclude=("n5b",))], rec)
+    assert results[0]["applied"] is True
+    assert results[0]["approved"] == [b.id]
+    assert _pending(act, a.id) == 1 and _approved(act, a.id) == []
+    assert _pending(act, b.id) == 0 and len(_approved(act, b.id)) == 1
+    assert [e.payload["run_id"] for e in _decisions(act)] == [b.id]
+    assert len(rec.sent) == 1
+    assert "1 merge(s) approved" in rec.sent[0]
+    assert "excluded: N5b" in rec.sent[0]
+    # a candidate can also be excluded by its full run id
+    c = _tiered(act, "S3a: squash", "B")
+    results = apply_commands(act, [TelegramCommand("merge", None, 9, batch=True,
+                                                   exclude=(c.id, "N5b"))], rec)
+    assert results[0]["applied"] is False and results[0]["reason"] == "nothing applicable"
+    assert _pending(act, a.id) == 1 and _pending(act, c.id) == 1
+    assert "excluded: N5b, S3a" in rec.sent[-1]
+
+
+def test_merge_all_with_unknown_excluded_name_approves_nothing(monkeypatch):
+    monkeypatch.setenv("NAVIGATOR_MERGE_TIER_B_BATCH", "1")
+    act = FakeACTClient()
+    a = _tiered(act, "N5b: inbox", "B")
+    b = _tiered(act, "D1: docs", "A")
+    rec = _Recorder()
+    results = apply_commands(act, [TelegramCommand("merge", None, 8, batch=True,
+                                                   exclude=("N5d",))], rec)  # typo for N5b
+    assert results == [{"run_id": None, "action": "merge", "applied": False,
+                        "reason": "unknown excluded name"}]
+    assert _pending(act, a.id) == 1 and _pending(act, b.id) == 1
+    assert _approved(act, a.id) == [] and _approved(act, b.id) == []
+    assert _decisions(act) == []
+    assert len(rec.sent) == 1
+    assert "NOT applied" in rec.sent[0] and "N5d" in rec.sent[0]
+    assert "n5d" not in rec.sent[0]
+    assert "waiting: N5b, D1" in rec.sent[0]
+
+
+def test_merge_all_reports_a_failing_run_and_keeps_the_rest(monkeypatch):
+    monkeypatch.setenv("NAVIGATOR_MERGE_TIER_B_BATCH", "1")
+    act = FakeACTClient()
+    a = _tiered(act, "N1: one", "B")
+    b = _tiered(act, "N2: two", "B")
+    c = _tiered(act, "N3: three", "B")
+    real = act.decide_approval
+    state = {"raised": False}
+
+    def flaky(approval_id, decision, actor, note=None):
+        if act.approvals[approval_id].target == b.id and not state["raised"]:
+            state["raised"] = True
+            raise RuntimeError("ACT hiccup at http://act.local/botSECRETTOKEN")
+        return real(approval_id, decision, actor) if note is None \
+            else real(approval_id, decision, actor, note=note)
+    act.decide_approval = flaky
+    rec = _Recorder()
+    results = apply_commands(act, [TelegramCommand("merge", None, 9, batch=True)], rec)
+    assert results[0]["applied"] is True
+    assert sorted(results[0]["approved"]) == sorted([a.id, c.id])
+    assert _pending(act, a.id) == 0 and _pending(act, c.id) == 0
+    assert _pending(act, b.id) == 1 and _approved(act, b.id) == []
+    ev = _decisions(act)
+    assert len(ev) == 2 and sorted(e.payload["run_id"] for e in ev) == sorted([a.id, c.id])
+    assert len(rec.sent) == 1
+    text = rec.sent[0]
+    assert "2 merge(s) approved" in text
+    assert "failed, re-send 'merge <name>' for: N2 (RuntimeError)" in text
+    assert "SECRETTOKEN" not in text
+
+
+def test_merge_all_off_changes_nothing(monkeypatch):
+    act = FakeACTClient()
+    a = _tiered(act, "N5b: inbox", "B")
+    b = _tiered(act, "D1: docs", "A")
+    rec = _Recorder()
+    results = apply_commands(act, [TelegramCommand("merge", None, 1, batch=True)], rec)
+    assert results == [{"run_id": None, "action": "merge", "applied": False,
+                        "reason": "batch off"}]
+    assert _pending(act, a.id) == 1 and _pending(act, b.id) == 1
+    assert _decisions(act) == []
+    assert rec.sent == [BATCH_OFF]
+    # a malformed value is off too
+    monkeypatch.setenv("NAVIGATOR_MERGE_TIER_B_BATCH", "maybe")
+    rec = _Recorder()
+    results = apply_commands(act, [TelegramCommand("merge", None, 2, batch=True,
+                                                   exclude=("N5b",))], rec)
+    assert results[0]["applied"] is False and results[0]["reason"] == "batch off"
+    assert _pending(act, a.id) == 1 and _pending(act, b.id) == 1
+    assert rec.sent == [BATCH_OFF]
+    # the single-run forms do not depend on the flag
+    results = apply_commands(act, [TelegramCommand("merge", None, 3, name="N5b")], rec)
+    assert results[0]["applied"] is True and _pending(act, a.id) == 0
+
+
+def test_merge_all_with_nothing_waiting(monkeypatch):
+    monkeypatch.setenv("NAVIGATOR_MERGE_TIER_B_BATCH", "1")
+    act = FakeACTClient()
+    rec = _Recorder()
+    results = apply_commands(act, [TelegramCommand("merge", None, 1, batch=True)], rec)
+    assert results == [{"run_id": None, "action": "merge", "applied": False,
+                        "reason": "nothing waiting for merge"}]
+    assert act.events == []
+    assert rec.sent == ["Navigator: merge all - nothing waiting for merge"]
+
+
+def test_merge_all_never_touches_unaudited_runs(monkeypatch):
+    monkeypatch.setenv("NAVIGATOR_MERGE_TIER_B_BATCH", "1")
+    act = FakeACTClient()
+    run = _run(act, "X1: x", audited=False)
+    act.emit_event(Event(kind="run.awaiting_review", correlation_id=run.correlation_id,
+                         ts=datetime.now(timezone.utc) - timedelta(seconds=0.5),
+                         payload={"run_id": run.id, "verified_sha": VERIFIED_SHA,
+                                  "merge_tier": "B"}))
+    assert merge_tier_of(act, run) == "B" and not is_audited(act, run.id)
+    _run(act, "S4: no approval", pending=False)
+    _run(act, "S5: still building", phase=RunPhase.building, audited=False)
+    rec = _Recorder()
+    results = apply_commands(act, [TelegramCommand("merge", None, 1, batch=True)], rec)
+    assert results[0]["applied"] is False
+    assert results[0]["reason"] == "nothing waiting for merge"
+    assert _pending(act, run.id) == 1 and _approved(act, run.id) == []
+    assert _decisions(act) == []
+
+
+def test_merge_all_through_poll_once_and_bare_merge_still_lists_both(tmp_path, monkeypatch):
+    # 'merge all' no longer parses as the short name 'all'; bare 'merge' is unchanged
+    monkeypatch.setenv("NAVIGATOR_MERGE_TIER_B_BATCH", "1")
+    act = FakeACTClient()
+    a = _tiered(act, "N5b: inbox", "B")
+    b = _tiered(act, "S3a: squash", "B")
+    rec = _Recorder()
+    cmds = _inbox(tmp_path, [_update(1, "merge"), _update(2, "merge all except S3a")]).poll_once()
+    assert cmds == [TelegramCommand("merge", None, 1),
+                    TelegramCommand("merge", None, 2, batch=True, exclude=("S3a",))]
+    results = apply_commands(act, cmds, rec)
+    assert results[0]["reason"] == "ambiguous: several runs waiting for merge"
+    assert results[1]["applied"] is True and results[1]["approved"] == [a.id]
+    assert _pending(act, a.id) == 0 and _pending(act, b.id) == 1
+    assert "not applied" in rec.sent[0] and "excluded: S3a" in rec.sent[1]
