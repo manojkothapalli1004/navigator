@@ -31,6 +31,10 @@ def _env(tmp_path, monkeypatch):
     monkeypatch.setenv("NAVIGATOR_DECISIONS_TZ", "America/New_York")
     monkeypatch.setenv("NAVIGATOR_DECISIONS_STATE_PATH", str(tmp_path / "decisions_state.json"))
     monkeypatch.setenv("NAVIGATOR_MANUAL_DECISIONS_PATH", str(tmp_path / "manual_decisions.json"))
+    # the operator's shell exports these once the daemon plist carries them; every
+    # default-case assertion below must not depend on the machine
+    monkeypatch.delenv("NAVIGATOR_DIGEST_HOUR", raising=False)
+    monkeypatch.delenv("NAVIGATOR_DECISIONS_NUDGES", raising=False)
     AUDITED.clear()
     # _candidates asks cli.is_audited through the telegram_inbox module global
     monkeypatch.setattr(telegram_inbox, "is_audited", lambda act, run_id: run_id in AUDITED)
@@ -252,6 +256,143 @@ def test_digest_with_nothing_waiting_sets_date_and_sends_nothing(tmp_path):
                                    manual_file=str(tmp_path / "none.json"))
     assert rec.sent == [] and out == {"items": 0, "digest_sent": False, "nudged": 0}
     assert decisions.read_state(state)["digest"] == "2026-10-25"
+
+
+# ---- f2) NAVIGATOR_DIGEST_HOUR / NAVIGATOR_DECISIONS_NUDGES -------------------
+
+def test_digest_hour_env_moves_the_digest_and_exempts_it_from_quiet(tmp_path, monkeypatch):
+    act = FakeACTClient()
+    _merge_run(act, "Quota: pause builds")
+    # NEGATIVE: with the variable unset 7am is quiet
+    rec0, state0 = _Recorder(), tmp_path / "s0.json"
+    _seed(state0, {}, "2026-10-24")
+    out = decisions.decisions_tick(act, rec0, now=_ny(25, 7, 5), state_file=state0)
+    assert out == {"quiet": True, "items": 1} and rec0.sent == []
+    assert decisions.read_state(state0)["digest"] == "2026-10-24"
+    monkeypatch.setenv("NAVIGATOR_DIGEST_HOUR", "7")
+    rec, state = _Recorder(), tmp_path / "s.json"
+    _seed(state, {}, "2026-10-24")
+    out = decisions.decisions_tick(act, rec, now=_ny(25, 7, 5), state_file=state)
+    assert out == {"items": 1, "digest_sent": True, "nudged": 0}
+    assert len(rec.sent) == 1
+    assert rec.sent[0].startswith("Morning digest") and "merge Quota" in rec.sent[0]
+    assert decisions.read_state(state)["digest"] == "2026-10-25"
+    # once per day: the next tick in the same hour sends nothing more
+    decisions.decisions_tick(act, rec, now=_ny(25, 7, 20), state_file=state)
+    assert len(rec.sent) == 1
+
+
+def test_digest_hour_exempts_only_that_hour(tmp_path, monkeypatch):
+    monkeypatch.setenv("NAVIGATOR_DIGEST_HOUR", "7")
+    act, rec, state = FakeACTClient(), _Recorder(), tmp_path / "s.json"
+    run = _merge_run(act, "Quota: pause builds")
+    _seed(state, {f"merge:{run.id}": _ny(24, 20)}, "2026-10-24")
+    out = decisions.decisions_tick(act, rec, now=_ny(25, 6, 30), state_file=state)
+    assert out == {"quiet": True, "items": 1} and rec.sent == []
+    out = decisions.decisions_tick(act, rec, now=_ny(25, 23, 10), state_file=state)
+    assert out == {"quiet": True, "items": 1} and rec.sent == []
+    assert decisions.read_state(state)["digest"] == "2026-10-24"
+    assert decisions._quiet(_ny(25, 7), 7) is False
+    assert decisions._quiet(_ny(25, 7)) is True
+    assert decisions._quiet(_ny(25, 6), 7) is True
+
+
+def test_nudges_off_sends_digest_but_no_reminders(tmp_path, monkeypatch):
+    monkeypatch.setenv("NAVIGATOR_DECISIONS_NUDGES", "0")
+    act, rec, state = FakeACTClient(), _Recorder(), tmp_path / "s.json"
+    run = _merge_run(act, "Quota: pause builds")
+    now = _ny(24, 10)
+    seen = now - timedelta(hours=5)
+    _seed(state, {f"merge:{run.id}": seen}, "2026-10-24")
+    out = decisions.decisions_tick(act, rec, now=now, state_file=state)
+    assert rec.sent == [] and out["nudged"] == 0
+    assert out == {"items": 1, "digest_sent": False, "nudged": 0}
+    assert decisions.read_state(state)["nudged"] == {}
+    # digest not yet sent today: exactly the digest, no reminder
+    _seed(state, {f"merge:{run.id}": seen}, "2026-10-23")
+    out = decisions.decisions_tick(act, rec, now=now, state_file=state)
+    assert out == {"items": 1, "digest_sent": True, "nudged": 0}
+    assert len(rec.sent) == 1
+    assert rec.sent[0].startswith("Morning digest") and "merge Quota" in rec.sent[0]
+    assert not any("Reminder" in t for t in rec.sent)
+    assert decisions.read_state(state)["digest"] == "2026-10-24"
+
+
+def test_nudges_default_on(tmp_path):
+    act, rec, state = FakeACTClient(), _Recorder(), tmp_path / "s.json"
+    run = _merge_run(act, "Quota: pause builds")
+    now = _ny(24, 10)
+    _seed(state, {f"merge:{run.id}": now - timedelta(hours=5)}, "2026-10-24")
+    out = decisions.decisions_tick(act, rec, now=now, state_file=state)
+    assert out == {"items": 1, "digest_sent": False, "nudged": 1}
+    assert len(rec.sent) == 1 and "Reminder" in rec.sent[0]
+
+
+def test_nudges_true_false_spellings(monkeypatch):
+    for raw, expected in (("1", True), ("true", True), ("TRUE", True), (" 0 ", False),
+                          ("false", False), ("False", False), ("", True)):
+        monkeypatch.setenv("NAVIGATOR_DECISIONS_NUDGES", raw)
+        assert decisions.nudges_enabled() is expected, raw
+    monkeypatch.delenv("NAVIGATOR_DECISIONS_NUDGES")
+    assert decisions.nudges_enabled() is True
+    monkeypatch.setenv("NAVIGATOR_DIGEST_HOUR", " 7 ")
+    assert decisions.digest_hour() == 7
+    monkeypatch.delenv("NAVIGATOR_DIGEST_HOUR")
+    assert decisions.digest_hour() == decisions.DIGEST_HOUR == 8
+
+
+def test_bad_values_raise_naming_the_variable(tmp_path, monkeypatch):
+    rec, state = _Recorder(), tmp_path / "s.json"
+    missing = str(tmp_path / "none.json")
+    for raw in ("25", "x", "-1"):
+        monkeypatch.setenv("NAVIGATOR_DIGEST_HOUR", raw)
+        with pytest.raises(ValueError, match="NAVIGATOR_DIGEST_HOUR"):
+            decisions.decisions_tick(FakeACTClient(), rec, now=_ny(24, 10), state_file=state,
+                                     manual_file=missing)
+        assert not state.exists()  # raised before any state write
+    assert rec.sent == []
+    monkeypatch.setenv("NAVIGATOR_DIGEST_HOUR", "")
+    monkeypatch.setenv("NAVIGATOR_DECISIONS_NUDGES", "maybe")
+    with pytest.raises(ValueError, match="NAVIGATOR_DECISIONS_NUDGES"):
+        decisions.decisions_tick(FakeACTClient(), rec, now=_ny(24, 10), state_file=state,
+                                 manual_file=missing)
+    assert not state.exists()
+    monkeypatch.delenv("NAVIGATOR_DECISIONS_NUDGES")
+    # "" for the digest hour is the default: no raise
+    out = decisions.decisions_tick(FakeACTClient(), rec, now=_ny(24, 10), state_file=state,
+                                   manual_file=missing)
+    assert out == {"items": 0, "digest_sent": False, "nudged": 0}
+    assert state.exists() and rec.sent == []
+
+
+def test_fallback_hour_is_capped_so_a_late_digest_still_goes_out(tmp_path, monkeypatch):
+    monkeypatch.setenv("NAVIGATOR_DIGEST_HOUR", "21")
+    act, rec, state = FakeACTClient(), _Recorder(), tmp_path / "s.json"
+    _seed(state, {}, "2026-10-24")
+
+    def broken(*args, **kwargs):
+        raise RuntimeError("ACT hiccup")
+
+    monkeypatch.setattr(act, "list_proposals", broken)
+    missing = str(tmp_path / "none.json")
+    decisions.decisions_tick(act, rec, now=_ny(25, 21, 5), state_file=state,
+                             manual_file=missing, candidates=broken)
+    assert rec.sent == [] and decisions.read_state(state)["digest"] == "2026-10-24"
+    # 23 would be quiet: the fallback is 22, not 23
+    decisions.decisions_tick(act, rec, now=_ny(25, 22, 5), state_file=state,
+                             manual_file=missing, candidates=broken)
+    assert rec.sent == ["(could not list: merge, proposal)"]
+    assert decisions.read_state(state)["digest"] == "2026-10-25"
+
+
+def test_decisions_step_reports_a_bad_digest_hour(monkeypatch):
+    monkeypatch.setenv("NAVIGATOR_DIGEST_HOUR", "x")
+    rec = _Recorder()
+    nav = SimpleNamespace(act=FakeACTClient(), notifier=rec)
+    summary = {}
+    main_mod._decisions_step(nav, summary)
+    assert summary["decisions_error"] == "ValueError"
+    assert "decisions" not in summary and rec.sent == []
 
 
 # ---- g) a notifier that raises --------------------------------------------------
