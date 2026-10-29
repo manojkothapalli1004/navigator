@@ -45,7 +45,8 @@ _ROLE_OUTPUT_SPEC = {
                    'naming of context.test_files. context.related_files are for reference: use them '
                    'to get models, fixtures and APIs right. Never write non-test related files; '
                    'DO update existing test files among them when your change alters an API '
-                   'they call.'),
+                   'they call. If a run_tests tool is available, its result describes the worktree '
+                   'BEFORE your edits; still reply with the full JSON object.'),
     Role.verifier: ('Choose commands that prove context.proposal works, each starting with an entry '
                     'of context.allowed_commands. Commands run inside context.workdir; use paths '
                     'relative to it (context.changed_files already are). Respond with ONLY a JSON '
@@ -108,7 +109,8 @@ class ClaudeSDKDriver:
         self.estimated_cost_per_call_usd = estimated_cost_per_call_usd
         # build 2: when on, a builder request that carries a runner and run_dir gets the
         # run_tests MCP tool (builder_tools.make_run_tests_server), at most builder_test_runs
-        # calls per turn; last_test_runs is the calls record of the most recent builder call
+        # calls per BUILD (the request's test_budget: one counter shared by the first attempt and
+        # every repair turn); last_test_runs is the calls record of the most recent builder call
         self.builder_tests = builder_tests
         self.builder_test_runs = builder_test_runs
         self.last_test_runs: list = []
@@ -170,11 +172,15 @@ class ClaudeSDKDriver:
             # tooled builder: the SDK session's cwd is the run worktree (read-only tools stay inside it)
             if (self.builder_tests and request.runner is not None and request.run_dir
                     and _accepts_mcp_servers(query_fn)):
-                # build 2: one in-process MCP tool, run_tests, bounded per turn; it runs the
-                # allowlisted pytest entry through phases._run_sealed and the repo's runner
+                # build 2: one in-process MCP tool, run_tests, bounded per build (request.test_budget
+                # is phases' per-build counter; None keeps a fresh per-call budget); it runs the
+                # allowlisted pytest entry through phases._run_sealed and the repo's runner. The
+                # worktree path lets the tool strip a repo-relative "<workdir>/" prefix (2b)
                 server, calls = make_run_tests_server(request.runner, request.run_dir,
                                                       request.allowed_commands,
-                                                      max_runs=self.builder_test_runs)
+                                                      max_runs=self.builder_test_runs,
+                                                      budget=request.test_budget,
+                                                      worktree=request.worktree_path)
                 self.last_test_runs = calls
                 raw = query_fn(prompt, cwd=request.worktree_path, mcp_servers={"navigator": server},
                                mcp_tools=(QUALIFIED_TOOL,))
