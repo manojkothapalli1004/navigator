@@ -12,7 +12,8 @@ from navigator.clients.orc_client import FakeORCClient
 from navigator.safety.command_runner import CommandRunner
 from navigator.config import Settings
 from navigator.contracts.proposal import Proposal, compute_origin_hash
-from navigator.contracts.enums import RiskTier, RunPhase, ApprovalGate, ApprovalDecision, RunStatus
+from navigator.contracts.enums import RiskTier, RunPhase, ApprovalGate, ApprovalDecision, RunStatus, Role
+from navigator.runtime.drivers.base import DriverResult
 
 def _seed(tmp_path):
     repo = tmp_path/"repo"; repo.mkdir()
@@ -447,6 +448,56 @@ def test_tier_failure_never_loses_the_awaiting_review_event(tmp_path, monkeypatc
         raise RuntimeError("tier broke")
 
     monkeypatch.setattr("navigator.runtime.executor.classify_for_repo", boom)
+    run = execute_proposal(_proposal(repo, sha), **d)  # must NOT raise
+    assert run.phase == RunPhase.awaiting_review
+    ev = [e for e in d["act"].events
+          if e.kind == "run.awaiting_review" and e.payload["run_id"] == run.id][0]
+    assert ev.payload["merge_tier"] is None
+
+
+# --- merge tiers 3a2: NUL-separated names and the tier git call inside the guard -------
+
+class _NamedWriteDriver:
+    """Scripted builder writing the given (relpath, content) pairs; the verifier runs
+    `git status` (DEFAULT_ALLOWLIST): a .md-only build has no python change to py_compile."""
+    def __init__(self, writes):
+        self.writes = writes
+
+    def run_role(self, request):
+        if request.role == Role.builder:
+            return DriverResult(role=Role.builder, file_writes=list(self.writes), summary="wrote")
+        return DriverResult(role=Role.verifier, commands=[["git", "status"]], summary="verify")
+
+
+def test_awaiting_review_tier_sees_a_double_quote_name_unquoted(tmp_path):
+    # NEGATIVE: on main the tier git call printed the name C-quoted, no pattern matched it and
+    # the tier was "B"; with -z the name is exact and a docs-only change is "A"
+    repo, sha = _seed(tmp_path); d = _deps(tmp_path, repo)
+    files = ['docs/a"b.md']
+    d["driver"] = _NamedWriteDriver([(files[0], "# a\n")])
+    prop = Proposal(title="t", rationale="r", repo=str(repo), base_commit_sha=sha, intended_changes="x",
+                    affected_files=files, risk_tier=RiskTier.low, origin="periodic", status="approved",
+                    proposal_origin_hash=compute_origin_hash(str(repo), "x", files, "periodic", None))
+    run = execute_proposal(prop, **d)
+    assert run.phase == RunPhase.awaiting_review
+    ev = [e for e in d["act"].events
+          if e.kind == "run.awaiting_review" and e.payload["run_id"] == run.id][0]
+    assert ev.payload["merge_tier"] == "A"
+
+
+def test_tier_git_failure_never_loses_the_awaiting_review_event(tmp_path, monkeypatch):
+    # NEGATIVE: on main the tier's _git_run call sat outside the guard and the OSError escaped
+    # execute_proposal
+    import navigator.runtime.executor as ex
+    repo, sha = _seed(tmp_path); d = _deps(tmp_path, repo)
+    real = ex._git_run
+
+    def flaky(cwd, *args):
+        if "--no-renames" in args and "--name-only" in args:
+            raise OSError("git vanished")
+        return real(cwd, *args)
+
+    monkeypatch.setattr(ex, "_git_run", flaky)
     run = execute_proposal(_proposal(repo, sha), **d)  # must NOT raise
     assert run.phase == RunPhase.awaiting_review
     ev = [e for e in d["act"].events
