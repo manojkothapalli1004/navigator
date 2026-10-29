@@ -17,6 +17,15 @@ TOOLED_SYSTEM_PROMPT_SUFFIX = (
     "network are denied and only waste turns. Your final reply must still be ONLY the requested "
     "JSON object.")
 
+# build 2b: appended to the tooled prompt ONLY when the call passes mcp_servers (the builder's
+# run_tests server); the model reads this next to builder_tools.TOOL_DESCRIPTION
+TESTS_SYSTEM_PROMPT_SUFFIX = (
+    " You also have run_tests(paths=[...]): it runs the repository's allowlisted pytest command (plus -q, plus "
+    "the given paths relative to the run directory) inside your worktree and returns rc= and the output tail. "
+    "It is bounded per build; a call that is rejected still counts. IMPORTANT: your JSON file_edits/file_writes "
+    "are applied AFTER you reply, so run_tests exercises the files as they are NOW; use it to understand the "
+    "current state and to check existing tests, not to validate edits you have not made yet.")
+
 # operator decision 2026-10-15: the builder runs on claude-fable-5-1, whose credits run
 # out first; an account/model error must move the SAME query to the next model in the
 # chain instead of failing the run (2026-08-25..10-09: 216 cycles lost to a masked Fable
@@ -183,7 +192,8 @@ def make_sdk_query_fn(*, model: str | None = None,
             # session only; `tools` stays the built-in set
             allowed = list(tools) + [t for t in mcp_tools if t not in tools]
             extra = {"mcp_servers": mcp_servers} if mcp_servers else {}
-            options = ClaudeAgentOptions(system_prompt=system_prompt + TOOLED_SYSTEM_PROMPT_SUFFIX,
+            options = ClaudeAgentOptions(system_prompt=system_prompt + TOOLED_SYSTEM_PROMPT_SUFFIX
+                                         + (TESTS_SYSTEM_PROMPT_SUFFIX if mcp_servers else ""),
                                          model=use_model, max_turns=max_turns, tools=list(tools),
                                          allowed_tools=allowed, cwd=cwd, setting_sources=[],
                                          settings=_TOOLED_SETTINGS, **extra)

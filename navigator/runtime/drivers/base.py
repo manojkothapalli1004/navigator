@@ -19,6 +19,9 @@ class DriverRequest:
     runner: object | None = None
     run_dir: str | None = None
     allowed_commands: tuple[str, ...] = ()
+    # build 2b: the per-BUILD run_tests counter ({"used": int}) owned by phases.run_build_and_verify
+    # and shared by the first attempt and every repair turn; None = a fresh per-call budget
+    test_budget: dict | None = None
 
 @dataclass
 class DriverResult:

@@ -60,8 +60,11 @@ def build_navigator(settings: Settings):
                                # waits at most 300s for the default executor on Python 3.12; a longer
                                # runner timeout would let pytest outlive the query with os.environ
                                # still sealed. The verifier shares this runner, so its per-command
-                               # bound is capped too (only bites when NAVIGATOR_COMMAND_TIMEOUT_S > 300)
-                               timeout_s=min(settings.command_timeout_s, 300.0))
+                               # bound is capped too (only bites when NAVIGATOR_COMMAND_TIMEOUT_S > 300). 2b: the clamp
+                               # exists only for that worker-thread overrun, so it applies only while the
+                               # tool is enabled; with it off the verifier keeps the configured bound
+                               timeout_s=(min(settings.command_timeout_s, 300.0) if settings.builder_tests
+                                          else settings.command_timeout_s))
         nav = Navigator(act=act, orc=orc, driver=driver, runner=runner, settings=settings,
                         repo=rc.path, lock_path=settings.lock_path, workdir=rc.workdir,
                         squash=rc.squash, brief=rc.brief, context_files=rc.context_files,
