@@ -393,8 +393,9 @@ def test_run_role_builder_with_tests_passes_an_mcp_server_and_the_tool_name(monk
         return json.dumps({"file_writes": [["a.py", "x\n"]], "commands": [], "summary": "b"})
     def plain_fn(prompt):
         return json.dumps({"commands": [], "summary": "v"})
-    def fake_server(runner, run_dir, allowed_commands, *, max_runs):
-        server_args.update(args=(runner, run_dir, allowed_commands), max_runs=max_runs)
+    def fake_server(runner, run_dir, allowed_commands, *, max_runs, budget=None, worktree=None):
+        server_args.update(args=(runner, run_dir, allowed_commands), max_runs=max_runs,
+                           budget=budget, worktree=worktree)
         return "SERVER", ["c1"]
     monkeypatch.setattr(csd, "make_run_tests_server", fake_server)
     d = ClaudeSDKDriver(query_fn=plain_fn, budget_guard=BudgetGuard(2.0),
@@ -404,7 +405,8 @@ def test_run_role_builder_with_tests_passes_an_mcp_server_and_the_tool_name(monk
     res = d.run_role(DriverRequest(role=Role.builder, context={}, worktree_path="/tmp/w7",
                                    runner="RUNNER", run_dir="/tmp/w7",
                                    allowed_commands=("uv run pytest",)))
-    assert server_args == {"args": ("RUNNER", "/tmp/w7", ("uv run pytest",)), "max_runs": 2}
+    assert server_args == {"args": ("RUNNER", "/tmp/w7", ("uv run pytest",)), "max_runs": 2,
+                           "budget": None, "worktree": "/tmp/w7"}
     assert seen == {"cwd": "/tmp/w7", "mcp_servers": {"navigator": "SERVER"},
                     "mcp_tools": ("mcp__navigator__run_tests",)}
     assert d.last_test_runs == ["c1"]
@@ -470,3 +472,39 @@ def test_run_role_without_runner_or_with_tests_off_is_build_1_behaviour(monkeypa
                                  runner="RUNNER", run_dir="/tmp/w7", allowed_commands=("uv run pytest",)))
     assert seen[-1] == {"cwd": "/tmp/w7"} and called == []
     assert d.last_test_runs == [] and d_off.last_test_runs == [] and d_cwd.last_test_runs == []
+
+
+# --- build 2b: the request's per-build budget reaches the server; the builder is told ---------
+
+def test_run_role_passes_the_request_budget_to_the_server(monkeypatch):
+    from navigator.runtime.drivers import claude_sdk_driver as csd
+    seen = []
+    def fake_server(runner, run_dir, allowed_commands, *, max_runs, budget=None, worktree=None):
+        seen.append({"max_runs": max_runs, "budget": budget, "worktree": worktree})
+        return "SERVER", []
+    monkeypatch.setattr(csd, "make_run_tests_server", fake_server)
+    def builder_fn(prompt, *, cwd=None, mcp_servers=None, mcp_tools=()):
+        return json.dumps({"file_writes": [["a.py", "x\n"]], "commands": [], "summary": "b"})
+    d = ClaudeSDKDriver(query_fn=builder_fn, budget_guard=BudgetGuard(10.0), builder_tests=True,
+                        builder_test_runs=3)
+    shared = {"used": 2}
+    d.run_role(DriverRequest(role=Role.builder, context={}, worktree_path="/tmp/w7", runner="RUNNER",
+                             run_dir="/tmp/w7", allowed_commands=("uv run pytest",), test_budget=shared))
+    assert seen[-1]["budget"] is shared  # the SAME dict: phases counts across repair turns
+    assert seen[-1] == {"max_runs": 3, "budget": shared, "worktree": "/tmp/w7"}
+    d.run_role(DriverRequest(role=Role.builder, context={}, worktree_path="/tmp/w7", runner="RUNNER",
+                             run_dir="/tmp/w7", allowed_commands=("uv run pytest",)))
+    assert seen[-1]["budget"] is None  # no per-build counter: 2a's fresh per-call budget
+    assert len(seen) == 2
+
+
+def test_builder_prompt_says_run_tests_describes_the_worktree_before_its_edits():
+    prompts = []
+    d = make_driver({"file_writes": [], "commands": [], "summary": ""}, prompts=prompts)
+    d.run_role(DriverRequest(role=Role.builder, context={}, worktree_path="/tmp/w"))
+    assert "If a run_tests tool is available" in prompts[0]
+    assert "BEFORE your edits" in prompts[0]
+    assert prompts[0].endswith("still reply with the full JSON object.")
+    # the sentence is the builder's alone
+    d.run_role(DriverRequest(role=Role.verifier, context={}, worktree_path="/tmp/w"))
+    assert "run_tests" not in prompts[1]
