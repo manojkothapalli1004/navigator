@@ -306,3 +306,77 @@ def test_session_limit_without_fallback_is_quota_exhausted(monkeypatch):
     with pytest.raises(RuntimeError) as exc:
         make_sdk_query_fn()("x")
     assert not isinstance(exc.value, QuotaExhaustedError)
+
+
+# --- builder tools (operator decision 2026-10-28): read-only tools inside the worktree -----
+
+# EXACTLY the deny list of sdk_query._TOOLED_SETTINGS, in order: an added, dropped or
+# reordered entry fails test_tooled_options_set_cwd_tools_turns_and_deny_list
+DENY = [
+    "Read(//Users/**)", "Read(//System/Volumes/Data/**)", "Read(//private/var/folders/**)",
+    "Read(//private/tmp/claude-*/**)", "Read(//tmp/claude-*/**)",
+    "Read(**/.env*)", "Read(**/*.pem)", "Read(**/*.key)",
+    "Grep(//Users/**)", "Grep(//System/Volumes/Data/**)", "Grep(//private/var/folders/**)",
+    "Grep(//private/tmp/claude-*/**)", "Grep(//tmp/claude-*/**)",
+    "Glob(//Users/**)", "Glob(//System/Volumes/Data/**)", "Glob(//private/var/folders/**)",
+    "Glob(//private/tmp/claude-*/**)", "Glob(//tmp/claude-*/**)",
+    "Bash", "Write", "Edit", "NotebookEdit", "WebFetch", "WebSearch",
+]
+
+
+def test_tool_less_options_are_unchanged_even_when_cwd_is_passed(monkeypatch):
+    captured = {}
+    _stub_sdk(monkeypatch, captured)
+    fn = make_sdk_query_fn()
+    assert fn("hello", cwd="/tmp/wt") == '{"commands": [], "summary": "ok"}'
+    opts = captured["options"]
+    assert "cwd" not in opts
+    assert opts["tools"] == [] and opts["allowed_tools"] == [] and opts["max_turns"] == 4
+    assert json.loads(opts["settings"]) == {"disableClaudeAiConnectors": True}
+    assert "Read" not in opts["system_prompt"]
+
+
+def test_tooled_options_set_cwd_tools_turns_and_deny_list(monkeypatch):
+    captured = {}
+    _stub_sdk(monkeypatch, captured)
+    fn = make_sdk_query_fn(tools=("Read", "Grep", "Glob"), max_turns=30)
+    fn("hello", cwd="/private/tmp/navigator-worktrees/run-x")
+    opts = captured["options"]
+    assert opts["cwd"] == "/private/tmp/navigator-worktrees/run-x"
+    assert opts["tools"] == ["Read", "Grep", "Glob"]
+    assert opts["allowed_tools"] == ["Read", "Grep", "Glob"]
+    assert opts["max_turns"] == 30
+    assert opts["setting_sources"] == []
+    settings = json.loads(opts["settings"])
+    assert len(DENY) == 24
+    assert settings == {"disableClaudeAiConnectors": True, "permissions": {"deny": DENY}}
+    assert "JSON" in opts["system_prompt"] and "Read" in opts["system_prompt"]
+    assert opts["system_prompt"].startswith("You are a Navigator subagent")
+
+
+def test_tools_without_cwd_fall_back_to_tool_less_options(monkeypatch):
+    # NEGATIVE: tools alone never change the session; only a call that passes cwd does
+    captured = {}
+    _stub_sdk(monkeypatch, captured)
+    fn = make_sdk_query_fn(tools=("Read",), max_turns=30)
+    fn("hello")
+    opts = captured["options"]
+    assert "cwd" not in opts and opts["tools"] == [] and opts["max_turns"] == 4
+    assert json.loads(opts["settings"]) == {"disableClaudeAiConnectors": True}
+
+
+def test_max_turns_never_changes_the_tool_less_options(monkeypatch):
+    # NEGATIVE: the tool-less options keep the literal 4 whatever max_turns was passed
+    captured = {}
+    _stub_sdk(monkeypatch, captured)
+    fn = make_sdk_query_fn(max_turns=99)
+    fn("hello")
+    assert captured["options"]["max_turns"] == 4
+    assert captured["options"]["tools"] == []
+
+
+def test_cwd_is_keyword_only(monkeypatch):
+    captured = {}
+    _stub_sdk(monkeypatch, captured)
+    with pytest.raises(TypeError):
+        make_sdk_query_fn()("hello", "/tmp/wt")
