@@ -357,11 +357,26 @@ def test_builder_tests_flag_reaches_the_daemon_driver(tmp_path, monkeypatch):
     with pytest.raises(ValueError, match="NAVIGATOR_BUILDER_TESTS"):
         build_navigator(s3)
 
-def test_runner_timeout_is_capped_at_300s(tmp_path):
-    # build 2: NAVIGATOR_COMMAND_TIMEOUT_S above 300 is clamped for the per-repo runner (the
-    # run_tests worker must not outlive a cancelled builder query with os.environ sealed);
-    # the verifier shares that runner, so its per-command bound drops too
-    repo = _seed_repo(tmp_path)
-    assert build_navigator(_settings(tmp_path, repo, command_timeout_s=900.0)).runner.timeout_s == 300.0
-    assert build_navigator(_settings(tmp_path, repo, command_timeout_s=120.0)).runner.timeout_s == 120.0
-    assert build_navigator(_settings(tmp_path, repo, command_timeout_s=300.0)).runner.timeout_s == 300.0
+def test_runner_timeout_is_capped_at_300s_only_while_builder_tests_are_on(tmp_path, monkeypatch):
+    # build 2b: the clamp exists only for the run_tests worker-thread overrun (asyncio.run waits
+    # at most 300s for the executor), so it applies only while the tool is enabled; with it off
+    # the verifier's full-suite bound is the configured NAVIGATOR_COMMAND_TIMEOUT_S (navigator's
+    # own suite takes ~260s; other repos are unmeasured)
+    _daemon_env(tmp_path, monkeypatch)
+    monkeypatch.setenv("NAVIGATOR_COMMAND_TIMEOUT_S", "900")
+    for k in ("NAVIGATOR_BUILDER_TOOLS", "NAVIGATOR_BUILDER_TESTS"):
+        monkeypatch.delenv(k, raising=False)
+    assert build_navigator(Settings.from_env()).runner.timeout_s == 900.0
+    monkeypatch.setenv("NAVIGATOR_BUILDER_TOOLS", "1")
+    assert build_navigator(Settings.from_env()).runner.timeout_s == 900.0  # tools alone never clamp
+    monkeypatch.setenv("NAVIGATOR_BUILDER_TESTS", "1")
+    assert build_navigator(Settings.from_env()).runner.timeout_s == 300.0
+    monkeypatch.setenv("NAVIGATOR_COMMAND_TIMEOUT_S", "120")
+    assert build_navigator(Settings.from_env()).runner.timeout_s == 120.0
+    monkeypatch.setenv("NAVIGATOR_COMMAND_TIMEOUT_S", "300")
+    assert build_navigator(Settings.from_env()).runner.timeout_s == 300.0
+    # the same through Settings kwargs: the flag, not the driver, decides
+    repo = _seed_repo(tmp_path / "kw")
+    assert build_navigator(_settings(tmp_path, repo, command_timeout_s=900.0)).runner.timeout_s == 900.0
+    assert build_navigator(_settings(tmp_path, repo, command_timeout_s=900.0, builder_tools=True,
+                                     builder_tests=True)).runner.timeout_s == 300.0
