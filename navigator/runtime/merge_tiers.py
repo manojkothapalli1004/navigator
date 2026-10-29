@@ -11,39 +11,64 @@ from pathlib import Path
 
 TIERS = ("A", "B", "C")
 
-# matched with fnmatch.fnmatchcase against BOTH the posix relpath and its basename; '*' crosses '/'
+# C patterns are matched with fnmatch.fnmatchcase against the posix relpath AND every path component
+# (_match_components); A patterns against the relpath and its basename only (_match); '*' crosses '/'
+# 3a2: money, auth and key/cert/database paths fail closed to C (cold audit of 3a). Deliberately NOT 'pay*'
+# (payload.py) and NOT '*order*' (recorder.py, border.css); '*perm*' accepts the odd false positive.
+MONEY_C = ("*billing*", "*payment*", "*payout*", "*refund*", "pay.py", "order*", "*wallet*", "*ledger*",
+           "*invoice*", "*stripe*", "*paypal*", "*checkout*")
+AUTH_C = ("oauth*", "session*", "*perm*")
+KEY_C = ("claude.md", "agents.md", ".claude/*", "*.crt", "*.cer", "*.p12", "*.pfx", "*.jks", "*.keystore", "id_rsa*", "id_ed25519*", "id_ecdsa*",
+         "*api_key*", "*api-key*", "*apikey*", "*private*key*", "*.db", "*.sqlite*")
 UNIVERSAL_C = ("*.env", "*.env.*", "*.pem", "*.key", "*secret*", "*credential*", "*token*", "*password*",
                "*migrations/*", "*alembic/*", "*.sql", "pyproject.toml", "uv.lock", "requirements*.txt",
                "auth*", "*security*", "deps.py", "*routes/*", "models.py", "db.py", "config.py", "settings.py",
-               ".github/*", "deploy/*", "*.plist*", "*.sh", "legal.py")
+               ".github/*", "deploy/*", "*.plist*", "*.sh", "legal.py") + MONEY_C + AUTH_C + KEY_C
 NAVIGATOR_C = ("navigator/safety/*", "navigator/runtime/phases.py", "navigator/runtime/executor.py",
                "navigator/runtime/loop.py", "navigator/runtime/merge_tiers.py", "navigator/runtime/worktree.py",
                "navigator/runtime/checkpoint.py", "navigator/runtime/drivers/*", "navigator/observability/telegram_*",
                "navigator/observability/actions.py", "navigator/cli.py", "navigator/config.py", "navigator/__main__.py",
                "navigator/runtime/fleet.py", "navigator/clients/act_client.py", "navigator/runtime/lock.py",
                "navigator/contracts/*")
-TEST_A = ("tests/*", "*/tests/*", "test_*.py", "*_test.py", "conftest.py")
+TEST_A = ("tests/*", "*/tests/*")  # 3a2: directory only; a test_*.py outside a tests dir is code (B)
+CONFTEST = "conftest.py"  # 3a2: runs code at import under the verifier: never A
 DOC_A = ("*.md", "*.rst", "docs/*", "*.txt")
 ALWAYS_C_REPOS = ("trader",)
 CODE_SUFFIXES = (".py", ".sh", ".toml", ".cfg", ".ini", ".yml", ".yaml", ".json", ".js", ".ts")
 
 
-def _match(path: str, patterns) -> bool:
+def _normalize(path: str) -> str:
     posix = Path(path).as_posix()
     if posix.startswith("./"):
         posix = posix[2:]
     # NOT str.lstrip("./"): that strips CHARACTERS, turning ".env" into "env" and ".github/x" into "github/x"
     posix = posix.lstrip("/")
-    posix = posix.lower()  # docs/SECRETS.md, API_TOKEN.txt must still hit *secret* / *token*; all patterns are lowercase
+    # docs/SECRETS.md, API_TOKEN.txt must still hit *secret* / *token*; all patterns are lowercase
+    return posix.lower()
+
+
+def _match(path: str, patterns) -> bool:
+    posix = _normalize(path)
     name = Path(posix).name
     return any(fnmatch.fnmatchcase(posix, pat) or fnmatch.fnmatchcase(name, pat) for pat in patterns)
 
 
+def _match_components(path: str, patterns) -> bool:
+    """Like _match, but every path component counts too, so "auth*" hits app/auth/jwt.py and app/authz/roles.py.
+    C-only: letting DOC_A/TEST_A see components would make notes.md/build.go a doc (fail-open to A)."""
+    posix = _normalize(path)
+    parts = posix.split("/")
+    return any(fnmatch.fnmatchcase(posix, pat) or any(fnmatch.fnmatchcase(part, pat) for part in parts)
+               for pat in patterns)
+
+
 def _is_c(path: str, extra) -> bool:
-    return _match(path, UNIVERSAL_C) or _match(path, extra)
+    return _match_components(path, UNIVERSAL_C) or _match_components(path, extra)
 
 
 def _is_a(path: str) -> bool:
+    if Path(path).name.lower() == CONFTEST:
+        return False
     if _match(path, TEST_A):
         return True
     # docs/conf.py is code, not a doc; requirements*.txt is a dependency file, not a doc
@@ -59,7 +84,10 @@ def classify(changed, *, repo_name: str, tier_c_paths=(), tier_floor: str = "A")
         raise ValueError(f"tier_floor must be one of {TIERS}, got {tier_floor!r}")
     if repo_name in ALWAYS_C_REPOS or tier_floor == "C" or not changed:
         return "C"
-    extra = tuple(tier_c_paths or ()) + (NAVIGATOR_C if repo_name == "navigator" else ())
+    if any(p != p.strip() for p in changed):
+        return "C"  # a name with leading/trailing whitespace is nobody's honest change: fail closed (3a2)
+    # paths are lowercased in _match, so per-repo patterns must be too (3a2)
+    extra = tuple(p.lower() for p in (tier_c_paths or ())) + (NAVIGATOR_C if repo_name == "navigator" else ())
     if any(_is_c(p, extra) for p in changed):
         return "C"
     tier = "A" if all(_is_a(p) for p in changed) else "B"
@@ -83,23 +111,24 @@ def classify_for_repo(changed, repo_path: str, cfg) -> str:
 
 
 def changed_files_for_run(repo: str, run) -> list | None:
-    """`git -c core.quotePath=false diff --no-renames --name-only <run.base_commit_sha>..<run.verified_sha>` in
-    repo (core.quotePath=false so a non-ASCII path is not printed quoted, which would stop every pattern
-    matching it; --no-renames so a file moved out of a C path into tests/ or docs/ still lists its old path;
-    the run's own commits; _rebase_one moves base_commit_sha, so this is right after a sibling merge). None
-    when verified_sha is missing or git fails (a TimeoutExpired or OSError is also None)."""
+    """`git diff --no-renames --name-only -z <run.base_commit_sha>..<run.verified_sha>` in repo
+    (-z: NUL-separated and never quoted; core.quotePath=false still printed a name holding '"' or '\\'
+    C-quoted, so no pattern could match it; --no-renames so a file moved out of a C path into tests/ or
+    docs/ still lists its old path; the run's own commits; _rebase_one moves base_commit_sha, so this is
+    right after a sibling merge). None when verified_sha is missing or git fails (a TimeoutExpired or
+    OSError is also None)."""
     base = getattr(run, "base_commit_sha", None)
     verified = getattr(run, "verified_sha", None)
     if not verified or not base:
         return None
     try:
-        proc = subprocess.run(["git", "-c", "core.quotePath=false", "diff", "--no-renames", "--name-only",
-                               f"{base}..{verified}"], cwd=repo, capture_output=True, text=True, timeout=60)
+        proc = subprocess.run(["git", "diff", "--no-renames", "--name-only", "-z", f"{base}..{verified}"],
+                              cwd=repo, capture_output=True, text=True, timeout=60)
     except (subprocess.TimeoutExpired, OSError):
         return None
     if proc.returncode != 0:
         return None
-    return [l.strip() for l in proc.stdout.splitlines() if l.strip()]
+    return [n for n in proc.stdout.split("\x00") if n]
 
 
 def tier_for_run(repo: str, run, cfg) -> str | None:
