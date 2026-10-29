@@ -65,6 +65,12 @@ class Settings:
     # ordered model fallback chain; empty = fallback disabled
     sdk_model_fallbacks: list[str] = field(default_factory=lambda: list(DEFAULT_SDK_MODEL_FALLBACKS))
     sdk_model_cooldown_s: int = DEFAULT_SDK_MODEL_COOLDOWN_S
+    # builder read-only tools (operator decision 2026-10-28): when on, the BUILDER role's SDK
+    # session gets Read/Grep/Glob with cwd = its run worktree; writes still arrive as JSON and
+    # pass every gate; planner and verifier stay tool-less. Off = byte-identical to before.
+    builder_tools: bool = False
+    sdk_builder_max_turns: int = 30
+    sdk_builder_timeout_s: float = 900.0
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -103,6 +109,9 @@ class Settings:
                                                 ",".join(DEFAULT_SDK_MODEL_FALLBACKS)),
             sdk_model_cooldown_s=_positive_int_env("NAVIGATOR_SDK_MODEL_COOLDOWN_S",
                                                    str(DEFAULT_SDK_MODEL_COOLDOWN_S)),
+            builder_tools=_bool_env("NAVIGATOR_BUILDER_TOOLS", "0"),
+            sdk_builder_max_turns=_positive_int_env("NAVIGATOR_SDK_BUILDER_MAX_TURNS", "30"),
+            sdk_builder_timeout_s=_positive_float_env("NAVIGATOR_SDK_BUILDER_TIMEOUT_S", "900.0"),
         )
 
 

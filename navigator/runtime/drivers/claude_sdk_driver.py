@@ -1,3 +1,4 @@
+import inspect
 import json
 import shlex
 from pathlib import Path
@@ -52,6 +53,18 @@ _ROLE_OUTPUT_SPEC = {
 
 _COMMAND_ROLES = (Role.builder, Role.verifier)
 
+# the builder's read-only tool set when Settings.builder_tools is on (design 2026-10-28)
+BUILDER_TOOLS: tuple[str, ...] = ("Read", "Grep", "Glob")
+
+
+def _accepts_cwd(fn) -> bool:
+    # True if fn takes a `cwd` keyword (or **kwargs); the many (prompt)-only query fns do not
+    try:
+        params = inspect.signature(fn).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(p.name == "cwd" or p.kind is p.VAR_KEYWORD for p in params)
+
 
 def git_flags_prompt_line() -> str:
     return ("git flag allowlist per subcommand (applies to context.allowed_commands entries "
@@ -70,9 +83,9 @@ def _shape(value) -> str:
 class ClaudeSDKDriver:
     """SubagentDriver backed by an injectable LLM query function.
 
-    query_fn is (prompt: str) -> str so tests run offline; the real
-    claude-agent-sdk binding is supplied at wiring time (sdk extra), never
-    imported here.
+    query_fn is (prompt: str) -> str so tests run offline; a builder query_fn may
+    also accept cwd=; the real claude-agent-sdk binding is supplied at wiring time
+    (sdk extra), never imported here.
     """
     def __init__(self, *, query_fn: Callable[[str], str], budget_guard: BudgetGuard,
                  role_query_fns: dict[Role, Callable[[str], str]] | None = None,
@@ -104,6 +117,22 @@ class ClaudeSDKDriver:
                       cooldowns=cooldowns)
         role_fns = {Role(role): make_query_fn(model=model, **common)
                     for role, model in settings.sdk_role_models.items()}
+        if settings.builder_tools:
+            # the deny list blocks /Users/**: a worktree root there would deny the builder its own
+            # files and burn every turn, so refuse at wiring time instead of failing silently per run
+            root = str(Path(settings.worktree_root).resolve())
+            if root == "/Users" or root.startswith(("/Users/", "/System/Volumes/Data/Users/")):
+                raise ValueError("NAVIGATOR_BUILDER_TOOLS needs NAVIGATOR_WORKTREE_ROOT outside /Users "
+                                 "(the builder's deny list blocks /Users/**); got "
+                                 + settings.worktree_root)
+            # the builder (and only the builder) gets read-only tools; it keeps its role model
+            # (NAVIGATOR_SDK_MODEL_BUILDER, else the default model), the same fallback chain and
+            # the SAME cooldown dict; it never gets less time than a tool-less query
+            builder_model = settings.sdk_role_models.get("builder", settings.sdk_model)
+            role_fns[Role.builder] = make_query_fn(
+                model=builder_model, tools=BUILDER_TOOLS, max_turns=settings.sdk_builder_max_turns,
+                timeout_s=max(settings.sdk_timeout_s, settings.sdk_builder_timeout_s),
+                fallbacks=common["fallbacks"], cooldown_s=common["cooldown_s"], cooldowns=cooldowns)
         return cls(query_fn=make_query_fn(model=settings.sdk_model, **common),
                    role_query_fns=role_fns, budget_guard=budget_guard,
                    estimated_cost_per_call_usd=estimated_cost_per_call_usd)
@@ -111,7 +140,12 @@ class ClaudeSDKDriver:
     def run_role(self, request: DriverRequest) -> DriverResult:
         self.budget_guard.check_before_call(self.estimated_cost_per_call_usd)
         query_fn = self.role_query_fns.get(request.role, self.query_fn)
-        raw = query_fn(self._build_prompt(request))
+        prompt = self._build_prompt(request)
+        if request.role == Role.builder and request.worktree_path is not None and _accepts_cwd(query_fn):
+            # tooled builder: the SDK session's cwd is the run worktree (read-only tools stay inside it)
+            raw = query_fn(prompt, cwd=request.worktree_path)
+        else:
+            raw = query_fn(prompt)
         self.budget_guard.record_spend(self.estimated_cost_per_call_usd)
         # N9: the builder's file_edits are resolved against the file contents it was
         # shown (context.files: relpath -> current text, None for a new file)

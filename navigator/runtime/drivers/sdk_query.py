@@ -11,6 +11,12 @@ DEFAULT_SYSTEM_PROMPT = (
     "You are a Navigator subagent. Reply with ONLY the requested JSON object \u2014 "
     "no prose, no markdown fences.")
 
+TOOLED_SYSTEM_PROMPT_SUFFIX = (
+    " You may use Read, Grep and Glob to inspect files inside the worktree (your current "
+    "directory) before answering. The operator's files outside it, Write, Edit, Bash and the "
+    "network are denied and only waste turns. Your final reply must still be ONLY the requested "
+    "JSON object.")
+
 # operator decision 2026-10-15: the builder runs on claude-fable-5-1, whose credits run
 # out first; an account/model error must move the SAME query to the next model in the
 # chain instead of failing the run (2026-08-25..10-09: 216 cycles lost to a masked Fable
@@ -58,7 +64,9 @@ def make_sdk_query_fn(*, model: str | None = None,
                       cooldown_s: float = DEFAULT_MODEL_COOLDOWN_S,
                       cooldowns: dict | None = None,
                       clock: Callable[[], float] = time.monotonic,
-                      wall_clock: Callable[[], float] = time.time) -> Callable[[str], str]:
+                      wall_clock: Callable[[], float] = time.time,
+                      tools: tuple[str, ...] = (),
+                      max_turns: int = 4) -> Callable[[str], str]:  # query_fn(prompt, *, cwd=None)
     """Build a (prompt) -> str query_fn backed by claude-agent-sdk.
 
     Imported lazily so the package works without the sdk extra; the returned
@@ -107,6 +115,11 @@ def make_sdk_query_fn(*, model: str | None = None,
     caused by one) is raised as navigator.safety.errors.QuotaExhaustedError, a
     RuntimeError subclass with the same message plus .marker and .resets_at (ISO-8601
     UTC, clamped like the cooldown, or None).
+
+    Builder tools (off unless `tools` is non-empty AND the call passes cwd): the query
+    runs with those tools allowed, cwd set to the worktree, max_turns=`max_turns` and
+    _TOOLED_SETTINGS; with `tools` empty, or cwd None, the options are exactly the
+    tool-less ones (max_turns 4, tools=[], _LOCKED_SETTINGS, no cwd).
     """
     try:
         from claude_agent_sdk import ClaudeAgentOptions, ResultMessage, query
@@ -120,6 +133,7 @@ def make_sdk_query_fn(*, model: str | None = None,
         logger = get_logger("navigator.sdk")
 
     fallbacks = tuple(fallbacks or ())
+    tools = tuple(tools or ())
     chain = model_chain(model, fallbacks)
     fallback_enabled = bool(model) and bool(fallbacks)
     if cooldowns is None:
@@ -151,16 +165,24 @@ def make_sdk_query_fn(*, model: str | None = None,
         except Exception:
             pass
 
-    def _run_query(prompt: str, meta: dict, use_model) -> str:
+    def _run_query(prompt: str, meta: dict, use_model, *, cwd: str | None = None) -> str:
         # max_turns=4 not 1: the CLI occasionally burns turns before the
         # final reply (observed live 2026-07-08, and again 2026-07-18 at 2).
         # Tools are disabled, so unused headroom costs nothing.
         # setting_sources=[] keeps the operator's hooks/plugins/skills out of
         # the subagent session \u2014 with them loaded, skill reminders push the
         # model into tool calls until max_turns errors (observed same day).
-        options = ClaudeAgentOptions(system_prompt=system_prompt, model=use_model,
-                                     max_turns=4, tools=[], allowed_tools=[],
-                                     setting_sources=[], settings=_LOCKED_SETTINGS)
+        if tools and cwd:
+            # tooled builder: read-only tools inside the worktree, more turns (reads cost turns),
+            # deny list from _TOOLED_SETTINGS; the reply contract is unchanged
+            options = ClaudeAgentOptions(system_prompt=system_prompt + TOOLED_SYSTEM_PROMPT_SUFFIX,
+                                         model=use_model, max_turns=max_turns, tools=list(tools),
+                                         allowed_tools=list(tools), cwd=cwd, setting_sources=[],
+                                         settings=_TOOLED_SETTINGS)
+        else:
+            options = ClaudeAgentOptions(system_prompt=system_prompt, model=use_model,
+                                         max_turns=4, tools=[], allowed_tools=[],
+                                         setting_sources=[], settings=_LOCKED_SETTINGS)
         results: list[str] = []
         error: list[str] = []
 
@@ -198,7 +220,7 @@ def make_sdk_query_fn(*, model: str | None = None,
             raise RuntimeError("claude-agent-sdk returned no result message")
         return _strip_fences(results[-1])
 
-    def _query_once(prompt: str, use_model) -> str:
+    def _query_once(prompt: str, use_model, *, cwd: str | None = None) -> str:
         meta: dict = {"num_turns": None, "subtype": None}
         start = time.monotonic()
 
@@ -209,7 +231,7 @@ def make_sdk_query_fn(*, model: str | None = None,
                     "reply_chars": reply_chars}
 
         try:
-            text = _run_query(prompt, meta, use_model)
+            text = _run_query(prompt, meta, use_model, cwd=cwd)
         except TimeoutError as e:
             fields = _fields(0)
             fields["timeout_s"] = timeout_s
@@ -246,14 +268,14 @@ def make_sdk_query_fn(*, model: str | None = None,
             raise classified from e
         raise e
 
-    def _attempt(prompt: str, use_model) -> str:
+    def _attempt(prompt: str, use_model, *, cwd: str | None = None) -> str:
         # one bounded retry for model-side flakes (max-turns error results,
         # missing result message, truncated/non-JSON output \u2014 all observed
         # live on fable-5 through 2026-07-18). Wall-clock timeouts are NOT
         # retried: doubling a 300s wait starves the tick cadence.
         # With fallback disabled this is byte-for-byte the historical behaviour.
         try:
-            text = _query_once(prompt, use_model)
+            text = _query_once(prompt, use_model, cwd=cwd)
         except TimeoutError:
             raise
         except Exception as e:
@@ -263,12 +285,12 @@ def make_sdk_query_fn(*, model: str | None = None,
             if not _is_retryable(e):
                 _raise_classified(e)
             try:
-                return _query_once(prompt, use_model)
+                return _query_once(prompt, use_model, cwd=cwd)
             except Exception as e2:
                 _raise_classified(e2)
         if _is_valid_json_object(text):
             return text
-        retry = _query_once(prompt, use_model)
+        retry = _query_once(prompt, use_model, cwd=cwd)
         # still bad after the retry: hand it to the driver's strict parser so
         # the failure surfaces with head/tail detail \u2014 never invent structure
         return retry
@@ -348,7 +370,7 @@ def make_sdk_query_fn(*, model: str | None = None,
             # never have a live one, so this is a guard, not a path
             cooldowns[use_model] = (until, False)
 
-    def _probe_or_fail(prompt: str, now: float) -> str:
+    def _probe_or_fail(prompt: str, now: float, *, cwd: str | None = None) -> str:
         # every model is cooling: at most one probe call per interval (per shared dict);
         # between probes fail fast with zero SDK calls. The gate is reset by a successful
         # probe, or by the first call that finds candidates once the block lapsed (N7e F2).
@@ -365,7 +387,7 @@ def make_sdk_query_fn(*, model: str | None = None,
             raise _all_cooling_error(now)
         cooldowns[_PROBE_KEY] = now
         try:
-            text = _attempt(prompt, probe_model)
+            text = _attempt(prompt, probe_model, cwd=cwd)
         except TimeoutError:
             raise
         except Exception as e:
@@ -379,9 +401,9 @@ def make_sdk_query_fn(*, model: str | None = None,
         cooldowns.pop(_PROBE_KEY, None)
         return text
 
-    def query_fn(prompt: str) -> str:
+    def query_fn(prompt: str, *, cwd: str | None = None) -> str:
         if not fallback_enabled:
-            return _attempt(prompt, model)
+            return _attempt(prompt, model, cwd=cwd)
         now = clock()
         # a model still cooling down from a recent account error is skipped; any live
         # account-wide entry in the shared dict blocks every model; when every model is
@@ -389,7 +411,7 @@ def make_sdk_query_fn(*, model: str | None = None,
         account_until = _account_until(now)
         candidates = [m for m in chain if _blocked_until(m, account_until) <= now]
         if not candidates:
-            return _probe_or_fail(prompt, now)
+            return _probe_or_fail(prompt, now, cwd=cwd)
         # N7e F2: candidates exist, so no account-wide block is live (one blocks every
         # model of every chain) and the outage the gate belonged to is over. Dropping it
         # here makes the next outage start with a zero-call failure and probe only after
@@ -397,7 +419,7 @@ def make_sdk_query_fn(*, model: str | None = None,
         cooldowns.pop(_PROBE_KEY, None)
         for i, use_model in enumerate(candidates):
             try:
-                return _attempt(prompt, use_model)
+                return _attempt(prompt, use_model, cwd=cwd)
             except TimeoutError:
                 raise  # never fallen back: a second full wait starves the tick
             except Exception as e:
@@ -421,6 +443,26 @@ def make_sdk_query_fn(*, model: str | None = None,
 # subagents only return JSON: tools=[] drops the built-in toolset (allowed_tools=[]
 # alone leaves it visible), and this drops the account's claude.ai connectors
 _LOCKED_SETTINGS = json.dumps({"disableClaudeAiConnectors": True})
+
+# tooled builder (NAVIGATOR_BUILDER_TOOLS): read-only tools inside the worktree. Worktrees live
+# under /tmp, so denying /Users/** (and its macOS firmlink twin /System/Volumes/Data/**) blocks
+# the operator's home (calwbot, .env, ~/.claude, the Telegram inbox); other Claude sessions'
+# scratchpads (/private/tmp/claude-*, /tmp/claude-*) and the per-user temp tree
+# (/private/var/folders) are denied too; writes, shell and network tools are denied outright.
+# Proven live 2026-10-28 (SDK 0.2.165): a file under /tmp read OK, the firmlink path, a
+# scratchpad file and Write denied.
+_TOOLED_SETTINGS = json.dumps({
+    "disableClaudeAiConnectors": True,
+    "permissions": {"deny": [
+        "Read(//Users/**)", "Read(//System/Volumes/Data/**)", "Read(//private/var/folders/**)",
+        "Read(//private/tmp/claude-*/**)", "Read(//tmp/claude-*/**)",
+        "Read(**/.env*)", "Read(**/*.pem)", "Read(**/*.key)",
+        "Grep(//Users/**)", "Grep(//System/Volumes/Data/**)", "Grep(//private/var/folders/**)",
+        "Grep(//private/tmp/claude-*/**)", "Grep(//tmp/claude-*/**)",
+        "Glob(//Users/**)", "Glob(//System/Volumes/Data/**)", "Glob(//private/var/folders/**)",
+        "Glob(//private/tmp/claude-*/**)", "Glob(//tmp/claude-*/**)",
+        "Bash", "Write", "Edit", "NotebookEdit", "WebFetch", "WebSearch"]},
+})
 
 
 def _describe_error(message) -> str:

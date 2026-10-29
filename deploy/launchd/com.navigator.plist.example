@@ -25,6 +25,7 @@
   <dict>
     <key>NAVIGATOR_DRIVER</key>              <string>claude_sdk</string>
     <key>NAVIGATOR_SDK_MODEL</key>           <string>claude-opus-5-5</string>
+    <key>NAVIGATOR_BUILDER_TOOLS</key>     <string>0</string>
     <key>NAVIGATOR_MODE</key>                <string>dry_run</string>
     <key>NAVIGATOR_REPO</key>                <string>/ABSOLUTE/PATH/TO/target-repo</string>
     <key>NAVIGATOR_ACT_BASE_URL</key>        <string>http://127.0.0.1:8090</string>

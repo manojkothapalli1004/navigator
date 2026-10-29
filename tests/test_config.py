@@ -173,3 +173,41 @@ def test_merge_in_dry_run_env_wiring(monkeypatch):
         monkeypatch.setenv("NAVIGATOR_MERGE_IN_DRY_RUN", v)
         with pytest.raises(ValueError, match="NAVIGATOR_MERGE_IN_DRY_RUN"):
             cfg.Settings.from_env()
+
+def test_builder_tools_env_wiring(monkeypatch):
+    # operator decision 2026-10-28: builder read-only tools, off by default
+    import pytest
+    for k in ("NAVIGATOR_BUILDER_TOOLS", "NAVIGATOR_SDK_BUILDER_MAX_TURNS",
+              "NAVIGATOR_SDK_BUILDER_TIMEOUT_S"):
+        monkeypatch.delenv(k, raising=False)
+    assert cfg.Settings().builder_tools is False
+    assert cfg.Settings().sdk_builder_max_turns == 30
+    assert cfg.Settings().sdk_builder_timeout_s == 900.0
+    s = cfg.Settings.from_env()
+    assert s.builder_tools is False
+    assert s.sdk_builder_max_turns == 30
+    assert s.sdk_builder_timeout_s == 900.0
+    monkeypatch.setenv("NAVIGATOR_BUILDER_TOOLS", "1")
+    assert cfg.Settings.from_env().builder_tools is True
+    monkeypatch.setenv("NAVIGATOR_BUILDER_TOOLS", "true")
+    assert cfg.Settings.from_env().builder_tools is True
+    monkeypatch.setenv("NAVIGATOR_BUILDER_TOOLS", "0")
+    assert cfg.Settings.from_env().builder_tools is False
+    monkeypatch.setenv("NAVIGATOR_BUILDER_TOOLS", "maybe")
+    with pytest.raises(ValueError, match="NAVIGATOR_BUILDER_TOOLS"):
+        cfg.Settings.from_env()
+    monkeypatch.setenv("NAVIGATOR_BUILDER_TOOLS", "0")
+    monkeypatch.setenv("NAVIGATOR_SDK_BUILDER_MAX_TURNS", "12")
+    assert cfg.Settings.from_env().sdk_builder_max_turns == 12
+    monkeypatch.setenv("NAVIGATOR_SDK_BUILDER_MAX_TURNS", "0")
+    with pytest.raises(ValueError, match="NAVIGATOR_SDK_BUILDER_MAX_TURNS"):
+        cfg.Settings.from_env()
+    monkeypatch.setenv("NAVIGATOR_SDK_BUILDER_MAX_TURNS", "abc")
+    with pytest.raises(ValueError, match="NAVIGATOR_SDK_BUILDER_MAX_TURNS"):
+        cfg.Settings.from_env()
+    monkeypatch.setenv("NAVIGATOR_SDK_BUILDER_MAX_TURNS", "12")
+    monkeypatch.setenv("NAVIGATOR_SDK_BUILDER_TIMEOUT_S", "12.5")
+    assert cfg.Settings.from_env().sdk_builder_timeout_s == 12.5
+    monkeypatch.setenv("NAVIGATOR_SDK_BUILDER_TIMEOUT_S", "0")
+    with pytest.raises(ValueError, match="NAVIGATOR_SDK_BUILDER_TIMEOUT_S"):
+        cfg.Settings.from_env()

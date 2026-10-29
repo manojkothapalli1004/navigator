@@ -310,3 +310,29 @@ def test_cycle_reports_quota_exhausted_without_the_sdk_text(tmp_path, monkeypatc
     assert "error" not in summary
     blob = json.dumps(summary)
     assert "SECRET" not in blob and "session limit" not in blob and "claude.ai" not in blob
+
+def test_builder_tools_flag_reaches_the_daemon_driver(tmp_path, monkeypatch):
+    # operator decision 2026-10-28: NAVIGATOR_BUILDER_TOOLS gives the builder (and only the
+    # builder) read-only tools with its own turn cap and timeout
+    import navigator.__main__ as m
+    from navigator.contracts.enums import Role
+    built = []
+    def fake_make(*, model, timeout_s, **kw):
+        built.append((model, timeout_s, kw))
+        return lambda p: model
+    monkeypatch.setattr(m, "make_sdk_query_fn", fake_make)
+    s = _settings(tmp_path, _seed_repo(tmp_path), driver="claude_sdk", sdk_model="claude-fable-5-1",
+                  sdk_role_models={"planner": "claude-sonnet-5-5", "verifier": "claude-sonnet-5-5"},
+                  builder_tools=True, sdk_builder_max_turns=20, sdk_builder_timeout_s=1200.0,
+                  sdk_timeout_s=77.0)
+    drv = build_navigator(s).driver
+    assert drv.role_query_fns[Role.builder]("x") == "claude-fable-5-1"
+    tooled = [(mo, t, kw) for mo, t, kw in built if "tools" in kw]
+    assert len(tooled) == 1
+    assert tooled[0][2]["tools"] == ("Read", "Grep", "Glob")
+    assert tooled[0][2]["max_turns"] == 20
+    assert tooled[0][1] == 1200.0
+    others = [(mo, t, kw) for mo, t, kw in built if "tools" not in kw]
+    assert len(others) == 3
+    for _, t, kw in others:
+        assert "max_turns" not in kw and t == 77.0
