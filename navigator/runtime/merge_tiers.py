@@ -1,6 +1,7 @@
 """Merge tiers (operator decision 2026-10-28, 'ask me less').
 
-A pure classifier: A = tests/docs only, C = money/auth/secret/migration/dependency paths,
+A pure classifier: A = test files and data fixtures inside a tests directory, or documents/images
+(whitelisted suffixes) only, C = money/auth/secret/migration/dependency paths,
 Navigator's own safety code (only when the repo is named navigator) or the trader repo,
 else B. Nothing here merges anything; the executor records the tier on every
 run.awaiting_review event and later builds act on it. classify() never calls git.
@@ -18,12 +19,13 @@ TIERS = ("A", "B", "C")
 MONEY_C = ("*billing*", "*payment*", "*payout*", "*refund*", "pay.py", "order*", "*wallet*", "*ledger*",
            "*invoice*", "*stripe*", "*paypal*", "*checkout*")
 AUTH_C = ("oauth*", "session*", "*perm*")
-KEY_C = ("claude.md", "agents.md", ".claude/*", "*.crt", "*.cer", "*.p12", "*.pfx", "*.jks", "*.keystore", "id_rsa*", "id_ed25519*", "id_ecdsa*",
+KEY_C = ("claude.md", "agents.md", ".claude/*", "gemini.md", "claude.local.md", ".claude", "*.crt", "*.cer", "*.p12", "*.pfx", "*.jks", "*.keystore", "id_rsa*", "id_ed25519*", "id_ecdsa*",
          "*api_key*", "*api-key*", "*apikey*", "*private*key*", "*.db", "*.sqlite*")
 UNIVERSAL_C = ("*.env", "*.env.*", "*.pem", "*.key", "*secret*", "*credential*", "*token*", "*password*",
                "*migrations/*", "*alembic/*", "*.sql", "pyproject.toml", "uv.lock", "requirements*.txt",
                "auth*", "*security*", "deps.py", "*routes/*", "models.py", "db.py", "config.py", "settings.py",
-               ".github/*", "deploy/*", "*.plist*", "*.sh", "legal.py") + MONEY_C + AUTH_C + KEY_C
+               ".github/*", "deploy/*", "*.plist*", "*.sh", "legal.py", "constraints*.txt", "runtime.txt",
+               ".envrc", "*.pth") + MONEY_C + AUTH_C + KEY_C
 NAVIGATOR_C = ("navigator/safety/*", "navigator/runtime/phases.py", "navigator/runtime/executor.py",
                "navigator/runtime/loop.py", "navigator/runtime/merge_tiers.py", "navigator/runtime/worktree.py",
                "navigator/runtime/checkpoint.py", "navigator/runtime/drivers/*", "navigator/observability/telegram_*",
@@ -34,7 +36,12 @@ TEST_A = ("tests/*", "*/tests/*")  # 3a2: directory only; a test_*.py outside a 
 CONFTEST = "conftest.py"  # 3a2: runs code at import under the verifier: never A
 DOC_A = ("*.md", "*.rst", "docs/*", "*.txt")
 ALWAYS_C_REPOS = ("trader",)
-CODE_SUFFIXES = (".py", ".sh", ".toml", ".cfg", ".ini", ".yml", ".yaml", ".json", ".js", ".ts")
+# 3a3: tier A is a whitelist; anything else that used to be A is B
+TEST_NAMES_A = ("test_*.py", "*_test.py", "*.test.ts", "*.test.tsx", "*.test.js", "*.test.jsx",
+                "*.spec.ts", "*.spec.tsx", "*.spec.js", "*.spec.jsx")
+FIXTURE_SUFFIXES_A = (".json", ".csv", ".txt", ".md", ".yaml", ".yml", ".xml", ".snap", ".golden",
+                      ".png", ".jpg", ".jpeg", ".gif", ".svg")
+DOC_SUFFIXES_A = (".md", ".rst", ".txt", ".adoc", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp")
 
 
 def _normalize(path: str) -> str:
@@ -67,13 +74,17 @@ def _is_c(path: str, extra) -> bool:
 
 
 def _is_a(path: str) -> bool:
-    if Path(path).name.lower() == CONFTEST:
+    name = Path(path).name.lower()
+    suffix = Path(path).suffix.lower()
+    if name == CONFTEST:
         return False
-    if _match(path, TEST_A):
+    # 3a3: inside a tests dir only test files and data fixtures (not pytest.ini, __init__.py, plugins)
+    if _match(path, TEST_A) and (any(fnmatch.fnmatchcase(name, pat) for pat in TEST_NAMES_A)
+                                 or suffix in FIXTURE_SUFFIXES_A):
         return True
-    # docs/conf.py is code, not a doc; requirements*.txt is a dependency file, not a doc
-    return (_match(path, DOC_A) and Path(path).suffix.lower() not in CODE_SUFFIXES
-            and not fnmatch.fnmatchcase(Path(path).name.lower(), "requirements*.txt"))
+    # docs: only document/image suffixes; requirements*.txt is a dependency file, not a doc
+    return (_match(path, DOC_A) and suffix in DOC_SUFFIXES_A
+            and not fnmatch.fnmatchcase(name, "requirements*.txt"))
 
 
 def classify(changed, *, repo_name: str, tier_c_paths=(), tier_floor: str = "A") -> str:
@@ -116,7 +127,7 @@ def changed_files_for_run(repo: str, run) -> list | None:
     C-quoted, so no pattern could match it; --no-renames so a file moved out of a C path into tests/ or
     docs/ still lists its old path; the run's own commits; _rebase_one moves base_commit_sha, so this is
     right after a sibling merge). None when verified_sha is missing or git fails (a TimeoutExpired or
-    OSError is also None)."""
+    OSError is also None, and so is a name that is not valid UTF-8: UnicodeDecodeError fails closed)."""
     base = getattr(run, "base_commit_sha", None)
     verified = getattr(run, "verified_sha", None)
     if not verified or not base:
@@ -124,7 +135,7 @@ def changed_files_for_run(repo: str, run) -> list | None:
     try:
         proc = subprocess.run(["git", "diff", "--no-renames", "--name-only", "-z", f"{base}..{verified}"],
                               cwd=repo, capture_output=True, text=True, timeout=60)
-    except (subprocess.TimeoutExpired, OSError):
+    except (subprocess.TimeoutExpired, OSError, UnicodeDecodeError):
         return None
     if proc.returncode != 0:
         return None

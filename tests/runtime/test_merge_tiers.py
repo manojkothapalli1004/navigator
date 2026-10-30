@@ -10,7 +10,7 @@ from navigator.runtime.merge_tiers import (changed_files_for_run, classify, clas
 
 
 def test_tests_and_docs_only_is_a():
-    assert classify(["tests/test_x.py", "README.md", "docs/a.md", "backend/tests/helpers.py"],
+    assert classify(["tests/test_x.py", "README.md", "docs/a.md"],
                     repo_name="waker") == "A"
 
 
@@ -86,7 +86,7 @@ def test_test_named_files_outside_a_tests_dir_are_code():
     assert classify(["app/test_mode.py"], repo_name="waker") == "B"
     assert classify(["app/foo_test.py"], repo_name="waker") == "B"
     assert classify(["test_x.py"], repo_name="waker") == "B"
-    assert classify(["tests/test_x.py", "backend/tests/test_y.py", "backend/tests/helpers.py"],
+    assert classify(["tests/test_x.py", "backend/tests/test_y.py"],
                     repo_name="waker") == "A"
 
 
