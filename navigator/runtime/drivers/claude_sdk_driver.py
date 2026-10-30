@@ -118,19 +118,24 @@ class ClaudeSDKDriver:
     @classmethod
     def from_settings(cls, settings: Settings, *, budget_guard: BudgetGuard,
                       make_query_fn: Callable[..., Callable[[str], str]] | None = None,
-                      estimated_cost_per_call_usd: float = 0.25) -> "ClaudeSDKDriver":
+                      estimated_cost_per_call_usd: float = 0.25,
+                      cooldowns: dict | None = None) -> "ClaudeSDKDriver":
         """Wire the live driver from Settings: per-role models (cheaper models where
         the role doesn't need the strongest one), the model fallback chain and ONE
         cooldown dict shared by every query fn, so a model that ran out of credits
         for the builder is skipped by the other roles too.
 
         make_query_fn is injectable (default: make_sdk_query_fn) so the wiring is
-        testable without the sdk extra.
+        testable without the sdk extra. `cooldowns` (U2a settings hot reload): when given,
+        that SAME dict object is used instead of a fresh one, so a driver rebuilt after a
+        settings change keeps the models already cooling. The dict used is exposed as
+        driver.cooldowns.
         """
         if make_query_fn is None:
             from navigator.runtime.drivers.sdk_query import make_sdk_query_fn
             make_query_fn = make_sdk_query_fn
-        cooldowns: dict = {}
+        if cooldowns is None:
+            cooldowns = {}
         common = dict(timeout_s=settings.sdk_timeout_s,
                       fallbacks=tuple(settings.sdk_model_fallbacks),
                       cooldown_s=settings.sdk_model_cooldown_s,
@@ -158,11 +163,13 @@ class ClaudeSDKDriver:
             # under /Users, and never without the tooled session it rides on
             raise ValueError("NAVIGATOR_BUILDER_TESTS needs NAVIGATOR_BUILDER_TOOLS=1 (the run_tests tool rides on "
                              "the tooled builder session)")
-        return cls(query_fn=make_query_fn(model=settings.sdk_model, **common),
-                   role_query_fns=role_fns, budget_guard=budget_guard,
-                   estimated_cost_per_call_usd=estimated_cost_per_call_usd,
-                   builder_tests=settings.builder_tests,
-                   builder_test_runs=settings.builder_test_runs)
+        driver = cls(query_fn=make_query_fn(model=settings.sdk_model, **common),
+                     role_query_fns=role_fns, budget_guard=budget_guard,
+                     estimated_cost_per_call_usd=estimated_cost_per_call_usd,
+                     builder_tests=settings.builder_tests,
+                     builder_test_runs=settings.builder_test_runs)
+        driver.cooldowns = cooldowns
+        return driver
 
     def run_role(self, request: DriverRequest) -> DriverResult:
         self.budget_guard.check_before_call(self.estimated_cost_per_call_usd)

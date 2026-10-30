@@ -4,13 +4,15 @@ import os
 import subprocess
 import sys
 import time
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
 import structlog
-from navigator.cli import COMMANDS, run_cli
-from navigator.config import RepoConfig, Settings, effective_repos
+from navigator.cli import COMMANDS, _safe, run_cli
+from navigator.config import (ENV_ONLY_FIELDS, HOT_FIELDS, WIRING_FIELDS, RepoConfig, Settings,
+                              effective_repos)
 from navigator.runtime.fleet import Fleet
 from navigator.contracts.enums import Role
 from navigator.observability import decisions
@@ -214,21 +216,168 @@ def _reconcile_with_readiness(nav: Navigator) -> None:
                 return
             time.sleep(_RECONCILE_DELAY_S)
 
+# ---- U2a: settings hot reload from the ACT document navigator/settings --------------------
+# The daemon starts on Settings.from_env() (`base`). At the top of each cycle it reads the
+# document and overlays its validated hot fields on `base` (document > env > default; the
+# env-only safety fields are refused, see config.HOT_FIELDS / ENV_ONLY_FIELDS). Nothing in
+# this path may fail or stop a cycle: an ACT error keeps the current settings. With no
+# document the daemon behaves byte-identically to before (no settings_* key in a cycle line).
+_SETTINGS_DOC = "navigator/settings"
+_STATUS_DOC = "navigator/status"
+_STATUS_ACTOR = "navigator-daemon"
+
+
+def _doc_act(nav):
+    """The ACT client used for the settings/status documents, or None when the navigator has
+    none with a get_doc (the bare FakeNav doubles in tests): then nothing is reloaded."""
+    act = getattr(nav, "telegram_act", None) or getattr(nav, "act", None)
+    if act is not None and callable(getattr(act, "get_doc", None)):
+        return act
+    return None
+
+
+def _members(target) -> list:
+    """The single-repo navigators behind `target`: a Fleet's members, else target itself."""
+    navigators = getattr(target, "navigators", None)
+    return list(navigators) if navigators else [target]
+
+
+def _reload_settings(act, base: Settings, applied: tuple[int, dict] | None):
+    """Read navigator/settings. Returns (new_settings, applied, rejected, error) where
+    `applied` is the (version, body) pair the caller should keep:
+    - no document: (None, None, [], None); a caller holding an applied document returns to base
+    - unchanged (same version AND body as `applied`): (None, applied, [], None)
+    - new document: (base.overlay(body)[0], (version, body), rejected, None)
+    - any exception: (None, applied, [], "<Class>: <msg>") meaning keep the current settings.
+    A deleted-and-recreated document at the same version but a different body counts as new."""
+    try:
+        doc = act.get_doc(_SETTINGS_DOC)
+        if doc is None:
+            return None, None, [], None
+        body, version = doc
+        if applied is not None and version == applied[0] and body == applied[1]:
+            return None, applied, [], None
+        new, rejected = base.overlay(body)
+        return new, (version, body), rejected, None
+    except Exception as e:
+        return None, applied, [], f"{type(e).__name__}: {e}"[:200]
+
+
+def _apply_settings(target, new: Settings, old: Settings) -> tuple[Settings, str | None]:
+    """Put `new` into effect on every member of `target`. Returns (the settings ACTUALLY
+    applied, error or None). A change to a WIRING_FIELDS value rebuilds the ClaudeSDKDriver
+    with the SAME budget guard and cooldown dict; if that rebuild fails for ANY reason the old
+    driver stays and only the non-wiring fields apply. A FakeSubagentDriver is never rebuilt."""
+    applied = new
+    error = None
+    driver = getattr(target, "driver", None)
+    if (isinstance(driver, ClaudeSDKDriver)
+            and any(getattr(new, f) != getattr(old, f) for f in WIRING_FIELDS)):
+        try:
+            rebuilt = ClaudeSDKDriver.from_settings(new, budget_guard=driver.budget_guard,
+                                                    make_query_fn=make_sdk_query_fn,
+                                                    cooldowns=getattr(driver, "cooldowns", None))
+        except Exception as e:
+            applied = replace(new, **{f: getattr(old, f) for f in WIRING_FIELDS})
+            error = f"{type(e).__name__}: {e}"[:300]
+        else:
+            for nav in _members(target):
+                nav.driver = rebuilt
+            triage = getattr(target, "triage", None)
+            if triage is not None:
+                triage.query_fn = _triage_query_fn(rebuilt)
+    for nav in _members(target):
+        nav.settings = applied
+        runner = getattr(nav, "runner", None)
+        if runner is not None:
+            # the same clamp build_navigator applies (see the comment there)
+            runner.timeout_s = (min(applied.command_timeout_s, 300.0) if applied.builder_tests
+                                else applied.command_timeout_s)
+    return applied, error
+
+
+def _env_only_value(settings: Settings, name: str) -> str:
+    """Redacted printable form of an env-only field for the status document."""
+    v = getattr(settings, name)
+    if name == "repos":
+        text = json.dumps([r.path for r in v])
+    elif isinstance(v, list):
+        text = json.dumps(v)
+    else:
+        text = str(v)
+    return _safe(text)
+
+
+def _write_status(act, target, settings: Settings, version, cycle: int, summary: dict, *,
+                  error: str | None = None, rejected: list[str] | None = None) -> str | None:
+    """Write navigator/status for the UI after a cycle: the effective hot fields, the redacted
+    env-only fields and the last settings error / rejected keys (they persist here until a
+    later reload clears them). Never raises: returns None, or the failing exception's class
+    name (its text could carry a URL)."""
+    try:
+        body = {"ts": _now_iso(), "cycle": cycle, "code_sha": code_sha(),
+                "settings_version": version, "members": len(_members(target)),
+                "summary": summary,
+                "effective": {f: getattr(settings, f) for f in sorted(HOT_FIELDS)},
+                "env_only": {f: _env_only_value(settings, f) for f in sorted(ENV_ONLY_FIELDS)},
+                "settings_error": error,
+                "settings_rejected": list(rejected or [])}
+        act.put_doc(_STATUS_DOC, body, actor=_STATUS_ACTOR)
+    except Exception as e:
+        return type(e).__name__
+    return None
+
+
 _FAILURE_WARN_THRESHOLD = 4
 
 def run_daemon(nav: Navigator, settings: Settings, *, max_cycles: int | None = None) -> None:
     # which navigator code is running: lets outcomes/cycles be tied to a commit
     print(json.dumps({"ts": _now_iso(), "startup": "navigator", "code_sha": code_sha()}), flush=True)
     _reconcile_with_readiness(nav)
+    # U2a settings hot reload: `base` is the environment, `current` what this cycle runs with
+    # (document > env > default), `applied` the (version, body) of the document in force
+    base = settings
+    current = settings
+    applied: tuple[int, dict] | None = None
+    last_error: str | None = None   # shown in navigator/status until a later reload clears it
+    last_rejected: list[str] = []
     cycle = 0
     consecutive_failures = 0
     while True:
         cycle += 1
+        act = _doc_act(nav)
+        settings_error: str | None = None
+        rejected: list[str] = []
+        if act is not None:
+            try:
+                new, applied_next, rejected, settings_error = _reload_settings(act, base, applied)
+                if (new is None and applied_next is None and applied is not None
+                        and settings_error is None):
+                    new = base  # the document is gone: back to the environment settings
+                if new is not None:
+                    if new != current:
+                        current, apply_error = _apply_settings(nav, new, current)
+                        settings_error = settings_error or apply_error
+                    applied = applied_next
+                    last_rejected = list(rejected)
+                    last_error = settings_error
+                elif settings_error is not None:
+                    last_error = settings_error
+            except Exception as e:  # nothing in reload/apply may kill the daemon or fail a cycle
+                settings_error = f"{type(e).__name__}: {e}"[:300]
+                last_error = settings_error
         _reset_budget(nav)
         try:
-            summary = _cycle(nav, settings)
+            summary = _cycle(nav, current)
         except Exception as e:  # a dependency blip must not kill the daemon; retry next tick
             summary = {"error": f"{type(e).__name__}: {e}"[:300]}
+        # settings_* keys only when they carry information: no document = byte-identical lines
+        if applied is not None:
+            summary["settings_version"] = applied[0]
+        if rejected:
+            summary["settings_rejected"] = list(rejected)
+        if settings_error is not None:
+            summary["settings_error"] = settings_error
         failure = summary.get("error") or summary.get("planner_error")
         if not failure:
             if consecutive_failures >= _FAILURE_WARN_THRESHOLD:
@@ -242,10 +391,15 @@ def run_daemon(nav: Navigator, settings: Settings, *, max_cycles: int | None = N
             if consecutive_failures == _FAILURE_WARN_THRESHOLD:
                 nav.notifier.send(f"Navigator cycles failing: {consecutive_failures} in a row. "
                                   f"Latest: {summary['error']}")
+        if act is not None:
+            write_error = _write_status(act, nav, current, applied[0] if applied else None,
+                                        cycle, summary, error=last_error, rejected=last_rejected)
+            if write_error is not None:
+                summary["status_write_error"] = write_error
         print(json.dumps({"ts": _now_iso(), "cycle": cycle, **summary}), flush=True)
         if max_cycles is not None and cycle >= max_cycles:
             return
-        time.sleep(settings.tick_interval_s)
+        time.sleep(current.tick_interval_s)
 
 def _configure_logging() -> None:
     # stdout carries one JSON summary per cycle; human logs must not interleave
