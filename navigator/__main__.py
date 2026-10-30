@@ -184,6 +184,15 @@ def _decisions_step(nav, summary: dict) -> None:
             summary["decisions_error"] = "state_write_failed"
     except Exception as e:
         summary["decisions_error"] = type(e).__name__
+    # U3: publish what waits on the operator for the UI; separate from the tick so it
+    # runs even when the tick raised, and never touches summary["decisions"]
+    try:
+        act = getattr(nav, "telegram_act", None) or nav.act
+        if callable(getattr(act, "put_doc", None)):
+            body = decisions.snapshot(act)
+            act.put_doc(decisions.DECISIONS_DOC, body, actor=decisions.DOC_ACTOR)
+    except Exception as e:
+        summary["decisions_snapshot_error"] = type(e).__name__
 
 def _cycle(nav: Navigator, settings: Settings) -> dict:
     summary: dict = {"mode": settings.mode, "driver": settings.driver}
