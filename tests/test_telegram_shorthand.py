@@ -390,8 +390,16 @@ def test_run_like_short_name_lists_run_id_to_reply_with():
 
 # ---- 3c: merge all / merge all except ... ---------------------------------------
 
-BATCH_OFF = ("Navigator: merge all is off - set NAVIGATOR_MERGE_TIER_B_BATCH=1 for the "
-             "Telegram process")
+BATCH_OFF = ("Navigator: merge all is off - turn on 'merge all (tier A/B)' in Navigator settings "
+             "(http://127.0.0.1:3000/navigator/settings), or set NAVIGATOR_MERGE_TIER_B_BATCH=1")
+
+
+def test_batch_off_text_points_at_settings_page():
+    assert "navigator/settings" in BATCH_OFF
+    assert "merge all (tier A/B)" in BATCH_OFF
+    assert BATCH_OFF.startswith("Navigator: merge all is off")
+
+
 FULL_ID = "run-01ARZ3NDEKTSV4RRFFQ69G5FAV"
 
 
