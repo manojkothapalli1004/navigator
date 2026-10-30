@@ -1,5 +1,6 @@
 import dataclasses
 import json
+import math
 import os
 import zoneinfo
 from dataclasses import dataclass, field
@@ -204,12 +205,17 @@ ENV_ONLY_FIELDS = frozenset({
 _HOT_BOOL_FIELDS = frozenset({"merge_in_dry_run", "operator_preapprove", "merge_tier_a_auto",
                               "merge_tier_b_batch", "rebase_stale_runs", "builder_tools",
                               "builder_tests", "decisions_nudges"})
-# int fields with their lower bound
-_HOT_INT_MIN = {"builder_test_runs": 1, "max_open_proposals": 1, "max_proposals_per_tick": 1,
-                "proposal_ttl_days": 1, "planner_merge_window": 1, "sdk_builder_max_turns": 1,
-                "builder_repair_turns": 0, "tick_interval_s": 60}
-_HOT_POSITIVE_FLOAT_FIELDS = frozenset({"planner_throttle_hours", "sdk_timeout_s",
-                                        "sdk_builder_timeout_s"})
+# int fields with their inclusive (lower, upper) bounds (rev1: every int hot field is bounded
+# above too, so a document can never hand the daemon a value like time.sleep(10**10))
+_HOT_INT_RANGE: dict[str, tuple[int, int]] = {
+    "builder_test_runs": (1, 50), "max_open_proposals": (1, 100), "max_proposals_per_tick": (1, 20),
+    "proposal_ttl_days": (1, 365), "planner_merge_window": (1, 1000), "sdk_builder_max_turns": (1, 200),
+    "builder_repair_turns": (0, 5), "tick_interval_s": (60, 86400),
+}
+# positive float fields with their inclusive upper bound; a value must also be finite
+# (json.loads accepts Infinity/NaN, which would disable a timeout or stop the planner)
+_HOT_FLOAT_MAX: dict[str, int] = {"planner_throttle_hours": 720, "sdk_timeout_s": 7200,
+                                  "sdk_builder_timeout_s": 7200}
 _SDK_ROLES = ("planner", "builder", "verifier")
 
 
@@ -237,15 +243,29 @@ def _hot_value_error(key: str, v) -> str | None:
         if not all(isinstance(model, str) and model for model in v.values()):
             return "values must be non-empty strings"
         return None
-    if key in _HOT_INT_MIN:
-        lo = _HOT_INT_MIN[key]
-        return None if _is_json_int(v) and v >= lo else f"must be an integer >= {lo}"
+    if key in _HOT_INT_RANGE:
+        lo, hi = _HOT_INT_RANGE[key]
+        return None if _is_json_int(v) and lo <= v <= hi else f"must be an integer {lo}..{hi}"
     if key == "digest_hour":
         return None if _is_json_int(v) and 0 <= v <= 23 else "must be an integer 0..23"
-    if key in _HOT_POSITIVE_FLOAT_FIELDS:
-        return None if _is_json_number(v) and v > 0 else "must be a number > 0"
+    if key in _HOT_FLOAT_MAX:
+        hi = _HOT_FLOAT_MAX[key]
+        reason = f"must be a number > 0 and <= {hi}"
+        # order matters: type check, then finiteness on floats ONLY (math.isfinite on a huge
+        # int such as 10**400 would raise OverflowError), then the range check (which also
+        # refuses any int above the bound without converting it to float)
+        if not _is_json_number(v):
+            return reason
+        if isinstance(v, float) and not math.isfinite(v):
+            return reason
+        return None if 0 < v <= hi else reason
     if key == "planner_min_merge_rate":
-        return None if _is_json_number(v) and 0.0 <= v <= 1.0 else "must be a number between 0 and 1"
+        reason = "must be a number between 0 and 1"
+        if not _is_json_number(v):
+            return reason
+        if isinstance(v, float) and not math.isfinite(v):
+            return reason
+        return None if 0.0 <= v <= 1.0 else reason
     if key == "decisions_tz":
         if not isinstance(v, str) or not v:
             return "must be a time zone name"
@@ -261,7 +281,7 @@ def _hot_value(key: str, v):
     """The value stored for a validated hot field (no aliasing of the document's objects)."""
     if key == "sdk_role_models":
         return dict(v)
-    if key in _HOT_POSITIVE_FLOAT_FIELDS or key == "planner_min_merge_rate":
+    if key in _HOT_FLOAT_MAX or key == "planner_min_merge_rate":
         return float(v)
     return v
 
