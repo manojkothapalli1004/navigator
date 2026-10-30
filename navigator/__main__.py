@@ -330,6 +330,31 @@ def _write_status(act, target, settings: Settings, version, cycle: int, summary:
 
 _FAILURE_WARN_THRESHOLD = 4
 
+# rev1: the daemon's sleep can never raise. time.sleep(10**10) raises OverflowError outside
+# every try in run_daemon and would kill the daemon, so the tick is clamped here regardless
+# of what Settings holds (a document value is already bounded by Settings.overlay; this is
+# the last line of defence for any other path).
+_SLEEP_FALLBACK_S = 900.0
+_SLEEP_MIN_S = 1.0
+_SLEEP_MAX_S = 86400.0
+
+
+def _sleep_seconds(settings) -> float:
+    """The seconds run_daemon sleeps between cycles: settings.tick_interval_s clamped to
+    1..86400 (inf -> 86400, -inf -> 1). A bool, a non-number, NaN or any error -> 900.
+    Never raises."""
+    try:
+        v = settings.tick_interval_s
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            return _SLEEP_FALLBACK_S
+        if v != v:  # NaN
+            return _SLEEP_FALLBACK_S
+        # int/float comparisons are exact in Python: no float(v) on a huge int
+        return float(min(max(v, _SLEEP_MIN_S), _SLEEP_MAX_S))
+    except Exception:
+        return _SLEEP_FALLBACK_S
+
+
 def run_daemon(nav: Navigator, settings: Settings, *, max_cycles: int | None = None) -> None:
     # which navigator code is running: lets outcomes/cycles be tied to a commit
     print(json.dumps({"ts": _now_iso(), "startup": "navigator", "code_sha": code_sha()}), flush=True)
@@ -399,7 +424,7 @@ def run_daemon(nav: Navigator, settings: Settings, *, max_cycles: int | None = N
         print(json.dumps({"ts": _now_iso(), "cycle": cycle, **summary}), flush=True)
         if max_cycles is not None and cycle >= max_cycles:
             return
-        time.sleep(current.tick_interval_s)
+        time.sleep(_sleep_seconds(current))
 
 def _configure_logging() -> None:
     # stdout carries one JSON summary per cycle; human logs must not interleave
