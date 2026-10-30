@@ -109,7 +109,7 @@ def test_boot_time_parses_sysctl(monkeypatch):
     monkeypatch.setattr(lock_mod, "_BOOT_TIME", None)
     monkeypatch.setattr(lock_mod.subprocess, "run", fake_run)
     assert lock_mod.boot_time() == 1793236549
-    assert seen["argv"] == ["sysctl", "-n", "kern.boottime"]
+    assert seen["argv"][1:] == ["-n", "kern.boottime"] and seen["argv"][0] in ("/usr/sbin/sysctl", "sysctl")
     assert seen["timeout"] == 5
     assert lock_mod._BOOT_TIME == 1793236549  # cached after the first success
     # cached: a now-failing sysctl is not consulted

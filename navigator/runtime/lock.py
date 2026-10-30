@@ -10,6 +10,9 @@ from contextlib import contextmanager
 from pathlib import Path
 
 _BOOT_TIME: int | None = None  # cached after the first successful read; None is never cached
+# launchd services often run with a PATH lacking /usr/sbin, where macOS keeps sysctl; use the
+# absolute path when it exists so the reboot-safe lock works there too, else fall back to PATH
+_SYSCTL = "/usr/sbin/sysctl"
 
 
 def boot_time() -> int | None:
@@ -19,7 +22,8 @@ def boot_time() -> int | None:
     if _BOOT_TIME is not None:
         return _BOOT_TIME
     try:
-        proc = subprocess.run(["sysctl", "-n", "kern.boottime"], capture_output=True,
+        cmd = _SYSCTL if os.path.exists(_SYSCTL) else "sysctl"
+        proc = subprocess.run([cmd, "-n", "kern.boottime"], capture_output=True,
                               text=True, timeout=5)
     except Exception:
         return None
