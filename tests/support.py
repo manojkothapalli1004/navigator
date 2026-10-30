@@ -56,3 +56,10 @@ class ProtocolOnlyACT:
 
     def emit_event(self, event: Event) -> None:
         return self._inner.emit_event(event)
+
+    def get_doc(self, key: str) -> tuple[dict, int] | None:
+        return self._inner.get_doc(key)
+
+    def put_doc(self, key: str, body: dict, actor: str,
+                expected_version: int | None = None) -> int:
+        return self._inner.put_doc(key, body, actor, expected_version)
