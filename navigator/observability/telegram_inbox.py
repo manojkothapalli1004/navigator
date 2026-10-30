@@ -436,7 +436,7 @@ def _apply_batch(act, cmd: TelegramCommand, notifier) -> dict:
     are listed. One reply, one run.telegram_decision event per approved run. Only a
     raise BEFORE the loop propagates to apply_commands; per-run failures are reported
     in the summary so a re-sent 'merge all' cannot lose the runs already approved."""
-    if not batch_enabled():
+    if not batch_enabled(act):
         notifier.send("Navigator: merge all is off - set NAVIGATOR_MERGE_TIER_B_BATCH=1 "
                       "for the Telegram process")
         return {"run_id": None, "action": "merge", "applied": False, "reason": "batch off"}
