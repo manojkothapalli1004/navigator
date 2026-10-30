@@ -146,14 +146,39 @@ def _triage_step(nav, summary: dict) -> None:
     except Exception as e:
         summary["triage_error"] = f"{type(e).__name__}: {e}"[:300]
 
+_DECISIONS_FIELDS = ("digest_hour", "decisions_nudges", "decisions_tz")
+
+
+def _decisions_settings(nav):
+    """U2b: the Settings decisions_tick should consult, or None when no decisions field is
+    set (then the tick reads its environment variables exactly as before). A Fleet has no
+    settings of its own: its first member's are used."""
+    s = getattr(nav, "settings", None)
+    if s is None:
+        members = getattr(nav, "navigators", None)
+        if members:
+            s = getattr(members[0], "settings", None)
+    if s is None:
+        return None
+    if any(getattr(s, f, None) is not None for f in _DECISIONS_FIELDS):
+        return s
+    return None
+
+
 def _decisions_step(nav, summary: dict) -> None:
     """The decisions inbox tick (observability/decisions.py): the 4h nudge and the 8am
     digest for everything waiting on the operator. Never breaks the cycle: an exception
     goes into the summary as its class name ONLY (a notifier's error text can carry the
-    token-bearing URL); a tick that could not write its state file is reported too."""
+    token-bearing URL); a tick that could not write its state file is reported too.
+    The settings document's decisions fields (U2b) are passed only when one is set, so
+    the two-argument call stays byte-identical otherwise."""
     try:
         act = getattr(nav, "telegram_act", None) or nav.act
-        result = decisions.decisions_tick(act, nav.notifier)
+        s = _decisions_settings(nav)
+        if s is not None:
+            result = decisions.decisions_tick(act, nav.notifier, settings=s)
+        else:
+            result = decisions.decisions_tick(act, nav.notifier)
         summary["decisions"] = result
         if isinstance(result, dict) and result.get("state_write_failed"):
             summary["decisions_error"] = "state_write_failed"

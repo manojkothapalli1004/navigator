@@ -136,9 +136,21 @@ def tier_for_run(repo: str, run, cfg) -> str | None:
     return None if changed is None else classify_for_repo(changed, repo, cfg)
 
 
-def batch_enabled() -> bool:
-    """NAVIGATOR_MERGE_TIER_B_BATCH as the Telegram-handling process sees it (it has no
-    Settings). A malformed value is off."""
+def batch_enabled(act=None) -> bool:
+    """Whether 'merge all' is on for the Telegram-handling process (it has no Settings).
+    U2b: with an ACT client that has get_doc, the settings document navigator/settings
+    wins when its merge_tier_b_batch is a bool. A missing document, a missing or non-bool
+    key, or ANY exception while reading falls back to NAVIGATOR_MERGE_TIER_B_BATCH exactly
+    as before (a malformed value is off). Never raises."""
+    if act is not None and callable(getattr(act, "get_doc", None)):
+        try:
+            doc = act.get_doc("navigator/settings")
+            if doc is not None:
+                value = doc[0].get("merge_tier_b_batch")
+                if isinstance(value, bool):
+                    return value
+        except Exception:
+            pass
     from navigator.config import _bool_env
     try:
         return _bool_env("NAVIGATOR_MERGE_TIER_B_BATCH", "0")

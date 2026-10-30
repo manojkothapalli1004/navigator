@@ -28,7 +28,9 @@ Nothing is sent in the quiet hours (QUIET_START_HOUR..QUIET_END_HOUR local) EXCE
 the digest hour, which is never quiet (a 7am digest must get through QUIET_END_HOUR=8).
 A NAVIGATOR_DIGEST_HOUR / NAVIGATOR_DECISIONS_NUDGES value that does not parse raises
 ValueError naming the variable (reported per cycle as decisions_error) before any state
-write. Neither is a Settings key, so they are documented here, not in navigator.toml.example.
+write. U2b: the daemon passes its Settings to decisions_tick when the settings document
+(navigator/settings) sets digest_hour / decisions_nudges / decisions_tz; a non-None field
+beats the environment variable, None keeps the env path above.
 
 Only decisions_tick (the daemon cycle, __main__._decisions_step) writes the state file:
 first_seen per item key, the local day each item was last nudged, and the local day of
@@ -91,7 +93,10 @@ def manual_path() -> str:
     return os.getenv("NAVIGATOR_MANUAL_DECISIONS_PATH") or DEFAULT_MANUAL_PATH
 
 
-def local_tz():
+def local_tz(settings=None):
+    """settings.decisions_tz when set (U2b), else NAVIGATOR_DECISIONS_TZ / DEFAULT_TZ."""
+    if settings is not None and getattr(settings, "decisions_tz", None) is not None:
+        return zoneinfo.ZoneInfo(settings.decisions_tz)
     return zoneinfo.ZoneInfo(os.getenv("NAVIGATOR_DECISIONS_TZ") or DEFAULT_TZ)
 
 
@@ -104,10 +109,12 @@ def _bad_env(name: str, raw: str, expected: str) -> None:
     raise ValueError(msg)
 
 
-def digest_hour() -> int:
-    """NAVIGATOR_DIGEST_HOUR (local hour 0-23 of the morning digest; default DIGEST_HOUR).
-    A value that is not an integer in 0..23 raises ValueError naming the variable
-    (reported per cycle as decisions_error)."""
+def digest_hour(settings=None) -> int:
+    """settings.digest_hour when set (U2b), else NAVIGATOR_DIGEST_HOUR (local hour 0-23 of
+    the morning digest; default DIGEST_HOUR). An env value that is not an integer in
+    0..23 raises ValueError naming the variable (reported per cycle as decisions_error)."""
+    if settings is not None and getattr(settings, "digest_hour", None) is not None:
+        return settings.digest_hour
     raw = os.getenv("NAVIGATOR_DIGEST_HOUR")
     if raw is None or not raw.strip():
         return DIGEST_HOUR
@@ -120,9 +127,12 @@ def digest_hour() -> int:
     return hour
 
 
-def nudges_enabled() -> bool:
-    """NAVIGATOR_DECISIONS_NUDGES: '1'/'true'/unset = the 4h reminders are sent;
-    '0'/'false' = digest only. Anything else raises ValueError naming the variable."""
+def nudges_enabled(settings=None) -> bool:
+    """settings.decisions_nudges when set (U2b), else NAVIGATOR_DECISIONS_NUDGES:
+    '1'/'true'/unset = the 4h reminders are sent; '0'/'false' = digest only. Anything
+    else raises ValueError naming the variable."""
+    if settings is not None and getattr(settings, "decisions_nudges", None) is not None:
+        return settings.decisions_nudges
     raw = (os.getenv("NAVIGATOR_DECISIONS_NUDGES") or "1").strip().lower()
     if raw in ("1", "true"):
         return True
@@ -411,7 +421,7 @@ def _due(first_seen_iso, now: datetime) -> bool:
 
 
 def decisions_tick(act, notifier, now: datetime | None = None, state_file=None,
-                   manual_file=None, candidates=None) -> dict:
+                   manual_file=None, candidates=None, settings=None) -> dict:
     """One daemon-cycle pass over the decisions list: record first_seen for new items,
     prune vanished ones (keeping every key of a kind whose source failed, and every merge
     key whose run is still open at awaiting_review - an audit-check hiccup drops the run
@@ -440,12 +450,13 @@ def decisions_tick(act, notifier, now: datetime | None = None, state_file=None,
     now = datetime.now(timezone.utc) if now is None else now
     if now.tzinfo is None:
         raise ValueError("now must be tz-aware")
-    # a bad value raises here, before any state write
-    digest_at = digest_hour()
-    nudges = nudges_enabled()
+    # a bad value raises here, before any state write; `settings` (U2b) wins over the
+    # environment for each field it sets
+    digest_at = digest_hour(settings)
+    nudges = nudges_enabled(settings)
     # a digest hour of 21-23 would put +2 at 23-25 (quiet / never): cap the fallback
     fallback_at = min(digest_at + 2, 22)
-    local = now.astimezone(local_tz())
+    local = now.astimezone(local_tz(settings))
     today = local.date().isoformat()
     path = state_file or state_path()
     items, failed = collect_with_status(act, manual_file, candidates)

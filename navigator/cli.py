@@ -11,6 +11,11 @@ daemon as the declined outcome's reason_code.
 `inbox [--since UPDATE_ID]` prints the Telegram inbox file (JSON lines, newest
 last) so other tools read operator messages from the file instead of calling
 getUpdates themselves.
+`settings` (U2b) shows the ACT settings document navigator/settings next to what the
+daemon reports in navigator/status; `settings set <field> <value>` / `settings unset
+<field>` write it with optimistic versioning (actor 'operator'), refusing env-only
+and invalid fields exactly as Settings.overlay does. The daemon applies a change at
+its next cycle.
 `cleanup [--apply]` is the exception: it removes finished runs' worktrees and
 nav/run-* branches directly (dry run unless --apply).
 `doctor [--plist PATH]` is read-only: it replays the daemon's startup against the
@@ -61,7 +66,7 @@ from navigator.contracts.enums import (ApprovalDecision, ApprovalGate, ProposalS
 from navigator.contracts.event import Event
 
 COMMANDS = ("status", "approve", "decline", "diff", "merge", "reject", "retry", "cleanup",
-            "doctor", "audited", "inbox")
+            "doctor", "audited", "inbox", "settings")
 ACTOR = "operator"
 AUDITOR = "auditor"
 # merge-gate decline reasons accepted by `navigator reject <run> --reason CODE`
@@ -84,11 +89,15 @@ def run_cli(argv: list[str], *, act, out: TextIO, worktree_root: str | None = No
               f"navigator doctor [--plist PATH]; "
               f"navigator audited <run-id> [--note TEXT]; "
               f"navigator reject <run-id> [--reason CODE]; "
-              f"navigator inbox [--since UPDATE_ID])", file=out)
+              f"navigator inbox [--since UPDATE_ID]; "
+              f"navigator settings | navigator settings set <field> <value> | "
+              f"navigator settings unset <field>)", file=out)
         return 2
     cmd, args = argv[0], argv[1:]
     if cmd == "status":
         return _status(act, out)
+    if cmd == "settings":
+        return _settings(act, args, out)
     if cmd == "doctor":
         return _doctor(args, out, act=act)
     if cmd == "audited":
@@ -397,6 +406,211 @@ def _retry(act, pid, out) -> int:
     act.decide_approval(grant.id, ApprovalDecision.approved, actor=ACTOR)
     print(f"{pid}: one retry granted (runs on the daemon's next execute cycle)", file=out)
     return 0
+
+
+# ---- settings (U2b: the UI document from the terminal) ------------------------
+
+_SETTINGS_DOC = "navigator/settings"
+_STATUS_DOC = "navigator/status"
+_SETTINGS_USAGE = ("usage: navigator settings | navigator settings set <field> <value> | "
+                   "navigator settings unset <field>")
+# hot fields whose raw CLI value is always kept as a string (never parsed as a number)
+_STRING_SETTINGS = frozenset({"sdk_model", "decisions_tz"})
+_SDK_ROLE_ENV_KEYS = ("NAVIGATOR_SDK_MODEL_PLANNER", "NAVIGATOR_SDK_MODEL_BUILDER",
+                      "NAVIGATOR_SDK_MODEL_VERIFIER")
+
+
+def _json(value) -> str:
+    """One-line JSON form of a document value, control characters replaced."""
+    return _printable(json.dumps(value, sort_keys=True, default=str))
+
+
+def _settings(act, args: list[str], out) -> int:
+    if args == []:
+        return _settings_show(act, out)
+    if len(args) == 3 and args[0] == "set":
+        return _settings_set(act, args[1], args[2], out)
+    if len(args) == 2 and args[0] == "unset":
+        return _settings_unset(act, args[1], out)
+    print(_SETTINGS_USAGE, file=out)
+    return 2
+
+
+def _settings_show(act, out) -> int:
+    """Print the settings document and what the daemon reports as in effect: one line per
+    hot field, labelled (document) when the document sets it, (daemon env/default) when
+    only the status document knows its value, (no status) otherwise. Read-only; an ACT
+    error on either read prints one line and exits 1."""
+    from navigator.config import HOT_FIELDS
+    try:
+        doc = act.get_doc(_SETTINGS_DOC)
+        status = act.get_doc(_STATUS_DOC)
+    except Exception as e:
+        print(f"settings: ACT unreachable ({type(e).__name__})", file=out)
+        return 1
+    body = doc[0] if doc is not None and isinstance(doc[0], dict) else {}
+    if doc is None:
+        print("settings document: absent", file=out)
+    else:
+        print(f"settings document: version {_printable(doc[1])}", file=out)
+    sbody = status[0] if status is not None and isinstance(status[0], dict) else None
+    if sbody is None:
+        print("daemon status: absent", file=out)
+    else:
+        print(f"daemon status: cycle {_printable(sbody.get('cycle'))} at "
+              f"{_printable(sbody.get('ts'))}, applied version "
+              f"{_printable(sbody.get('settings_version'))}", file=out)
+    effective = sbody.get("effective") if sbody is not None else None
+    if not isinstance(effective, dict):
+        effective = {}
+    for name in sorted(HOT_FIELDS):
+        if name in body:
+            print(f"{name} = {_json(body[name])}  (document)", file=out)
+        elif name in effective:
+            print(f"{name} = {_json(effective[name])}  (daemon env/default)", file=out)
+        else:
+            print(f"{name} = ?  (no status)", file=out)
+    if sbody is not None:
+        rejected = sbody.get("settings_rejected")
+        if isinstance(rejected, list) and rejected:
+            print("rejected: " + ", ".join(_printable(r) for r in rejected), file=out)
+        if sbody.get("settings_error"):
+            print(f"settings error: {_printable(sbody['settings_error'])}", file=out)
+    return 0
+
+
+def _parse_setting(name: str, raw: str):
+    """CLI text -> document value. sdk_model and decisions_tz stay strings; sdk_role_models
+    takes 'planner=m1,builder=m2' (empty = {}; a pair without '=' is a ValueError);
+    elsewhere 'true'/'false' -> bool, an int literal -> int, a FINITE float literal ->
+    float, anything else (including inf/nan) stays a string for Settings.overlay to
+    refuse."""
+    if name in _STRING_SETTINGS:
+        return raw
+    if name == "sdk_role_models":
+        pairs: dict[str, str] = {}
+        for chunk in raw.split(","):
+            chunk = chunk.strip()
+            if not chunk:
+                continue
+            role, sep, model = chunk.partition("=")
+            if not sep:
+                raise ValueError("expected role=model pairs")
+            pairs[role.strip()] = model.strip()
+        return pairs
+    text = raw.strip()
+    if text.lower() == "true":
+        return True
+    if text.lower() == "false":
+        return False
+    try:
+        return int(text)
+    except ValueError:
+        pass
+    try:
+        number = float(text)
+    except ValueError:
+        return raw
+    return number if math.isfinite(number) else raw
+
+
+def _settings_set(act, name: str, raw: str, out) -> int:
+    """Validate with Settings.overlay (env-only/unknown fields and bad values are refused,
+    exit 2), then write the document with the version just read as expected_version."""
+    from navigator.clients.act_client import DocVersionConflict
+    from navigator.config import Settings
+    try:
+        value = _parse_setting(name, raw)
+    except ValueError as e:
+        print(f"refused: {_printable(name)}: {e}", file=out)
+        return 2
+    _, rejected = Settings().overlay({name: value})
+    if rejected:
+        print(f"refused: {_printable(rejected[0])}", file=out)
+        return 2
+    try:
+        doc = act.get_doc(_SETTINGS_DOC)
+        body, expected = (dict(doc[0]), doc[1]) if doc is not None else ({}, 0)
+        body[name] = value
+        version = act.put_doc(_SETTINGS_DOC, body, actor=ACTOR, expected_version=expected)
+    except DocVersionConflict as e:
+        print(f"settings changed meanwhile (now version {e.current_version}) - run it again",
+              file=out)
+        return 1
+    except Exception as e:
+        print(f"settings: ACT unreachable ({type(e).__name__})", file=out)
+        return 1
+    print(f"{_SETTINGS_DOC} version {version}: {name} = {_json(value)} "
+          f"(the daemon applies it at its next cycle)", file=out)
+    return 0
+
+
+def _settings_unset(act, name: str, out) -> int:
+    """Remove one key from the document (expected_version = the version just read). A key
+    that is not set writes nothing and exits 0."""
+    from navigator.clients.act_client import DocVersionConflict
+    try:
+        doc = act.get_doc(_SETTINGS_DOC)
+        if doc is None or not isinstance(doc[0], dict) or name not in doc[0]:
+            print(f"{_printable(name)} is not set in the document", file=out)
+            return 0
+        body = dict(doc[0])
+        del body[name]
+        version = act.put_doc(_SETTINGS_DOC, body, actor=ACTOR, expected_version=doc[1])
+    except DocVersionConflict as e:
+        print(f"settings changed meanwhile (now version {e.current_version}) - run it again",
+              file=out)
+        return 1
+    except Exception as e:
+        print(f"settings: ACT unreachable ({type(e).__name__})", file=out)
+        return 1
+    print(f"{_SETTINGS_DOC} version {version}: {_printable(name)} unset "
+          f"(the daemon applies it at its next cycle)", file=out)
+    return 0
+
+
+def _settings_env_keys(name: str) -> tuple[str, ...]:
+    """The plist env key(s) the daemon would read for hot field `name`."""
+    if name == "sdk_role_models":
+        return _SDK_ROLE_ENV_KEYS
+    return ("NAVIGATOR_" + name.upper(),)
+
+
+def _check_settings_doc(act, env: dict, out) -> None:
+    """doctor: report the settings document (read-only, informational): absent, unreadable
+    (exception class only) or present with its version; one WARN per plist env key the
+    document overrides; one WARN per key the daemon refused (navigator/status
+    settings_rejected). Never affects doctor's exit code; never writes."""
+    if act is None:
+        return
+    from navigator.config import HOT_FIELDS
+    try:
+        doc = act.get_doc(_SETTINGS_DOC)
+    except Exception as e:
+        print(f"WARN settings document unreadable: {type(e).__name__}", file=out)
+        return
+    if doc is None:
+        print("info settings document absent (daemon runs on its environment)", file=out)
+    else:
+        body, version = doc
+        print(f"ok   settings document version {_printable(version)}", file=out)
+        body = body if isinstance(body, dict) else {}
+        for name in sorted(HOT_FIELDS):
+            if name not in body:
+                continue
+            for key in _settings_env_keys(name):
+                if key in env:
+                    print(f"WARN the settings document overrides {key} (plist value ignored)",
+                          file=out)
+    try:
+        status = act.get_doc(_STATUS_DOC)
+    except Exception as e:
+        print(f"WARN daemon status unreadable: {type(e).__name__}", file=out)
+        return
+    if status is not None and isinstance(status[0], dict):
+        rejected = status[0].get("settings_rejected")
+        for item in rejected if isinstance(rejected, list) else []:
+            print(f"WARN settings document key refused: {_printable(item)}", file=out)
 
 
 # ---- doctor ------------------------------------------------------------------
@@ -808,6 +1022,8 @@ def _doctor(args: list[str], out, act=None) -> int:
     _check_backlog(act, settings, repos, out)
     # two launchd jobs polling Telegram's getUpdates (file presence only)
     _check_duplicate_telegram_readers(out)
+    # U2b: the settings document vs the plist env (informational, never a failure)
+    _check_settings_doc(act, env, out)
 
     if failures:
         print(f"doctor: {failures} problem(s)", file=out)
