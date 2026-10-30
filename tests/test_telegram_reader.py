@@ -455,7 +455,7 @@ def test_main_reader_holds_the_reader_lock_while_running_and_releases_it(tmp_pat
     monkeypatch.setattr(tr, "HTTPACTClient", lambda url: None)
     _creds(monkeypatch)
     assert main_reader() == 0
-    assert seen["holder"] == str(os.getpid())
+    assert seen["holder"].split()[0] == str(os.getpid())
     assert not lock.exists()
 
 
