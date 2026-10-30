@@ -50,6 +50,13 @@ is best-effort (observability/notify.py swallows errors): a message Telegram los
 retried, because the notifier never reports it. The state-not-advanced retry applies
 only to a notifier whose send raises.
 
+U3 (design D3): snapshot() is what the daemon publishes each cycle to the ACT document
+navigator/decisions (__main__._decisions_step): the same items collect_with_status
+returns, each with the exact actions the Telegram words accept, plus the runs at the
+merge gate that are not audited yet (awaiting_audit, shown without buttons). A due digest
+is also kept as navigator/digest/latest plus one navigator.digest event, with the outcomes
+merged / failed since the previous digest (tracked by the last outcome id seen).
+
 This module must not import telegram_proposals (telegram_proposals imports it).
 """
 import json
@@ -62,10 +69,12 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from navigator.contracts.enums import ProposalStatus, RunPhase
+from navigator.contracts.enums import ApprovalDecision, ApprovalGate, ProposalStatus, RunPhase
+from navigator.contracts.event import Event
 from navigator.observability import actions
 from navigator.observability.logging import get_logger
 from navigator.observability.telegram_inbox import _candidates, _reply_arg, short_name
+from navigator.runtime.outcome_store import OutcomeStore
 
 log = get_logger("navigator.decisions")
 
@@ -83,6 +92,17 @@ CHUNK = 3900
 MANUAL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,31}")
 # the kinds the 4h nudge applies to (proposals never nudge)
 NUDGE_KINDS = ("merge", "manual")
+# U3: the ACT documents / event published for the UI
+DECISIONS_DOC = "navigator/decisions"
+DIGEST_DOC = "navigator/digest/latest"
+DIGEST_EVENT = "navigator.digest"
+DOC_ACTOR = "navigator-daemon"
+DEFAULT_OUTCOME_PATH = "/tmp/navigator-outcomes.jsonl"
+OUTCOMES_SCANNED = 200
+OUTCOMES_FALLBACK = 20
+# the actions the Telegram words accept for each kind (manual steps have no button)
+KIND_ACTIONS = {"merge": ("merge", "reject"), "proposal": ("approve", "decline"),
+                "manual": ()}
 
 
 def state_path() -> str:
@@ -490,6 +510,7 @@ def decisions_tick(act, notifier, now: datetime | None = None, state_file=None,
     if _quiet(local, digest_at):
         return {"quiet": True, "items": n}
     digest_sent = False
+    publish_error = None
     # with a failed source the digest waits (unsent, unmarked) until the fallback hour,
     # then goes out naming the kinds it could not list
     digest_due = (local.hour >= digest_at and state["digest"] != today
@@ -500,16 +521,20 @@ def decisions_tick(act, notifier, now: datetime | None = None, state_file=None,
             and state["digest"] != today)
     if digest_due:
         state["digest"] = today
+        sent_chunks: list[str] = []
         if items:
             for text in format_decisions(items, now, first_seen,
                                          header="Morning digest - waiting on you"):
                 notifier.send(text)
+                sent_chunks.append(text)
             digest_sent = True
             for d in items:  # the digest already named them: no nudge right after it
                 if d.kind in NUDGE_KINDS:
                     nudged[d.key] = today
         if failed:
             notifier.send("(could not list: " + ", ".join(sorted(failed)) + ")")
+        # U3: keep the digest for the UI (never raises; marks/messages unaffected)
+        publish_error = _publish_digest(act, items, sent_chunks, now, settings, failed)
     # NAVIGATOR_DECISIONS_NUDGES=0: digest only (the digest's own nudged marks still
     # happened above, so turning reminders back on never repeats a digested item)
     due = [] if held or not nudges else [d for d in items if d.kind in NUDGE_KINDS
@@ -522,9 +547,188 @@ def decisions_tick(act, notifier, now: datetime | None = None, state_file=None,
         for d in due:
             nudged[d.key] = today
     result = {"items": n, "digest_sent": digest_sent, "nudged": len(due)}
+    if publish_error is not None:
+        result["digest_publish_error"] = publish_error
     if not write_state(path, state):
         result["state_write_failed"] = True
     return result
+
+
+# ---- U3: published documents ------------------------------------------------------
+
+def _try(fn, default=None):
+    try:
+        return fn()
+    except Exception as e:
+        log.warning("decisions.snapshot_part_failed", error=type(e).__name__)
+        return default
+
+
+def _repo_of(act, proposal_id):
+    if not proposal_id:
+        return None
+    prop = _try(lambda: act.get_proposal(proposal_id))
+    repo = getattr(prop, "repo", None)
+    return repo if isinstance(repo, str) else None
+
+
+def _tier_of(act, run):
+    from navigator.cli import merge_tier_of
+    tier = _try(lambda: merge_tier_of(act, run))
+    return tier if tier in ("A", "B", "C") else None
+
+
+def _pending_merge(act, run_id):
+    return act.list_approvals(target=run_id, gate=ApprovalGate.merge,
+                              decision=ApprovalDecision.pending)
+
+
+def _snapshot_item(act, d: Decision, runs_by_id: dict, hows: dict) -> dict:
+    ident = d.key.partition(":")[2]
+    entry = {"key": d.key, "kind": d.kind, "title": d.title, "reply": d.reply,
+             "since": d.since.isoformat() if d.since is not None else None,
+             "repo": None, "run_id": None, "proposal_id": None, "approval_id": None,
+             "tier": None, "actions": list(KIND_ACTIONS.get(d.kind, ())), "how": None}
+    if d.kind == "merge":
+        entry["run_id"] = ident
+        pending = _try(lambda: _pending_merge(act, ident), []) or []
+        entry["approval_id"] = pending[0].id if pending else None
+        run = runs_by_id.get(ident)
+        if run is not None:
+            entry["proposal_id"] = run.proposal_id
+            entry["repo"] = _repo_of(act, run.proposal_id)
+            entry["tier"] = _tier_of(act, run)
+    elif d.kind == "proposal":
+        entry["proposal_id"] = ident
+        entry["repo"] = _repo_of(act, ident)
+    elif d.kind == "manual":
+        how = hows.get(ident)
+        entry["how"] = how if isinstance(how, str) else None
+    return entry
+
+
+def _awaiting_audit(act, open_runs, merge_keys: set) -> list[dict]:
+    """Runs at the merge gate (awaiting_review + pending merge approval) that are not
+    merge candidates, i.e. not audited. No extra is_audited call."""
+    out = []
+    for run in open_runs:
+        if run.phase != RunPhase.awaiting_review or f"merge:{run.id}" in merge_keys:
+            continue
+        if not _pending_merge(act, run.id):
+            continue
+        prop = _try(lambda: act.get_proposal(run.proposal_id))
+        title = _flat(getattr(prop, "title", "") or "") or run.id
+        repo = getattr(prop, "repo", None)
+        out.append({"run_id": run.id, "proposal_id": run.proposal_id, "title": title,
+                    "repo": repo if isinstance(repo, str) else None,
+                    "tier": _tier_of(act, run)})
+    return out
+
+
+def snapshot(act, now: datetime | None = None, manual_file=None, candidates=None) -> dict:
+    """The navigator/decisions document body: collect_with_status's items, each with the
+    actions the Telegram words accept, plus awaiting_audit (unaudited runs at the merge
+    gate, no buttons) and the sorted kinds that failed to list. Never raises."""
+    now = _aware(now) or datetime.now(timezone.utc)
+    try:
+        items, failed = collect_with_status(act, manual_file, candidates)
+        failed = set(failed)
+    except Exception as e:
+        log.warning("decisions.snapshot_collect_failed", error=type(e).__name__)
+        items, failed = [], {"merge", "manual", "proposal"}
+    try:
+        open_runs = list(act.list_open_runs())
+    except Exception as e:
+        log.warning("decisions.snapshot_open_runs_failed", error=type(e).__name__)
+        open_runs = None
+    runs_by_id = {r.id: r for r in open_runs or []}
+    hows = {}
+    if any(d.kind == "manual" for d in items):
+        hows = _try(lambda: {it["id"]: it["how"]
+                             for it in read_manual(manual_file or manual_path())}, {}) or {}
+    out = []
+    for d in items:
+        try:
+            out.append(_snapshot_item(act, d, runs_by_id, hows))
+        except Exception as e:
+            log.warning("decisions.snapshot_item_failed", kind=d.kind, error=type(e).__name__)
+            failed.add(d.kind)
+    awaiting: list[dict] = []
+    if open_runs is None or "merge" in failed:
+        failed.add("awaiting_audit")
+    else:
+        try:
+            awaiting = _awaiting_audit(act, open_runs,
+                                       {d.key for d in items if d.kind == "merge"})
+        except Exception as e:
+            log.warning("decisions.awaiting_audit_failed", error=type(e).__name__)
+            awaiting = []
+            failed.add("awaiting_audit")
+    return {"ts": now.isoformat(timespec="seconds"), "items": out,
+            "awaiting_audit": awaiting, "failed": sorted(failed)}
+
+
+def digest_body(items: list[Decision], chunks: list[str], now, outcomes_since: list,
+                previous_through: str | None, could_not_list=None, settings=None) -> dict:
+    """The navigator/digest/latest body. outcomes_since is newest-first."""
+    now = _aware(now) or datetime.now(timezone.utc)
+    merged = [{"run_id": o.run_id, "proposal_id": o.proposal_id, "summary": o.summary}
+              for o in outcomes_since if getattr(o, "status", None) == "completed"]
+    failed = [{"run_id": o.run_id, "proposal_id": o.proposal_id, "summary": o.summary,
+               "reason_code": getattr(o, "reason_code", None)}
+              for o in outcomes_since if getattr(o, "status", None) == "failed"]
+    through = getattr(outcomes_since[0], "id", None) if outcomes_since else previous_through
+    return {"date": now.astimezone(local_tz(settings)).date().isoformat(),
+            "sent_at": now.isoformat(timespec="seconds"),
+            "chunks": list(chunks),
+            "items": [{"key": d.key, "kind": d.kind, "title": d.title, "reply": d.reply}
+                      for d in items],
+            "could_not_list": sorted(could_not_list or []),
+            "merged_since_last": merged, "failed_since_last": failed,
+            "outcomes_through": through}
+
+
+def _outcome_path(settings=None) -> str:
+    path = getattr(settings, "outcome_path", None) if settings is not None else None
+    return path or os.getenv("NAVIGATOR_OUTCOME_PATH") or DEFAULT_OUTCOME_PATH
+
+
+def _publish_digest(act, items, sent_chunks, now, settings=None, failed=None) -> str | None:
+    """Write navigator/digest/latest and emit one navigator.digest event. Returns None, or
+    the class name of the exception that stopped it (never raises). A previous digest
+    dated today (a re-sent digest after a state-write failure) is left alone. An act
+    without documents (a bare test double) publishes nothing."""
+    try:
+        if not (callable(getattr(act, "put_doc", None))
+                and callable(getattr(act, "get_doc", None))):
+            return None
+        today = now.astimezone(local_tz(settings)).date().isoformat()
+        prev = act.get_doc(DIGEST_DOC)
+        prev_body = prev[0] if prev is not None else None
+        if not isinstance(prev_body, dict):
+            prev_body = None
+        if prev_body is not None and prev_body.get("date") == today:
+            return None
+        previous_through = prev_body.get("outcomes_through") if prev_body else None
+        if not isinstance(previous_through, str):
+            previous_through = None
+        outcomes = OutcomeStore(_outcome_path(settings)).latest(OUTCOMES_SCANNED)
+        kept = None
+        if previous_through is not None:
+            for i, o in enumerate(outcomes):
+                if o.id == previous_through:
+                    kept = outcomes[:i]
+                    break
+        if kept is None:  # no previous digest, or its id is gone (file wiped / > 200 newer)
+            kept = outcomes[:OUTCOMES_FALLBACK]
+        body = digest_body(items, sent_chunks, now, kept, previous_through,
+                           could_not_list=failed, settings=settings)
+        act.put_doc(DIGEST_DOC, body, actor=DOC_ACTOR)
+        act.emit_event(Event(kind=DIGEST_EVENT, correlation_id=None, payload=body))
+    except Exception as e:
+        log.warning("decisions.digest_publish_failed", error=type(e).__name__)
+        return type(e).__name__
+    return None
 
 
 # ---- CLI: track manual steps ----------------------------------------------------
