@@ -1,3 +1,4 @@
+import copy
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Protocol
@@ -26,6 +27,9 @@ class ACTClient(Protocol):
     def emit_event(self, event: Event) -> None: ...
     def list_events(self, kinds: set[str] | None = None,
                     since: datetime | None = None) -> list: ...
+    def get_doc(self, key: str) -> tuple[dict, int] | None: ...
+    def put_doc(self, key: str, body: dict, actor: str,
+                expected_version: int | None = None) -> int: ...
 
 # The run fields HTTPACTClient.update_run persists (columns status/phase/worktree_path/
 # ended_at/cost_usd plus the _run_payload fields). FakeACTClient.update_run keeps
@@ -41,6 +45,8 @@ class FakeACTClient:
         self.runs: dict[str, Run] = {}
         self.approvals: dict[str, Approval] = {}
         self.events: list[Event] = []
+        # key -> (body, version, actor); versions start at 1
+        self.docs: dict[str, tuple[dict, int, str]] = {}
     def create_proposal(self, p: Proposal) -> Proposal:
         self.proposals[p.id] = p; return p
     def get_proposal(self, proposal_id: str) -> Proposal | None:
@@ -90,6 +96,20 @@ class FakeACTClient:
         floor = _parse_ts(since)
         return [e.model_copy(deep=True) for e in self.events
                 if (kinds is None or e.kind in kinds) and _not_before(e.ts, floor)]
+    def get_doc(self, key: str) -> tuple[dict, int] | None:
+        entry = self.docs.get(key)
+        if entry is None:
+            return None
+        body, version, _actor = entry
+        return (copy.deepcopy(body), version)
+    def put_doc(self, key: str, body: dict, actor: str,
+                expected_version: int | None = None) -> int:
+        existing = self.docs.get(key)
+        current = existing[1] if existing is not None else 0
+        if expected_version is not None and expected_version != current:
+            raise DocVersionConflict(current)
+        self.docs[key] = (copy.deepcopy(body), current + 1, actor)
+        return current + 1
 
 # ACT clamps list endpoints at 500; request the max so nothing is silently dropped.
 _LIST_LIMIT = 500
@@ -101,6 +121,15 @@ _EVENT_MAX_PAGES = 50
 class ACTEventsTooLarge(RuntimeError):
     """list_events gave up: ACT holds more than _EVENT_MAX_PAGES full pages of
     navigator events (callers that only need recent ones should pass `since`)."""
+
+
+class DocVersionConflict(RuntimeError):
+    """put_doc was given an expected_version that is not the document's current
+    version (ACT answered 409); `.current_version` is the version ACT holds now."""
+
+    def __init__(self, current_version: int):
+        super().__init__(f"document version conflict (current {current_version})")
+        self.current_version = current_version
 
 
 def _not_before(ts, floor: datetime | None) -> bool:
@@ -364,3 +393,34 @@ class HTTPACTClient:
                 raise RuntimeError("ACT events: full page without a cursor")
             after = cursor
         raise ACTEventsTooLarge(f"ACT events: more than {_EVENT_MAX_PAGES} pages")
+
+    # ---- documents ------------------------------------------------------------
+
+    def get_doc(self, key: str) -> tuple[dict, int] | None:
+        """(body, version) of ACT document `key` via GET /api/v1/agent/docs/<key>,
+        or None when ACT answers 404. Keys are fixed constants like
+        "navigator/settings"; the key is passed through as-is (ACT's {key:path}
+        route accepts the "/"), so a key containing "?", "#" or ".." is not
+        supported. A plain 404 from an ACT that predates the docs route also reads
+        as None on purpose: the daemon then runs on its environment settings, which
+        is today's behaviour (design D2, byte-identical default). Any other error
+        status raises httpx.HTTPStatusError."""
+        r = self.client.get(f"{self.base_url}/docs/{key}")
+        if r.status_code == 404:
+            return None
+        r.raise_for_status()
+        d = r.json()
+        return (d["body"], int(d["version"]))
+
+    def put_doc(self, key: str, body: dict, actor: str,
+                expected_version: int | None = None) -> int:
+        """Write ACT document `key` via PUT /api/v1/agent/docs/<key> and return the
+        new version. A 409 (stale expected_version) raises DocVersionConflict
+        carrying ACT's current_version; any other error status raises
+        httpx.HTTPStatusError."""
+        r = self.client.put(f"{self.base_url}/docs/{key}", json={
+            "body": body, "actor": actor, "expected_version": expected_version})
+        if r.status_code == 409:
+            raise DocVersionConflict(int(r.json().get("current_version", 0)))
+        r.raise_for_status()
+        return int(r.json()["version"])
