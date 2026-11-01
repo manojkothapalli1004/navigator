@@ -23,13 +23,16 @@ class ResumeFailed(Exception):
 
 class Engine:
     def __init__(self, store: Store, runner: TurnRunner, lock_path: Path | None = None,
-                 turn_timeout_s: float = TURN_TIMEOUT_S):
+                 turn_timeout_s: float = TURN_TIMEOUT_S, notify: Callable[[dict], None] | None = None):
         self.store, self.runner, self.turn_timeout_s = store, runner, turn_timeout_s
+        self.notify = notify  # tells the operator's phone about a new approval card (C3)
         self._dropped: set[int] = set()
         self.lock_path = Path(lock_path) if lock_path else store.root / "turn.lock"
         self._pending: asyncio.Queue | None = None
         self._subs: list[asyncio.Queue] = []
         self._task: asyncio.Task | None = None
+        self._turn_task: asyncio.Task | None = None
+        self._cancelled = False
         self.busy = False
 
     @property
@@ -63,12 +66,43 @@ class Engine:
         window reconnects and re-reads /history."""
         return id(q) in self._dropped
 
-    def submit(self, text: str, source: str) -> dict:
+    def cancel(self) -> bool:
+        """Stop the running turn (the operator's Stop button); False when nothing runs."""
+        if self._turn_task is None or self._turn_task.done():
+            return False
+        self._cancelled = True
+        self._turn_task.cancel()
+        return True
+
+    async def _run(self, prompt: str, sid: str | None, emit) -> str | None:
+        # the runner call is its own task so cancel() stops it without stopping the worker
+        self._turn_task = asyncio.ensure_future(asyncio.wait_for(self.runner(prompt, sid, emit),
+                                                                 self.turn_timeout_s))
+        try:
+            return await self._turn_task
+        finally:
+            self._turn_task = None
+
+    def submit(self, text: str, source: str, internal: bool = False) -> dict:
+        # "approval" messages come only from the conductor itself, after the operator approves a card
+        if source not in SOURCES and not (internal and source == "approval"):
+            raise ValueError(f"unknown source {source!r}")
         user = self._append({"kind": "user", "text": text, "source": source})
         ahead = self.queue_len + (1 if self.busy else 0)
         self._append({"kind": "status", "state": "queued", "msg_id": user["id"], "detail": ahead})
         self._pending.put_nowait(user)
         return user
+
+    def on_card(self, card: dict) -> None:
+        """A card was raised or changed state: every window sees it; a new one goes to the phone."""
+        # card_id, not id: each state change is its own history entry with its own id
+        self._append({"kind": "card", "card_id": card["id"],
+                      **{k: v for k, v in card.items() if k not in ("id", "fingerprint")}})
+        if card.get("state") == "pending" and self.notify:
+            try:
+                self.notify(card)
+            except Exception as e:  # a Telegram hiccup never breaks a turn
+                _log.warning("conductor.card_notify_failed: %s", type(e).__name__)
 
     def _append(self, entry: dict) -> dict:
         entry = self.store.append(entry)
@@ -112,6 +146,8 @@ class Engine:
             await asyncio.to_thread(fcntl.flock, lock, fcntl.LOCK_EX)  # waits out a terminal turn (C5)
             self._append({"kind": "status", "state": "running", "msg_id": msg_id})
             parts: list[str] = []
+            prompt = f"[{user.get('source', 'web')}] {user['text']}"
+            self._cancelled = False
 
             def emit(ev: dict) -> None:
                 if ev.get("type") == "delta":
@@ -120,13 +156,18 @@ class Engine:
 
             try:
                 try:
-                    sid = await asyncio.wait_for(self.runner(user["text"], self.store.session_id, emit),
-                                                 self.turn_timeout_s)
+                    sid = await self._run(prompt, self.store.session_id, emit)
                 except ResumeFailed:
                     self.store.set_session_id(None)
                     self._append({"kind": "note", "text": "previous conversation could not be resumed; starting fresh"})
                     parts.clear()
-                    sid = await asyncio.wait_for(self.runner(user["text"], None, emit), self.turn_timeout_s)
+                    sid = await self._run(prompt, None, emit)
+            except asyncio.CancelledError:
+                if not self._cancelled:
+                    raise  # the engine itself is stopping
+                self._append({"kind": "status", "state": "error", "msg_id": msg_id,
+                              "detail": "cancelled by operator"})
+                return
             except asyncio.TimeoutError:
                 self._append({"kind": "status", "state": "error", "msg_id": msg_id,
                               "detail": f"timed out after {self.turn_timeout_s:.0f}s; the turn was stopped"})

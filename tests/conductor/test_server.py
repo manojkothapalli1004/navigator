@@ -135,3 +135,80 @@ def test_event_stream_ends_when_subscriber_dropped(tmp_path):
         assert eng._subs == []
         await eng.stop()
     asyncio.run(asyncio.wait_for(go(), 10))
+
+
+def test_post_cancel_endpoint(tmp_path):
+    async def go(c, eng):
+        r = await c.post("/cancel")
+        assert r.status_code == 200 and r.json() == {"cancelled": False}
+    asyncio.run(_with_app(tmp_path, go))
+
+
+def _cards_app(tmp_path):
+    from navigator.conductor.cards import Cards
+    cards = Cards(tmp_path / "cards.json")
+    eng = Engine(Store(tmp_path / "c"), _runner)
+    return eng, cards, server.build_app(eng, cards=cards)
+
+
+def test_cards_endpoints_approve_decline_404_409(tmp_path):
+    async def go():
+        eng, cards, app = _cards_app(tmp_path); await eng.start()
+        a, _ = cards.raise_card("Bash", {"command": "git push"}, "git push")
+        b, _ = cards.raise_card("Bash", {"command": "git merge x"}, "git merge")
+        try:
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://c") as c:
+                assert [x["code"] for x in (await c.get("/cards")).json()] == [a["code"], b["code"]]
+                assert "fingerprint" not in (await c.get("/cards")).json()[0]
+                r = await c.post(f"/cards/{a['code']}/approve", json={"via": "web"})
+                assert r.status_code == 200 and r.json()["state"] == "approved"
+                assert (await c.post(f"/cards/{a['code']}/approve", json={"via": "web"})).status_code == 409
+                assert (await c.post("/cards/NOPE22/approve", json={"via": "web"})).status_code == 404
+                assert (await c.post(f"/cards/{b['id']}/decline", json={"via": "telegram"})).json()["state"] == "declined"
+                assert (await c.post(f"/cards/{b['id']}/decline", json={"via": "fax"})).status_code == 422
+                c2, _ = cards.raise_card("Bash", {"command": "git rebase x"}, "git rebase")
+                assert (await c.post(f"/cards/{c2['code']}/foo", json={"via": "web"})).status_code == 404
+                assert cards.pending()[-1]["state"] == "pending"
+        finally:
+            await eng.stop()
+    asyncio.run(go())
+
+
+def test_approve_submits_internal_message(tmp_path):
+    async def go():
+        eng, cards, app = _cards_app(tmp_path); await eng.start()
+        a, _ = cards.raise_card("Bash", {"command": "git push origin main"}, "git push")
+        try:
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://c") as c:
+                await c.post(f"/cards/{a['code']}/approve", json={"via": "telegram"})
+        finally:
+            await asyncio.sleep(0.1); await eng.stop()
+        users = [e for e in eng.store.history() if e["kind"] == "user"]
+        assert users[-1]["source"] == "approval"
+        assert "git push origin main" in users[-1]["text"] and a["code"] in users[-1]["text"]
+        assert [e["state"] for e in eng.store.history() if e["kind"] == "card"] == ["approved"]
+    asyncio.run(go())
+
+
+def test_peer_ancestry():
+    parents = {50: 40, 40: 10, 10: 1, 60: 1}
+    ppid = parents.get
+    assert server.is_descendant(50, 10, ppid) is True
+    assert server.is_descendant(60, 10, ppid) is False
+    assert server.is_descendant(10, 10, ppid) is False  # the conductor itself (tests, CLI in-process)
+
+
+def test_socket_refuses_the_conversations_own_tools():
+    import subprocess, sys
+    d = Path(tempfile.mkdtemp(prefix="cdt", dir="/tmp"))
+    sock = d / "c.sock"
+    _serve(sock, d / "state")
+    # a child of this process (the conductor) = a tool the conversation started
+    code = ("import httpx,sys\n"
+            "try:\n"
+            f"  r=httpx.Client(transport=httpx.HTTPTransport(uds={str(sock)!r})).get('http://c/status')\n"
+            "  print(r.status_code)\n"
+            "except Exception as e:\n"
+            "  print('refused', type(e).__name__)\n")
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=30).stdout
+    assert out.startswith("refused"), out

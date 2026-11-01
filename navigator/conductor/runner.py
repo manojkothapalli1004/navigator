@@ -14,20 +14,33 @@ CWD = "/Users/Manoj/calwbot"
 _MISSING_SESSION = re.compile(r"no conversation found|session.{0,40}(not found|does not exist)", re.I)
 
 
-def options(session_id: str | None) -> ClaudeAgentOptions:
+WINDOWS_PROMPT = (
+    "You are the operator's one shared conversation, reached from three windows: the ACT website "
+    "chat panel, Telegram and the terminal. Each operator message starts with the window it came "
+    "from: [web], [telegram] or [terminal]. Replies are usually read on a phone: keep them short "
+    "and plain. To offer the operator a page of the website, put it on its own line as "
+    "[open:/path], e.g. [open:/navigator/decisions]; pages: /, /navigator, /navigator/decisions, "
+    "/navigator/settings, /trader. Gated actions (merge, push, history rewrites, "
+    "settings/CLAUDE.md edits, launchd changes, trader paths) are refused here: say what you "
+    "would run and ask the operator to approve it.")
+
+
+def options(session_id: str | None, hook=None) -> ClaudeAgentOptions:
     # the same settings terminal Claude uses in this workspace, plus the hard gate
     return ClaudeAgentOptions(
         model=MODEL, cwd=CWD, setting_sources=["user", "project", "local"],
-        permission_mode="default", resume=session_id, include_partial_messages=True,
-        hooks={"PreToolUse": [HookMatcher(hooks=[gate.pre_tool_use_hook])]},
+        system_prompt={"type": "preset", "preset": "claude_code", "append": WINDOWS_PROMPT},
+        permission_mode="auto", resume=session_id, include_partial_messages=True,
+        hooks={"PreToolUse": [HookMatcher(hooks=[hook or gate.pre_tool_use_hook])]},
         can_use_tool=gate.can_use_tool)
 
 
-async def sdk_turn(prompt: str, session_id: str | None, emit: Callable[[dict], None]) -> str | None:
+async def sdk_turn(prompt: str, session_id: str | None, emit: Callable[[dict], None],
+                   hook=None) -> str | None:
     sid = None
     seen_text = False
     try:
-        async with ClaudeSDKClient(options=options(session_id)) as client:
+        async with ClaudeSDKClient(options=options(session_id, hook)) as client:
             await client.query(prompt)
             async for m in client.receive_response():
                 if isinstance(m, StreamEvent):

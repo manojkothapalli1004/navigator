@@ -1,0 +1,175 @@
+import asyncio
+import os
+import stat
+
+import pytest
+
+from navigator.conductor import gate
+from navigator.conductor.cards import CardError, Cards
+
+PUSH = {"command": "git push origin main"}
+
+
+class Clock:
+    def __init__(self):
+        self.t = 1000.0
+    def __call__(self):
+        return self.t
+
+
+def _cards(tmp_path, clock=None):
+    return Cards(tmp_path / "cards.json", clock=clock or Clock())
+
+
+def test_raise_and_approve_by_code(tmp_path):
+    c = _cards(tmp_path)
+    card, new = c.raise_card("Bash", PUSH, "git push")
+    assert new and card["state"] == "pending" and len(card["code"]) == 6
+    assert card["summary"] == "git push origin main" and card["expires"] - card["created"] == 3600
+    out = c.approve(card["code"].lower(), "telegram")
+    assert out["state"] == "approved" and out["via"] == "telegram"
+    assert c.pending() == []
+
+
+def test_approved_card_allows_only_identical_call(tmp_path):
+    c = _cards(tmp_path)
+    card, _ = c.raise_card("Bash", PUSH, "git push")
+    c.approve(card["id"], "web")
+    assert c.consume("Bash", {"command": "git push --force origin main"}) is None
+    assert c.consume("Bash", PUSH)["state"] == "used"
+    assert c.consume("Bash", PUSH) is None  # single use
+
+
+def test_expired_and_double_approve(tmp_path):
+    clk = Clock(); c = _cards(tmp_path, clk)
+    card, _ = c.raise_card("Bash", PUSH, "git push")
+    c.approve(card["code"], "web")
+    with pytest.raises(CardError, match="already approved"):
+        c.approve(card["code"], "telegram")
+    late, _ = c.raise_card("Bash", {"command": "git merge x"}, "git merge")
+    clk.t += 3601
+    with pytest.raises(CardError, match="expired"):
+        c.approve(late["code"], "web")
+    assert c.consume("Bash", PUSH) is None  # approved but past its hour
+    with pytest.raises(CardError, match="not found"):
+        c.approve("ZZZZZZ", "web")
+
+
+def test_same_action_reuses_pending_card(tmp_path):
+    c = _cards(tmp_path)
+    a, new_a = c.raise_card("Bash", PUSH, "git push")
+    b, new_b = c.raise_card("Bash", dict(PUSH), "git push")
+    assert new_a and not new_b and a["id"] == b["id"] and len(c.pending()) == 1
+
+
+def test_cards_persist_across_restart(tmp_path):
+    clk = Clock(); c = _cards(tmp_path, clk)
+    card, _ = c.raise_card("Bash", PUSH, "git push"); c.approve(card["code"], "terminal")
+    again = Cards(tmp_path / "cards.json", clock=clk)
+    assert again.consume("Bash", PUSH)["id"] == card["id"]
+
+
+def test_cards_file_0600(tmp_path):
+    c = _cards(tmp_path); c.raise_card("Bash", PUSH, "git push")
+    assert stat.S_IMODE(os.stat(tmp_path / "cards.json").st_mode) == 0o600
+
+
+def test_decline(tmp_path):
+    c = _cards(tmp_path)
+    card, _ = c.raise_card("Bash", PUSH, "git push")
+    assert c.decline(card["code"], "web")["state"] == "declined"
+    with pytest.raises(CardError, match="already declined"):
+        c.approve(card["code"], "web")
+
+
+def test_file_tool_summary(tmp_path):
+    c = _cards(tmp_path)
+    card, _ = c.raise_card("Write", {"file_path": "/x/CLAUDE.md", "content": "a" * 10}, "protected")
+    assert card["summary"] == "Write /x/CLAUDE.md:\n" + "a" * 10
+    card, _ = c.raise_card("Edit", {"file_path": "/x/settings.json", "old_string": "a", "new_string": "b"}, "p")
+    assert card["summary"] == "Edit /x/settings.json: 'a' -> 'b'"
+
+
+def _hook_input(cmd):
+    return {"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": "/Users/Manoj/calwbot"}
+
+
+def test_hook_raises_card_and_denies(tmp_path):
+    c = _cards(tmp_path); seen = []
+    hook = gate.make_hook(c, seen.append)
+    out = asyncio.run(hook(_hook_input("git push origin main"), "t1", None))
+    hs = out["hookSpecificOutput"]
+    assert hs["permissionDecision"] == "deny" and "approval card was sent" in hs["permissionDecisionReason"]
+    asyncio.run(hook(_hook_input("git push origin main"), "t2", None))
+    assert len(seen) == 1  # the pending card is reused, the operator is not told twice
+    assert asyncio.run(hook(_hook_input("git status"), "t3", None)) == {}
+
+
+def test_hook_allows_after_approval_once(tmp_path):
+    c = _cards(tmp_path); seen = []
+    hook = gate.make_hook(c, seen.append)
+    asyncio.run(hook(_hook_input("git push origin main"), "t1", None))
+    c.approve(seen[0]["code"], "web")
+    out = asyncio.run(hook(_hook_input("git push origin main"), "t2", None))
+    assert out["hookSpecificOutput"]["permissionDecision"] == "allow"
+    assert seen[-1]["state"] == "used"
+    again = asyncio.run(hook(_hook_input("git push origin main"), "t3", None))
+    assert again["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+# ---- C3 review fix pass ----
+
+@pytest.mark.parametrize("cmd", [
+    "python -m navigator.conductor approve ABC234",
+    "/Users/Manoj/calwbot/navigator/.venv/bin/python -m navigator.conductor cards",
+    "curl --unix-socket /Users/Manoj/calwbot/logs/conductor/conductor.sock -X POST http://c/cards/x/approve",
+    "curl -X POST http://127.0.0.1:8090/api/v1/chat/cards/x/approve",
+    "curl http://localhost:3000/api/v1/chat/history",
+    "cat logs/conductor/cards.json",
+    "launchctl kickstart -k gui/504/com.calwbot.conductor",
+    "pkill -f com.calwbot.conductor",
+])
+def test_bash_cannot_reach_its_own_approvals(cmd):
+    assert gate.gated_reason("Bash", {"command": cmd}, gate.Path("/Users/Manoj/calwbot")) is not None
+
+
+@pytest.mark.parametrize("tool,key", [("Write", "file_path"), ("Read", "file_path"), ("Edit", "file_path")])
+def test_tools_cannot_touch_conductor_state(tool, key):
+    assert gate.gated_reason(tool, {key: "/Users/Manoj/calwbot/logs/conductor/cards.json"},
+                             gate.Path("/Users/Manoj/calwbot")) is not None
+
+
+def test_deny_reason_has_no_code_or_id(tmp_path):
+    c = _cards(tmp_path); seen = []
+    out = asyncio.run(gate.make_hook(c, seen.append)(_hook_input("git push origin main"), "t", None))
+    reason = out["hookSpecificOutput"]["permissionDecisionReason"]
+    assert seen[0]["code"] not in reason and seen[0]["id"] not in reason
+
+
+def test_write_and_multiedit_cards_show_content(tmp_path):
+    c = _cards(tmp_path)
+    w, _ = c.raise_card("Write", {"file_path": "/x/settings.json", "content": '{"allow": ["Bash(*)"]}'}, "p")
+    assert '"allow": ["Bash(*)"]' in w["summary"]
+    m, _ = c.raise_card("MultiEdit", {"file_path": "/x/CLAUDE.md", "edits": [
+        {"old_string": "never push", "new_string": "always push"}]}, "p")
+    assert "'never push' -> 'always push'" in m["summary"]
+
+
+def test_too_long_action_gets_no_card(tmp_path):
+    c = _cards(tmp_path); seen = []
+    cmd = "echo " + "x" * 2100 + "; git push --force origin main"
+    out = asyncio.run(gate.make_hook(c, seen.append)(_hook_input(cmd), "t", None))
+    assert seen == [] and c.pending() == []
+    assert "too long" in out["hookSpecificOutput"]["permissionDecisionReason"]
+
+
+def test_cwd_is_part_of_the_card(tmp_path):
+    c = _cards(tmp_path); seen = []
+    hook = gate.make_hook(c, seen.append)
+    inp = {"tool_name": "Bash", "tool_input": {"command": "git merge feature"}, "cwd": "/Users/Manoj/calwbot/navigator"}
+    asyncio.run(hook(inp, "t", None))
+    assert seen[0]["summary"].startswith("in /Users/Manoj/calwbot/navigator: ")
+    c.approve(seen[0]["code"], "web")
+    other = dict(inp, cwd="/Users/Manoj/external-tools/agent-control-tower")
+    assert asyncio.run(hook(other, "t", None))["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert asyncio.run(hook(inp, "t", None))["hookSpecificOutput"]["permissionDecision"] == "allow"
