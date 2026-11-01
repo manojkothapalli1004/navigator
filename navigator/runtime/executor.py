@@ -15,8 +15,10 @@ from navigator.runtime.worktree import (
     WorktreeHandle, create_worktree, preserve_failed, remove_worktree)
 from navigator.runtime.checkpoint import diff_artifact
 from navigator.runtime.merge_tiers import changed_files_for_run, classify_for_repo, repo_config_for
+from navigator.safety.command_runner import FRONTEND_SUITE
 from navigator.runtime.outcome_store import OutcomeStore
-from navigator.runtime.phases import NO_CHANGE_SUMMARY, reverify, run_build_and_verify, run_dir_for
+from navigator.runtime.phases import (FRONTEND_SUFFIXES, NO_CHANGE_SUMMARY, reverify,
+                                      run_build_and_verify, run_dir_for)
 from navigator.ids import new_id
 from navigator.safety.approval_engine import require_gate
 from navigator.safety.circuit_breakers import CircuitBreakers
@@ -165,7 +167,8 @@ def execute_proposal(proposal: Proposal, *, act, orc, driver, runner, settings,
                       "affected_files": list(proposal.affected_files),
                       **_previous_failure(settings, proposal.id)},
             breakers=breakers, started_monotonic=started, workdir=workdir,
-            repair_turns=getattr(settings, "builder_repair_turns", 0))
+            repair_turns=getattr(settings, "builder_repair_turns", 0),
+            **_frontend_kwargs(settings, proposal))
     except QuotaExhaustedError as e:
         # the run is finalized here; the re-raise lets the loop pause until resets_at
         _defer_quota(act, orc, run, handle, e, settings)
@@ -533,9 +536,6 @@ def _ran_pytest(entry: dict) -> bool:
     return bool(argv) and (argv[0] == "pytest" or (argv[:2] == ["uv", "run"] and "pytest" in argv))
 
 
-FRONTEND_SUFFIXES = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".css")
-
-
 def _ran_vitest(entry: dict) -> bool:
     """The entry ran the frontend test suite: `vitest ...`, `npx vitest ...` or `npm (run) test`
     (not merely an argv that mentions vitest, e.g. `echo vitest`)."""
@@ -544,7 +544,15 @@ def _ran_vitest(entry: dict) -> bool:
             or argv[:2] == ["npm", "test"] or argv[:3] == ["npm", "run", "test"])
 
 
-def suite_green(verification: list, changed: list) -> bool:
+def _ran_frontend_suite(entries: list) -> bool:
+    """Every FRONTEND_SUITE command has a Navigator-tagged (suite="frontend") rc-0 entry."""
+    ok = {tuple(str(a) for a in e.get("argv_list") or ()) for e in entries
+          if e.get("suite") == "frontend" and e.get("returncode") == 0}
+    return all(tuple(a) in ok for a in FRONTEND_SUITE)
+
+
+def suite_green(verification: list, changed: list, frontend_dir: str | None = None,
+                origin: str | None = None) -> bool:
     """The recorded verification proves the change: a non-empty log whose LAST entry has
     returncode 0 and, when any changed path is a .py file, at least one entry ran pytest
     (argv_list[0] == "pytest", or argv_list[:2] == ["uv", "run"] with "pytest" in argv_list;
@@ -557,7 +565,12 @@ def suite_green(verification: list, changed: list) -> bool:
     if any(str(p).endswith(".py") for p in (changed or [])):
         if not any(_ran_pytest(e) for e in entries):
             return False
-    if any(str(p).endswith(FRONTEND_SUFFIXES) for p in (changed or [])):
+    if frontend_dir and any(str(p).startswith(f"{frontend_dir}/") and str(p).endswith(FRONTEND_SUFFIXES)
+                            for p in (changed or [])):
+        # a repo with a frontend_dir: only Navigator's own tagged suite counts
+        if not _ran_frontend_suite(entries):
+            return False
+    elif any(str(p).endswith(FRONTEND_SUFFIXES) for p in (changed or [])):
         return any(_ran_vitest(e) for e in entries)
     return True
 
@@ -576,9 +589,11 @@ def auto_merge_ok(act, run, repo, settings) -> bool:
             return False
         prop = act.get_proposal(run.proposal_id)
         origin = prop.origin if prop is not None else None
-        if classify_for_repo(changed, repo, repo_config_for(settings, repo), origin=origin) != "A":
+        cfg = repo_config_for(settings, repo)
+        if classify_for_repo(changed, repo, cfg, origin=origin) != "A":
             return False
-        return suite_green(run.verification, changed)
+        return suite_green(run.verification, changed,
+                           frontend_dir=getattr(cfg, "frontend_dir", None), origin=origin)
     except Exception as e:
         _log.warning("merge.auto_check_failed", run_id=run.id, error=type(e).__name__)
         return False
@@ -667,12 +682,21 @@ def _stale_skip_reason(repo: str, run: Run) -> str | None:
     return None
 
 
+def _frontend_kwargs(settings, proposal) -> dict:
+    """run_build_and_verify/reverify kwargs for the proposal's repo: its frontend_dir and the
+    live checkout to clone node_modules from."""
+    cfg = repo_config_for(settings, proposal.repo)
+    return {"frontend_dir": getattr(cfg, "frontend_dir", None), "repo_path": Path(proposal.repo)}
+
+
 def _recorded_argvs(verification) -> list[list[str]]:
     """The commands a run was verified with: argv_list where recorded, else the argv
-    string split shell-style (entries recorded before argv_list existed)."""
+    string split shell-style (entries recorded before argv_list existed). Entries tagged
+    "suite" were run by Navigator itself (frontend suite, checker re-check) and are re-run by
+    reverify, not replayed through the allowlist."""
     out = []
     for entry in verification or []:
-        if not isinstance(entry, dict):
+        if not isinstance(entry, dict) or entry.get("suite"):
             continue
         argv = entry.get("argv_list") or shlex.split(str(entry.get("argv") or ""))
         if argv:
@@ -722,8 +746,10 @@ def _rebase_one(run: Run, merged: Run, new_head: str, *, act, orc, runner, setti
     # reverify (N17: the sibling's change is already in HEAD, the rebase dropped it)
     changed = ([l.strip() for l in names.stdout.splitlines() if l.strip()]
                if names.returncode == 0 else None)
+    prop = act.get_proposal(run.proposal_id)
     res = reverify(runner, run_dir_for(Path(wt), workdir), _recorded_argvs(run.verification),
-                   changed_files=changed)
+                   changed_files=changed, wt=Path(wt),
+                   **(_frontend_kwargs(settings, prop) if prop is not None else {}))
     if res.verify_returncode != 0:
         if res.no_change:
             summary = f"stale after merge of {merged.id}: {NO_CHANGE_SUMMARY}"
