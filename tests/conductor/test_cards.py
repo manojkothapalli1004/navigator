@@ -56,6 +56,23 @@ def test_bash_background_flag_still_part_of_the_action(tmp_path):
     assert c.consume("Bash", {**PUSH, "run_in_background": False})["state"] == "used"
 
 
+def test_sandbox_flag_and_unknown_keys_still_part_of_the_action(tmp_path):
+    # cold audit 2026-11-01: an approved command must not re-run with the sandbox disabled
+    c = _cards(tmp_path)
+    card, _ = c.raise_card("Bash", PUSH, "git push")
+    c.approve(card["id"], "web")
+    assert c.consume("Bash", {**PUSH, "dangerouslyDisableSandbox": True}) is None
+    assert c.consume("Bash", {**PUSH, "some_future_flag": 1}) is None
+    assert c.consume("Bash", {**PUSH, "run_in_background": "false"}) is None  # not coerced
+    assert c.consume("Bash", PUSH)["state"] == "used"
+
+
+def test_sandbox_flag_shown_on_card(tmp_path):
+    c = _cards(tmp_path)
+    card, _ = c.raise_card("Bash", {**PUSH, "dangerouslyDisableSandbox": True}, "git push")
+    assert card["summary"] == "git push origin main  [sandbox disabled]"
+
+
 def test_same_bash_command_new_label_reuses_pending_card(tmp_path):
     c = _cards(tmp_path)
     a, _ = c.raise_card("Bash", {**PUSH, "description": "one"}, "git push")

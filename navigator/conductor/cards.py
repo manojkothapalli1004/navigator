@@ -25,11 +25,17 @@ class CardError(Exception):
 
 def _action(tool_name: str, tool_input: dict) -> dict:
     """What actually runs. A Bash call's description label and timeout don't change the action
-    (2026-11-01: re-runs with a new label never matched their approved card); background does."""
-    if tool_name == "Bash":
-        return {"command": tool_input.get("command"),
-                "run_in_background": bool(tool_input.get("run_in_background"))}
-    return tool_input
+    (2026-11-01: re-runs with a new label never matched their approved card). Every other key —
+    sandbox flag, background, anything added later — still has to match exactly."""
+    if tool_name != "Bash":
+        return tool_input
+    action = {k: v for k, v in tool_input.items() if k not in _BASH_IGNORED}
+    if action.get("run_in_background") is False:
+        del action["run_in_background"]  # explicit False == absent; anything else is kept as-is
+    return action
+
+
+_BASH_IGNORED = ("description", "timeout")
 
 
 def fingerprint(tool_name: str, tool_input: dict, cwd: str | None = None) -> str:
@@ -42,6 +48,8 @@ def summarize(tool_name: str, tool_input: dict, cwd: str | None = None) -> str:
     """Everything the operator approves, in full: the card is the only thing they see."""
     if tool_name == "Bash":
         s = str(tool_input.get("command", ""))
+        if tool_input.get("dangerouslyDisableSandbox"):
+            s += "  [sandbox disabled]"
     elif tool_name == "Edit":
         s = f"Edit {tool_input.get('file_path')}: {tool_input.get('old_string')!r} -> {tool_input.get('new_string')!r}"
     elif tool_name == "MultiEdit":
