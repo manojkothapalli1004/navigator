@@ -23,9 +23,11 @@ class ResumeFailed(Exception):
 
 class Engine:
     def __init__(self, store: Store, runner: TurnRunner, lock_path: Path | None = None,
-                 turn_timeout_s: float = TURN_TIMEOUT_S, notify: Callable[[dict], None] | None = None):
+                 turn_timeout_s: float = TURN_TIMEOUT_S, notify: Callable[[dict], None] | None = None,
+                 reply: Callable[[str], None] | None = None):
         self.store, self.runner, self.turn_timeout_s = store, runner, turn_timeout_s
         self.notify = notify  # tells the operator's phone about a new approval card (C3)
+        self.reply = reply  # sends a Telegram-originated turn's outcome back to Telegram (C4)
         self._dropped: set[int] = set()
         self.lock_path = Path(lock_path) if lock_path else store.root / "turn.lock"
         self._pending: asyncio.Queue | None = None
@@ -83,11 +85,13 @@ class Engine:
         finally:
             self._turn_task = None
 
-    def submit(self, text: str, source: str, internal: bool = False) -> dict:
+    def submit(self, text: str, source: str, internal: bool = False,
+               reply_via: str | None = None) -> dict:
         # "approval" messages come only from the conductor itself, after the operator approves a card
         if source not in SOURCES and not (internal and source == "approval"):
             raise ValueError(f"unknown source {source!r}")
-        user = self._append({"kind": "user", "text": text, "source": source})
+        user = self._append({"kind": "user", "text": text, "source": source,
+                             **({"reply_via": reply_via} if reply_via else {})})
         ahead = self.queue_len + (1 if self.busy else 0)
         self._append({"kind": "status", "state": "queued", "msg_id": user["id"], "detail": ahead})
         self._pending.put_nowait(user)
@@ -103,6 +107,22 @@ class Engine:
                 self.notify(card)
             except Exception as e:  # a Telegram hiccup never breaks a turn
                 _log.warning("conductor.card_notify_failed: %s", type(e).__name__)
+
+    @staticmethod
+    def _to_telegram(user: dict) -> bool:
+        return user.get("source") == "telegram" or user.get("reply_via") == "telegram"
+
+    def _reply(self, user: dict, text: str) -> None:
+        if not self.reply or not self._to_telegram(user):
+            return
+        try:
+            self.reply(text)
+        except Exception as e:  # a Telegram hiccup never breaks a turn
+            _log.warning("conductor.telegram_reply_failed: %s", type(e).__name__)
+
+    def _error(self, user: dict, detail: str) -> None:
+        self._append({"kind": "status", "state": "error", "msg_id": user["id"], "detail": detail})
+        self._reply(user, f"Stopped: {detail}")
 
     def _append(self, entry: dict) -> dict:
         entry = self.store.append(entry)
@@ -122,14 +142,18 @@ class Engine:
 
     def _mark_interrupted(self) -> None:
         last: dict[str, str] = {}
+        users: dict[str, dict] = {}
         for e in self.store.history(limit=100000):
             if e.get("kind") == "status":
                 last[e["msg_id"]] = e["state"]
+            elif e.get("kind") == "user":
+                users[e["id"]] = e
         for msg_id, state in last.items():
             if state in ("queued", "running"):
                 # not re-run: the turn may already have had side effects
-                self._append({"kind": "status", "state": "interrupted", "msg_id": msg_id,
-                              "detail": "the conductor restarted before this finished; send it again if needed"})
+                detail = "the conductor restarted before this finished; send it again if needed"
+                self._append({"kind": "status", "state": "interrupted", "msg_id": msg_id, "detail": detail})
+                self._reply(users.get(msg_id, {}), f"Interrupted: {detail}")
 
     async def _worker(self) -> None:
         while True:
@@ -165,20 +189,19 @@ class Engine:
             except asyncio.CancelledError:
                 if not self._cancelled:
                     raise  # the engine itself is stopping
-                self._append({"kind": "status", "state": "error", "msg_id": msg_id,
-                              "detail": "cancelled by operator"})
+                self._error(user, "cancelled by operator")
                 return
             except asyncio.TimeoutError:
-                self._append({"kind": "status", "state": "error", "msg_id": msg_id,
-                              "detail": f"timed out after {self.turn_timeout_s:.0f}s; the turn was stopped"})
+                self._error(user, f"timed out after {self.turn_timeout_s:.0f}s; the turn was stopped")
                 return
             except Exception as e:  # the worker must outlive any one turn
-                self._append({"kind": "status", "state": "error", "msg_id": msg_id,
-                              "detail": f"{type(e).__name__}: {str(e)[:300]}"})
+                self._error(user, f"{type(e).__name__}: {str(e)[:300]}")
                 return
             finally:
                 fcntl.flock(lock, fcntl.LOCK_UN)
             if sid:
                 self.store.set_session_id(sid)
-            self._append({"kind": "assistant", "text": "".join(parts) or "(no reply text)", "reply_to": msg_id})
+            text = "".join(parts) or "(no reply text)"
+            self._append({"kind": "assistant", "text": text, "reply_to": msg_id})
             self._append({"kind": "status", "state": "done", "msg_id": msg_id})
+            self._reply(user, text)

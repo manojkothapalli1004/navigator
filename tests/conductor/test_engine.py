@@ -234,3 +234,59 @@ async def test_card_entry_published_without_fingerprint(tmp_path):
     # each state change is its own history entry; the card is named by card_id
     assert cards[0]["id"] != cards[1]["id"] and {c["card_id"] for c in cards} == {"i"}
     assert [c["state"] for c in sent] == ["pending"]  # only a new card goes to Telegram
+
+
+# --- C4: replies go back to Telegram for Telegram-originated turns only ---
+
+def _reng(tmp_path, runner, sent):
+    return Engine(Store(tmp_path / "c"), runner, lock_path=tmp_path / "c" / "turn.lock", reply=sent.append)
+
+
+@aio
+async def test_telegram_turn_reply_sent(tmp_path):
+    sent = []; eng = _reng(tmp_path, FakeRunner(), sent); await eng.start()
+    eng.submit("hello", "telegram"); await _drain(eng); await eng.stop()
+    assert sent == ["re:he"]
+
+
+@aio
+async def test_web_turn_not_sent_to_telegram(tmp_path):
+    sent = []; eng = _reng(tmp_path, FakeRunner(), sent); await eng.start()
+    eng.submit("hello", "web"); eng.submit("hi", "terminal"); await _drain(eng); await eng.stop()
+    assert sent == []
+
+
+@aio
+async def test_telegram_turn_error_sends_stopped(tmp_path):
+    sent = []; eng = _reng(tmp_path, FakeRunner(fail={"x": "boom"}), sent); await eng.start()
+    eng.submit("x", "telegram"); await _drain(eng); await eng.stop()
+    assert sent == ["Stopped: RuntimeError: sdk exploded"]
+
+
+@aio
+async def test_approval_via_telegram_replies(tmp_path):
+    sent = []; eng = _reng(tmp_path, FakeRunner(), sent); await eng.start()
+    u = eng.submit("Card ABC234 was approved", "approval", internal=True, reply_via="telegram")
+    eng.submit("Card XYZ789 was approved", "approval", internal=True, reply_via="web")
+    await _drain(eng); await eng.stop()
+    assert u["reply_via"] == "telegram" and sent == ["re:[a"]  # FakeRunner keeps the [approval] prefix
+
+
+@aio
+async def test_interrupted_telegram_turn_notifies(tmp_path):
+    s = Store(tmp_path / "c")
+    t = s.append({"kind": "user", "text": "x", "source": "telegram"})
+    s.append({"kind": "status", "state": "running", "msg_id": t["id"]})
+    w = s.append({"kind": "user", "text": "y", "source": "web"})
+    s.append({"kind": "status", "state": "queued", "msg_id": w["id"]})
+    sent = []; eng = _reng(tmp_path, FakeRunner(), sent); await eng.start(); await eng.stop()
+    assert sent == ["Interrupted: the conductor restarted before this finished; send it again if needed"]
+
+
+@aio
+async def test_reply_failure_does_not_break_turn(tmp_path):
+    def bad(text):
+        raise OSError("net down")
+    eng = Engine(Store(tmp_path / "c"), FakeRunner(), lock_path=tmp_path / "c" / "turn.lock", reply=bad)
+    await eng.start(); m = eng.submit("hello", "telegram"); await _drain(eng); await eng.stop()
+    assert _status(eng.store, m["id"])[-1] == "done"

@@ -93,7 +93,8 @@ def build_app(engine: Engine, manage_engine: bool = False, cards=None) -> Starle
         engine.on_card(card)
         if card["state"] == "approved":
             engine.submit(f"Card {card['code']} was approved by the operator via {via}. Run exactly this "
-                          f"now, unchanged: {card['summary']}", "approval", internal=True)
+                          f"now, unchanged: {card['summary']}", "approval", internal=True,
+                          reply_via=via)
         return JSONResponse(_public(card))
 
     @asynccontextmanager
@@ -178,7 +179,8 @@ def serve(socket_path: Path, root: Path, runner=None) -> None:
     import threading
     # the Telegram post blocks up to 15 s: never inside the turn's event loop
     notify = lambda card: threading.Thread(target=telegram.send_card, args=(card, creds), daemon=True).start()
-    engine = Engine(Store(root), runner, notify=notify)
+    reply = lambda text: threading.Thread(target=telegram.send_text, args=(text, creds), daemon=True).start()
+    engine = Engine(Store(root), runner, notify=notify, reply=reply)
     engine_ref.append(engine)
     # bound here, not by uvicorn: uvicorn chmods its own unix sockets to 0666
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
