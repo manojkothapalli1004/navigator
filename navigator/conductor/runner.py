@@ -20,7 +20,7 @@ WINDOWS_PROMPT = (
     "from: [web], [telegram] or [terminal]. Replies are usually read on a phone: keep them short "
     "and plain. To offer the operator a page of the website, put it on its own line as "
     "[open:/path], e.g. [open:/navigator/decisions]; pages: /, /navigator, /navigator/decisions, "
-    "/navigator/settings, /trader, /system. Gated actions (merge, push, history rewrites, "
+    "/navigator/settings, /trader. Gated actions (merge, push, history rewrites, "
     "settings/CLAUDE.md edits, launchd changes, trader paths) are refused here: say what you "
     "would run and ask the operator to approve it.")
 
