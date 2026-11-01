@@ -70,3 +70,12 @@ def test_expired_or_superseded_or_aborted_close_the_fault(tmp_path):
         s.mark_filed(fnd(i).fingerprint, f"prop-{i}")
     s.sync_proposals({"prop-1": "expired", "prop-2": "superseded", "prop-3": "aborted"})
     assert s.open_proposals() == {}
+
+
+def test_cleared_reported_once_not_every_run(tmp_path):
+    s = FindingStore(tmp_path / "store.json")
+    s.record([fnd(1)], T0)
+    s.mark_filed(fnd(1).fingerprint, "prop-1")
+    assert s.record([], T1).cleared == [fnd(1).fingerprint]
+    assert s.record([], "2026-10-31T22:00:00+00:00").cleared == []
+    assert s.open_proposals() == {fnd(1).fingerprint: "prop-1"}   # the proposal is still followed

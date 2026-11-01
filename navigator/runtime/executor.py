@@ -537,8 +537,11 @@ FRONTEND_SUFFIXES = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".css")
 
 
 def _ran_vitest(entry: dict) -> bool:
+    """The entry ran the frontend test suite: `vitest ...`, `npx vitest ...` or `npm (run) test`
+    (not merely an argv that mentions vitest, e.g. `echo vitest`)."""
     argv = [str(a) for a in (entry.get("argv_list") or str(entry.get("argv") or "").split())]
-    return "vitest" in argv
+    return (argv[:1] == ["vitest"] or argv[:2] == ["npx", "vitest"]
+            or argv[:2] == ["npm", "test"] or argv[:3] == ["npm", "run", "test"])
 
 
 def suite_green(verification: list, changed: list) -> bool:

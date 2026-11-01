@@ -39,7 +39,9 @@ def _statuses(act, store: FindingStore) -> dict[str, str]:
         try:
             runs = act.list_runs_for_proposal(pid)
             if runs:
-                out[pid] = getattr(runs[-1].status, "value", str(runs[-1].status))
+                # the client promises no order: the latest run is the one that started last
+                latest = max(runs, key=lambda r: str(getattr(r, "started_at", "") or ""))
+                out[pid] = getattr(latest.status, "value", str(latest.status))
                 continue
             prop = act.get_proposal(pid)
             if prop is not None:
@@ -77,6 +79,9 @@ def cmd_run(args, *, browse_fn, act, notifier, root: Path, base_sha) -> int:
         return 2
     except browse_mod.BrowserUnavailable as e:
         notifier.send(f"Site checker: could not start Chrome ({e})")
+        return 2
+    except Exception as e:  # anything else: say so instead of dying silently under launchd
+        notifier.send(f"Site checker: run failed ({type(e).__name__}: {e})")
         return 2
     now = time.time()
     findings: list[Finding] = [f for snap, shot in snaps for f in check_page(snap, now, screenshot=shot)]

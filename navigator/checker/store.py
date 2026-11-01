@@ -55,16 +55,19 @@ class FindingStore:
                 continue
             entry["last_seen"] = now
             entry["finding"] = asdict(f)
+            entry.pop("gone", None)
             if entry["state"] == "merged":
                 t.regressions.append(f)
             elif entry["state"] in ("unfiled", "open"):
                 t.still_open.append(f)
         for fp, entry in list(self._data.items()):
-            if fp in seen or entry["state"] not in ("unfiled", "open"):
+            if fp in seen or entry["state"] not in ("unfiled", "open") or entry.get("gone"):
                 continue
             t.cleared.append(fp)
             if entry["state"] == "unfiled":
                 del self._data[fp]   # gone before anyone filed it: nothing to track
+            else:
+                entry["gone"] = True  # reported once; its proposal is still followed until it closes
         self._save()
         return t
 

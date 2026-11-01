@@ -43,3 +43,13 @@ def test_frontend_change_needs_a_vitest_run_to_count_as_green():
     other = {"returncode": 0, "argv_list": ["git", "status"]}
     assert suite_green([ok], FRONT) is True
     assert suite_green([other], FRONT) is False
+
+
+@pytest.mark.parametrize("argv", [["echo", "vitest"], ["grep", "vitest", "x"], ["cat", "vitest.config.ts"]])
+def test_vitest_must_actually_be_the_program(argv):
+    assert suite_green([{"returncode": 0, "argv_list": argv}], FRONT) is False
+
+
+@pytest.mark.parametrize("argv", [["npx", "vitest", "run"], ["vitest", "run"], ["npm", "run", "test"]])
+def test_real_vitest_invocations_count(argv):
+    assert suite_green([{"returncode": 0, "argv_list": argv}], FRONT) is True

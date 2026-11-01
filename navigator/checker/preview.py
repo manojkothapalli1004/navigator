@@ -28,8 +28,10 @@ def build(branch: str, work: Path, port: int = PREVIEW_PORT) -> str:
     if work.exists():
         shutil.rmtree(work)
     work.mkdir(parents=True)
-    subprocess.run(["git", f"--work-tree={work}", "checkout", branch, "--", "frontend"], cwd=ACT_REPO, check=True)
-    subprocess.run(["git", "reset", "-q"], cwd=ACT_REPO, check=True)   # the checkout above also staged into the index
+    # git archive reads the branch without touching the live repo's index or working tree
+    tar = work / "frontend.tar"
+    subprocess.run(["git", "archive", "--format=tar", f"--output={tar}", branch, "frontend"], cwd=ACT_REPO, check=True)
+    subprocess.run(["tar", "-xf", str(tar), "-C", str(work)], check=True)
     fe = work / "frontend"
     subprocess.run(["cp", "-cR", str(ACT_REPO / "frontend" / "node_modules"), str(fe / "node_modules")], check=True)
     subprocess.run([str(fe / "node_modules/.bin/next"), "build"], cwd=fe, check=True, capture_output=True)

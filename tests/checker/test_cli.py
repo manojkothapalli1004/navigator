@@ -94,3 +94,35 @@ def test_preview_stop_only_kills_port_owner(monkeypatch):
     preview.stop(3001)
     assert calls[0] == ["lsof", "-tiTCP:3001", "-sTCP:LISTEN"]
     assert killed == [4242, 4343]
+
+
+def test_latest_run_is_by_start_time_not_list_order(tmp_path):
+    from navigator.checker.store import FindingStore
+    from navigator.checker.checks import Finding
+    store = FindingStore(tmp_path / "s.json")
+    f = Finding("/", "phone", "hscroll", "body", "x")
+    store.record([f], "2026-10-31T20:00:00+00:00")
+    store.mark_filed(f.fingerprint, "prop-1")
+    newer = SimpleNamespace(status="completed", started_at="2026-10-31T21:00:00+00:00")
+    older = SimpleNamespace(status="failed", started_at="2026-10-31T20:30:00+00:00")
+    act = FakeACT()
+    act.list_runs_for_proposal = lambda pid: [newer, older]
+    assert cli._statuses(act, store) == {"prop-1": "completed"}
+
+
+def test_unexpected_error_exits_2_with_a_message(tmp_path):
+    def boom(base, out):
+        raise RuntimeError("weird")
+    code, notes = run(tmp_path, boom)
+    assert code == 2 and "failed" in notes.sent[0] and "weird" in notes.sent[0]
+
+
+def test_preview_export_never_touches_the_live_index(monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.setattr(preview.subprocess, "run", lambda argv, **kw: calls.append(argv) or SimpleNamespace(stdout="", returncode=0))
+    monkeypatch.setattr(preview.subprocess, "Popen", lambda *a, **k: None)
+    monkeypatch.setattr(preview.urllib.request, "urlopen", lambda *a, **k: None)
+    preview.build("nav/run-x", tmp_path / "work")
+    git_cmds = [c for c in calls if c and c[0] == "git"]
+    assert git_cmds and all(c[1] not in ("reset", "checkout", "add") for c in git_cmds)
+    assert any(c[1] == "archive" for c in git_cmds)
