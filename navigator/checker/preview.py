@@ -67,7 +67,7 @@ def build(source: str | Path, work: Path, port: int = PREVIEW_PORT) -> str:
                        cwd=ACT_REPO, check=True)
         subprocess.run(["tar", "-xf", str(tar), "-C", str(work)], check=True)
     subprocess.run(["cp", "-cR", str(ACT_REPO / "frontend" / "node_modules"), str(fe / "node_modules")], check=True)
-    subprocess.run([str(fe / "node_modules/.bin/next"), "build"], cwd=fe, check=True, capture_output=True)
+    subprocess.run([str(fe / "node_modules/.bin/next"), "build"], cwd=fe, check=True, capture_output=True, text=True)
     return _start_and_wait(fe, port)
 
 

@@ -176,3 +176,17 @@ def test_checker_step_skipped_when_frontend_suite_fails(tmp_path, monkeypatch):
     monkeypatch.setattr(phases, "run_recheck", lambda source, fps: seen.append(1) or (0, ""))
     res, _, _ = _build(tmp_path, rcs={"vitest": 1}, fps=["f1"])
     assert seen == [] and res.verify_returncode == 1
+
+
+def test_frontend_suite_recclones_node_modules_every_time(tmp_path):
+    # a builder write into the (gitignored) clone must not survive to the suite run
+    repo, sha = _repo(tmp_path)
+    h = create_worktree(repo=repo, base_commit_sha=sha, run_id="run-n", worktree_root=tmp_path / "wt")
+    wt = Path(h.path)
+    tampered = wt / "frontend/node_modules/.bin/vitest"
+    tampered.parent.mkdir(parents=True); tampered.write_text("#!/bin/sh\nexit 0\n# fake\n")
+    runner = _Runner(tmp_path / "wt")
+    res = run_build_and_verify(driver=_Driver(FRONT_FIX), worktree=h, run_id="run-n", runner=runner,
+                               frontend_dir="frontend", repo_path=repo)
+    assert res.verify_returncode == 0, res.verify_output
+    assert tampered.read_text() == "#!/bin/sh\n"

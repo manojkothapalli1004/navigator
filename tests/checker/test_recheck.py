@@ -83,3 +83,19 @@ def test_suite_green_checker_origin_requires_recheck():
                        origin="site-checker") is False
     untagged = {"argv_list": ["checker-verify", "f1"], "returncode": 0}
     assert suite_green(_suite() + [untagged], FRONT, frontend_dir="frontend", origin="site-checker") is False
+
+
+def test_verify_preview_crash_is_rc2_with_build_output(tmp_path, monkeypatch, capsys):
+    from navigator.checker import __main__ as cli
+    from navigator.checker.checks import Finding
+    from navigator.checker.store import FindingStore
+    f = Finding("/", "phone", "tap-size", "x", "small")
+    FindingStore(tmp_path / "store.json").record([f], "2026-11-01T00:00:00+00:00")
+    def boom(source, work):
+        raise subprocess.CalledProcessError(1, ["next", "build"], output="", stderr="Failed to fetch `Onest`")
+    monkeypatch.setattr(cli.preview, "build", boom)
+    monkeypatch.setattr(cli.preview, "stop", lambda port=3001: None)
+    monkeypatch.setattr(cli.preview, "LOCK_PATH", tmp_path / "preview.lock")
+    rc = cli.cmd_verify(["--source", str(tmp_path), "--fingerprint", f.fingerprint], root=tmp_path)
+    assert rc == 2
+    assert "Failed to fetch `Onest`" in capsys.readouterr().err

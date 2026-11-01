@@ -119,6 +119,14 @@ def cmd_verify(args, *, root: Path) -> int:
     except preview.PreviewBusy as e:
         print(str(e), file=sys.stderr)
         return 2
+    except Exception as e:
+        # the preview or the browser broke, not the fix: exit 2 so Navigator doesn't read it as
+        # "the fault is still there" (rc 1) and send the builder after it
+        detail = getattr(e, "stderr", None) or getattr(e, "output", None) or ""
+        if isinstance(detail, bytes):
+            detail = detail.decode(errors="replace")
+        print(f"checker error: {type(e).__name__}: {e}\n{str(detail)[-1500:]}", file=sys.stderr)
+        return 2
 
 
 def _verify_on_preview(source, work: Path, out: Path, wanted: dict) -> int:

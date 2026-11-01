@@ -2,6 +2,7 @@ import ast
 import inspect
 import os
 import re
+import shutil
 import subprocess
 import time
 from collections import Counter, deque
@@ -944,18 +945,20 @@ def _run_frontend_suite(runner, wt: Path, repo_path: Path | None, frontend_dir: 
     node_modules (gitignored), so the live checkout's is APFS-cloned in first. Entries are
     tagged suite="frontend": only Navigator writes that tag, and suite_green requires it."""
     fdir = Path(wt) / frontend_dir
-    if not (fdir / "node_modules").is_dir():
-        live = Path(repo_path) / frontend_dir / "node_modules" if repo_path else None
-        if live is None or not live.is_dir():
-            res.verify_returncode, res.repairable = 1, False
-            res.verify_output = f"live checkout has no {frontend_dir}/node_modules"
-            return
-        cp = subprocess.run(["cp", "-cR", str(live), str(fdir / "node_modules")],
-                            capture_output=True, text=True)
-        if cp.returncode != 0:
-            res.verify_returncode, res.repairable = 1, False
-            res.verify_output = f"node_modules clone failed: {cp.stderr[-500:]}"
-            return
+    live = Path(repo_path) / frontend_dir / "node_modules" if repo_path else None
+    if live is None or not live.is_dir():
+        res.verify_returncode, res.repairable = 1, False
+        res.verify_output = f"live checkout has no {frontend_dir}/node_modules"
+        return
+    # a fresh clone every time: node_modules is gitignored, so a builder write into it (say a
+    # fake .bin/vitest on a repair turn) would be invisible to the audit diff
+    shutil.rmtree(fdir / "node_modules", ignore_errors=True)
+    cp = subprocess.run(["cp", "-cR", str(live), str(fdir / "node_modules")],
+                        capture_output=True, text=True)
+    if cp.returncode != 0:
+        res.verify_returncode, res.repairable = 1, False
+        res.verify_output = f"node_modules clone failed: {cp.stderr[-500:]}"
+        return
     env = sealed_verifier_env()
     for argv in FRONTEND_SUITE:
         timeout = FRONTEND_BUILD_TIMEOUT_S if argv[-1] == "build" else FRONTEND_TIMEOUT_S
