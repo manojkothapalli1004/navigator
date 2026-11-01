@@ -92,6 +92,32 @@ def _shape(value) -> str:
     return type(value).__name__
 
 
+def _with_editable(files, raw: str, wt: Path, editable_dir: str) -> dict:
+    """context.files plus the worktree text of every file_edits path that resolves to an
+    existing regular file inside wt/editable_dir (site-checker proposals name no files,
+    so the builder finds them with its tools). Anything else stays unknown and is
+    refused by _apply_file_edits as before; malformed responses are left to _parse."""
+    out = dict(files) if isinstance(files, dict) else {}
+    try:
+        edits = json.loads(raw).get("file_edits") or []
+        root = (wt / editable_dir).resolve()
+    except (ValueError, TypeError, AttributeError, OSError):
+        return out
+    for entry in edits if isinstance(edits, list) else []:
+        rel = entry[0] if isinstance(entry, (list, tuple)) and entry else None
+        if not isinstance(rel, str) or not rel or rel in out or Path(rel).is_absolute():
+            continue
+        target = wt / rel
+        try:
+            real = target.resolve()
+        except OSError:
+            continue
+        if target.is_symlink() or not real.is_relative_to(root) or not real.is_file():
+            continue
+        out[rel] = real.read_text()[:_MAX_FILE_CHARS]
+    return out
+
+
 class ClaudeSDKDriver:
     """SubagentDriver backed by an injectable LLM query function.
 
@@ -201,6 +227,9 @@ class ClaudeSDKDriver:
         files = None
         if request.role == Role.builder and isinstance(request.context, dict):
             files = request.context.get("files")
+            editable = request.context.get("editable_dir")
+            if isinstance(editable, str) and editable and request.worktree_path:
+                files = _with_editable(files, raw, Path(request.worktree_path), editable)
         return self._parse(request.role, raw, files=files)
 
     def _build_prompt(self, request: DriverRequest) -> str:

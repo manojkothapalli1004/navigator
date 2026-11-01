@@ -231,3 +231,49 @@ def test_malformed_entry_error_describes_the_shape_but_carries_no_entry_text(ent
         _run({"file_edits": [entry], "summary": "s"}, files={"a.py": BASE})
     msg = str(ei.value)
     assert shape in msg and "SEKRIT" not in msg
+
+
+# site-checker proposals name no files: context.editable_dir lets the builder edit an
+# existing file under that dir, its base text read from the worktree at parse time
+def _run_wt(response, wt, ctx):
+    d = ClaudeSDKDriver(query_fn=lambda prompt: json.dumps(response), budget_guard=BudgetGuard(10.0))
+    return d.run_role(DriverRequest(role=Role.builder, context=ctx, worktree_path=str(wt)))
+
+
+def _wt(tmp_path):
+    (tmp_path / "frontend/components").mkdir(parents=True)
+    (tmp_path / "frontend/components/A.tsx").write_text("const h = 18;\n")
+    (tmp_path / "backend").mkdir()
+    (tmp_path / "backend/x.py").write_text("x = 1\n")
+    return tmp_path
+
+
+def test_editable_dir_edit_reads_base_from_worktree(tmp_path):
+    wt = _wt(tmp_path)
+    res = _run_wt({"file_edits": [["frontend/components/A.tsx", "18", "40"]], "summary": "s"},
+                  wt, {"files": {}, "editable_dir": "frontend"})
+    assert res.file_writes == [("frontend/components/A.tsx", "const h = 40;\n")]
+
+
+@pytest.mark.parametrize("rel", ["backend/x.py", "frontend/../backend/x.py", "/etc/hosts",
+                                 "frontend/missing.tsx"])
+def test_editable_dir_refuses_outside_or_missing(tmp_path, rel):
+    wt = _wt(tmp_path)
+    with pytest.raises(DriverParseError, match="not in context.files"):
+        _run_wt({"file_edits": [[rel, "x", "y"]], "summary": "s"}, wt,
+                {"files": {}, "editable_dir": "frontend"})
+
+
+def test_editable_dir_refuses_symlink_escaping_dir(tmp_path):
+    wt = _wt(tmp_path)
+    (wt / "frontend/link.py").symlink_to(wt / "backend/x.py")
+    with pytest.raises(DriverParseError, match="not in context.files"):
+        _run_wt({"file_edits": [["frontend/link.py", "x", "y"]], "summary": "s"}, wt,
+                {"files": {}, "editable_dir": "frontend"})
+
+
+def test_without_editable_dir_worktree_file_still_refused(tmp_path):
+    wt = _wt(tmp_path)
+    with pytest.raises(DriverParseError, match="not in context.files"):
+        _run_wt({"file_edits": [["frontend/components/A.tsx", "18", "40"]], "summary": "s"},
+                wt, {"files": {}})
