@@ -92,7 +92,7 @@ def test_preview_stop_only_kills_port_owner(monkeypatch):
     monkeypatch.setattr(preview.subprocess, "run", fake_run)
     monkeypatch.setattr(preview.os, "kill", lambda pid, sig: killed.append(pid))
     preview.stop(3001)
-    assert calls[0] == ["lsof", "-tiTCP:3001", "-sTCP:LISTEN"]
+    assert calls[0] == [preview.LSOF, "-tiTCP:3001", "-sTCP:LISTEN"]
     assert killed == [4242, 4343]
 
 

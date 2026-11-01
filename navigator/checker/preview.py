@@ -43,8 +43,12 @@ def lock(path: Path = LOCK_PATH, timeout_s: float = 900):
             fcntl.flock(fh, fcntl.LOCK_UN)
 
 
+# the sealed verify env's PATH has no /usr/sbin (same as boot_time's sysctl)
+LSOF = "/usr/sbin/lsof" if os.path.exists("/usr/sbin/lsof") else "lsof"
+
+
 def stop(port: int = PREVIEW_PORT) -> None:
-    out = subprocess.run(["lsof", f"-tiTCP:{port}", "-sTCP:LISTEN"], capture_output=True, text=True).stdout
+    out = subprocess.run([LSOF, f"-tiTCP:{port}", "-sTCP:LISTEN"], capture_output=True, text=True).stdout
     for pid in (int(p) for p in out.split() if p.strip().isdigit()):
         os.kill(pid, signal.SIGTERM)
 
