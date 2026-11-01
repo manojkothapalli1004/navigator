@@ -24,8 +24,11 @@ class CardError(Exception):
 
 
 def fingerprint(tool_name: str, tool_input: dict, cwd: str | None = None) -> str:
-    # the folder is part of the action: an approved `git merge x` must not run in another repo
-    return hashlib.sha256(json.dumps([tool_name, tool_input, cwd], sort_keys=True, default=str)
+    # the folder is part of the action: an approved `git merge x` must not run in another repo.
+    # For Bash only the command is the action: the model's description label, timeout and
+    # background flag change between the blocked call and the approved retry
+    action = {"command": tool_input.get("command")} if tool_name == "Bash" else tool_input
+    return hashlib.sha256(json.dumps([tool_name, action, cwd], sort_keys=True, default=str)
                           .encode()).hexdigest()
 
 

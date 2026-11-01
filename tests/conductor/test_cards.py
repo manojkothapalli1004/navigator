@@ -173,3 +173,13 @@ def test_cwd_is_part_of_the_card(tmp_path):
     other = dict(inp, cwd="/Users/Manoj/external-tools/agent-control-tower")
     assert asyncio.run(hook(other, "t", None))["hookSpecificOutput"]["permissionDecision"] == "deny"
     assert asyncio.run(hook(inp, "t", None))["hookSpecificOutput"]["permissionDecision"] == "allow"
+
+
+def test_bash_card_matches_on_command_not_label(tmp_path):
+    # live 2026-11-01: the model re-ran an approved command with a new description and the
+    # card never matched, so the same card was raised again and again
+    c = _cards(tmp_path)
+    card, _ = c.raise_card("Bash", {"command": "git merge x", "description": "Merge x"}, "git merge", cwd="/r")
+    c.approve(card["code"], "web")
+    assert c.consume("Bash", {"command": "git merge x", "description": "Run approved merge",
+                              "timeout": 60000}, cwd="/r")["id"] == card["id"]
