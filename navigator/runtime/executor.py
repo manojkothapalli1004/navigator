@@ -398,7 +398,12 @@ def merge_after_approval(run: Run, *, act, orc, driver, runner, settings, squash
     revert = ((f"git -C {repo} revert {merged_sha}" if squash else f"git -C {repo} revert -m 1 {merged_sha}")
               if merged_sha else f"merge sha unknown - run: git -C {repo} log -1")
     try:  # FIRST: the operator's note (Telegram goes through the ACT emit) must survive an ORC failure
-        _emit(act, run, "run.completed", merge_sha=merged_sha, auto=auto, revert=revert)
+        try:  # the proposal only shapes the message; a lookup failure must not cost the note
+            prop = act.get_proposal(run.proposal_id)
+        except Exception:
+            prop = None
+        _emit(act, run, "run.completed", merge_sha=merged_sha, auto=auto, revert=revert,
+              origin=getattr(prop, "origin", None), title=getattr(prop, "title", None))
     except Exception as e:
         _log.warning("merge.completed_event_failed", run_id=run.id, error=type(e).__name__)
     if auto:  # close the operator's leftover pending approval: the merge is done, so `navigator reject` must not

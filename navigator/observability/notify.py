@@ -131,7 +131,10 @@ class NotifyingACT:
             return f"Navigator: {run_id} declined; worktree kept for inspection"
         if kind == "run.completed":
             text = f"Navigator: {run_id} merged"
-            if p.get("auto"):
+            if p.get("auto") and p.get("origin") == "site-checker":
+                text = (f"Navigator: {run_id} fixed site fault: {p.get('title') or 'untitled'}"
+                        " — merged automatically (checker re-check passed, audited)")
+            elif p.get("auto"):
                 text += " automatically (tier A: tests/docs only, audited, verification green)"
             if p.get("revert"):
                 text += f"\nrevert: {p['revert']}"

@@ -23,10 +23,9 @@ def build_proposal(f: Finding, base_sha: str) -> Proposal:
 - Fix it in frontend/ only (frontend/components, frontend/app, frontend/lib); do not touch backend/.
 - Add a vitest test under frontend/tests that fails before the fix and passes after.
 - Keep the existing look (fonts, colours, spacing scale); phone first.
-3. VERIFY
-- cd frontend && npx vitest run   (full suite green)
-- cd frontend && npx tsc --noEmit -p .
-- The checker re-checks this fault on a preview of the branch before merge (fingerprint {f.fingerprint}).
+3. VERIFY (Navigator runs these itself; the verifier need only run `git status`)
+- typecheck, vitest and next build in frontend/ (all must pass)
+- the checker re-check: this fault must be gone on a preview of the change (fingerprint {f.fingerprint})
 """
     return Proposal(
         origin=CHECKER_ORIGIN,

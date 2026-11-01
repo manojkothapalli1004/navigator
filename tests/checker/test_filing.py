@@ -47,3 +47,9 @@ def test_act_down_keeps_unfiled_then_files_once(tmp_path):
     assert len(file_findings(store, act, "abc")) == 1
     assert file_findings(store, act, "abc") == []
     assert len(act.created) == 1
+
+
+def test_proposal_verify_text_has_no_cd_or_npx():
+    text = build_proposal(F, "abc123").intended_changes
+    assert "cd " not in text and "npx" not in text
+    assert "typecheck, vitest and next build" in text and "checker re-check" in text
