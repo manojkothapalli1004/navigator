@@ -188,3 +188,27 @@ def test_approve_submits_internal_message(tmp_path):
         assert "git push origin main" in users[-1]["text"] and a["code"] in users[-1]["text"]
         assert [e["state"] for e in eng.store.history() if e["kind"] == "card"] == ["approved"]
     asyncio.run(go())
+
+
+def test_peer_ancestry():
+    parents = {50: 40, 40: 10, 10: 1, 60: 1}
+    ppid = parents.get
+    assert server.is_descendant(50, 10, ppid) is True
+    assert server.is_descendant(60, 10, ppid) is False
+    assert server.is_descendant(10, 10, ppid) is False  # the conductor itself (tests, CLI in-process)
+
+
+def test_socket_refuses_the_conversations_own_tools():
+    import subprocess, sys
+    d = Path(tempfile.mkdtemp(prefix="cdt", dir="/tmp"))
+    sock = d / "c.sock"
+    _serve(sock, d / "state")
+    # a child of this process (the conductor) = a tool the conversation started
+    code = ("import httpx,sys\n"
+            "try:\n"
+            f"  r=httpx.Client(transport=httpx.HTTPTransport(uds={str(sock)!r})).get('http://c/status')\n"
+            "  print(r.status_code)\n"
+            "except Exception as e:\n"
+            "  print('refused', type(e).__name__)\n")
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=30).stdout
+    assert out.startswith("refused"), out

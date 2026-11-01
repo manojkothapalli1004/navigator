@@ -115,6 +115,47 @@ def build_app(engine: Engine, manage_engine: bool = False, cards=None) -> Starle
                      lifespan=lifespan)
 
 
+def _ppid(pid: int) -> int | None:
+    import subprocess
+    out = subprocess.run(["/bin/ps", "-o", "ppid=", "-p", str(pid)], capture_output=True, text=True).stdout
+    return int(out) if out.strip().isdigit() else None
+
+
+def is_descendant(pid: int, ancestor: int, ppid_of=_ppid) -> bool:
+    """True when `pid` was started (directly or not) by `ancestor` - a tool the conversation ran."""
+    seen = 0
+    cur = ppid_of(pid) if pid != ancestor else None
+    while cur and cur > 1 and seen < 64:
+        if cur == ancestor:
+            return True
+        cur, seen = ppid_of(cur), seen + 1
+    return False
+
+
+def _peer_pid(sock) -> int | None:
+    try:  # macOS: SOL_LOCAL=0, LOCAL_PEERPID=2 (asyncio hands us a TransportSocket wrapper)
+        return int(sock.getsockopt(0, 2))
+    except (OSError, AttributeError, TypeError, ValueError):
+        return None
+
+
+def _guarded_protocol():
+    """uvicorn's h11 protocol, but a connection from a process the conversation started (its Bash,
+    a script it wrote, curl) is closed before any request is read: the conversation must never
+    approve its own card or read the approval state. Same-user processes are otherwise trusted."""
+    from uvicorn.protocols.http.h11_impl import H11Protocol
+
+    class Guarded(H11Protocol):
+        def connection_made(self, transport):
+            sock = transport.get_extra_info("socket")
+            pid = _peer_pid(sock) if sock is not None else None
+            if pid is not None and is_descendant(pid, os.getpid()):
+                transport.close()
+                return
+            super().connection_made(transport)
+    return Guarded
+
+
 def serve(socket_path: Path, root: Path, runner=None) -> None:
     """Run the conductor on `socket_path` (replacing a stale file) with state in `root`."""
     import socket
@@ -143,4 +184,5 @@ def serve(socket_path: Path, root: Path, runner=None) -> None:
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     sock.bind(str(socket_path))
     os.chmod(socket_path, 0o600)
-    uvicorn.Server(uvicorn.Config(build_app(engine, manage_engine=True, cards=cards), log_level="warning")).run(sockets=[sock])
+    uvicorn.Server(uvicorn.Config(build_app(engine, manage_engine=True, cards=cards), log_level="warning",
+                                  http=_guarded_protocol())).run(sockets=[sock])

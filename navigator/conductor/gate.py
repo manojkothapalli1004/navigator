@@ -9,20 +9,28 @@ import re
 from pathlib import Path
 
 HOME = Path.home()
-GATED_DIRS = (HOME / ".claude", HOME / "Library" / "LaunchAgents", Path("/Users/Manoj/calwbot/trader"))
+CONDUCTOR_DIR = Path("/Users/Manoj/calwbot/logs/conductor")
+GATED_DIRS = (HOME / ".claude", HOME / "Library" / "LaunchAgents", Path("/Users/Manoj/calwbot/trader"),
+              CONDUCTOR_DIR)
+READ_TOOLS = {"Read": "file_path", "Grep": "path", "Glob": "path", "NotebookRead": "notebook_path"}
 MEMORY_DIR = re.compile(r"^" + re.escape(str(HOME / ".claude" / "projects")) + r"/[^/]+/memory/")
 GATED_NAMES = {"settings.json", "settings.local.json", "CLAUDE.md", ".claude.json", ".mcp.json"}
 WRITE_TOOLS = {"Write": "file_path", "Edit": "file_path", "MultiEdit": "file_path",
                "NotebookEdit": "notebook_path"}
 GIT_GATED = {"merge", "push", "pull", "rebase", "cherry-pick", "revert", "am", "filter-branch",
              "filter-repo", "update-ref", "replace"}
-LAUNCHCTL_GATED = {"load", "unload", "bootstrap", "bootout", "remove", "enable", "disable"}
+LAUNCHCTL_GATED = {"load", "unload", "bootstrap", "bootout", "remove", "enable", "disable",
+                   "kickstart", "kill", "submit"}
 NAVIGATOR_GATED = {"merge", "reject", "audited", "approve", "decline", "abandon"}
 # any of these in a Bash command means it may write a protected file (reads get stopped too:
 # the Read tool is the way to read them)
 _PROTECTED_TEXT = re.compile(
     r"CLAUDE\.md|settings(\.local)?\.json|\.claude\.json|\.mcp\.json|\.git/hooks|Library/LaunchAgents"
     r"|\.claude/(settings|hooks|plugins|agents|commands|skills|output-styles)")
+# the conversation must never reach its own approval channels (approve its own card, read or
+# forge cards.json, restart the conductor to reload a forged file)
+_CONDUCTOR_TEXT = re.compile(r"navigator\.conductor|conductor\.sock|logs/conductor|com\.calwbot\.conductor"
+                             r"|api/v1/chat|cards\.json")
 _TRADER = re.compile(r"(^|[\s/'\"=:])trader(/|\s|$)")
 _SPLIT = re.compile(r"[\s;&|(){}<>`$]+")
 _REVISION = re.compile(r"^(HEAD|@)([~^]\d*)+$|^[0-9a-f]{7,40}$")
@@ -57,6 +65,8 @@ def _bash_reason(command: str) -> str | None:
     # purpose - a false stop costs one approval.
     if _TRADER.search(command):
         return "touches trader/ (money paths)"
+    if m := _CONDUCTOR_TEXT.search(command):
+        return f"touches the chat service's own approvals ({m.group(0)})"
     if m := _PROTECTED_TEXT.search(command):
         return f"touches {m.group(0)} (permissions, hooks or services)"
     tokens = [t for t in _SPLIT.split(command.replace('"', " ").replace("'", " ")) if t]
@@ -96,6 +106,12 @@ def gated_reason(tool_name: str, tool_input: dict, cwd: Path) -> str | None:
     key = WRITE_TOOLS.get(tool_name)
     if key and tool_input.get(key):
         return _path_reason(str(tool_input[key]), cwd)
+    key = READ_TOOLS.get(tool_name)
+    if key and tool_input.get(key):
+        p = Path(str(tool_input[key])).expanduser()
+        p = (p if p.is_absolute() else Path(cwd) / p).resolve()
+        if p == CONDUCTOR_DIR or CONDUCTOR_DIR in p.parents:
+            return "reads the chat service's approval state"
     return None
 
 
@@ -114,26 +130,36 @@ async def can_use_tool(tool_name: str, input_data: dict, context):
                                         "window; tell the operator what you wanted to run and why")
 
 
-CARD_HINT = ("approval card {code} was sent to the operator (website, Telegram, terminal). Stop and "
-             "wait; when it is approved you will be told to run exactly the same command again.")
+# no code or id here: the model must never hold what approves its own card
+CARD_HINT = ("an approval card was sent to the operator (website, Telegram, terminal). Stop and wait; "
+             "if it is approved you will be told to run exactly the same command again, in the same folder.")
+TOO_LONG_HINT = ("too long to show the operator on an approval card; split it into shorter steps so the "
+                 "gated part can be shown in full")
 
 
 def make_hook(cards, on_card):
     """C3: a gated call raises an approval card instead of a plain deny; the one identical call
     after the operator approves it is allowed (explicitly, so no permission prompt can stop it)."""
     async def hook(input_data: dict, tool_use_id, context) -> dict:
+        from navigator.conductor.cards import CardError
         name, tool_input = input_data.get("tool_name", ""), input_data.get("tool_input") or {}
-        reason = gated_reason(name, tool_input, Path(input_data.get("cwd") or "/Users/Manoj/calwbot"))
+        cwd = str(input_data.get("cwd") or "/Users/Manoj/calwbot")
+        reason = gated_reason(name, tool_input, Path(cwd))
         if reason is None:
             return {}
-        used = cards.consume(name, tool_input)
+        used = cards.consume(name, tool_input, cwd=cwd)
         if used is not None:
             on_card(used)
             return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "allow",
                                            "permissionDecisionReason": f"approval card {used['code']} approved"}}
-        card, new = cards.raise_card(name, tool_input, reason)
-        if new:
-            on_card(card)
+        try:
+            card, new = cards.raise_card(name, tool_input, reason, cwd=cwd)
+        except CardError:
+            hint = TOO_LONG_HINT
+        else:
+            hint = CARD_HINT
+            if new:
+                on_card(card)
         return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
-                                       "permissionDecisionReason": f"{reason} — {CARD_HINT.format(code=card['code'])}"}}
+                                       "permissionDecisionReason": f"{reason} — {hint}"}}
     return hook

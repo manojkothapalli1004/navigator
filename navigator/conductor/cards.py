@@ -23,27 +23,29 @@ class CardError(Exception):
     pass
 
 
-def fingerprint(tool_name: str, tool_input: dict) -> str:
-    return hashlib.sha256(json.dumps([tool_name, tool_input], sort_keys=True, default=str)
+def fingerprint(tool_name: str, tool_input: dict, cwd: str | None = None) -> str:
+    # the folder is part of the action: an approved `git merge x` must not run in another repo
+    return hashlib.sha256(json.dumps([tool_name, tool_input, cwd], sort_keys=True, default=str)
                           .encode()).hexdigest()
 
 
-def summarize(tool_name: str, tool_input: dict) -> str:
+def summarize(tool_name: str, tool_input: dict, cwd: str | None = None) -> str:
+    """Everything the operator approves, in full: the card is the only thing they see."""
     if tool_name == "Bash":
         s = str(tool_input.get("command", ""))
-    elif tool_name in ("Edit", "MultiEdit"):
-        s = f"{tool_name} {tool_input.get('file_path')}: {tool_input.get('old_string')!r} -> {tool_input.get('new_string')!r}"
-        if tool_name == "MultiEdit":
-            s = f"MultiEdit {tool_input.get('file_path')}: {len(tool_input.get('edits') or [])} edits"
+    elif tool_name == "Edit":
+        s = f"Edit {tool_input.get('file_path')}: {tool_input.get('old_string')!r} -> {tool_input.get('new_string')!r}"
+    elif tool_name == "MultiEdit":
+        edits = "; ".join(f"{e.get('old_string')!r} -> {e.get('new_string')!r}"
+                          for e in (tool_input.get("edits") or []) if isinstance(e, dict))
+        s = f"MultiEdit {tool_input.get('file_path')}: {edits}"
     elif tool_name in ("Write", "NotebookEdit"):
         path = tool_input.get("file_path") or tool_input.get("notebook_path")
         body = tool_input.get("content") or tool_input.get("new_source") or ""
-        s = f"{tool_name} {path} ({len(str(body))} chars)"
+        s = f"{tool_name} {path}:\n{body}"
     else:
         s = f"{tool_name} {json.dumps(tool_input, sort_keys=True, default=str)}"
-    if len(s) > MAX_SUMMARY:
-        s = s[:MAX_SUMMARY] + f" … [truncated, {len(s)} chars in full]"
-    return s
+    return f"in {cwd}: {s}" if cwd else s
 
 
 class Cards:
@@ -81,8 +83,13 @@ class Cards:
                 return card
         raise CardError("not found")
 
-    def raise_card(self, tool_name: str, tool_input: dict, reason: str) -> tuple[dict, bool]:
-        fp = fingerprint(tool_name, tool_input)
+    def raise_card(self, tool_name: str, tool_input: dict, reason: str,
+                   cwd: str | None = None) -> tuple[dict, bool]:
+        summary = summarize(tool_name, tool_input, cwd)
+        if len(summary) > MAX_SUMMARY:
+            # a truncated card could hide the gated part, and the retry could never match it
+            raise CardError("too long")
+        fp = fingerprint(tool_name, tool_input, cwd)
         for card in reversed(self._cards):
             if card["fingerprint"] == fp and card["state"] == "pending" and self._live(card):
                 return dict(card), False
@@ -92,7 +99,7 @@ class Cards:
         while code in codes:
             code = "".join(secrets.choice(CODE_ALPHABET) for _ in range(CODE_LEN))
         card = {"id": secrets.token_urlsafe(16), "code": code, "tool": tool_name,
-                "summary": summarize(tool_name, tool_input), "reason": reason, "fingerprint": fp,
+                "summary": summary, "reason": reason, "fingerprint": fp,
                 "state": "pending", "created": now, "expires": now + self.ttl_s}
         self._cards.append(card)
         self._save()
@@ -114,8 +121,8 @@ class Cards:
     def decline(self, key: str, via: str) -> dict:
         return self._decide(key, via, "declined")
 
-    def consume(self, tool_name: str, tool_input: dict) -> dict | None:
-        fp = fingerprint(tool_name, tool_input)
+    def consume(self, tool_name: str, tool_input: dict, cwd: str | None = None) -> dict | None:
+        fp = fingerprint(tool_name, tool_input, cwd)
         for card in reversed(self._cards):
             if card["fingerprint"] == fp and card["state"] == "approved" and self._live(card):
                 card["state"] = "used"

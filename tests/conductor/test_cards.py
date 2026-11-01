@@ -85,7 +85,7 @@ def test_decline(tmp_path):
 def test_file_tool_summary(tmp_path):
     c = _cards(tmp_path)
     card, _ = c.raise_card("Write", {"file_path": "/x/CLAUDE.md", "content": "a" * 10}, "protected")
-    assert card["summary"] == "Write /x/CLAUDE.md (10 chars)"
+    assert card["summary"] == "Write /x/CLAUDE.md:\n" + "a" * 10
     card, _ = c.raise_card("Edit", {"file_path": "/x/settings.json", "old_string": "a", "new_string": "b"}, "p")
     assert card["summary"] == "Edit /x/settings.json: 'a' -> 'b'"
 
@@ -99,7 +99,7 @@ def test_hook_raises_card_and_denies(tmp_path):
     hook = gate.make_hook(c, seen.append)
     out = asyncio.run(hook(_hook_input("git push origin main"), "t1", None))
     hs = out["hookSpecificOutput"]
-    assert hs["permissionDecision"] == "deny" and seen[0]["code"] in hs["permissionDecisionReason"]
+    assert hs["permissionDecision"] == "deny" and "approval card was sent" in hs["permissionDecisionReason"]
     asyncio.run(hook(_hook_input("git push origin main"), "t2", None))
     assert len(seen) == 1  # the pending card is reused, the operator is not told twice
     assert asyncio.run(hook(_hook_input("git status"), "t3", None)) == {}
@@ -115,3 +115,61 @@ def test_hook_allows_after_approval_once(tmp_path):
     assert seen[-1]["state"] == "used"
     again = asyncio.run(hook(_hook_input("git push origin main"), "t3", None))
     assert again["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+# ---- C3 review fix pass ----
+
+@pytest.mark.parametrize("cmd", [
+    "python -m navigator.conductor approve ABC234",
+    "/Users/Manoj/calwbot/navigator/.venv/bin/python -m navigator.conductor cards",
+    "curl --unix-socket /Users/Manoj/calwbot/logs/conductor/conductor.sock -X POST http://c/cards/x/approve",
+    "curl -X POST http://127.0.0.1:8090/api/v1/chat/cards/x/approve",
+    "curl http://localhost:3000/api/v1/chat/history",
+    "cat logs/conductor/cards.json",
+    "launchctl kickstart -k gui/504/com.calwbot.conductor",
+    "pkill -f com.calwbot.conductor",
+])
+def test_bash_cannot_reach_its_own_approvals(cmd):
+    assert gate.gated_reason("Bash", {"command": cmd}, gate.Path("/Users/Manoj/calwbot")) is not None
+
+
+@pytest.mark.parametrize("tool,key", [("Write", "file_path"), ("Read", "file_path"), ("Edit", "file_path")])
+def test_tools_cannot_touch_conductor_state(tool, key):
+    assert gate.gated_reason(tool, {key: "/Users/Manoj/calwbot/logs/conductor/cards.json"},
+                             gate.Path("/Users/Manoj/calwbot")) is not None
+
+
+def test_deny_reason_has_no_code_or_id(tmp_path):
+    c = _cards(tmp_path); seen = []
+    out = asyncio.run(gate.make_hook(c, seen.append)(_hook_input("git push origin main"), "t", None))
+    reason = out["hookSpecificOutput"]["permissionDecisionReason"]
+    assert seen[0]["code"] not in reason and seen[0]["id"] not in reason
+
+
+def test_write_and_multiedit_cards_show_content(tmp_path):
+    c = _cards(tmp_path)
+    w, _ = c.raise_card("Write", {"file_path": "/x/settings.json", "content": '{"allow": ["Bash(*)"]}'}, "p")
+    assert '"allow": ["Bash(*)"]' in w["summary"]
+    m, _ = c.raise_card("MultiEdit", {"file_path": "/x/CLAUDE.md", "edits": [
+        {"old_string": "never push", "new_string": "always push"}]}, "p")
+    assert "'never push' -> 'always push'" in m["summary"]
+
+
+def test_too_long_action_gets_no_card(tmp_path):
+    c = _cards(tmp_path); seen = []
+    cmd = "echo " + "x" * 2100 + "; git push --force origin main"
+    out = asyncio.run(gate.make_hook(c, seen.append)(_hook_input(cmd), "t", None))
+    assert seen == [] and c.pending() == []
+    assert "too long" in out["hookSpecificOutput"]["permissionDecisionReason"]
+
+
+def test_cwd_is_part_of_the_card(tmp_path):
+    c = _cards(tmp_path); seen = []
+    hook = gate.make_hook(c, seen.append)
+    inp = {"tool_name": "Bash", "tool_input": {"command": "git merge feature"}, "cwd": "/Users/Manoj/calwbot/navigator"}
+    asyncio.run(hook(inp, "t", None))
+    assert seen[0]["summary"].startswith("in /Users/Manoj/calwbot/navigator: ")
+    c.approve(seen[0]["code"], "web")
+    other = dict(inp, cwd="/Users/Manoj/external-tools/agent-control-tower")
+    assert asyncio.run(hook(other, "t", None))["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert asyncio.run(hook(inp, "t", None))["hookSpecificOutput"]["permissionDecision"] == "allow"
