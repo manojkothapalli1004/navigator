@@ -66,6 +66,9 @@ def build_app(engine: Engine, manage_engine: bool = False) -> Starlette:
         return JSONResponse({"busy": engine.busy, "queue_len": engine.queue_len,
                              "session_id_set": engine.store.session_id is not None})
 
+    async def cancel(req: Request):
+        return JSONResponse({"cancelled": engine.cancel()})
+
     @asynccontextmanager
     async def lifespan(app):
         if manage_engine:
@@ -78,7 +81,8 @@ def build_app(engine: Engine, manage_engine: bool = False) -> Starlette:
 
     return Starlette(routes=[Route("/messages", post_message, methods=["POST"]),
                              Route("/history", history), Route("/events", events),
-                             Route("/status", status)], lifespan=lifespan)
+                             Route("/status", status),
+                             Route("/cancel", cancel, methods=["POST"])], lifespan=lifespan)
 
 
 def serve(socket_path: Path, root: Path, runner=None) -> None:

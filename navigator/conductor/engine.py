@@ -30,6 +30,8 @@ class Engine:
         self._pending: asyncio.Queue | None = None
         self._subs: list[asyncio.Queue] = []
         self._task: asyncio.Task | None = None
+        self._turn_task: asyncio.Task | None = None
+        self._cancelled = False
         self.busy = False
 
     @property
@@ -62,6 +64,23 @@ class Engine:
         """The engine gave up on this subscriber (it fell behind); its stream must end so the
         window reconnects and re-reads /history."""
         return id(q) in self._dropped
+
+    def cancel(self) -> bool:
+        """Stop the running turn (the operator's Stop button); False when nothing runs."""
+        if self._turn_task is None or self._turn_task.done():
+            return False
+        self._cancelled = True
+        self._turn_task.cancel()
+        return True
+
+    async def _run(self, prompt: str, sid: str | None, emit) -> str | None:
+        # the runner call is its own task so cancel() stops it without stopping the worker
+        self._turn_task = asyncio.ensure_future(asyncio.wait_for(self.runner(prompt, sid, emit),
+                                                                 self.turn_timeout_s))
+        try:
+            return await self._turn_task
+        finally:
+            self._turn_task = None
 
     def submit(self, text: str, source: str) -> dict:
         user = self._append({"kind": "user", "text": text, "source": source})
@@ -112,6 +131,8 @@ class Engine:
             await asyncio.to_thread(fcntl.flock, lock, fcntl.LOCK_EX)  # waits out a terminal turn (C5)
             self._append({"kind": "status", "state": "running", "msg_id": msg_id})
             parts: list[str] = []
+            prompt = f"[{user.get('source', 'web')}] {user['text']}"
+            self._cancelled = False
 
             def emit(ev: dict) -> None:
                 if ev.get("type") == "delta":
@@ -120,13 +141,18 @@ class Engine:
 
             try:
                 try:
-                    sid = await asyncio.wait_for(self.runner(user["text"], self.store.session_id, emit),
-                                                 self.turn_timeout_s)
+                    sid = await self._run(prompt, self.store.session_id, emit)
                 except ResumeFailed:
                     self.store.set_session_id(None)
                     self._append({"kind": "note", "text": "previous conversation could not be resumed; starting fresh"})
                     parts.clear()
-                    sid = await asyncio.wait_for(self.runner(user["text"], None, emit), self.turn_timeout_s)
+                    sid = await self._run(prompt, None, emit)
+            except asyncio.CancelledError:
+                if not self._cancelled:
+                    raise  # the engine itself is stopping
+                self._append({"kind": "status", "state": "error", "msg_id": msg_id,
+                              "detail": "cancelled by operator"})
+                return
             except asyncio.TimeoutError:
                 self._append({"kind": "status", "state": "error", "msg_id": msg_id,
                               "detail": f"timed out after {self.turn_timeout_s:.0f}s; the turn was stopped"})

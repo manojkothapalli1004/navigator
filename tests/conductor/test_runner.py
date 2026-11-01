@@ -77,3 +77,10 @@ def test_text_blocks_separated():
     out = []
     asyncio.run(runner.sdk_turn("hi", None, out.append))
     assert "".join(e["text"] for e in out) == "a\n\nb"
+
+
+def test_options_append_windows_prompt():
+    o = runner.options(None)
+    assert o.system_prompt == {"type": "preset", "preset": "claude_code", "append": runner.WINDOWS_PROMPT}
+    for word in ("[web]", "[telegram]", "[terminal]", "[open:/navigator/decisions]"):
+        assert word in runner.WINDOWS_PROMPT

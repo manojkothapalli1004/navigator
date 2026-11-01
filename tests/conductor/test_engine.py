@@ -1,6 +1,7 @@
 import asyncio
 import fcntl
 import functools
+import re
 
 import pytest
 
@@ -19,6 +20,8 @@ class FakeRunner:
     def __init__(self, gate=None, fail=None):
         self.calls, self.gate, self.fail = [], gate, fail or {}
     async def __call__(self, prompt, session_id, emit):
+        self.raw = getattr(self, "raw", []) + [prompt]
+        prompt = re.sub(r"^\[(web|telegram|terminal)\] ", "", prompt)  # the engine's source prefix
         self.calls.append((prompt, session_id))
         if self.gate is not None:
             await self.gate.wait()
@@ -171,3 +174,40 @@ async def test_dropped_subscriber_is_flagged(tmp_path):
     eng.submit("aa", "web"); await _drain(eng)
     assert eng.is_dropped(q)
     await eng.stop()
+
+
+@aio
+async def test_prompt_prefixed_with_source(tmp_path):
+    r = FakeRunner(); eng = _eng(tmp_path, r); await eng.start()
+    eng.submit("hello", "telegram"); await _drain(eng)
+    assert r.raw == ["[telegram] hello"]
+    assert [e["text"] for e in eng.store.history() if e["kind"] == "user"] == ["hello"]
+
+
+@aio
+async def test_cancel_running_turn_marks_error_and_next_runs(tmp_path):
+    gate = asyncio.Event(); r = FakeRunner(gate)
+    eng = _eng(tmp_path, r); await eng.start()
+    a = eng.submit("aa", "web"); await asyncio.sleep(0.05)
+    assert eng.cancel() is True
+    gate.set(); b = eng.submit("bb", "web"); await _drain(eng)
+    assert _status(eng.store, a["id"])[-1] == "error"
+    assert any(e.get("detail") == "cancelled by operator" for e in eng.store.history() if e.get("msg_id") == a["id"])
+    assert _status(eng.store, b["id"])[-1] == "done"
+
+
+@aio
+async def test_cancel_idle_returns_false(tmp_path):
+    eng = _eng(tmp_path, FakeRunner()); await eng.start()
+    assert eng.cancel() is False
+
+
+@aio
+async def test_cancel_keeps_previous_session_id(tmp_path):
+    eng = _eng(tmp_path, FakeRunner()); await eng.start()
+    eng.submit("aa", "web"); await _drain(eng)
+    sid = eng.store.session_id
+    gate = asyncio.Event(); eng.runner = FakeRunner(gate)
+    eng.submit("bb", "web"); await asyncio.sleep(0.05)
+    eng.cancel(); await _drain(eng)
+    assert eng.store.session_id == sid

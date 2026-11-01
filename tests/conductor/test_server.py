@@ -135,3 +135,10 @@ def test_event_stream_ends_when_subscriber_dropped(tmp_path):
         assert eng._subs == []
         await eng.stop()
     asyncio.run(asyncio.wait_for(go(), 10))
+
+
+def test_post_cancel_endpoint(tmp_path):
+    async def go(c, eng):
+        r = await c.post("/cancel")
+        assert r.status_code == 200 and r.json() == {"cancelled": False}
+    asyncio.run(_with_app(tmp_path, go))
