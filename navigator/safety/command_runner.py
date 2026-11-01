@@ -130,6 +130,14 @@ def _clean_env() -> dict[str, str]:
     # configuration (live 2026-10-10: NAVIGATOR_DRIVER leaked into a verifier pytest)
     return {k: v for k, v in os.environ.items() if not k.startswith("NAVIGATOR_")}
 
+# Navigator's own frontend suite (runtime/phases._run_frontend_suite): fixed argv, run in the
+# repo's frontend_dir, never chosen by a verifier, so it bypasses the string allowlist
+FRONTEND_SUITE: tuple[tuple[str, ...], ...] = (
+    ("node_modules/.bin/tsc", "--noEmit"),
+    ("node_modules/.bin/vitest", "run"),
+    ("node_modules/.bin/next", "build"),
+)
+
 @dataclass
 class CommandResult:
     returncode: int
@@ -185,3 +193,21 @@ class CommandRunner:
         except OSError as e:
             raise CommandRejected(f"command failed to start: {' '.join(argv)} ({e})") from e
         return CommandResult(proc.returncode, proc.stdout, proc.stderr, interpreter)
+
+    def run_fixed(self, argv: list[str], cwd: Path, timeout_s: float,
+                  env: dict | None = None) -> CommandResult:
+        """Run one of FRONTEND_SUITE exactly (no allowlist: the argv set is fixed here). cwd
+        must be inside worktree_root; a timeout or spawn failure is CommandRejected."""
+        if tuple(argv) not in FRONTEND_SUITE:
+            raise CommandRejected(f"not a fixed suite command: {' '.join(map(str, argv))}")
+        cwd = Path(cwd).resolve()
+        if cwd != self.worktree_root and self.worktree_root not in cwd.parents:
+            raise CommandRejected(f"cwd outside worktree: {cwd}")
+        try:
+            proc = subprocess.run(list(argv), cwd=cwd, capture_output=True, text=True, shell=False,
+                                  timeout=timeout_s, env=env if env is not None else _clean_env())
+        except subprocess.TimeoutExpired as e:
+            raise CommandRejected(f"command timed out after {timeout_s}s: {' '.join(argv)}") from e
+        except OSError as e:
+            raise CommandRejected(f"command failed to start: {' '.join(argv)} ({e})") from e
+        return CommandResult(proc.returncode, proc.stdout, proc.stderr)

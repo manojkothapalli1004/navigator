@@ -2,6 +2,7 @@ import ast
 import inspect
 import os
 import re
+import shutil
 import subprocess
 import time
 from collections import Counter, deque
@@ -14,8 +15,9 @@ from navigator.safety.errors import CommandRejected
 from navigator.runtime.drivers.base import DriverRequest, SubagentDriver
 from navigator.runtime.worktree import WorktreeHandle
 from navigator.runtime.checkpoint import checkpoint, diff_artifact
-from navigator.safety.command_runner import CommandRunner
+from navigator.safety.command_runner import FRONTEND_SUITE, CommandRunner
 from navigator.contracts.enums import Role
+from navigator.checker.recheck import run_recheck
 
 # N17 (live 2026-10-20): a builder that returned no file changes was verified on an
 # unchanged tree and parked at the merge gate with an empty diff. An empty change is a
@@ -701,12 +703,19 @@ def run_build_and_verify(driver: SubagentDriver, worktree: WorktreeHandle,
                          proposal: dict | None = None,
                          breakers: CircuitBreakers | None = None,
                          started_monotonic: float | None = None,
-                         workdir: str = ".", repair_turns: int = 0) -> PhaseResult:
+                         workdir: str = ".", repair_turns: int = 0,
+                         frontend_dir: str | None = None, repo_path: Path | None = None,
+                         checker_fingerprints: list[str] | None = None) -> PhaseResult:
     """Build and verify `proposal` in `worktree`. With repair_turns > 0, a repairable
     verify failure (PhaseResult.repairable: a test/skip-gate/missing-tests failure) is fed
     back to the builder up to that many more times in the SAME worktree. The returned
     result accumulates every attempt's file_writes and checkpoints and carries the LAST
-    attempt's verify_* and no_change."""
+    attempt's verify_* and no_change. frontend_dir (RepoConfig.frontend_dir) turns on the fixed
+    frontend suite for changes under it, cloning node_modules from repo_path's checkout;
+    checker_fingerprints (not None for site-checker proposals) waives the frontend
+    test-change rule and adds the checker re-check."""
+    fe = {"frontend_dir": frontend_dir, "repo_path": repo_path,
+          "checker_fingerprints": checker_fingerprints}
     wt = Path(worktree.path)
     # the worktree is created at the run's base commit and nothing has been committed
     # yet: this HEAD is the base the finished build is diffed against (N17)
@@ -722,7 +731,7 @@ def run_build_and_verify(driver: SubagentDriver, worktree: WorktreeHandle,
     tracked = subprocess.run(["git", "ls-files"], cwd=wt, capture_output=True, text=True).stdout.split()
     res = _attempt(driver, wt, base, run_id, runner, proposal, breakers, started, workdir,
                    run_dir, tracked, PhaseResult(), cp_start=1, baseline=None,
-                   test_budget=test_budget)
+                   test_budget=test_budget, **fe)
     if repair_turns <= 0:
         return res
     # Repair turns (outcomes 2026-10-09..23: 69 of 182 non-merged builds failed on builder
@@ -740,7 +749,7 @@ def run_build_and_verify(driver: SubagentDriver, worktree: WorktreeHandle,
             + res.verify_output[-2000:])
         res = _attempt(driver, wt, base, run_id, runner, repair, breakers, started, workdir,
                        run_dir, tracked, PhaseResult(), cp_start=1 + len(checkpoints),
-                       baseline=base, prior_writes=tuple(file_writes), test_budget=test_budget)
+                       baseline=base, prior_writes=tuple(file_writes), test_budget=test_budget, **fe)
         used += 1
         file_writes = list(dict.fromkeys(file_writes + res.file_writes))
         checkpoints.extend(res.checkpoints)
@@ -756,7 +765,9 @@ def _attempt(driver: SubagentDriver, wt: Path, base: str, run_id: str, runner: C
              proposal: dict, breakers: CircuitBreakers | None, started: float, workdir: str,
              run_dir: Path, tracked: list[str], res: PhaseResult, cp_start: int,
              baseline: str | None, prior_writes: tuple[str, ...] = (),
-             test_budget: dict | None = None) -> PhaseResult:
+             test_budget: dict | None = None, frontend_dir: str | None = None,
+             repo_path: Path | None = None,
+             checker_fingerprints: list[str] | None = None) -> PhaseResult:
     """One builder + verifier pass, filling and returning `res`. Checkpoint numbers start
     at cp_start. baseline=None is the first attempt (today's behaviour exactly);
     baseline=<base sha> is a repair turn: prior_writes (paths earlier attempts wrote) are
@@ -838,6 +849,13 @@ def _attempt(driver: SubagentDriver, wt: Path, base: str, run_id: str, runner: C
         res.verify_output = ("builder changed code but made no test changes: "
                              + ", ".join(code_changed))
         return res
+    front_code = [f for f in gate_writes if _is_frontend_code(f, frontend_dir)]
+    if (front_code and checker_fingerprints is None
+            and not any(f.startswith(f"{frontend_dir}/tests/") for f in gate_writes)):
+        res.verify_returncode = 1; res.repairable = True
+        res.verify_output = ("builder changed frontend code but made no test changes: "
+                             + ", ".join(front_code))
+        return res
     if _requires_tests(run_dir, gate_writes) and not _runs_tests(verify.commands):
         res.verify_returncode = 1
         res.verify_output = ("verifier did not run the test suite for a python change: "
@@ -881,7 +899,82 @@ def _attempt(driver: SubagentDriver, wt: Path, base: str, run_id: str, runner: C
             break
     if res.verify_returncode == 0 and _requires_tests(run_dir, gate_writes):
         _run_full_suite(runner, run_dir, res, breakers)
+    if res.verify_returncode == 0 and _frontend_changed(gate_writes, frontend_dir):
+        _run_frontend_suite(runner, wt, repo_path, frontend_dir, res, breakers)
+    if res.verify_returncode == 0 and checker_fingerprints is not None:
+        _run_checker_recheck(wt, frontend_dir, checker_fingerprints, res)
     return res
+
+
+def _run_checker_recheck(wt: Path, frontend_dir: str | None, fingerprints: list[str],
+                         res: PhaseResult) -> None:
+    """Site-checker run: the checker re-checks its own faults on a preview built from this
+    worktree's frontend (uncommitted edits included). Entry tagged suite="checker"."""
+    if not fingerprints:
+        res.verify_returncode, res.repairable = 1, False
+        res.verify_output = "no checker faults recorded for this proposal"
+        return
+    rc, out = run_recheck(Path(wt) / (frontend_dir or "frontend"), list(fingerprints))
+    res.verify_log.append({"argv": "checker-verify " + " ".join(fingerprints),
+                           "argv_list": ["checker-verify", *fingerprints], "returncode": rc,
+                           "output_tail": out[-1500:], "suite": "checker"})
+    res.verify_returncode, res.verify_output = rc, out
+    # rc 1: a fault is still on the page - the builder can try again; 2/126: checker trouble
+    res.repairable = rc == 1
+
+
+FRONTEND_SUFFIXES = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".css")
+FRONTEND_TIMEOUT_S = 300
+FRONTEND_BUILD_TIMEOUT_S = 600
+
+
+def _frontend_changed(changed: list[str], frontend_dir: str | None) -> bool:
+    return bool(frontend_dir) and any(
+        str(f).startswith(f"{frontend_dir}/") and str(f).endswith(FRONTEND_SUFFIXES) for f in changed)
+
+
+def _is_frontend_code(rel: str, frontend_dir: str | None) -> bool:
+    return (_frontend_changed([rel], frontend_dir)
+            and not rel.startswith(f"{frontend_dir}/tests/"))
+
+
+def _run_frontend_suite(runner, wt: Path, repo_path: Path | None, frontend_dir: str,
+                        res: PhaseResult, breakers) -> None:
+    """Navigator's own frontend suite (FRONTEND_SUITE: typecheck, vitest, next build) in
+    <wt>/<frontend_dir>, sealed env, stop at the first failure. Worktrees have no
+    node_modules (gitignored), so the live checkout's is APFS-cloned in first. Entries are
+    tagged suite="frontend": only Navigator writes that tag, and suite_green requires it."""
+    fdir = Path(wt) / frontend_dir
+    live = Path(repo_path) / frontend_dir / "node_modules" if repo_path else None
+    if live is None or not live.is_dir():
+        res.verify_returncode, res.repairable = 1, False
+        res.verify_output = f"live checkout has no {frontend_dir}/node_modules"
+        return
+    # a fresh clone every time: node_modules is gitignored, so a builder write into it (say a
+    # fake .bin/vitest on a repair turn) would be invisible to the audit diff
+    shutil.rmtree(fdir / "node_modules", ignore_errors=True)
+    cp = subprocess.run(["cp", "-cR", str(live), str(fdir / "node_modules")],
+                        capture_output=True, text=True)
+    if cp.returncode != 0:
+        res.verify_returncode, res.repairable = 1, False
+        res.verify_output = f"node_modules clone failed: {cp.stderr[-500:]}"
+        return
+    env = sealed_verifier_env()
+    for argv in FRONTEND_SUITE:
+        timeout = FRONTEND_BUILD_TIMEOUT_S if argv[-1] == "build" else FRONTEND_TIMEOUT_S
+        try:
+            r = runner.run_fixed(list(argv), cwd=fdir, timeout_s=timeout, env=env)
+            rc, out = r.returncode, r.stdout + r.stderr
+        except CommandRejected as e:
+            rc, out = 126, f"frontend suite command rejected: {e}"
+        res.verify_log.append({"argv": " ".join(argv), "argv_list": list(argv), "returncode": rc,
+                               "output_tail": out[-1500:], "suite": "frontend"})
+        res.verify_returncode, res.verify_output = rc, out
+        if rc != 0:
+            res.repairable = rc != 126
+            if breakers:
+                breakers.record_failure(" ".join(argv))
+            return
 
 
 def _run_full_suite(runner, run_dir: Path, res: PhaseResult, breakers) -> None:
@@ -922,7 +1015,9 @@ def run_dir_for(wt: Path, workdir: str) -> Path:
 
 
 def reverify(runner, run_dir: Path, argvs: list[list[str]], breakers=None,
-             changed_files: list[str] | None = None) -> PhaseResult:
+             changed_files: list[str] | None = None, wt: Path | None = None,
+             frontend_dir: str | None = None, repo_path: Path | None = None,
+             checker_fingerprints: list[str] | None = None) -> PhaseResult:
     """Re-run a run's recorded verification commands in `run_dir` (N12d: a rebased
     sibling is re-verified with the commands that verified it; no driver call). Same
     per-command loop as run_build_and_verify: stop at the first non-zero return code, a
@@ -974,4 +1069,11 @@ def reverify(runner, run_dir: Path, argvs: list[list[str]], breakers=None,
         entry = next((a for a in runner.allowlist if "pytest" in a.split()), None)
         if entry is None or entry.split() + ["-q"] not in argvs:
             _run_full_suite(runner, run_dir, res, breakers)
+    # Navigator-run suites are never replayed from the record (_recorded_argvs drops them):
+    # they run again here against the rebased tree
+    if (res.verify_returncode == 0 and wt is not None
+            and _frontend_changed(list(changed_files or []), frontend_dir)):
+        _run_frontend_suite(runner, Path(wt), repo_path, frontend_dir, res, breakers)
+    if res.verify_returncode == 0 and wt is not None and checker_fingerprints is not None:
+        _run_checker_recheck(Path(wt), frontend_dir, checker_fingerprints, res)
     return res

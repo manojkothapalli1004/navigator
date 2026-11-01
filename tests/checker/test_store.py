@@ -79,3 +79,12 @@ def test_cleared_reported_once_not_every_run(tmp_path):
     assert s.record([], T1).cleared == [fnd(1).fingerprint]
     assert s.record([], "2026-10-31T22:00:00+00:00").cleared == []
     assert s.open_proposals() == {fnd(1).fingerprint: "prop-1"}   # the proposal is still followed
+
+
+def test_fingerprints_for(tmp_path):
+    s = FindingStore(tmp_path / "store.json")
+    s.record([fnd(1), fnd(2), fnd(3)], T0)
+    a, b, c = fnd(1).fingerprint, fnd(2).fingerprint, fnd(3).fingerprint
+    s.mark_filed(b, "prop-1"); s.mark_filed(a, "prop-1"); s.mark_filed(c, "prop-2")
+    assert s.fingerprints_for("prop-1") == sorted([a, b])
+    assert s.fingerprints_for("nope") == []

@@ -120,8 +120,7 @@ def test_unexpected_error_exits_2_with_a_message(tmp_path):
 def test_preview_export_never_touches_the_live_index(monkeypatch, tmp_path):
     calls = []
     monkeypatch.setattr(preview.subprocess, "run", lambda argv, **kw: calls.append(argv) or SimpleNamespace(stdout="", returncode=0))
-    monkeypatch.setattr(preview.subprocess, "Popen", lambda *a, **k: None)
-    monkeypatch.setattr(preview.urllib.request, "urlopen", lambda *a, **k: None)
+    monkeypatch.setattr(preview, "_start_and_wait", lambda fe, port: "http://127.0.0.1:3001")
     preview.build("nav/run-x", tmp_path / "work")
     git_cmds = [c for c in calls if c and c[0] == "git"]
     assert git_cmds and all(c[1] not in ("reset", "checkout", "add") for c in git_cmds)

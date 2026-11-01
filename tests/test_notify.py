@@ -124,3 +124,14 @@ def test_review_message_shows_the_tier():
     act.emit_event(_ev("run.awaiting_review", run_id="run-3", title="t", diff="", verification=[],
                        merge_tier=None))
     assert "tier:" not in rec.sent[2]
+
+
+def test_auto_merge_line_for_checker_fix():
+    rec = _Recorder()
+    act = NotifyingACT(FakeACTClient(), rec)
+    act.emit_event(_ev("run.completed", run_id="run-1", merge_sha="abc", auto=True, revert="git revert x",
+                       origin="site-checker", title="Site checker: tap-size on / (phone)"))
+    assert ("fixed site fault: Site checker: tap-size on / (phone) — merged automatically "
+            "(checker re-check passed, audited)") in rec.sent[0]
+    assert "tests/docs only" not in rec.sent[0]
+    assert "revert: git revert x" in rec.sent[0]
