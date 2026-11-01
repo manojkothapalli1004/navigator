@@ -23,10 +23,19 @@ class CardError(Exception):
     pass
 
 
+def _action(tool_name: str, tool_input: dict) -> dict:
+    """What actually runs. A Bash call's description label and timeout don't change the action
+    (2026-11-01: re-runs with a new label never matched their approved card); background does."""
+    if tool_name == "Bash":
+        return {"command": tool_input.get("command"),
+                "run_in_background": bool(tool_input.get("run_in_background"))}
+    return tool_input
+
+
 def fingerprint(tool_name: str, tool_input: dict, cwd: str | None = None) -> str:
     # the folder is part of the action: an approved `git merge x` must not run in another repo
-    return hashlib.sha256(json.dumps([tool_name, tool_input, cwd], sort_keys=True, default=str)
-                          .encode()).hexdigest()
+    return hashlib.sha256(json.dumps([tool_name, _action(tool_name, tool_input), cwd], sort_keys=True,
+                                     default=str).encode()).hexdigest()
 
 
 def summarize(tool_name: str, tool_input: dict, cwd: str | None = None) -> str:

@@ -40,6 +40,38 @@ def test_approved_card_allows_only_identical_call(tmp_path):
     assert c.consume("Bash", PUSH) is None  # single use
 
 
+def test_bash_label_and_timeout_do_not_change_the_action(tmp_path):
+    # 2026-11-01: approvals failed because the re-run had a different description label
+    c = _cards(tmp_path)
+    card, _ = c.raise_card("Bash", {**PUSH, "description": "Push main", "timeout": 1000}, "git push")
+    c.approve(card["id"], "web")
+    assert c.consume("Bash", {**PUSH, "description": "Run the approved push", "timeout": 5000})["state"] == "used"
+
+
+def test_bash_background_flag_still_part_of_the_action(tmp_path):
+    c = _cards(tmp_path)
+    card, _ = c.raise_card("Bash", PUSH, "git push")
+    c.approve(card["id"], "web")
+    assert c.consume("Bash", {**PUSH, "run_in_background": True}) is None
+    assert c.consume("Bash", {**PUSH, "run_in_background": False})["state"] == "used"
+
+
+def test_same_bash_command_new_label_reuses_pending_card(tmp_path):
+    c = _cards(tmp_path)
+    a, _ = c.raise_card("Bash", {**PUSH, "description": "one"}, "git push")
+    b, new = c.raise_card("Bash", {**PUSH, "description": "two"}, "git push")
+    assert not new and a["id"] == b["id"]
+
+
+def test_non_bash_inputs_unchanged(tmp_path):
+    c = _cards(tmp_path)
+    w = {"file_path": "/x/CLAUDE.md", "content": "a"}
+    card, _ = c.raise_card("Write", w, "protected")
+    c.approve(card["id"], "web")
+    assert c.consume("Write", {**w, "content": "b"}) is None
+    assert c.consume("Write", w)["state"] == "used"
+
+
 def test_expired_and_double_approve(tmp_path):
     clk = Clock(); c = _cards(tmp_path, clk)
     card, _ = c.raise_card("Bash", PUSH, "git push")
