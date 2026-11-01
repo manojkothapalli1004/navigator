@@ -25,21 +25,22 @@ WINDOWS_PROMPT = (
     "would run and ask the operator to approve it.")
 
 
-def options(session_id: str | None) -> ClaudeAgentOptions:
+def options(session_id: str | None, hook=None) -> ClaudeAgentOptions:
     # the same settings terminal Claude uses in this workspace, plus the hard gate
     return ClaudeAgentOptions(
         model=MODEL, cwd=CWD, setting_sources=["user", "project", "local"],
         system_prompt={"type": "preset", "preset": "claude_code", "append": WINDOWS_PROMPT},
         permission_mode="auto", resume=session_id, include_partial_messages=True,
-        hooks={"PreToolUse": [HookMatcher(hooks=[gate.pre_tool_use_hook])]},
+        hooks={"PreToolUse": [HookMatcher(hooks=[hook or gate.pre_tool_use_hook])]},
         can_use_tool=gate.can_use_tool)
 
 
-async def sdk_turn(prompt: str, session_id: str | None, emit: Callable[[dict], None]) -> str | None:
+async def sdk_turn(prompt: str, session_id: str | None, emit: Callable[[dict], None],
+                   hook=None) -> str | None:
     sid = None
     seen_text = False
     try:
-        async with ClaudeSDKClient(options=options(session_id)) as client:
+        async with ClaudeSDKClient(options=options(session_id, hook)) as client:
             await client.query(prompt)
             async for m in client.receive_response():
                 if isinstance(m, StreamEvent):

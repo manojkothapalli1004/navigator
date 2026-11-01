@@ -39,7 +39,7 @@ async def event_stream(engine: Engine, is_disconnected, keepalive_s: float = KEE
         engine.unsubscribe(q)
 
 
-def build_app(engine: Engine, manage_engine: bool = False) -> Starlette:
+def build_app(engine: Engine, manage_engine: bool = False, cards=None) -> Starlette:
     async def post_message(req: Request):
         try:
             body = await req.json()
@@ -69,6 +69,33 @@ def build_app(engine: Engine, manage_engine: bool = False) -> Starlette:
     async def cancel(req: Request):
         return JSONResponse({"cancelled": engine.cancel()})
 
+    def _public(card: dict) -> dict:
+        return {k: v for k, v in card.items() if k != "fingerprint"}
+
+    async def list_cards(req: Request):
+        return JSONResponse([_public(c) for c in cards.pending()])
+
+    async def decide(req: Request):
+        from navigator.conductor.cards import CardError
+        try:
+            via = (await req.json() or {}).get("via")
+        except ValueError:
+            via = None
+        if via not in SOURCES:
+            return JSONResponse({"error": f"via must be one of {', '.join(SOURCES)}"}, status_code=422)
+        action = req.path_params["action"]
+        if action not in ("approve", "decline"):
+            return JSONResponse({"error": "not found"}, status_code=404)
+        try:
+            card = (cards.approve if action == "approve" else cards.decline)(req.path_params["key"], via)
+        except CardError as e:
+            return JSONResponse({"error": str(e)}, status_code=404 if str(e) == "not found" else 409)
+        engine.on_card(card)
+        if card["state"] == "approved":
+            engine.submit(f"Card {card['code']} was approved by the operator via {via}. Run exactly this "
+                          f"now, unchanged: {card['summary']}", "approval", internal=True)
+        return JSONResponse(_public(card))
+
     @asynccontextmanager
     async def lifespan(app):
         if manage_engine:
@@ -82,23 +109,38 @@ def build_app(engine: Engine, manage_engine: bool = False) -> Starlette:
     return Starlette(routes=[Route("/messages", post_message, methods=["POST"]),
                              Route("/history", history), Route("/events", events),
                              Route("/status", status),
-                             Route("/cancel", cancel, methods=["POST"])], lifespan=lifespan)
+                             Route("/cancel", cancel, methods=["POST"])]
+                     + ([Route("/cards", list_cards),
+                         Route("/cards/{key}/{action:str}", decide, methods=["POST"])] if cards else []),
+                     lifespan=lifespan)
 
 
 def serve(socket_path: Path, root: Path, runner=None) -> None:
     """Run the conductor on `socket_path` (replacing a stale file) with state in `root`."""
     import socket
     import uvicorn
+    from navigator.conductor import gate, telegram
+    from navigator.conductor.cards import Cards
+    cards = Cards(Path(root) / "cards.json")
+    creds = telegram.load_creds()
+    engine_ref: list[Engine] = []
+    hook = gate.make_hook(cards, lambda card: engine_ref[0].on_card(card))
     if runner is None:
-        from navigator.conductor.runner import sdk_turn as runner
+        from functools import partial
+        from navigator.conductor.runner import sdk_turn
+        runner = partial(sdk_turn, hook=hook)
     socket_path = Path(socket_path)
     socket_path.parent.mkdir(parents=True, exist_ok=True)
     os.chmod(socket_path.parent, 0o700)  # nobody else can even reach the socket's directory
     if socket_path.exists() or socket_path.is_symlink():
         socket_path.unlink()
-    engine = Engine(Store(root), runner)
+    import threading
+    # the Telegram post blocks up to 15 s: never inside the turn's event loop
+    notify = lambda card: threading.Thread(target=telegram.send_card, args=(card, creds), daemon=True).start()
+    engine = Engine(Store(root), runner, notify=notify)
+    engine_ref.append(engine)
     # bound here, not by uvicorn: uvicorn chmods its own unix sockets to 0666
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     sock.bind(str(socket_path))
     os.chmod(socket_path, 0o600)
-    uvicorn.Server(uvicorn.Config(build_app(engine, manage_engine=True), log_level="warning")).run(sockets=[sock])
+    uvicorn.Server(uvicorn.Config(build_app(engine, manage_engine=True, cards=cards), log_level="warning")).run(sockets=[sock])

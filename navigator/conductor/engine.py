@@ -23,8 +23,9 @@ class ResumeFailed(Exception):
 
 class Engine:
     def __init__(self, store: Store, runner: TurnRunner, lock_path: Path | None = None,
-                 turn_timeout_s: float = TURN_TIMEOUT_S):
+                 turn_timeout_s: float = TURN_TIMEOUT_S, notify: Callable[[dict], None] | None = None):
         self.store, self.runner, self.turn_timeout_s = store, runner, turn_timeout_s
+        self.notify = notify  # tells the operator's phone about a new approval card (C3)
         self._dropped: set[int] = set()
         self.lock_path = Path(lock_path) if lock_path else store.root / "turn.lock"
         self._pending: asyncio.Queue | None = None
@@ -82,12 +83,24 @@ class Engine:
         finally:
             self._turn_task = None
 
-    def submit(self, text: str, source: str) -> dict:
+    def submit(self, text: str, source: str, internal: bool = False) -> dict:
+        # "approval" messages come only from the conductor itself, after the operator approves a card
+        if source not in SOURCES and not (internal and source == "approval"):
+            raise ValueError(f"unknown source {source!r}")
         user = self._append({"kind": "user", "text": text, "source": source})
         ahead = self.queue_len + (1 if self.busy else 0)
         self._append({"kind": "status", "state": "queued", "msg_id": user["id"], "detail": ahead})
         self._pending.put_nowait(user)
         return user
+
+    def on_card(self, card: dict) -> None:
+        """A card was raised or changed state: every window sees it; a new one goes to the phone."""
+        self._append({"kind": "card", **{k: v for k, v in card.items() if k != "fingerprint"}})
+        if card.get("state") == "pending" and self.notify:
+            try:
+                self.notify(card)
+            except Exception as e:  # a Telegram hiccup never breaks a turn
+                _log.warning("conductor.card_notify_failed: %s", type(e).__name__)
 
     def _append(self, entry: dict) -> dict:
         entry = self.store.append(entry)

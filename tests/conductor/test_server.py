@@ -142,3 +142,49 @@ def test_post_cancel_endpoint(tmp_path):
         r = await c.post("/cancel")
         assert r.status_code == 200 and r.json() == {"cancelled": False}
     asyncio.run(_with_app(tmp_path, go))
+
+
+def _cards_app(tmp_path):
+    from navigator.conductor.cards import Cards
+    cards = Cards(tmp_path / "cards.json")
+    eng = Engine(Store(tmp_path / "c"), _runner)
+    return eng, cards, server.build_app(eng, cards=cards)
+
+
+def test_cards_endpoints_approve_decline_404_409(tmp_path):
+    async def go():
+        eng, cards, app = _cards_app(tmp_path); await eng.start()
+        a, _ = cards.raise_card("Bash", {"command": "git push"}, "git push")
+        b, _ = cards.raise_card("Bash", {"command": "git merge x"}, "git merge")
+        try:
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://c") as c:
+                assert [x["code"] for x in (await c.get("/cards")).json()] == [a["code"], b["code"]]
+                assert "fingerprint" not in (await c.get("/cards")).json()[0]
+                r = await c.post(f"/cards/{a['code']}/approve", json={"via": "web"})
+                assert r.status_code == 200 and r.json()["state"] == "approved"
+                assert (await c.post(f"/cards/{a['code']}/approve", json={"via": "web"})).status_code == 409
+                assert (await c.post("/cards/NOPE22/approve", json={"via": "web"})).status_code == 404
+                assert (await c.post(f"/cards/{b['id']}/decline", json={"via": "telegram"})).json()["state"] == "declined"
+                assert (await c.post(f"/cards/{b['id']}/decline", json={"via": "fax"})).status_code == 422
+                c2, _ = cards.raise_card("Bash", {"command": "git rebase x"}, "git rebase")
+                assert (await c.post(f"/cards/{c2['code']}/foo", json={"via": "web"})).status_code == 404
+                assert cards.pending()[-1]["state"] == "pending"
+        finally:
+            await eng.stop()
+    asyncio.run(go())
+
+
+def test_approve_submits_internal_message(tmp_path):
+    async def go():
+        eng, cards, app = _cards_app(tmp_path); await eng.start()
+        a, _ = cards.raise_card("Bash", {"command": "git push origin main"}, "git push")
+        try:
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://c") as c:
+                await c.post(f"/cards/{a['code']}/approve", json={"via": "telegram"})
+        finally:
+            await asyncio.sleep(0.1); await eng.stop()
+        users = [e for e in eng.store.history() if e["kind"] == "user"]
+        assert users[-1]["source"] == "approval"
+        assert "git push origin main" in users[-1]["text"] and a["code"] in users[-1]["text"]
+        assert [e["state"] for e in eng.store.history() if e["kind"] == "card"] == ["approved"]
+    asyncio.run(go())

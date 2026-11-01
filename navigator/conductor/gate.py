@@ -112,3 +112,28 @@ async def can_use_tool(tool_name: str, input_data: dict, context):
     from claude_agent_sdk import PermissionResultDeny
     return PermissionResultDeny(message="this needs a human OK and nobody can answer a prompt in this "
                                         "window; tell the operator what you wanted to run and why")
+
+
+CARD_HINT = ("approval card {code} was sent to the operator (website, Telegram, terminal). Stop and "
+             "wait; when it is approved you will be told to run exactly the same command again.")
+
+
+def make_hook(cards, on_card):
+    """C3: a gated call raises an approval card instead of a plain deny; the one identical call
+    after the operator approves it is allowed (explicitly, so no permission prompt can stop it)."""
+    async def hook(input_data: dict, tool_use_id, context) -> dict:
+        name, tool_input = input_data.get("tool_name", ""), input_data.get("tool_input") or {}
+        reason = gated_reason(name, tool_input, Path(input_data.get("cwd") or "/Users/Manoj/calwbot"))
+        if reason is None:
+            return {}
+        used = cards.consume(name, tool_input)
+        if used is not None:
+            on_card(used)
+            return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "allow",
+                                           "permissionDecisionReason": f"approval card {used['code']} approved"}}
+        card, new = cards.raise_card(name, tool_input, reason)
+        if new:
+            on_card(card)
+        return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                       "permissionDecisionReason": f"{reason} — {CARD_HINT.format(code=card['code'])}"}}
+    return hook

@@ -211,3 +211,24 @@ async def test_cancel_keeps_previous_session_id(tmp_path):
     eng.submit("bb", "web"); await asyncio.sleep(0.05)
     eng.cancel(); await _drain(eng)
     assert eng.store.session_id == sid
+
+
+@aio
+async def test_internal_approval_source_only(tmp_path):
+    eng = _eng(tmp_path, FakeRunner()); await eng.start()
+    with pytest.raises(ValueError):
+        eng.submit("run it", "approval")
+    u = eng.submit("run it", "approval", internal=True); await _drain(eng)
+    assert u["source"] == "approval" and eng.runner.raw == ["[approval] run it"]
+
+
+@aio
+async def test_card_entry_published_without_fingerprint(tmp_path):
+    sent = []
+    eng = Engine(Store(tmp_path / "c"), FakeRunner(), lock_path=tmp_path / "c" / "turn.lock", notify=sent.append)
+    await eng.start()
+    eng.on_card({"id": "i", "code": "ABC234", "state": "pending", "fingerprint": "f", "summary": "git push"})
+    eng.on_card({"id": "i", "code": "ABC234", "state": "used", "fingerprint": "f", "summary": "git push"})
+    cards = [e for e in eng.store.history() if e["kind"] == "card"]
+    assert [c["state"] for c in cards] == ["pending", "used"] and "fingerprint" not in cards[0]
+    assert [c["state"] for c in sent] == ["pending"]  # only a new card goes to Telegram
