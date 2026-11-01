@@ -16,6 +16,7 @@ from navigator.runtime.worktree import WorktreeHandle
 from navigator.runtime.checkpoint import checkpoint, diff_artifact
 from navigator.safety.command_runner import FRONTEND_SUITE, CommandRunner
 from navigator.contracts.enums import Role
+from navigator.checker.recheck import run_recheck
 
 # N17 (live 2026-10-20): a builder that returned no file changes was verified on an
 # unchanged tree and parked at the merge gate with an empty diff. An empty change is a
@@ -899,7 +900,26 @@ def _attempt(driver: SubagentDriver, wt: Path, base: str, run_id: str, runner: C
         _run_full_suite(runner, run_dir, res, breakers)
     if res.verify_returncode == 0 and _frontend_changed(gate_writes, frontend_dir):
         _run_frontend_suite(runner, wt, repo_path, frontend_dir, res, breakers)
+    if res.verify_returncode == 0 and checker_fingerprints is not None:
+        _run_checker_recheck(wt, frontend_dir, checker_fingerprints, res)
     return res
+
+
+def _run_checker_recheck(wt: Path, frontend_dir: str | None, fingerprints: list[str],
+                         res: PhaseResult) -> None:
+    """Site-checker run: the checker re-checks its own faults on a preview built from this
+    worktree's frontend (uncommitted edits included). Entry tagged suite="checker"."""
+    if not fingerprints:
+        res.verify_returncode, res.repairable = 1, False
+        res.verify_output = "no checker faults recorded for this proposal"
+        return
+    rc, out = run_recheck(Path(wt) / (frontend_dir or "frontend"), list(fingerprints))
+    res.verify_log.append({"argv": "checker-verify " + " ".join(fingerprints),
+                           "argv_list": ["checker-verify", *fingerprints], "returncode": rc,
+                           "output_tail": out[-1500:], "suite": "checker"})
+    res.verify_returncode, res.verify_output = rc, out
+    # rc 1: a fault is still on the page - the builder can try again; 2/126: checker trouble
+    res.repairable = rc == 1
 
 
 FRONTEND_SUFFIXES = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".css")
@@ -1051,4 +1071,6 @@ def reverify(runner, run_dir: Path, argvs: list[list[str]], breakers=None,
     if (res.verify_returncode == 0 and wt is not None
             and _frontend_changed(list(changed_files or []), frontend_dir)):
         _run_frontend_suite(runner, Path(wt), repo_path, frontend_dir, res, breakers)
+    if res.verify_returncode == 0 and wt is not None and checker_fingerprints is not None:
+        _run_checker_recheck(Path(wt), frontend_dir, checker_fingerprints, res)
     return res

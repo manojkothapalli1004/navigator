@@ -143,3 +143,36 @@ def test_suite_green_ignores_untagged_vitest_for_frontend_dir_repo():
 
 def test_suite_green_frontend_dir_none_unchanged():
     assert suite_green([{"argv_list": ["npx", "vitest", "run"], "returncode": 0}], FRONT) is True
+
+
+def test_checker_step_runs_after_frontend_suite(tmp_path, monkeypatch):
+    import navigator.runtime.phases as phases
+    seen = []
+    monkeypatch.setattr(phases, "run_recheck", lambda source, fps: seen.append((Path(source), fps)) or (0, "PASS"))
+    res, runner, wt = _build(tmp_path, fps=["f1"])
+    assert res.verify_returncode == 0, res.verify_output
+    assert seen == [(wt / "frontend", ["f1"])]
+    assert res.verify_log[-1]["suite"] == "checker" and res.verify_log[-1]["argv_list"] == ["checker-verify", "f1"]
+
+
+def test_checker_step_fault_still_there_is_repairable(tmp_path, monkeypatch):
+    import navigator.runtime.phases as phases
+    monkeypatch.setattr(phases, "run_recheck", lambda source, fps: (1, "FAIL f1"))
+    res, _, _ = _build(tmp_path, fps=["f1"])
+    assert res.verify_returncode == 1 and res.repairable is True
+
+
+def test_checker_step_no_fingerprints_fails(tmp_path, monkeypatch):
+    import navigator.runtime.phases as phases
+    monkeypatch.setattr(phases, "run_recheck", lambda source, fps: (0, ""))
+    res, _, _ = _build(tmp_path, fps=[])
+    assert res.verify_returncode == 1 and res.repairable is False
+    assert "no checker faults recorded for this proposal" in res.verify_output
+
+
+def test_checker_step_skipped_when_frontend_suite_fails(tmp_path, monkeypatch):
+    import navigator.runtime.phases as phases
+    seen = []
+    monkeypatch.setattr(phases, "run_recheck", lambda source, fps: seen.append(1) or (0, ""))
+    res, _, _ = _build(tmp_path, rcs={"vitest": 1}, fps=["f1"])
+    assert seen == [] and res.verify_returncode == 1

@@ -84,6 +84,10 @@ class FindingStore:
         entry["state"], entry["proposal_id"] = "open", proposal_id
         self._save()
 
+    def fingerprints_for(self, proposal_id: str) -> list[str]:
+        """The faults filed under `proposal_id` (any state), sorted."""
+        return sorted(fp for fp, e in self._data.items() if e.get("proposal_id") == proposal_id)
+
     def open_proposals(self) -> dict[str, str]:
         return {fp: e["proposal_id"] for fp, e in self._data.items() if e["state"] == "open"}
 

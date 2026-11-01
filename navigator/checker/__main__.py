@@ -100,19 +100,31 @@ def cmd_run(args, *, browse_fn, act, notifier, root: Path, base_sha) -> int:
 
 
 def cmd_verify(args, *, root: Path) -> int:
-    branch = args[0]
+    """verify (<branch> | --source <frontend dir>) --fingerprint FP...: 0 every fault gone, 1 one
+    is still there, 2 unknown fingerprints or the preview is busy."""
     fps = [args[i + 1] for i, a in enumerate(args) if a == "--fingerprint"]
+    source = next((args[i + 1] for i, a in enumerate(args) if a == "--source"), None) or args[0]
     store = FindingStore(root / "store.json")
     wanted = {fp: Finding(**e["finding"]) for fp, e in store._data.items() if fp in fps}
     if not wanted:
         print("no known fault for those fingerprints", file=sys.stderr)
         return 2
-    out = root / f"verify-{branch.replace('/', '_')}"
+    label = Path(source).parent.name if Path(source).is_dir() else str(source).replace("/", "_")
+    out = root / f"verify-{label}"
     out.mkdir(parents=True, exist_ok=True)
     work = root / "preview-work"
-    base = preview.build(branch, work)
+    try:
+        with preview.lock():
+            return _verify_on_preview(source, work, out, wanted)
+    except preview.PreviewBusy as e:
+        print(str(e), file=sys.stderr)
+        return 2
+
+
+def _verify_on_preview(source, work: Path, out: Path, wanted: dict) -> int:
     ok = True
     try:
+        base = preview.build(source, work)
         with browse_mod.open_browser() as b:
             for fp, f in wanted.items():
                 snap, shot = browse_mod.snapshot(b, base, f.page, f.viewport, out)

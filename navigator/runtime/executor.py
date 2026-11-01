@@ -14,7 +14,9 @@ from navigator.contracts.enums import RunPhase, RunStatus, ApprovalGate, Approva
 from navigator.runtime.worktree import (
     WorktreeHandle, create_worktree, preserve_failed, remove_worktree)
 from navigator.runtime.checkpoint import diff_artifact
-from navigator.runtime.merge_tiers import changed_files_for_run, classify_for_repo, repo_config_for
+from navigator.runtime.merge_tiers import (CHECKER_ORIGIN, changed_files_for_run, classify_for_repo,
+                                          repo_config_for)
+from navigator.checker.store import FindingStore
 from navigator.safety.command_runner import FRONTEND_SUITE
 from navigator.runtime.outcome_store import OutcomeStore
 from navigator.runtime.phases import (FRONTEND_SUFFIXES, NO_CHANGE_SUMMARY, reverify,
@@ -571,7 +573,12 @@ def suite_green(verification: list, changed: list, frontend_dir: str | None = No
         if not _ran_frontend_suite(entries):
             return False
     elif any(str(p).endswith(FRONTEND_SUFFIXES) for p in (changed or [])):
-        return any(_ran_vitest(e) for e in entries)
+        if not any(_ran_vitest(e) for e in entries):
+            return False
+    if origin == CHECKER_ORIGIN:
+        # a site-checker fix is proven by the checker itself: every filed fault gone on a preview
+        if not any(e.get("suite") == "checker" and e.get("returncode") == 0 for e in entries):
+            return False
     return True
 
 
@@ -682,11 +689,18 @@ def _stale_skip_reason(repo: str, run: Run) -> str | None:
     return None
 
 
+CHECKER_STORE = Path("/Users/Manoj/calwbot/logs/navigator/checker/store.json")
+
+
 def _frontend_kwargs(settings, proposal) -> dict:
-    """run_build_and_verify/reverify kwargs for the proposal's repo: its frontend_dir and the
-    live checkout to clone node_modules from."""
+    """run_build_and_verify/reverify kwargs for the proposal's repo: its frontend_dir, the
+    live checkout to clone node_modules from and, for a site-checker proposal, the faults
+    filed under it (the checker re-check)."""
     cfg = repo_config_for(settings, proposal.repo)
-    return {"frontend_dir": getattr(cfg, "frontend_dir", None), "repo_path": Path(proposal.repo)}
+    kw = {"frontend_dir": getattr(cfg, "frontend_dir", None), "repo_path": Path(proposal.repo)}
+    if getattr(proposal, "origin", None) == CHECKER_ORIGIN:
+        kw["checker_fingerprints"] = FindingStore(CHECKER_STORE).fingerprints_for(proposal.id)
+    return kw
 
 
 def _recorded_argvs(verification) -> list[list[str]]:
