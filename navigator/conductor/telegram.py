@@ -47,3 +47,36 @@ def send_card(card: dict, creds: tuple[str, str] | None, post=httpx.post) -> boo
     except Exception as e:  # the URL holds the token: log the class name only
         _log.warning("conductor.telegram_send_failed: %s", type(e).__name__)
         return False
+
+
+def split_text(text: str, limit: int = 4000) -> list[str]:
+    """Telegram caps a message at 4096 chars: cut at a newline in the back half, else hard."""
+    parts: list[str] = []
+    while len(text) > limit:
+        cut = text.rfind("\n", 0, limit + 1)
+        if cut > limit // 2:
+            parts.append(text[:cut])
+            text = text[cut + 1:]
+        else:
+            parts.append(text[:limit])
+            text = text[limit:]
+    if text or not parts:
+        parts.append(text)
+    return parts
+
+
+def send_text(text: str, creds: tuple[str, str] | None, post=httpx.post) -> bool:
+    """C4: a reply for a Telegram-originated turn. True only if every chunk was accepted."""
+    if not creds:
+        return False
+    tok, chat = creds
+    ok = True
+    for chunk in split_text(text or "(no reply text)"):
+        try:
+            r = post(f"https://api.telegram.org/bot{tok}/sendMessage",
+                     json={"chat_id": chat, "text": chunk}, timeout=15)
+            ok = bool(r.json().get("ok")) and ok
+        except Exception as e:  # the URL holds the token: log the class name only
+            _log.warning("conductor.telegram_send_failed: %s", type(e).__name__)
+            return False
+    return ok
