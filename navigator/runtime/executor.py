@@ -218,7 +218,8 @@ def execute_proposal(proposal: Proposal, *, act, orc, driver, runner, settings,
         # the git call sits inside the guard so an OSError is 'tier unknown', not a lost event (3a2)
         names = _git_run(handle.path, "diff", "--no-renames", "--name-only", "-z", f"{head}..HEAD")
         changed = [n for n in names.stdout.split("\x00") if n] if names.returncode == 0 else None
-        tier = (classify_for_repo(changed, proposal.repo, repo_config_for(settings, proposal.repo))
+        tier = (classify_for_repo(changed, proposal.repo, repo_config_for(settings, proposal.repo),
+                                  origin=proposal.origin)
                 if changed is not None else None)
     except Exception as e:
         tier = None  # a tier failure must never lose the run.awaiting_review event or its Telegram message
@@ -532,6 +533,17 @@ def _ran_pytest(entry: dict) -> bool:
     return bool(argv) and (argv[0] == "pytest" or (argv[:2] == ["uv", "run"] and "pytest" in argv))
 
 
+FRONTEND_SUFFIXES = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".css")
+
+
+def _ran_vitest(entry: dict) -> bool:
+    """The entry ran the frontend test suite: `vitest ...`, `npx vitest ...` or `npm (run) test`
+    (not merely an argv that mentions vitest, e.g. `echo vitest`)."""
+    argv = [str(a) for a in (entry.get("argv_list") or str(entry.get("argv") or "").split())]
+    return (argv[:1] == ["vitest"] or argv[:2] == ["npx", "vitest"]
+            or argv[:2] == ["npm", "test"] or argv[:3] == ["npm", "run", "test"])
+
+
 def suite_green(verification: list, changed: list) -> bool:
     """The recorded verification proves the change: a non-empty log whose LAST entry has
     returncode 0 and, when any changed path is a .py file, at least one entry ran pytest
@@ -543,7 +555,10 @@ def suite_green(verification: list, changed: list) -> bool:
     if entries[-1].get("returncode") != 0:
         return False
     if any(str(p).endswith(".py") for p in (changed or [])):
-        return any(_ran_pytest(e) for e in entries)
+        if not any(_ran_pytest(e) for e in entries):
+            return False
+    if any(str(p).endswith(FRONTEND_SUFFIXES) for p in (changed or [])):
+        return any(_ran_vitest(e) for e in entries)
     return True
 
 
@@ -559,7 +574,9 @@ def auto_merge_ok(act, run, repo, settings) -> bool:
         changed = changed_files_for_run(repo, run)
         if changed is None:
             return False
-        if classify_for_repo(changed, repo, repo_config_for(settings, repo)) != "A":
+        prop = act.get_proposal(run.proposal_id)
+        origin = prop.origin if prop is not None else None
+        if classify_for_repo(changed, repo, repo_config_for(settings, repo), origin=origin) != "A":
             return False
         return suite_green(run.verification, changed)
     except Exception as e:
@@ -745,7 +762,8 @@ def _rebase_one(run: Run, merged: Run, new_head: str, *, act, orc, runner, setti
         tier_names = _git_run(wt, "diff", "--no-renames", "--name-only", "-z", f"{new_head}..HEAD")
         tier_changed = ([n for n in tier_names.stdout.split("\x00") if n]
                         if tier_names.returncode == 0 else None)
-        tier = (classify_for_repo(tier_changed, prop.repo, repo_config_for(settings, prop.repo))
+        tier = (classify_for_repo(tier_changed, prop.repo, repo_config_for(settings, prop.repo),
+                                  origin=prop.origin)
                 if (tier_changed is not None and prop is not None) else None)
     except Exception as e:
         tier = None

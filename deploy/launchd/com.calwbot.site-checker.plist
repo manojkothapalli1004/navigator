@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Site checker: runs after every change to ACT main and daily at 07:00. Report-only (no --file)
+     until Navigator can verify frontend builds. Installed by deploy/install_site_checker.sh. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.calwbot.site-checker</string>
+  <key>WorkingDirectory</key><string>/Users/Manoj/calwbot/navigator</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/Manoj/calwbot/navigator/.venv-checker/bin/python</string>
+    <string>-m</string><string>navigator.checker</string><string>run</string>
+  </array>
+  <key>WatchPaths</key>
+  <array>
+    <string>/Users/Manoj/external-tools/agent-control-tower/.git/refs/heads/main</string>
+    <string>/Users/Manoj/external-tools/agent-control-tower/.git/ORIG_HEAD</string>
+  </array>
+  <key>StartCalendarInterval</key><dict><key>Hour</key><integer>7</integer><key>Minute</key><integer>0</integer></dict>
+  <key>ThrottleInterval</key><integer>300</integer>
+  <key>StandardOutPath</key><string>/Users/Manoj/calwbot/logs/navigator/checker/launchd.out.log</string>
+  <key>StandardErrorPath</key><string>/Users/Manoj/calwbot/logs/navigator/checker/launchd.err.log</string>
+</dict>
+</plist>

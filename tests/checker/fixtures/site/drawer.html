@@ -1,0 +1,6 @@
+<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body><div style="display:none"><nav><a href="/">desktop rail</a></nav></div>
+<button aria-label="Open menu" onclick="document.getElementById('d').style.display='block'">menu</button>
+<div id="d" style="display:none"><nav><a href="/">drawer</a></nav></div>
+<script>document.addEventListener('keydown', e => { if (e.key === 'Escape') document.getElementById('d').style.display='none'; });</script>
+</body></html>

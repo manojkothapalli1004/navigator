@@ -28,6 +28,7 @@ class RepoConfig:
     max_proposals_per_tick: int | None = None
     tier_c_paths: list[str] | None = None   # extra merge-tier C patterns (merge_tiers.classify)
     tier_floor: str = "A"                    # lowest merge tier for this repo: "A" | "B" | "C"
+    checker_a_paths: list[str] | None = None  # site-checker runs touching only these are tier A (merge_tiers.classify)
 
 
 @dataclass
@@ -386,6 +387,12 @@ def _repos_env() -> list[RepoConfig]:
         if tier_c_paths is not None and (not isinstance(tier_c_paths, list)
                                          or not all(isinstance(p, str) for p in tier_c_paths)):
             raise ValueError("NAVIGATOR_REPOS_FILE tier_c_paths must be a list of strings")
+        checker_a_paths = entry.get("checker_a_paths")
+        if checker_a_paths is not None and (
+                not isinstance(checker_a_paths, list)
+                or not all(isinstance(p, str) and not p.startswith("/") and ".." not in p.split("/")
+                           for p in checker_a_paths)):
+            raise ValueError("NAVIGATOR_REPOS_FILE checker_a_paths must be a list of repo-relative patterns")
         tier_floor = entry.get("tier_floor", "A")
         if tier_floor not in ("A", "B", "C"):
             raise ValueError(f"NAVIGATOR_REPOS_FILE tier_floor must be A, B or C, got {tier_floor!r}")
@@ -397,6 +404,7 @@ def _repos_env() -> list[RepoConfig]:
                                 max_proposals_per_tick=entry.get("max_proposals_per_tick"),
                                 tier_c_paths=tier_c_paths,
                                 tier_floor=tier_floor,
+                                checker_a_paths=checker_a_paths,
                                 allowed_commands=_check_allowlist("NAVIGATOR_REPOS_FILE", cmds)
                                 if cmds is not None else None))
     return repos

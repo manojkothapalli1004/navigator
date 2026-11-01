@@ -7,10 +7,12 @@ dependencies = ["pydantic>=2.6", "httpx>=0.27", "structlog>=24.1", "python-ulid>
 [project.optional-dependencies]
 sdk = ["claude-agent-sdk>=0.1"]   # v1; NOT used in v0
 dev = ["pytest>=8.0"]
+checker = ["playwright>=1.47"]   # site checker; drives the installed Google Chrome (channel="chrome")
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+markers = ["browser: drives a real Chrome via Playwright; skipped when Chrome or playwright is missing"]
 
 [build-system]
 requires = ["hatchling"]
