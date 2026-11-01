@@ -10,6 +10,7 @@ ALLOWED_FAILED = ("/api/v1/agent/docs/navigator%2Fsettings",)
 MIN_TAP_PX = 40
 IMPOSSIBLE_PNL_X = 100   # p&l larger than this many times the starting capital is a data bug
 STALE_POLLS = 3
+STALE_FLOOR_S = 60
 GENERIC_RESOURCE_ERROR = "Failed to load resource"
 
 
@@ -75,7 +76,7 @@ def check_page(snap: PageSnapshot, now: float, screenshot: str | None = None) ->
             out.append(f("impossible-number", c["combo"], f"p&l {pnl:.2f} on capital {cap:.0f}"))
     for claim in snap.get("live_claims", []):
         age = now - float(claim["captured_at"])
-        if age > STALE_POLLS * float(claim["poll_ms"]) / 1000:
+        if age > max(STALE_POLLS * float(claim["poll_ms"]) / 1000, STALE_FLOOR_S):
             out.append(f("stale-live", claim["label"], f"data is {age:.0f}s old"))
     for name, ok in snap.get("interactions", {}).items():
         if ok is False:

@@ -57,9 +57,9 @@ def test_impossible_number():
 
 
 def test_stale_live():
-    claim = lambda age: [{"label": "trader", "captured_at": NOW - age, "poll_ms": 15000}]
-    assert checks_of(check_page(snap(live_claims=claim(60)), NOW)) == ["stale-live"]
-    assert check_page(snap(live_claims=claim(30)), NOW) == []
+    claim = lambda age: [{"label": "trader", "captured_at": NOW - age, "poll_ms": 30000}]
+    assert checks_of(check_page(snap(live_claims=claim(120)), NOW)) == ["stale-live"]
+    assert check_page(snap(live_claims=claim(70)), NOW) == []
 
 
 def test_interaction_false():
@@ -77,3 +77,9 @@ def test_generic_resource_404_console_line_left_to_request_check():
     msg = "Failed to load resource: the server responded with a status of 404 (Not Found)"
     req = ["404 http://127.0.0.1:3000/api/v1/agent/docs/navigator%2Fsettings"]
     assert check_page(snap(console_errors=[msg], failed_requests=req), NOW) == []
+
+
+def test_stale_live_fast_poll_has_60s_floor():
+    claim = lambda age: [{"label": "trader", "captured_at": NOW - age, "poll_ms": 5000}]
+    assert check_page(snap(live_claims=claim(20)), NOW) == []
+    assert checks_of(check_page(snap(live_claims=claim(90)), NOW)) == ["stale-live"]
