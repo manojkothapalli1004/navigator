@@ -190,3 +190,44 @@ def test_frontend_suite_recclones_node_modules_every_time(tmp_path):
                                frontend_dir="frontend", repo_path=repo)
     assert res.verify_returncode == 0, res.verify_output
     assert tampered.read_text() == "#!/bin/sh\n"
+
+
+class _CtxDriver(_Driver):
+    def __init__(self, writes):
+        super().__init__(writes); self.ctx = None
+    def run_role(self, request):
+        if request.role == Role.builder:
+            self.ctx = request.context
+        return super().run_role(request)
+
+
+def _ctx_for(tmp_path, fps, affected):
+    import navigator.runtime.phases as phases
+    repo, sha = _repo(tmp_path)
+    h = create_worktree(repo=repo, base_commit_sha=sha, run_id="run-e", worktree_root=tmp_path / "wt")
+    d = _CtxDriver([("frontend/page.tsx", "export const x = 4;\n")])
+    run_build_and_verify(driver=d, worktree=h, run_id="run-e", runner=_Runner(tmp_path / "wt"),
+                         proposal={"affected_files": affected}, frontend_dir="frontend",
+                         repo_path=repo, checker_fingerprints=fps)
+    return d.ctx
+
+
+def test_checker_run_without_files_gets_editable_dir(tmp_path, monkeypatch):
+    import navigator.runtime.phases as phases
+    monkeypatch.setattr(phases, "run_recheck", lambda source, fps: (0, "PASS"), raising=False)
+    assert _ctx_for(tmp_path, ["abc"], [])["editable_dir"] == "frontend"
+
+
+def test_non_checker_or_listed_files_get_no_editable_dir(tmp_path, monkeypatch):
+    import navigator.runtime.phases as phases
+    monkeypatch.setattr(phases, "run_recheck", lambda source, fps: (0, "PASS"), raising=False)
+    assert "editable_dir" not in _ctx_for(tmp_path / "a", None, [])
+    assert "editable_dir" not in _ctx_for(tmp_path / "b", ["abc"], ["frontend/page.tsx"])
+
+
+def test_checker_run_without_files_refuses_writes_outside_frontend(tmp_path, monkeypatch):
+    import navigator.runtime.phases as phases
+    monkeypatch.setattr(phases, "run_recheck", lambda source, fps: (0, "PASS"), raising=False)
+    with pytest.raises(ValueError, match="outside frontend/"):
+        _build(tmp_path, writes=[("backend/x.py", "x = 1\n")], fps=["abc"])
+    assert not list((tmp_path / "wt").glob("*/backend/x.py"))

@@ -782,11 +782,20 @@ def _attempt(driver: SubagentDriver, wt: Path, base: str, run_id: str, runner: C
                  "related_files": _related_files(wt, tracked, set(files),
                                                  mention_text=mention_text,
                                                  workdir=workdir or ".")}
+    if checker_fingerprints is not None and frontend_dir and not proposal.get("affected_files"):
+        # site-checker faults name a page, not a file: the builder finds the file with
+        # its tools and may edit any existing file under the frontend dir
+        build_ctx["editable_dir"] = frontend_dir
     build = driver.run_role(DriverRequest(role=Role.builder, context=build_ctx, worktree_path=str(wt),
                                           runner=runner, run_dir=str(run_dir),
                                           allowed_commands=tuple(runner.allowlist),
                                           test_budget=test_budget))
     _check_scope([rel for rel, _ in build.file_writes], proposal.get("affected_files", []))
+    if "editable_dir" in build_ctx:
+        # an empty affected_files leaves _check_scope open; a checker fix stays in frontend
+        for rel, _ in build.file_writes:
+            if not Path(rel).as_posix().startswith(f"{frontend_dir}/") or ".." in Path(rel).parts:
+                raise ValueError(f"builder wrote {rel!r} outside {frontend_dir}/ (site-checker fix)")
     if breakers:
         breakers.check_duration(started)
     if baseline is None:
