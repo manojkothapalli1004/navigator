@@ -223,3 +223,11 @@ def test_non_checker_or_listed_files_get_no_editable_dir(tmp_path, monkeypatch):
     monkeypatch.setattr(phases, "run_recheck", lambda source, fps: (0, "PASS"), raising=False)
     assert "editable_dir" not in _ctx_for(tmp_path / "a", None, [])
     assert "editable_dir" not in _ctx_for(tmp_path / "b", ["abc"], ["frontend/page.tsx"])
+
+
+def test_checker_run_without_files_refuses_writes_outside_frontend(tmp_path, monkeypatch):
+    import navigator.runtime.phases as phases
+    monkeypatch.setattr(phases, "run_recheck", lambda source, fps: (0, "PASS"), raising=False)
+    with pytest.raises(ValueError, match="outside frontend/"):
+        _build(tmp_path, writes=[("backend/x.py", "x = 1\n")], fps=["abc"])
+    assert not list((tmp_path / "wt").glob("*/backend/x.py"))

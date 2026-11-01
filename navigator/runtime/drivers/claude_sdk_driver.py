@@ -38,7 +38,9 @@ _ROLE_OUTPUT_SPEC = {
                    'when a full rewrite is genuinely shorter than the edits; a file_writes content '
                    'replaces the whole file \u2014 never elide unchanged code. Never list one path in '
                    'both file_edits and file_writes. '
-                   'Only write paths listed in context.files, plus test files. '
+                   'Only write paths listed in context.files, plus test files; when context.editable_dir '
+                   'is set you may instead edit or write any file under that directory (find it with '
+                   'your tools) and nothing outside it. '
                    'If the repo has tests, add or update tests that exercise the new or changed '
                    'behaviour (a passing suite that never runs the new path proves nothing). '
                    'You MAY add new test files not in context.files; follow the layout and '
@@ -110,11 +112,12 @@ def _with_editable(files, raw: str, wt: Path, editable_dir: str) -> dict:
         target = wt / rel
         try:
             real = target.resolve()
-        except OSError:
+            if target.is_symlink() or not real.is_relative_to(root) or not real.is_file():
+                continue
+            out[rel] = real.read_text()[:_MAX_FILE_CHARS]
+        except (OSError, ValueError):
+            # NUL bytes, over-long names, unreadable or non-UTF-8 files: left unknown
             continue
-        if target.is_symlink() or not real.is_relative_to(root) or not real.is_file():
-            continue
-        out[rel] = real.read_text()[:_MAX_FILE_CHARS]
     return out
 
 

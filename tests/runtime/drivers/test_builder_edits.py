@@ -277,3 +277,10 @@ def test_without_editable_dir_worktree_file_still_refused(tmp_path):
     with pytest.raises(DriverParseError, match="not in context.files"):
         _run_wt({"file_edits": [["frontend/components/A.tsx", "18", "40"]], "summary": "s"},
                 wt, {"files": {}})
+
+
+def test_editable_dir_odd_path_gives_parse_error(tmp_path):
+    wt = _wt(tmp_path)
+    with pytest.raises(DriverParseError):
+        _run_wt({"file_edits": [["frontend/a\x00b", "x", "y"]], "summary": "s"}, wt,
+                {"files": {}, "editable_dir": "frontend"})

@@ -791,6 +791,11 @@ def _attempt(driver: SubagentDriver, wt: Path, base: str, run_id: str, runner: C
                                           allowed_commands=tuple(runner.allowlist),
                                           test_budget=test_budget))
     _check_scope([rel for rel, _ in build.file_writes], proposal.get("affected_files", []))
+    if "editable_dir" in build_ctx:
+        # an empty affected_files leaves _check_scope open; a checker fix stays in frontend
+        for rel, _ in build.file_writes:
+            if not Path(rel).as_posix().startswith(f"{frontend_dir}/") or ".." in Path(rel).parts:
+                raise ValueError(f"builder wrote {rel!r} outside {frontend_dir}/ (site-checker fix)")
     if breakers:
         breakers.check_duration(started)
     if baseline is None:
