@@ -95,7 +95,9 @@ class Engine:
 
     def on_card(self, card: dict) -> None:
         """A card was raised or changed state: every window sees it; a new one goes to the phone."""
-        self._append({"kind": "card", **{k: v for k, v in card.items() if k != "fingerprint"}})
+        # card_id, not id: each state change is its own history entry with its own id
+        self._append({"kind": "card", "card_id": card["id"],
+                      **{k: v for k, v in card.items() if k not in ("id", "fingerprint")}})
         if card.get("state") == "pending" and self.notify:
             try:
                 self.notify(card)

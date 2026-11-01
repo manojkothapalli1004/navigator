@@ -231,4 +231,6 @@ async def test_card_entry_published_without_fingerprint(tmp_path):
     eng.on_card({"id": "i", "code": "ABC234", "state": "used", "fingerprint": "f", "summary": "git push"})
     cards = [e for e in eng.store.history() if e["kind"] == "card"]
     assert [c["state"] for c in cards] == ["pending", "used"] and "fingerprint" not in cards[0]
+    # each state change is its own history entry; the card is named by card_id
+    assert cards[0]["id"] != cards[1]["id"] and {c["card_id"] for c in cards} == {"i"}
     assert [c["state"] for c in sent] == ["pending"]  # only a new card goes to Telegram
