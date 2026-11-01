@@ -106,7 +106,8 @@ def _interactions(page, viewport: str) -> dict[str, bool]:
         if btn.count():
             btn.first.click()
             page.wait_for_timeout(400)
-            opened = page.locator("nav").count() > 0 and page.locator("nav").first.is_visible()
+            # the desktop rail is a <nav> too, hidden on phones: only a visible one counts
+            opened = page.locator("nav:visible").count() > 0
             page.keyboard.press("Escape")
             page.wait_for_timeout(300)
             result["menu-open"] = bool(opened)
@@ -167,7 +168,7 @@ def snapshot(browser, base: str, path: str, viewport: str, out_dir: Path) -> tup
             page.screenshot(path=shot, full_page=True)
             measured = page.evaluate(MEASURE_JS)
             interactions = _interactions(page, viewport)
-            if path.rstrip("/") == "/trader":
+            if path.rstrip("/") == "/trader" and viewport == "desktop":   # data, not layout: once is enough
                 combos = _combos(page, base)
         snap: PageSnapshot = {
             "page": path, "viewport": viewport, "status": status,

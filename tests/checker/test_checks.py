@@ -71,3 +71,9 @@ def test_interaction_false():
 def test_load_failure_short_circuits():
     found = check_page(snap(status=None, scroll_width=900, console_errors=["x"]), NOW)
     assert checks_of(found) == ["load"]
+
+
+def test_generic_resource_404_console_line_left_to_request_check():
+    msg = "Failed to load resource: the server responded with a status of 404 (Not Found)"
+    req = ["404 http://127.0.0.1:3000/api/v1/agent/docs/navigator%2Fsettings"]
+    assert check_page(snap(console_errors=[msg], failed_requests=req), NOW) == []

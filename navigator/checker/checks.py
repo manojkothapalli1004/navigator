@@ -10,6 +10,7 @@ ALLOWED_FAILED = ("/api/v1/agent/docs/navigator%2Fsettings",)
 MIN_TAP_PX = 40
 IMPOSSIBLE_PNL_X = 100   # p&l larger than this many times the starting capital is a data bug
 STALE_POLLS = 3
+GENERIC_RESOURCE_ERROR = "Failed to load resource"
 
 
 @dataclass(frozen=True)
@@ -54,6 +55,9 @@ def check_page(snap: PageSnapshot, now: float, screenshot: str | None = None) ->
 
     out: list[Finding] = []
     for msg in snap.get("console_errors", []):
+        # Chrome's line for a failed fetch carries no URL; the request check judges it by its URL
+        if msg.startswith(GENERIC_RESOURCE_ERROR):
+            continue
         out.append(f("console", msg[:80], msg))
     for req in snap.get("failed_requests", []):
         if not any(allowed in req for allowed in ALLOWED_FAILED):

@@ -52,3 +52,15 @@ def test_snapshot_detects_overflow_and_console_error(site, chrome, tmp_path):
 def test_unreachable_raises(chrome, tmp_path):
     with pytest.raises(browse.ConsoleUnreachable):
         browse.browse(f"http://127.0.0.1:{_free_port()}", tmp_path, browser=chrome)
+
+
+def test_menu_open_sees_the_drawer_not_the_hidden_rail(site, chrome, tmp_path):
+    snap, _ = browse.snapshot(chrome, site, "/drawer.html", "phone", tmp_path)
+    assert snap["interactions"]["menu-open"] is True
+
+
+def test_combos_only_read_on_desktop(site, chrome, tmp_path, monkeypatch):
+    monkeypatch.setattr(browse, "_combos", lambda page, base: [{"combo": "x", "total_pnl_usd": 1, "initial_capital": 1}])
+    phone, _ = browse.snapshot(chrome, site, "/trader/", "phone", tmp_path)
+    desk, _ = browse.snapshot(chrome, site, "/trader/", "desktop", tmp_path)
+    assert phone["combos"] == [] and desk["combos"] != []
