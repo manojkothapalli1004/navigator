@@ -29,6 +29,7 @@ class RepoConfig:
     tier_c_paths: list[str] | None = None   # extra merge-tier C patterns (merge_tiers.classify)
     tier_floor: str = "A"                    # lowest merge tier for this repo: "A" | "B" | "C"
     checker_a_paths: list[str] | None = None  # site-checker runs touching only these are tier A (merge_tiers.classify)
+    frontend_dir: str | None = None          # Navigator runs tsc + vitest + next build here on frontend changes
 
 
 @dataclass
@@ -393,6 +394,11 @@ def _repos_env() -> list[RepoConfig]:
                 or not all(isinstance(p, str) and not p.startswith("/") and ".." not in p.split("/")
                            for p in checker_a_paths)):
             raise ValueError("NAVIGATOR_REPOS_FILE checker_a_paths must be a list of repo-relative patterns")
+        frontend_dir = entry.get("frontend_dir")
+        if frontend_dir is not None and (
+                not isinstance(frontend_dir, str) or not frontend_dir or frontend_dir.startswith("/")
+                or any(part in ("", ".", "..") for part in frontend_dir.split("/"))):
+            raise ValueError("NAVIGATOR_REPOS_FILE frontend_dir must be a repo-relative directory")
         tier_floor = entry.get("tier_floor", "A")
         if tier_floor not in ("A", "B", "C"):
             raise ValueError(f"NAVIGATOR_REPOS_FILE tier_floor must be A, B or C, got {tier_floor!r}")
@@ -405,6 +411,7 @@ def _repos_env() -> list[RepoConfig]:
                                 tier_c_paths=tier_c_paths,
                                 tier_floor=tier_floor,
                                 checker_a_paths=checker_a_paths,
+                                frontend_dir=frontend_dir,
                                 allowed_commands=_check_allowlist("NAVIGATOR_REPOS_FILE", cmds)
                                 if cmds is not None else None))
     return repos
