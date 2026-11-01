@@ -36,6 +36,7 @@ TEST_A = ("tests/*", "*/tests/*")  # 3a2: directory only; a test_*.py outside a 
 CONFTEST = "conftest.py"  # 3a2: runs code at import under the verifier: never A
 DOC_A = ("*.md", "*.rst", "docs/*", "*.txt")
 ALWAYS_C_REPOS = ("trader",)
+CHECKER_ORIGIN = "site-checker"  # navigator.checker.filing files its fixes with this origin
 # 3a3: tier A is a whitelist; anything else that used to be A is B
 TEST_NAMES_A = ("test_*.py", "*_test.py", "*.test.ts", "*.test.tsx", "*.test.js", "*.test.jsx",
                 "*.spec.ts", "*.spec.tsx", "*.spec.js", "*.spec.jsx")
@@ -87,10 +88,13 @@ def _is_a(path: str) -> bool:
             and not fnmatch.fnmatchcase(name, "requirements*.txt"))
 
 
-def classify(changed, *, repo_name: str, tier_c_paths=(), tier_floor: str = "A") -> str:
+def classify(changed, *, repo_name: str, tier_c_paths=(), tier_floor: str = "A", origin: str | None = None,
+             checker_a_paths=()) -> str:
     """A: every path is a test or doc file; C: trader repo, floor C, an empty/None change list, or any path
     matching a C pattern (universal, navigator's own safety modules when repo_name == "navigator", or
-    tier_c_paths); else B. tier_floor raises the result (A < B < C)."""
+    tier_c_paths); else B. tier_floor raises the result (A < B < C). A site-checker run (origin
+    CHECKER_ORIGIN) whose every path matches checker_a_paths and none is C is A whatever the floor
+    (operator 2026-10-31: checker fixes auto-merge as tier A)."""
     if tier_floor not in TIERS:
         raise ValueError(f"tier_floor must be one of {TIERS}, got {tier_floor!r}")
     if repo_name in ALWAYS_C_REPOS or tier_floor == "C" or not changed:
@@ -101,6 +105,9 @@ def classify(changed, *, repo_name: str, tier_c_paths=(), tier_floor: str = "A")
     extra = tuple(p.lower() for p in (tier_c_paths or ())) + (NAVIGATOR_C if repo_name == "navigator" else ())
     if any(_is_c(p, extra) for p in changed):
         return "C"
+    if (origin == CHECKER_ORIGIN and checker_a_paths
+            and all(any(fnmatch.fnmatchcase(_normalize(p), pat.lower()) for pat in checker_a_paths) for p in changed)):
+        return "A"
     tier = "A" if all(_is_a(p) for p in changed) else "B"
     return tier if TIERS.index(tier) >= TIERS.index(tier_floor) else tier_floor
 
@@ -115,10 +122,11 @@ def repo_config_for(settings, repo_path: str):
     return None
 
 
-def classify_for_repo(changed, repo_path: str, cfg) -> str:
+def classify_for_repo(changed, repo_path: str, cfg, origin: str | None = None) -> str:
     return classify(changed, repo_name=Path(repo_path).name,
                     tier_c_paths=(cfg.tier_c_paths if cfg else None) or (),
-                    tier_floor=cfg.tier_floor if cfg else "A")
+                    tier_floor=cfg.tier_floor if cfg else "A", origin=origin,
+                    checker_a_paths=(getattr(cfg, "checker_a_paths", None) if cfg else None) or ())
 
 
 def changed_files_for_run(repo: str, run) -> list | None:
