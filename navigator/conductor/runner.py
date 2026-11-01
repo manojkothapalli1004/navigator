@@ -30,7 +30,7 @@ def options(session_id: str | None) -> ClaudeAgentOptions:
     return ClaudeAgentOptions(
         model=MODEL, cwd=CWD, setting_sources=["user", "project", "local"],
         system_prompt={"type": "preset", "preset": "claude_code", "append": WINDOWS_PROMPT},
-        permission_mode="default", resume=session_id, include_partial_messages=True,
+        permission_mode="auto", resume=session_id, include_partial_messages=True,
         hooks={"PreToolUse": [HookMatcher(hooks=[gate.pre_tool_use_hook])]},
         can_use_tool=gate.can_use_tool)
 

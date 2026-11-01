@@ -47,7 +47,7 @@ def test_streams_deltas_and_returns_session_id():
     sid = asyncio.run(runner.sdk_turn("hi", "s-1", out.append))
     assert sid == "s-9" and [e["text"] for e in out] == ["he", "llo"]
     o = FakeClient.seen_options
-    assert o.resume == "s-1" and o.include_partial_messages and o.permission_mode == "default"
+    assert o.resume == "s-1" and o.include_partial_messages and o.permission_mode == "auto"
     assert o.model == "claude-opus-5-5" and o.setting_sources == ["user", "project", "local"]
     assert str(o.cwd) == "/Users/Manoj/calwbot" and o.can_use_tool is not None and o.hooks["PreToolUse"]
 
@@ -84,3 +84,9 @@ def test_options_append_windows_prompt():
     assert o.system_prompt == {"type": "preset", "preset": "claude_code", "append": runner.WINDOWS_PROMPT}
     for word in ("[web]", "[telegram]", "[terminal]", "[open:/navigator/decisions]"):
         assert word in runner.WINDOWS_PROMPT
+
+
+def test_permission_mode_matches_terminal_auto():
+    # the operator's terminal runs defaultMode "auto" (~/.claude/settings.json); "default" made
+    # every prompt-worthy action (ORC read, ACT read, file write) a denial in a window with no human
+    assert runner.options(None).permission_mode == "auto"
