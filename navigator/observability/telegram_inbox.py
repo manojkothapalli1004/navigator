@@ -168,6 +168,24 @@ def is_operator_message(msg: dict, chat_id: str) -> bool:
     return isinstance(sender, dict) and str(sender.get("id")) == str(chat_id)
 
 
+_CARD_TAP = re.compile(r"^card:(approve|decline):([A-Z2-9]{6})$")
+
+
+def _card_tap(cq, now: float) -> dict | None:
+    """A tap on an approval card's Approve/Reject button (conductor C3), as the 'ok CODE' /
+    'no CODE' message bot.py already handles. The chat and sender still go through the same
+    operator check as a typed message; any other button data is ignored."""
+    if not isinstance(cq, dict) or not isinstance(cq.get("data"), str):
+        return None
+    m = _CARD_TAP.match(cq["data"])
+    card_msg = cq.get("message")
+    if m is None or not isinstance(card_msg, dict):
+        return None
+    return {"chat": card_msg.get("chat"), "from": cq.get("from"), "date": int(now),
+            "text": f"{'ok' if m.group(1) == 'approve' else 'no'} {m.group(2)}",
+            "callback_query_id": cq.get("id"), "card_message_id": card_msg.get("message_id")}
+
+
 class TelegramInbox:
     def __init__(self, token: str, chat_id: str, offset_path, inbox_path,
                  client: httpx.Client | None = None,
@@ -299,7 +317,9 @@ class TelegramInbox:
             if uid < offset:
                 continue  # already consumed: never processed twice
             last = uid if last is None else max(last, uid)
-            msg = update.get("message")  # edited_message/channel_post/callback_query: ignored
+            msg = update.get("message")  # edited_message/channel_post/other callback_query: ignored
+            if msg is None:
+                msg = _card_tap(update.get("callback_query"), now)
             if not isinstance(msg, dict) or not self._authorized(msg):
                 continue
             text = msg.get("text")
