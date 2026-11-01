@@ -22,10 +22,13 @@ MAX_TEXT = 20000
 KEEPALIVE_S = 15.0
 
 
-async def event_stream(engine: Engine, is_disconnected, keepalive_s: float = KEEPALIVE_S):
-    q = engine.subscribe()
+async def event_stream(engine: Engine, is_disconnected, keepalive_s: float = KEEPALIVE_S,
+                       maxsize: int = 500):
+    q = engine.subscribe(maxsize=maxsize)
     try:
         while not await is_disconnected():
+            if engine.is_dropped(q) and q.empty():
+                return  # fell behind: end the stream so the window reconnects and re-reads /history
             try:
                 ev = await asyncio.wait_for(q.get(), timeout=keepalive_s)
             except asyncio.TimeoutError:

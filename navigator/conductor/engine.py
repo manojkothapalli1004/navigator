@@ -13,6 +13,7 @@ from navigator.conductor.store import Store
 _log = logging.getLogger(__name__)
 
 SOURCES = ("web", "telegram", "terminal")
+TURN_TIMEOUT_S = 45 * 60  # a stuck turn (tool waiting on input, network stall) must not freeze every window
 TurnRunner = Callable[[str, "str | None", Callable[[dict], None]], Awaitable["str | None"]]
 
 
@@ -21,8 +22,10 @@ class ResumeFailed(Exception):
 
 
 class Engine:
-    def __init__(self, store: Store, runner: TurnRunner, lock_path: Path | None = None):
-        self.store, self.runner = store, runner
+    def __init__(self, store: Store, runner: TurnRunner, lock_path: Path | None = None,
+                 turn_timeout_s: float = TURN_TIMEOUT_S):
+        self.store, self.runner, self.turn_timeout_s = store, runner, turn_timeout_s
+        self._dropped: set[int] = set()
         self.lock_path = Path(lock_path) if lock_path else store.root / "turn.lock"
         self._pending: asyncio.Queue | None = None
         self._subs: list[asyncio.Queue] = []
@@ -55,6 +58,11 @@ class Engine:
         if q in self._subs:
             self._subs.remove(q)
 
+    def is_dropped(self, q: asyncio.Queue) -> bool:
+        """The engine gave up on this subscriber (it fell behind); its stream must end so the
+        window reconnects and re-reads /history."""
+        return id(q) in self._dropped
+
     def submit(self, text: str, source: str) -> dict:
         user = self._append({"kind": "user", "text": text, "source": source})
         ahead = self.queue_len + (1 if self.busy else 0)
@@ -75,6 +83,7 @@ class Engine:
                 # an entry is never silently lost: a window that can't keep up is dropped and
                 # re-reads /history when it reconnects
                 _log.warning("conductor.subscriber_dropped")
+                self._dropped.add(id(q))
                 self.unsubscribe(q)
 
     def _mark_interrupted(self) -> None:
@@ -111,12 +120,17 @@ class Engine:
 
             try:
                 try:
-                    sid = await self.runner(user["text"], self.store.session_id, emit)
+                    sid = await asyncio.wait_for(self.runner(user["text"], self.store.session_id, emit),
+                                                 self.turn_timeout_s)
                 except ResumeFailed:
                     self.store.set_session_id(None)
                     self._append({"kind": "note", "text": "previous conversation could not be resumed; starting fresh"})
                     parts.clear()
-                    sid = await self.runner(user["text"], None, emit)
+                    sid = await asyncio.wait_for(self.runner(user["text"], None, emit), self.turn_timeout_s)
+            except asyncio.TimeoutError:
+                self._append({"kind": "status", "state": "error", "msg_id": msg_id,
+                              "detail": f"timed out after {self.turn_timeout_s:.0f}s; the turn was stopped"})
+                return
             except Exception as e:  # the worker must outlive any one turn
                 self._append({"kind": "status", "state": "error", "msg_id": msg_id,
                               "detail": f"{type(e).__name__}: {str(e)[:300]}"})

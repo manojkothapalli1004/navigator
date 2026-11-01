@@ -116,3 +116,22 @@ def test_socket_mode_0600_and_stale_socket_replaced():
     r = httpx.Client(transport=httpx.HTTPTransport(uds=str(sock))).post(
         "http://c/messages", json={"text": "hi", "source": "terminal"})
     assert r.status_code == 202
+
+
+def test_event_stream_ends_when_subscriber_dropped(tmp_path):
+    async def go():
+        eng, _ = _client(tmp_path)
+        await eng.start()
+        async def never():
+            return False
+        gen = server.event_stream(eng, never, keepalive_s=0.05, maxsize=1)
+        first = await gen.__anext__()  # subscribes; first keepalive
+        for i in range(3):
+            eng.submit(f"m{i}", "web")
+        seen = 0
+        async for _ in gen:
+            seen += 1
+            assert seen < 50, "stream kept going after the subscriber was dropped"
+        assert eng._subs == []
+        await eng.stop()
+    asyncio.run(asyncio.wait_for(go(), 10))

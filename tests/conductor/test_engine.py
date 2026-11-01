@@ -149,3 +149,25 @@ async def test_events_published(tmp_path):
     assert {"type": "delta", "msg_id": m["id"], "text": "re:aa"} in evs
     assert any(e["type"] == "entry" and e["entry"]["kind"] == "assistant" for e in evs)
     await eng.stop()
+
+
+@aio
+async def test_hung_turn_times_out(tmp_path):
+    gate = asyncio.Event()
+    eng = Engine(Store(tmp_path / "c"), FakeRunner(gate), lock_path=tmp_path / "c" / "turn.lock", turn_timeout_s=0.1)
+    await eng.start()
+    a = eng.submit("aa", "web"); await _drain(eng)
+    err = [e for e in eng.store.history() if e.get("msg_id") == a["id"] and e.get("state") == "error"]
+    assert err and "timed out" in err[0]["detail"]
+    gate.set(); b = eng.submit("bb", "web"); await _drain(eng)
+    assert _status(eng.store, b["id"])[-1] == "done"
+    await eng.stop()
+
+
+@aio
+async def test_dropped_subscriber_is_flagged(tmp_path):
+    eng = _eng(tmp_path, FakeRunner()); await eng.start()
+    q = eng.subscribe(maxsize=1)
+    eng.submit("aa", "web"); await _drain(eng)
+    assert eng.is_dropped(q)
+    await eng.stop()
