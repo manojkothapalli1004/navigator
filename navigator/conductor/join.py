@@ -43,7 +43,31 @@ def socket_poster(socket: Path = SOCKET) -> Callable[[dict], dict]:
     return post
 
 
-def join(root: Path = ROOT, socket: Path = SOCKET, run=subprocess.call, post=None, out=sys.stdout,
+def run_claude(argv: list[str], cwd: str) -> int:
+    """Run the terminal's claude in the foreground. Ctrl-C belongs to claude (it interrupts a
+    reply there), so this process ignores SIGINT while waiting; a SIGTERM/SIGHUP to this process
+    stops claude before the turn lock is released, so two writers never share the session."""
+    import signal
+
+    def stop(signum, frame):
+        raise SystemExit(128 + signum)
+
+    old = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
+    p = subprocess.Popen(argv, cwd=cwd)
+    try:
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        signal.signal(signal.SIGTERM, stop)
+        signal.signal(signal.SIGHUP, stop)
+        return p.wait()
+    finally:
+        for sig, handler in old.items():
+            signal.signal(sig, handler)
+        if p.poll() is None:
+            p.kill()
+            p.wait()
+
+
+def join(root: Path = ROOT, socket: Path = SOCKET, run=run_claude, post=None, out=sys.stdout,
          home: Path | None = None) -> int:
     import httpx
     if not Store(root).session_id:

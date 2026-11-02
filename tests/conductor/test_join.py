@@ -165,3 +165,26 @@ def test_main_dispatches_join(monkeypatch):
     seen = []
     monkeypatch.setattr(joinmod, "join", lambda root, socket: seen.append((root, socket)) or 7)
     assert cli.main(["join"]) == 7 and seen == [(cli.ROOT, cli.SOCKET)]
+
+
+def test_ctrl_c_does_not_kill_claude(tmp_path):
+    # review: subprocess.call killed claude when the operator pressed Ctrl-C to interrupt a reply
+    import sys
+    from navigator.conductor import join as j
+    code = "import os,signal,time; os.kill(os.getppid(), signal.SIGINT); time.sleep(0.5); raise SystemExit(7)"
+    assert j.run_claude([sys.executable, "-c", code], cwd=str(tmp_path)) == 7
+
+
+def test_sigterm_kills_claude_before_the_lock_is_released(tmp_path):
+    import os, sys, time
+    import pytest
+    from navigator.conductor import join as j
+    pidfile = tmp_path / "pid"
+    code = (f"import os,signal,time; open({str(pidfile)!r},'w').write(str(os.getpid())); "
+            "os.kill(os.getppid(), signal.SIGTERM); time.sleep(30)")
+    with pytest.raises(SystemExit):
+        j.run_claude([sys.executable, "-c", code], cwd=str(tmp_path))
+    pid = int(pidfile.read_text())
+    time.sleep(0.2)
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)

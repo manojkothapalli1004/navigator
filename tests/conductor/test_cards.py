@@ -235,3 +235,10 @@ def test_bash_card_matches_on_command_not_label(tmp_path):
     c.approve(card["code"], "web")
     assert c.consume("Bash", {"command": "git merge x", "description": "Run approved merge",
                               "timeout": 60000}, cwd="/r")["id"] == card["id"]
+
+
+@pytest.mark.parametrize("cmd", ["claude -p hi", "/usr/local/bin/claude --resume abc -p 'git push'",
+                                 "cd /tmp && claude --print x", "env A=1 claude -p y"])
+def test_bash_cannot_start_another_claude(cmd):
+    # review: a second claude runs under the operator's settings, outside this conversation's gate
+    assert gate.gated_reason("Bash", {"command": cmd}, gate.Path("/Users/Manoj/calwbot")) is not None

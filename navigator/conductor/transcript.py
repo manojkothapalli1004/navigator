@@ -10,6 +10,11 @@ from pathlib import Path
 from navigator.conductor.runner import CWD
 
 
+# user records that the operator did not type: `!` command input/output (may hold secrets, e.g.
+# `! cat .env`), slash-command echoes and background-task notifications
+_NOT_TYPED = ("<bash-", "<local-command-", "<command-", "<task-notification")
+
+
 def transcript_path(session_id: str, cwd: str = CWD, home: Path | None = None) -> Path:
     slug = re.sub(r"[/.]", "-", cwd)
     return Path(home if home is not None else Path.home()) / ".claude" / "projects" / slug / f"{session_id}.jsonl"
@@ -50,7 +55,7 @@ def read_since(path: Path, offset: int) -> list[dict]:
         if kind not in ("user", "assistant"):
             continue
         text = _text((r.get("message") or {}).get("content"))
-        if not text:
+        if not text or (kind == "user" and text.startswith(_NOT_TYPED)):
             continue
         if kind == "assistant" and out and out[-1]["kind"] == "assistant":
             out[-1]["text"] += "\n\n" + text  # one reply split across tool calls
