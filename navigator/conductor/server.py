@@ -173,13 +173,30 @@ def _guarded_protocol():
     from uvicorn.protocols.http.h11_impl import H11Protocol
 
     class Guarded(H11Protocol):
+        _refused = False
+
         def connection_made(self, transport):
             sock = transport.get_extra_info("socket")
             pid = _peer_pid(sock) if sock is not None else None
             if pid is not None and is_descendant(pid, os.getpid()):
+                self._refused = True
                 transport.close()
                 return
             super().connection_made(transport)
+
+        # a refused connection never ran uvicorn's setup: its own callbacks would raise
+        # AttributeError into the log every time (2026-11-02 log noise), so they do nothing
+        def data_received(self, data):
+            if not self._refused:
+                super().data_received(data)
+
+        def connection_lost(self, exc):
+            if not self._refused:
+                super().connection_lost(exc)
+
+        def eof_received(self):
+            if not self._refused:
+                return super().eof_received()
     return Guarded
 
 
