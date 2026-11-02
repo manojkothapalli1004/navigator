@@ -66,7 +66,24 @@ def build_app(engine: Engine, manage_engine: bool = False, cards=None) -> Starle
     async def status(req: Request):
         return JSONResponse({"busy": engine.busy, "queue_len": engine.queue_len,
                              "session_id_set": engine.store.session_id is not None,
-                             "terminal": engine.terminal})
+                             "terminal": engine.terminal,
+                             "autopilot": engine.autopilot.public() if engine.autopilot else None})
+
+    async def autopilot(req: Request):
+        if engine.autopilot is None:
+            return JSONResponse({"error": "autopilot not configured"}, status_code=503)
+        try:
+            body = await req.json()
+        except ValueError:
+            body = None
+        action = body.get("action") if isinstance(body, dict) else None
+        via = body.get("via") if isinstance(body, dict) else None
+        if action not in ("on", "off", "status", "quiet_ok") or via not in SOURCES:
+            return JSONResponse({"error": f"action must be on/off/status/quiet_ok and via one of {', '.join(SOURCES)}"},
+                                status_code=422)
+        if action != "status":
+            engine.submit(f"autopilot {action.replace('_', ' ')}", via)  # same path as the chat words
+        return JSONResponse(engine.autopilot.public())
 
     async def terminal(req: Request):
         try:
@@ -136,6 +153,7 @@ def build_app(engine: Engine, manage_engine: bool = False, cards=None) -> Starle
                              Route("/history", history), Route("/events", events),
                              Route("/status", status),
                              Route("/terminal", terminal, methods=["POST"]),
+                             Route("/autopilot", autopilot, methods=["POST"]),
                              Route("/cancel", cancel, methods=["POST"])]
                      + ([Route("/cards", list_cards),
                          Route("/cards/{key}/{action:str}", decide, methods=["POST"])] if cards else []),
@@ -205,7 +223,10 @@ def serve(socket_path: Path, root: Path, runner=None) -> None:
     # the Telegram post blocks up to 15 s: never inside the turn's event loop; one sender thread
     # keeps cards and replies in the order they happened
     sender = telegram.Sender(creds)
-    engine = Engine(Store(root), runner, notify=sender.card, reply=sender.text)
+    from navigator.conductor.autopilot import Autopilot
+    engine = Engine(Store(root), runner, notify=sender.card, reply=sender.text,
+                    autopilot=Autopilot(Path(root) / "autopilot.json"),
+                    cards_pending=lambda: bool(cards.pending()))
     engine_ref.append(engine)
     # bound here, not by uvicorn: uvicorn chmods its own unix sockets to 0666
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)

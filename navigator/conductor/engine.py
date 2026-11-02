@@ -25,8 +25,11 @@ class ResumeFailed(Exception):
 class Engine:
     def __init__(self, store: Store, runner: TurnRunner, lock_path: Path | None = None,
                  turn_timeout_s: float = TURN_TIMEOUT_S, notify: Callable[[dict], None] | None = None,
-                 reply: Callable[[str], None] | None = None):
+                 reply: Callable[[str], None] | None = None, autopilot=None,
+                 cards_pending: Callable[[], bool] | None = None):
         self.store, self.runner, self.turn_timeout_s = store, runner, turn_timeout_s
+        self.autopilot = autopilot  # keeps working through the plan file between turns (off by default)
+        self.cards_pending = cards_pending or (lambda: False)
         self.notify = notify  # tells the operator's phone about a new approval card (C3)
         self.reply = reply  # sends a Telegram-originated turn's outcome back to Telegram (C4)
         self._dropped: set[int] = set()
@@ -92,9 +95,13 @@ class Engine:
 
     def submit(self, text: str, source: str, internal: bool = False,
                reply_via: str | None = None) -> dict:
-        # "approval" messages come only from the conductor itself, after the operator approves a card
-        if source not in SOURCES and not (internal and source == "approval"):
+        # "approval" / "autopilot" messages come only from the conductor itself
+        if source not in SOURCES and not (internal and source in ("approval", "autopilot")):
             raise ValueError(f"unknown source {source!r}")
+        if self.autopilot is not None and source in SOURCES:
+            if cmd := self.autopilot.command(text):
+                return self._autopilot_command(cmd, source)  # a switch, never a turn
+            self.autopilot.operator_turn()
         user = self._append({"kind": "user", "text": text, "source": source,
                              **({"reply_via": reply_via} if reply_via else {})})
         ahead = self.queue_len + (1 if self.busy else 0)
@@ -104,6 +111,48 @@ class Engine:
             self._reply(user, "You're in the terminal — I'll answer this when you leave it.")
         self._pending.put_nowait(user)
         return user
+
+    def _autopilot_command(self, cmd: str, source: str) -> dict:
+        ap = self.autopilot
+        if cmd == "on":
+            ap.set(True)
+        elif cmd == "off":
+            ap.set(False)
+        elif cmd == "quiet_ok":
+            ap.allow_quiet(True)
+        st = ap.public()
+        text = (f"Autopilot {'on' if st['on'] else 'off'} (via {source}) — {st['consecutive']}/{st['max_consecutive']} "
+                f"in a row, {st['today']}/{st['max_per_day']} today{', quiet hours allowed' if st['quiet_ok'] else ''}; "
+                f"plan: {st['plan']}")
+        note = self._append({"kind": "note", "text": text})
+        self._reply({"source": source}, text)
+        return note
+
+    def _after_turn(self, outcome: str) -> None:
+        """Autopilot: decide whether to queue the next plan item now that a turn ended."""
+        if self.autopilot is None:
+            return
+        try:
+            kind, what = self.autopilot.decide(outcome, cards_pending=bool(self.cards_pending()))
+        except Exception as e:  # the worker must outlive any autopilot hiccup
+            _log.warning("conductor.autopilot_failed: %s", type(e).__name__)
+            return
+        if kind == "off":
+            text = f"Autopilot turned off: {what}"
+            self._append({"kind": "note", "text": text})
+            self._send_telegram(text)
+        elif kind == "queue":
+            self.autopilot.started()
+            st = self.autopilot.public()
+            self._send_telegram(f"Autopilot: turn {st['consecutive']}/{st['max_consecutive']} — {what}")
+            self.submit(self.autopilot.prompt(what), "autopilot", internal=True, reply_via="telegram")
+
+    def _send_telegram(self, text: str) -> None:
+        if self.reply:
+            try:
+                self.reply(text)
+            except Exception as e:
+                _log.warning("conductor.telegram_reply_failed: %s", type(e).__name__)
 
     def terminal_joined(self) -> None:
         self.terminal = True
@@ -138,6 +187,8 @@ class Engine:
     def _reply(self, user: dict, text: str) -> None:
         if not self.reply or not self._to_telegram(user):
             return
+        if user.get("source") == "autopilot":
+            text = f"Autopilot: {text}"  # never mistaken for the operator's own messages
         try:
             self.reply(text)
         except Exception as e:  # a Telegram hiccup never breaks a turn
@@ -218,12 +269,15 @@ class Engine:
                 if not self._cancelled:
                     raise  # the engine itself is stopping
                 self._error(user, "cancelled by operator", reply=self._cancel_via != "telegram")
+                self._after_turn("cancelled")
                 return
             except asyncio.TimeoutError:
                 self._error(user, f"timed out after {self.turn_timeout_s:.0f}s; the turn was stopped")
+                self._after_turn("timeout")
                 return
             except Exception as e:  # the worker must outlive any one turn
                 self._error(user, f"{type(e).__name__}: {str(e)[:300]}")
+                self._after_turn("error")
                 return
             finally:
                 fcntl.flock(lock, fcntl.LOCK_UN)
@@ -233,3 +287,4 @@ class Engine:
             self._append({"kind": "assistant", "text": text, "reply_to": msg_id})
             self._append({"kind": "status", "state": "done", "msg_id": msg_id})
             self._reply(user, text)
+            self._after_turn("done")
