@@ -909,7 +909,7 @@ def _attempt(driver: SubagentDriver, wt: Path, base: str, run_id: str, runner: C
     if res.verify_returncode == 0 and _requires_tests(run_dir, gate_writes):
         _run_full_suite(runner, run_dir, res, breakers)
         if res.verify_returncode == 0:
-            _run_exercise_check(runner, wt, run_dir, gate_writes, res)
+            _run_exercise_check(runner, wt, run_dir, gate_writes, res, base=base)
     if res.verify_returncode == 0 and _frontend_changed(gate_writes, frontend_dir):
         _run_frontend_suite(runner, wt, repo_path, frontend_dir, res, breakers)
     if res.verify_returncode == 0 and checker_fingerprints is not None:
@@ -999,16 +999,18 @@ def exercise_verdict(rc: int) -> bool | None:
     return None
 
 
-def _run_exercise_check(runner, wt: Path, run_dir: Path, changed: list[str], res: PhaseResult) -> None:
+def _run_exercise_check(runner, wt: Path, run_dir: Path, changed: list[str], res: PhaseResult,
+                        base: str = "HEAD") -> None:
     """Does the run's new test exercise its change (2026-11-02)? Its changed test files are run
-    against the base code in a scratch worktree next to the run's (the builder's source edits are
-    still uncommitted, so HEAD is the base). Recorded as suite="exercise" with exercised
-    True/False/None; informational for review, and tier A auto-merge refuses exercised=False. It
-    never changes the verification result: a pure refactor's tests pass before and after."""
+    against the BASE commit (`base`: the builder's edits are already checkpoint-committed by now,
+    so HEAD is NOT the base) in a scratch worktree next to the run's. Recorded as
+    suite="exercise" with exercised True/False/None, inserted BEFORE the last entry (suite_green
+    reads the last entry's rc). Informational for review; tier A auto-merge refuses
+    exercised=False. It never changes the verification result: a refactor's tests pass both ways."""
     tests = [c for c in changed if _is_test_file(c)]
     source = [c for c in changed if c.endswith(".py") and not _is_test_file(c)]
-    if not tests or not source:
-        return
+    if not source or not [t for t in tests if Path(t).name != "conftest.py" and (Path(wt) / t).is_file()]:
+        return  # no source change, or no test that still exists to run: never the whole base suite
     entry = next((a for a in runner.allowlist if "pytest" in a.split()), None)
     if entry is None:
         return
@@ -1018,35 +1020,45 @@ def _run_exercise_check(runner, wt: Path, run_dir: Path, changed: list[str], res
     except ValueError:
         rel = Path(".")
     scratch = wt.parent / f"{wt.name}.exercise"
-    if scratch.exists():
+
+    def drop() -> None:
         subprocess.run(["git", "-C", str(wt), "worktree", "remove", "--force", str(scratch)], capture_output=True)
         shutil.rmtree(scratch, ignore_errors=True)
-    add = subprocess.run(["git", "-C", str(wt), "worktree", "add", "--detach", "-q", str(scratch), "HEAD"],
+        subprocess.run(["git", "-C", str(wt), "worktree", "prune"], capture_output=True)
+
+    def record(rc: int, out: str, argv: list[str]) -> None:
+        e = {"argv": " ".join(argv) or "exercise-check", "argv_list": argv or ["exercise-check"],
+             "returncode": rc, "output_tail": out[-1500:], "suite": "exercise", "exercised": exercise_verdict(rc)}
+        res.verify_log.insert(max(len(res.verify_log) - 1, 0), e) if res.verify_log else res.verify_log.append(e)
+
+    drop()  # a scratch left by a crash (directory and/or git's registration)
+    add = subprocess.run(["git", "-C", str(wt), "worktree", "add", "--detach", "-q", str(scratch), base],
                          capture_output=True, text=True)
     if add.returncode != 0:
-        res.verify_log.append({"argv": "exercise-check", "argv_list": ["exercise-check"], "returncode": 126,
-                               "output_tail": add.stderr[-500:], "suite": "exercise", "exercised": None})
+        record(126, add.stderr, [])
         return
     argv: list[str] = []
     try:
-        for t in tests:
-            src, dst = wt / t, scratch / t
-            if src.is_file():
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copyfile(src, dst)
+        try:
+            for t in tests:
+                if (wt / t).is_file():
+                    (scratch / t).parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(wt / t, scratch / t)
+        except OSError as e:
+            record(126, f"exercise-check copy failed: {type(e).__name__}", [])
+            return
         cwd = scratch / rel
-        argv = entry.split() + ["-q", "-p", "no:cacheprovider",
-                                *[os.path.relpath(scratch / t, cwd) for t in tests if (scratch / t).is_file()]]
+        paths = [os.path.relpath(scratch / t, cwd) for t in tests
+                 if Path(t).name != "conftest.py" and (scratch / t).is_file()]
+        argv = entry.split() + ["-q", "-p", "no:cacheprovider", *paths]
         try:
             r = _run_sealed(runner, argv, cwd)
             rc, out = r.returncode, r.stdout + r.stderr
         except CommandRejected as e:
             rc, out = 126, f"exercise-check command rejected: {e}"
+        record(rc, out, argv)
     finally:
-        subprocess.run(["git", "-C", str(wt), "worktree", "remove", "--force", str(scratch)], capture_output=True)
-        shutil.rmtree(scratch, ignore_errors=True)
-    res.verify_log.append({"argv": " ".join(argv), "argv_list": argv, "returncode": rc,
-                           "output_tail": out[-1500:], "suite": "exercise", "exercised": exercise_verdict(rc)})
+        drop()
 
 
 def _run_full_suite(runner, run_dir: Path, res: PhaseResult, breakers) -> None:

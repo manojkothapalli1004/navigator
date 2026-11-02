@@ -593,6 +593,16 @@ def unexercised_tests(verification: list) -> bool:
                for e in (verification or []))
 
 
+def carry_exercise(old: list, new: list) -> list:
+    """A rebase re-verifies with the recorded commands only; keep the exercise result (it judged
+    the run's tests against its own base) so a not-exercised run can't lose its auto-merge block."""
+    kept = [e for e in (old or []) if isinstance(e, dict) and e.get("suite") == "exercise"]
+    if not kept:
+        return new
+    new = list(new or [])
+    return new[:-1] + kept + new[-1:] if new else kept
+
+
 def auto_merge_ok(act, run, repo, settings) -> bool:
     """Every tier A auto-merge condition, recomputed from git and ACT at the moment of use
     (defence in depth: an approval record, an audit record or a tier payload can all be
@@ -791,7 +801,7 @@ def _rebase_one(run: Run, merged: Run, new_head: str, *, act, orc, runner, setti
     old_sha = run.verified_sha
     run.base_commit_sha = new_head
     run.verified_sha = _head(wt) or None
-    run.verification = res.verify_log
+    run.verification = carry_exercise(run.verification, res.verify_log)
     after = _normalized_diff(wt, new_head)
     identical = before is not None and after is not None and before == after
     if identical:
