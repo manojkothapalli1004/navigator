@@ -75,3 +75,55 @@ def test_send_text_empty_sends_placeholder():
     sent = []
     telegram.send_text("", ("T", "1"), post=_rec(sent))
     assert sent == ["(no reply text)"]
+
+
+# --- overnight 2026-11-02: Telegram counts UTF-16 units; one sender keeps messages in order ---
+
+def _units(s):
+    return len(s.encode("utf-16-le")) // 2
+
+
+def test_split_counts_utf16_units():
+    text = "\U0001F600" * 3000  # each emoji is 2 UTF-16 units: 6000 units
+    parts = telegram.split_text(text, limit=4000)
+    assert "".join(parts) == text and all(_units(p) <= 4000 for p in parts) and len(parts) == 2
+
+
+def test_split_mixed_prefers_newline_within_units():
+    text = "\U0001F600" * 1500 + "\n" + "b" * 2000  # 3000 + 1 + 2000 units
+    assert telegram.split_text(text, limit=4000) == ["\U0001F600" * 1500, "b" * 2000]
+
+
+def test_sender_keeps_order_across_cards_and_texts():
+    import threading, time
+    sent, done = [], threading.Event()
+
+    class R:
+        def json(self): return {"ok": True}
+
+    def post(url, **kw):
+        if not sent:
+            time.sleep(0.2)  # the first send is slow; later ones must still wait their turn
+        sent.append(kw["json"]["text"][:5])
+        if len(sent) == 3:
+            done.set()
+        return R()
+    s = telegram.Sender(("T", "1"), post=post)
+    s.text("first"); s.card({"code": "ABC234", "summary": "x", "reason": "y"}); s.text("third")
+    assert done.wait(3)
+    assert sent == ["first", "Appro", "third"]
+
+
+def test_sender_survives_errors_and_no_creds():
+    import threading
+    calls, done = [], threading.Event()
+
+    def post(url, **kw):
+        calls.append(1)
+        if len(calls) == 2:
+            done.set()
+        raise RuntimeError("down")
+    s = telegram.Sender(("T", "1"), post=post)
+    s.text("a"); s.text("b")
+    assert done.wait(3)
+    telegram.Sender(None).text("x")  # no creds: silently nothing

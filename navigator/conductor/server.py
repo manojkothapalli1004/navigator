@@ -196,11 +196,10 @@ def serve(socket_path: Path, root: Path, runner=None) -> None:
     os.chmod(socket_path.parent, 0o700)  # nobody else can even reach the socket's directory
     if socket_path.exists() or socket_path.is_symlink():
         socket_path.unlink()
-    import threading
-    # the Telegram post blocks up to 15 s: never inside the turn's event loop
-    notify = lambda card: threading.Thread(target=telegram.send_card, args=(card, creds), daemon=True).start()
-    reply = lambda text: threading.Thread(target=telegram.send_text, args=(text, creds), daemon=True).start()
-    engine = Engine(Store(root), runner, notify=notify, reply=reply)
+    # the Telegram post blocks up to 15 s: never inside the turn's event loop; one sender thread
+    # keeps cards and replies in the order they happened
+    sender = telegram.Sender(creds)
+    engine = Engine(Store(root), runner, notify=sender.card, reply=sender.text)
     engine_ref.append(engine)
     # bound here, not by uvicorn: uvicorn chmods its own unix sockets to 0666
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
