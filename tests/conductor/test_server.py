@@ -258,3 +258,34 @@ def test_terminal_endpoint_and_status(tmp_path):
         for b in bad:
             assert (await c.post("/terminal", json=b)).status_code == 422, b
     asyncio.run(_with_app(tmp_path, go))
+
+
+# --- 2026-11-02: a refused connection must not log an AttributeError from uvicorn ---
+
+def _refused_protocol(monkeypatch):
+    import uvicorn
+    from uvicorn.server import ServerState
+    monkeypatch.setattr(server, "_peer_pid", lambda sock: 12345)
+    monkeypatch.setattr(server, "is_descendant", lambda pid, root: True)
+    cfg = uvicorn.Config(app=lambda scope, receive, send: None, log_level="warning")
+    cfg.load()
+    proto = server._guarded_protocol()(config=cfg, server_state=ServerState(), app_state={})
+
+    class T:
+        closed = False
+        def get_extra_info(self, name, default=None):
+            return object() if name == "socket" else default
+        def close(self):
+            self.closed = True
+    t = T()
+    proto.connection_made(t)
+    return proto, t
+
+
+def test_refused_connection_closes_quietly(monkeypatch):
+    async def go():  # uvicorn's protocol needs a running loop
+        proto, t = _refused_protocol(monkeypatch)
+        assert t.closed
+        proto.data_received(b"GET /cards HTTP/1.1\r\nHost: c\r\n\r\n")  # must not be parsed or raise
+        proto.connection_lost(None)  # asyncio calls this after close(): must not raise
+    asyncio.run(go())
