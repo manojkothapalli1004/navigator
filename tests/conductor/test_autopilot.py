@@ -118,3 +118,29 @@ def test_command_words():
     assert Autopilot.command("autopilot quiet ok") == "quiet_ok"
     assert Autopilot.command("autopilot on please and also build x") is None
     assert Autopilot.command("turn autopilot on") is None
+
+
+def test_malformed_state_file_is_ignored(tmp_path):
+    (tmp_path / "plan.md").write_text(PLAN)
+    for bad in ("5", "[1,2]", '{"on": "false"}', "not json"):
+        (tmp_path / "state.json").write_text(bad)
+        ap = Autopilot(tmp_path / "state.json", tmp_path / "plan.md", clock=Clock())
+        assert ap.on is False, bad
+
+
+def test_cap_message_says_how_to_restart(tmp_path):
+    ap = _ap(tmp_path); ap.set(True)
+    for _ in range(MAX_CONSECUTIVE):
+        ap.started()
+    _, reason = ap.decide("done", cards_pending=False)
+    assert reason == "6 autopilot turns in a row (say 'autopilot on' to continue)"
+
+
+def test_runnable_recheck(tmp_path):
+    clock = Clock(); ap = _ap(tmp_path, clock=clock); ap.set(True)
+    assert ap.runnable(cards_pending=False) is None
+    assert ap.runnable(cards_pending=True) == "an approval card is waiting for you"
+    clock.t = NOON.replace(hour=23, minute=5)
+    assert "quiet hours" in ap.runnable(cards_pending=False)
+    ap.set(False)
+    assert ap.runnable(cards_pending=False) == "autopilot is off"

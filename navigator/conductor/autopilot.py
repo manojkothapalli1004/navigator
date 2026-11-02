@@ -32,9 +32,17 @@ class Autopilot:
         self.clock = clock or (lambda: datetime.now(ET))
         self.state = {"on": False, "consecutive": 0, "day": "", "today": 0, "quiet_ok": False}
         try:
-            self.state.update(json.loads(self.state_path.read_text()))
+            saved = json.loads(self.state_path.read_text())
         except (OSError, ValueError):
-            pass
+            saved = None
+        if isinstance(saved, dict):  # a damaged file must never stop the conductor from starting
+            self.state["on"] = saved.get("on") is True
+            self.state["quiet_ok"] = saved.get("quiet_ok") is True
+            for k in ("consecutive", "today"):
+                if isinstance(saved.get(k), int) and saved[k] >= 0:
+                    self.state[k] = saved[k]
+            if isinstance(saved.get("day"), str):
+                self.state["day"] = saved["day"]
 
     # ---- state ----
     @property
@@ -105,9 +113,8 @@ class Autopilot:
             return "off", f"{MAX_PER_DAY} autopilot turns today (the daily cap)"
         if self.state["consecutive"] >= MAX_CONSECUTIVE:
             self.set(False)
-            return "off", f"{MAX_CONSECUTIVE} autopilot turns in a row (send any message to reset, then autopilot on)"
-        hour = self.clock().astimezone(ET).hour
-        if (hour >= QUIET_START or hour < QUIET_END) and not self.state["quiet_ok"]:
+            return "off", f"{MAX_CONSECUTIVE} autopilot turns in a row (say 'autopilot on' to continue)"
+        if self._quiet():
             return "wait", "quiet hours (23:00-07:00 ET); say 'autopilot quiet ok' to allow"
         try:
             item = self.next_item()
@@ -118,6 +125,20 @@ class Autopilot:
             self.set(False)
             return "off", "the plan is done — every item is checked"
         return "queue", item
+
+    def _quiet(self) -> bool:
+        hour = self.clock().astimezone(ET).hour
+        return (hour >= QUIET_START or hour < QUIET_END) and not self.state["quiet_ok"]
+
+    def runnable(self, cards_pending: bool) -> str | None:
+        """Re-checked when a queued autopilot turn is about to start: None = go, else why not."""
+        if not self.on:
+            return "autopilot is off"
+        if cards_pending:
+            return "an approval card is waiting for you"
+        if self._quiet():
+            return "quiet hours (23:00-07:00 ET)"
+        return None
 
     def public(self) -> dict:
         self._roll_day()

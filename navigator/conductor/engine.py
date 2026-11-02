@@ -107,7 +107,7 @@ class Engine:
         ahead = self.queue_len + (1 if self.busy else 0)
         detail = TERMINAL_WAIT if self.terminal else ahead
         self._append({"kind": "status", "state": "queued", "msg_id": user["id"], "detail": detail})
-        if self.terminal:
+        if self.terminal and source != "autopilot":
             self._reply(user, "You're in the terminal — I'll answer this when you leave it.")
         self._pending.put_nowait(user)
         return user
@@ -132,6 +132,8 @@ class Engine:
         """Autopilot: decide whether to queue the next plan item now that a turn ended."""
         if self.autopilot is None:
             return
+        if outcome != "cancelled" and self.queue_len > 0:
+            return  # something is already waiting (an operator message): decide after it, never pile up
         try:
             kind, what = self.autopilot.decide(outcome, cards_pending=bool(self.cards_pending()))
         except Exception as e:  # the worker must outlive any autopilot hiccup
@@ -247,6 +249,14 @@ class Engine:
                 self.terminal = False
                 self._append({"kind": "note", "text": "Terminal session ended without saying goodbye; "
                                                       "its turns aren't in this history."})
+            if user.get("source") == "autopilot" and self.autopilot is not None:
+                # re-checked now, not only when queued: switched off, quiet hours or a card may have
+                # come up while it waited (behind other turns or the terminal's lock)
+                why = self.autopilot.runnable(cards_pending=bool(self.cards_pending()))
+                if why:
+                    self._append({"kind": "status", "state": "skipped", "msg_id": msg_id,
+                                  "detail": f"autopilot turn skipped: {why}"})
+                    return
             self._append({"kind": "status", "state": "running", "msg_id": msg_id})
             parts: list[str] = []
             prompt = f"[{user.get('source', 'web')}] {user['text']}"

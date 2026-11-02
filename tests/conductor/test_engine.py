@@ -468,3 +468,47 @@ async def test_internal_sources_cannot_toggle(tmp_path):
     r = FakeRunner(); eng, ap, sent = _apeng(tmp_path, r); await eng.start()
     eng.submit("autopilot on", "approval", internal=True); await _drain(eng); await eng.stop()
     assert ap.on is False  # only the operator's windows switch it
+
+
+# --- autopilot cold-audit fixes ---
+
+@aio
+async def test_autopilot_never_piles_up_behind_operator_messages(tmp_path):
+    gate = asyncio.Event(); r = FakeRunner(gate); eng, ap, sent = _apeng(tmp_path, r); ap.set(True)
+    await eng.start()
+    eng.submit("m1", "web"); await asyncio.sleep(0.05)
+    eng.submit("m2", "web")          # queued while m1 runs
+    gate.set(); await _drain(eng)
+    ap.set(False); await _drain(eng); await eng.stop()
+    hist = eng.store.history(limit=1000)
+    users = [e for e in hist if e["kind"] == "user"]
+    assert [u["source"] for u in users][:3] == ["web", "web", "autopilot"]  # m1 done -> m2 first
+    ap_ids = {u["id"] for u in users if u["source"] == "autopilot"}
+    ahead = [e["detail"] for e in hist if e.get("state") == "queued" and e.get("msg_id") in ap_ids]
+    # queued from the finishing turn itself (counts as 1, busy) and never behind another waiting turn (would be 2+)
+    assert ahead and all(a == 1 for a in ahead)
+
+
+@aio
+async def test_autopilot_turn_rechecks_when_it_starts(tmp_path):
+    r = FakeRunner(); eng, ap, sent = _apeng(tmp_path, r); ap.set(True)
+    lock = open(tmp_path / "c" / "turn.lock", "w")
+    fcntl.flock(lock, fcntl.LOCK_EX)  # e.g. the operator is in the terminal: the turn waits on the lock
+    await eng.start()
+    eng._after_turn("done")           # queues one autopilot turn, which blocks on the lock
+    await asyncio.sleep(0.05)
+    ap.set(False)                      # switched off while it waits
+    fcntl.flock(lock, fcntl.LOCK_UN); lock.close()
+    await _drain(eng); await eng.stop()
+    assert not any(p.startswith("[autopilot]") for p in getattr(r, "raw", []))
+    skipped = [e for e in eng.store.history() if e.get("state") == "skipped"]
+    assert skipped and "autopilot is off" in skipped[0]["detail"]
+
+
+@aio
+async def test_autopilot_turn_gets_no_terminal_notice(tmp_path):
+    r = FakeRunner(); eng, ap, sent = _apeng(tmp_path, r); ap.set(True)
+    eng.terminal = True
+    await eng.start(); eng.submit(ap.prompt("x"), "autopilot", internal=True, reply_via="telegram")
+    eng.terminal = False; ap.set(False); await _drain(eng); await eng.stop()
+    assert not any("You're in the terminal" in s for s in sent)
