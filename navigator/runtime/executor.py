@@ -587,6 +587,12 @@ def suite_green(verification: list, changed: list, frontend_dir: str | None = No
     return True
 
 
+def unexercised_tests(verification: list) -> bool:
+    """The recorded exercise check found the run's tests pass on the base code too (2026-11-02)."""
+    return any(isinstance(e, dict) and e.get("suite") == "exercise" and e.get("exercised") is False
+               for e in (verification or []))
+
+
 def auto_merge_ok(act, run, repo, settings) -> bool:
     """Every tier A auto-merge condition, recomputed from git and ACT at the moment of use
     (defence in depth: an approval record, an audit record or a tier payload can all be
@@ -596,6 +602,8 @@ def auto_merge_ok(act, run, repo, settings) -> bool:
     try:
         if not is_audited(act, run) or not base_on_head(repo, run):
             return False
+        if unexercised_tests(run.verification):
+            return False  # its tests pass without the change: a human looks at it
         changed = changed_files_for_run(repo, run)
         if changed is None:
             return False

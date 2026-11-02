@@ -908,6 +908,8 @@ def _attempt(driver: SubagentDriver, wt: Path, base: str, run_id: str, runner: C
             break
     if res.verify_returncode == 0 and _requires_tests(run_dir, gate_writes):
         _run_full_suite(runner, run_dir, res, breakers)
+        if res.verify_returncode == 0:
+            _run_exercise_check(runner, wt, run_dir, gate_writes, res)
     if res.verify_returncode == 0 and _frontend_changed(gate_writes, frontend_dir):
         _run_frontend_suite(runner, wt, repo_path, frontend_dir, res, breakers)
     if res.verify_returncode == 0 and checker_fingerprints is not None:
@@ -984,6 +986,67 @@ def _run_frontend_suite(runner, wt: Path, repo_path: Path | None, frontend_dir: 
             if breakers:
                 breakers.record_failure(" ".join(argv))
             return
+
+
+def exercise_verdict(rc: int) -> bool | None:
+    """pytest's return code for the run's tests on the BASE code: 1 failed / 2 errored (e.g. the new
+    code doesn't exist there) = they exercise the change; 0 passed / 5 nothing collected = they don't;
+    anything else (126 rejected, internal errors) = can't tell."""
+    if rc in (1, 2):
+        return True
+    if rc in (0, 5):
+        return False
+    return None
+
+
+def _run_exercise_check(runner, wt: Path, run_dir: Path, changed: list[str], res: PhaseResult) -> None:
+    """Does the run's new test exercise its change (2026-11-02)? Its changed test files are run
+    against the base code in a scratch worktree next to the run's (the builder's source edits are
+    still uncommitted, so HEAD is the base). Recorded as suite="exercise" with exercised
+    True/False/None; informational for review, and tier A auto-merge refuses exercised=False. It
+    never changes the verification result: a pure refactor's tests pass before and after."""
+    tests = [c for c in changed if _is_test_file(c)]
+    source = [c for c in changed if c.endswith(".py") and not _is_test_file(c)]
+    if not tests or not source:
+        return
+    entry = next((a for a in runner.allowlist if "pytest" in a.split()), None)
+    if entry is None:
+        return
+    wt = Path(wt)
+    try:
+        rel = Path(run_dir).resolve().relative_to(wt.resolve())
+    except ValueError:
+        rel = Path(".")
+    scratch = wt.parent / f"{wt.name}.exercise"
+    if scratch.exists():
+        subprocess.run(["git", "-C", str(wt), "worktree", "remove", "--force", str(scratch)], capture_output=True)
+        shutil.rmtree(scratch, ignore_errors=True)
+    add = subprocess.run(["git", "-C", str(wt), "worktree", "add", "--detach", "-q", str(scratch), "HEAD"],
+                         capture_output=True, text=True)
+    if add.returncode != 0:
+        res.verify_log.append({"argv": "exercise-check", "argv_list": ["exercise-check"], "returncode": 126,
+                               "output_tail": add.stderr[-500:], "suite": "exercise", "exercised": None})
+        return
+    argv: list[str] = []
+    try:
+        for t in tests:
+            src, dst = wt / t, scratch / t
+            if src.is_file():
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(src, dst)
+        cwd = scratch / rel
+        argv = entry.split() + ["-q", "-p", "no:cacheprovider",
+                                *[os.path.relpath(scratch / t, cwd) for t in tests if (scratch / t).is_file()]]
+        try:
+            r = _run_sealed(runner, argv, cwd)
+            rc, out = r.returncode, r.stdout + r.stderr
+        except CommandRejected as e:
+            rc, out = 126, f"exercise-check command rejected: {e}"
+    finally:
+        subprocess.run(["git", "-C", str(wt), "worktree", "remove", "--force", str(scratch)], capture_output=True)
+        shutil.rmtree(scratch, ignore_errors=True)
+    res.verify_log.append({"argv": " ".join(argv), "argv_list": argv, "returncode": rc,
+                           "output_tail": out[-1500:], "suite": "exercise", "exercised": exercise_verdict(rc)})
 
 
 def _run_full_suite(runner, run_dir: Path, res: PhaseResult, breakers) -> None:
