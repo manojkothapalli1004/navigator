@@ -26,7 +26,112 @@ NAVIGATOR_GATED = {"merge", "reject", "audited", "approve", "decline", "abandon"
 # the Read tool is the way to read them)
 _PROTECTED_TEXT = re.compile(
     r"CLAUDE\.md|settings(\.local)?\.json|\.claude\.json|\.mcp\.json|\.git/hooks|Library/LaunchAgents"
-    r"|\.claude/(settings|hooks|plugins|agents|commands|skills|output-styles)")
+    r"|\.claude/(settings|hooks|agents|commands|skills|output-styles)")
+# ~/.claude/plugins holds skill helper files the conversation reads a lot: a command that only
+# READS there passes (2026-11-02); anything that could write, run code or hide a command stays gated
+_PLUGINS_TEXT = re.compile(r"\.claude/plugins")
+# Allowlist, not blocklist (cold audit 2026-11-02 found 12 ways past a blocklist): every word must
+# be a plain literal or single-quoted (bash never expands either), every program a bare name from
+# this list, and every option one we know only reads.
+# no cd: the shell's cwd persists between Bash calls, so an allowed `cd ~/.claude/plugins/x` would
+# aim the NEXT, plugin-free command (echo x > SKILL.md) there unseen (terminal review 1). Without
+# cd, git also always runs in the conversation's own workspace repo with its own config.
+_READ_PROGRAMS = {"ls", "cat", "head", "tail", "grep", "find", "wc", "stat", "sed", "cut", "echo",
+                  "test", "pwd", "true", "git"}
+_SEPARATORS = {";", "&&", "||", "|"}
+_PLAIN = re.compile(r"^[A-Za-z0-9_./~:=,+%@-]+$")  # no $ { } * ? [ ] \ " ! ` ( ) < > & | ;
+_STDERR_ONLY = re.compile(r"(?<=\s)2>(/dev/null|&1)(?=\s|$|;|\|)")
+_VAR_USE = re.compile(r"^\$([A-Za-z_][A-Za-z0-9_]*)(/[A-Za-z0-9_./~:=,+%@-]*)?$")
+_ASSIGN_LITERAL = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=([A-Za-z0-9_./~:,+%@][A-Za-z0-9_./~:=,+%@-]*)$")
+_FIND_OK = {"-name", "-iname", "-path", "-ipath", "-type", "-maxdepth", "-mindepth", "-size", "-mtime",
+            "-mmin", "-newer", "-print", "-print0", "-o", "-a", "-not", "-and", "-or", "-L", "-H"}
+_SED_SCRIPT = re.compile(r"^(\d+(,\d+)?|\$|\d+,\$)?p$")  # print lines: 1,40p  5p  $p  10,$p
+_GIT_READ = {"status", "log", "show", "diff", "rev-parse"}
+_GIT_ARG_BAD = re.compile(r"^--(output|ext-diff|textconv|git-dir|work-tree|exec|upload-pack|config)")
+
+
+def _word(tok: str) -> str | None:
+    """The literal value of a lexed word, or None when bash could expand or reinterpret it."""
+    if len(tok) >= 2 and tok[0] == tok[-1] == "'":
+        inner = tok[1:-1]
+        return inner if "'" not in inner else None
+    return tok if _PLAIN.match(tok) else None
+
+
+def _args_read_only(prog: str, args: list[str]) -> bool:
+    if prog == "git":
+        if not args or args[0].startswith("-"):
+            return False  # no -C / -c / --git-dir: only the workspace's own repo, its own config
+        sub, rest = args[0], args[1:]
+        if any(_GIT_ARG_BAD.match(a) for a in rest):
+            return False
+        if sub in _GIT_READ:
+            return True
+        if sub == "branch":
+            return all(a in ("--show-current", "--list", "-a", "-r", "-v", "-vv") for a in rest)
+        return sub == "worktree" and rest == ["list"]
+    if prog == "find":
+        return all(not a.startswith("-") or a in _FIND_OK for a in args)
+    if prog == "sed":
+        flags = [a for a in args if a.startswith("-")]
+        plain = [a for a in args if not a.startswith("-")]
+        return set(flags) <= {"-n", "-E"} and bool(plain) and bool(_SED_SCRIPT.match(plain[0]))
+    return True  # ls cat head tail grep wc stat cut echo test cd pwd true: no write/exec options
+
+
+def _plugins_read_only(command: str) -> bool:
+    """True only if every piece of the command is a known read-only program with only literal
+    words, no output redirection, substitution, subshell or path escape. Unsure = False."""
+    import shlex
+    if "\n" in command or "`" in command or "\\" in command or ".." in command:
+        return False
+    # stderr-only redirects, written exactly as ' 2>/dev/null' or ' 2>&1', are the only ones allowed
+    command = _STDERR_ONLY.sub(" ", command)
+    def lexed(posix: bool) -> list[str]:
+        lex = shlex.shlex(command, posix=posix, punctuation_chars=True)
+        lex.commenters = ""  # '#' is literal: a comment can't hide the rest of the command from us
+        lex.wordchars += "~-./=,+%@:$*?[]{}!"  # keep these inside one word, then judge the whole word
+        return list(lex)
+    try:
+        tokens, joined = lexed(False), lexed(True)
+    except ValueError:
+        return False
+    # bash glues adjacent words into ONE argument ('1p'';w FILE' is the single sed script
+    # "1p;w FILE"); posix=True does the same. If the two readings differ, bash would see words
+    # we never checked (terminal review 1, 2026-11-02)
+    unquoted = [t[1:-1] if len(t) >= 2 and t[0] == t[-1] == "'" else t for t in tokens]
+    if unquoted != joined:
+        return False
+    pieces: list[list[str]] = [[]]
+    known: dict[str, str] = {}  # NAME=literal set earlier in this command (S=/path; ls $S/x)
+    for tok in tokens:
+        if tok in _SEPARATORS:
+            if len(pieces[-1]) == 1 and (a := _ASSIGN_LITERAL.match(pieces[-1][0])):
+                known[a.group(1)] = a.group(2)  # usable by the pieces after this one
+            pieces.append([])
+            continue
+        if m := _VAR_USE.match(tok):
+            if m.group(1) not in known:
+                return False  # $X we didn't see set to a plain literal: could be anything
+            tok = known[m.group(1)] + (m.group(2) or "")
+        word = _word(tok)
+        if word is None:
+            return False  # redirection, operator, expansion, double quotes, glob…
+        pieces[-1].append(word)
+    for words in pieces:
+        if not words:
+            continue
+        if len(words) == 1 and (a := _ASSIGN_LITERAL.match(words[0])):
+            known[a.group(1)] = a.group(2)  # a plain literal not starting with '-': expands to itself
+            continue
+        prog = words[0]
+        if "/" in prog or "=" in prog or prog not in _READ_PROGRAMS:
+            return False  # a path (./ls, /tmp/x/cat), VAR=x, or a program we don't know
+        if not _args_read_only(prog, words[1:]):
+            return False
+    return True
+
+
 # the conversation must never reach its own approval channels (approve its own card, read or
 # forge cards.json, restart the conductor to reload a forged file)
 _CONDUCTOR_TEXT = re.compile(r"navigator\.conductor|conductor\.sock|logs/conductor|com\.calwbot\.conductor"
@@ -69,7 +174,9 @@ def _bash_reason(command: str) -> str | None:
         return f"touches the chat service's own approvals ({m.group(0)})"
     if m := _PROTECTED_TEXT.search(command):
         return f"touches {m.group(0)} (permissions, hooks or services)"
-    tokens = [t for t in _SPLIT.split(command.replace('"', " ").replace("'", " ")) if t]
+    if (m := _PLUGINS_TEXT.search(command)) and not _plugins_read_only(command):
+        return f"touches {m.group(0)} (permissions, hooks or services)"
+    tokens =[t for t in _SPLIT.split(command.replace('"', " ").replace("'", " ")) if t]
     for i, tok in enumerate(tokens):
         prog = tok.rsplit("/", 1)[-1]
         nxt = tokens[i + 1] if i + 1 < len(tokens) else ""
