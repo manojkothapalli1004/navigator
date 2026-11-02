@@ -107,6 +107,9 @@ def _plugins_read_only(command: str) -> bool:
         if word is None:
             return False  # redirection, operator, expansion, double quotes, glob…
         pieces[-1].append(word)
+    progs = {w[0] for w in pieces if w}
+    if "cd" in progs and "git" in progs:
+        return False  # git in a repo we cd'd into runs that repo's own config (diff drivers, pager…)
     for words in pieces:
         if not words:
             continue

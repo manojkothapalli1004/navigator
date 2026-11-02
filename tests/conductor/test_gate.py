@@ -81,7 +81,9 @@ def test_write_gated_review(path):
 # ---- 2026-11-02: read-only looks at ~/.claude/plugins (skill helper files) pass; writes stay gated ----
 
 S = "~/.claude/plugins/cache/claude-plugins-official/superpowers/7.0.0/skills"
-C4_LS = (f"cd /Users/Manoj/calwbot/navigator && git status --short | head -5; git branch --show-current; "
+# the 2026-11-01 C4 command; its `cd … && git …` part now stays gated (a cd'd-to repo's own config
+# can run programs), so the read-only part is what must pass
+C4_LS = (f"git status --short | head -5; git branch --show-current; "
          f"git worktree list | head; S=/Users/Manoj/.claude/plugins/cache/claude-plugins-official/superpowers/"
          f"7.0.0/skills; ls $S/executing-plans/scripts $S/subagent-driven-development/scripts")
 
@@ -179,6 +181,7 @@ def test_plugins_reads_pass(cmd):
     "S=/tmp; ls ~/.claude/plugins ${S}",
     "S=x ls ~/.claude/plugins",                       # VAR=x prog
     "ls ~/.claude/plugins; S=/tmp/evil; $S/cat x",    # program from a variable
+    "cd /tmp/evilrepo && git log -p; ls ~/.claude/plugins",  # another repo's config can run programs
 ])
 def test_plugins_writes_and_others_stay_gated(cmd):
     assert gated_reason("Bash", {"command": cmd}, CWD), cmd
