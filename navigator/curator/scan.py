@@ -34,7 +34,8 @@ class Finding:
 
     def __post_init__(self):
         if not self.fingerprint:
-            key = "|".join([self.kind, *sorted(self.paths), self.detail])
+            # kind + paths only: the detail (overlap %, missing-path list) may wobble between runs
+            key = "|".join([self.kind, *sorted(self.paths)])
             self.fingerprint = hashlib.sha256(key.encode()).hexdigest()[:16]
 
 
@@ -85,7 +86,10 @@ def find(skills: list[Skill], local_prefixes=LOCAL_PREFIXES) -> list[Finding]:
         detail = (f"{len(group)} skills are named '{name}' and differ"
                   + (" (an installed copy is out of date?)" if installed_copy else ""))
         found.append(Finding("duplicate", [s.name for s in group], [str(s.path) for s in group], detail))
-    for a, b in combinations(skills, 2):
+    owned_bytes = {s.path.read_bytes() for s in skills if s.owned}
+    # an installed plugin copy identical to one of ours is the same skill: compare ours only once
+    distinct = [s for s in skills if s.owned or s.path.read_bytes() not in owned_bytes]
+    for a, b in combinations(distinct, 2):
         if a.name == b.name or not (a.owned or b.owned):
             continue
         wa, wb = _words(a.description), _words(b.description)

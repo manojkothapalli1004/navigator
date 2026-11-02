@@ -110,7 +110,7 @@ def test_file_emits_one_review_gated_proposal_once(tmp_path):
     rc, notes, act = _run(tmp_path, "--file")
     assert len(act.created) == 1
     p = act.created[0]
-    assert p.origin == "curator" and p.repo == "calwbot-skills" and p.base_commit_sha == "abc123"
+    assert p.origin == "curator" and p.repo == str(tmp_path) and p.base_commit_sha == "abc123"
     assert p.status.value == "proposed"  # review-gated: a human approves before anything is built
     assert "never edits" in p.intended_changes.lower() or "consolidat" in p.intended_changes.lower()
     assert all(not f.startswith("/") for f in p.affected_files)  # repo-relative, our skills only
@@ -138,3 +138,78 @@ def test_path_prefix_patterns_are_not_stale(tmp_path):
     own = tmp_path / "own"
     skill(own, "c", "h", "x", body=f"Write {tmp_path}/logs/handoff-<date>.md or {tmp_path}/logs/handoff- files\n")
     assert not [f for f in cscan.find(cscan.scan([own], []), (str(tmp_path) + '/',)) if f.kind == "stale"]
+
+
+# ---- cold-audit fixes ----
+
+class EventACT(ACT):
+    def __init__(self):
+        super().__init__(); self.events = []
+    def emit_event(self, e):
+        self.events.append(e)
+
+
+def test_findings_event_emitted_on_change(tmp_path):
+    _roots(tmp_path)
+    act = EventACT(); _run(tmp_path, act=act)
+    assert len(act.events) == 1 and act.events[0].kind == "curator.findings"
+    assert act.events[0].payload["count"] == 4
+    act2 = EventACT(); _run(tmp_path, act=act2)
+    assert act2.events == []  # nothing changed
+
+
+def test_fingerprint_ignores_volatile_detail(tmp_path):
+    a = cscan.Finding("overlap", ["x", "y"], ["/a", "/b"], "descriptions overlap 55%")
+    b = cscan.Finding("overlap", ["x", "y"], ["/a", "/b"], "descriptions overlap 61%")
+    assert a.fingerprint == b.fingerprint
+
+
+def test_a_b_a_does_not_refile(tmp_path):
+    own, plug = _roots(tmp_path)
+    _run(tmp_path, "--file")
+    extra = skill(own, "e", "extra", None)
+    _, _, act_b = _run(tmp_path, "--file")
+    assert len(act_b.created) == 1
+    extra.unlink(); extra.parent.rmdir()
+    _, _, act_a = _run(tmp_path, "--file")
+    assert act_a.created == []  # back to the first set: already filed once
+
+
+def test_repo_is_absolute_and_nothing_filed_without_affected_files(tmp_path):
+    _roots(tmp_path)
+    _, _, act = _run(tmp_path, "--file")
+    assert act.created[0].repo == str(tmp_path)  # Navigator keys repos by absolute path
+    other = tmp_path / "elsewhere"; skill(other, "q", "lonely", None)
+    notes, act2 = Notes(), ACT()
+    main(["run", "--file"], own_roots=[other], plugin_roots=[], root=tmp_path / "out2", act=act2, notifier=notes,
+         repo_root=tmp_path / "own", base_sha=lambda: "abc", local_prefixes=(str(tmp_path) + "/",))
+    assert act2.created == []  # its only finding is outside the skills repo: nothing to build there
+
+
+def test_no_base_sha_no_filing(tmp_path):
+    _roots(tmp_path)
+    notes, act = Notes(), ACT()
+    main(["run", "--file"], own_roots=[tmp_path / "own"], plugin_roots=[tmp_path / "plugins"], root=tmp_path / "out",
+         act=act, notifier=notes, repo_root=tmp_path, base_sha=lambda: "", local_prefixes=(str(tmp_path) + "/",))
+    assert act.created == [] and any("not filed" in s for s in notes.sent)
+
+
+def test_write_errors_exit_2_with_one_line(tmp_path, monkeypatch):
+    _roots(tmp_path)
+    (tmp_path / "out").mkdir(); (tmp_path / "out" / "state.json").write_text("[]")  # parses, not a dict
+    rc, notes, _ = _run(tmp_path)
+    assert rc == 1  # a non-dict state is just ignored
+    def boom(*a, **k):
+        raise PermissionError("ro")
+    monkeypatch.setattr(Path, "write_text", boom)
+    rc, notes, _ = _run(tmp_path)
+    assert rc == 2 and len(notes.sent) == 1 and "Curator: run failed" in notes.sent[0]
+
+
+def test_identical_installed_copy_not_double_counted_in_overlap(tmp_path):
+    own, plug = tmp_path / "own", tmp_path / "plugins"
+    skill(own, "a", "alpha", "Audit a change with a cold reviewer before a merge")
+    skill(own, "b", "beta", "Audit a change with a fresh cold reviewer before a merge")
+    skill(plug, "pkg/a", "alpha", "Audit a change with a cold reviewer before a merge")  # identical copy
+    overlaps = [f for f in cscan.find(cscan.scan([own], [plug])) if f.kind == "overlap"]
+    assert len(overlaps) == 1

@@ -14,6 +14,7 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 
+from navigator.contracts.event import Event
 from navigator.contracts.proposal import Proposal, compute_origin_hash
 from navigator.curator import scan as cscan
 
@@ -35,10 +36,10 @@ def build_proposal(findings: list[cscan.Finding], repo_root: Path, base_sha: str
     intent = "consolidate skills: " + ",".join(sorted(f.fingerprint for f in findings))
     return Proposal(
         origin="curator",
-        proposal_origin_hash=compute_origin_hash("calwbot-skills", intent, affected, "curator", None),
+        proposal_origin_hash=compute_origin_hash(str(repo_root), intent, affected, "curator", None),
         title=f"Skill consolidation: {len(findings)} findings",
         rationale="The curator scanned the skills and found:\n" + "\n".join(lines),
-        repo="calwbot-skills", base_commit_sha=base_sha,
+        repo=str(repo_root), base_commit_sha=base_sha,  # Navigator keys repos by absolute path
         intended_changes=("Consolidate the skills listed below — merge duplicates/overlaps into one skill, fix or "
                           "remove stale paths, add missing descriptions. Only skills under this repo may be "
                           "edited; installed plugin skills are left as they are. The curator itself never edits "
@@ -50,9 +51,13 @@ def cmd_run(args, *, own_roots, plugin_roots, root: Path, act, notifier, repo_ro
             local_prefixes=cscan.LOCAL_PREFIXES) -> int:
     try:
         found = cscan.find(cscan.scan(own_roots, plugin_roots), local_prefixes)
-    except Exception as e:
+        return _record(args, found, root=root, act=act, notifier=notifier, repo_root=repo_root, base_sha=base_sha)
+    except Exception as e:  # one line, never a traceback (and never exit 1, which means "findings")
         notifier.send(f"Curator: run failed ({type(e).__name__})")
         return 2
+
+
+def _record(args, found, *, root: Path, act, notifier, repo_root: Path, base_sha) -> int:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     run_dir = root / stamp
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -61,26 +66,43 @@ def cmd_run(args, *, own_roots, plugin_roots, root: Path, act, notifier, repo_ro
         state = json.loads(state_path.read_text())
     except (OSError, ValueError):
         state = {}
+    if not isinstance(state, dict):
+        state = {}
     fps = sorted(f.fingerprint for f in found)
     changed = fps != state.get("last", [])
-    filed = None
-    if found and "--file" in args and fps != state.get("filed", []):
-        try:
-            filed = act.create_proposal(build_proposal(found, repo_root, base_sha())).id
-            state["filed"] = fps
-        except Exception as e:
-            notifier.send(f"Curator: filing failed ({type(e).__name__})")
+    filed_sets = [x for x in state.get("filed_sets", []) if isinstance(x, list)]
+    filed, note = None, ""
+    if found and "--file" in args and fps not in filed_sets:
+        sha = base_sha()
+        prop = build_proposal(found, repo_root, sha)
+        if not sha:
+            note = "; not filed (can't read the skills repo's HEAD)"
+        elif not prop.affected_files:
+            note = "; not filed (none of these skills are in the skills repo)"
+        else:
+            try:
+                filed = act.create_proposal(prop).id
+                filed_sets = (filed_sets + [fps])[-50:]
+                state["filed_sets"] = filed_sets
+            except Exception as e:
+                note = f"; filing failed ({type(e).__name__})"
     (run_dir / "report.json").write_text(json.dumps(
-        {"findings": [asdict(f) | {"paths": f.paths} for f in found], "filed": filed}, indent=1, default=str))
+        {"findings": [asdict(f) for f in found], "filed": filed}, indent=1, default=str))
     state["last"] = fps
     state_path.write_text(json.dumps(state))
-    if found and (changed or filed):
-        kinds = {}
+    if found and (changed or filed or note):
+        kinds: dict[str, int] = {}
         for f in found:
             kinds[f.kind] = kinds.get(f.kind, 0) + 1
         summary = ", ".join(f"{n} {k}" for k, n in sorted(kinds.items()))
-        notifier.send(f"Curator: {len(found)} findings ({summary})" + (f"; filed {filed}" if filed else "")
+        notifier.send(f"Curator: {len(found)} findings ({summary})" + (f"; filed {filed}" if filed else "") + note
                       + f" — {run_dir / 'report.json'}")
+    if changed and hasattr(act, "emit_event"):
+        try:
+            act.emit_event(Event(kind="curator.findings", payload={
+                "count": len(found), "fingerprints": fps, "report": str(run_dir / "report.json"), "filed": filed}))
+        except Exception:
+            pass  # the report and Telegram line already carry it
     return 1 if found else 0
 
 
