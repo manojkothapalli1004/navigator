@@ -17,10 +17,19 @@ CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"  # no 0/O, 1/I/L: read off a p
 CODE_LEN = 6
 TTL_S = 3600
 MAX_SUMMARY = 2000
+DECLINE_COOLDOWN_S = 600  # a declined action can't raise a fresh card for 10 minutes
 
 
 class CardError(Exception):
     pass
+
+
+class Declined(CardError):
+    """The operator declined this exact action recently: no new card (2026-11-02 polish)."""
+
+    def __init__(self, minutes_ago: int):
+        super().__init__(f"declined {minutes_ago} min ago")
+        self.minutes_ago = minutes_ago
 
 
 def _action(tool_name: str, tool_input: dict) -> dict:
@@ -107,10 +116,15 @@ class Cards:
             # a truncated card could hide the gated part, and the retry could never match it
             raise CardError("too long")
         fp = fingerprint(tool_name, tool_input, cwd)
-        for card in reversed(self._cards):
-            if card["fingerprint"] == fp and card["state"] == "pending" and self._live(card):
-                return dict(card), False
         now = self.clock()
+        for card in reversed(self._cards):
+            if card["fingerprint"] != fp:
+                continue
+            if card["state"] == "declined" and now - card.get("decided", 0) < DECLINE_COOLDOWN_S:
+                # no retry-until-yes pop-ups; a clock stepping back reads as "just now", never negative
+                raise Declined(max(0, int((now - card["decided"]) // 60)))
+            if card["state"] == "pending" and self._live(card):
+                return dict(card), False
         codes = {c["code"] for c in self._cards}
         code = "".join(secrets.choice(CODE_ALPHABET) for _ in range(CODE_LEN))
         while code in codes:

@@ -36,6 +36,7 @@ class Engine:
         self._task: asyncio.Task | None = None
         self._turn_task: asyncio.Task | None = None
         self._cancelled = False
+        self._cancel_via: str | None = None
         self.busy = False
         self.terminal = False  # the operator joined from the terminal (C5)
 
@@ -70,11 +71,13 @@ class Engine:
         window reconnects and re-reads /history."""
         return id(q) in self._dropped
 
-    def cancel(self) -> bool:
-        """Stop the running turn (the operator's Stop button); False when nothing runs."""
+    def cancel(self, via: str | None = None) -> bool:
+        """Stop the running turn (the operator's Stop button / Telegram /stop); False when nothing
+        runs. via="telegram": the bot already answered "Stopped.", so no second Telegram reply."""
         if self._turn_task is None or self._turn_task.done():
             return False
         self._cancelled = True
+        self._cancel_via = via
         self._turn_task.cancel()
         return True
 
@@ -140,9 +143,10 @@ class Engine:
         except Exception as e:  # a Telegram hiccup never breaks a turn
             _log.warning("conductor.telegram_reply_failed: %s", type(e).__name__)
 
-    def _error(self, user: dict, detail: str) -> None:
+    def _error(self, user: dict, detail: str, reply: bool = True) -> None:
         self._append({"kind": "status", "state": "error", "msg_id": user["id"], "detail": detail})
-        self._reply(user, f"Stopped: {detail}")
+        if reply:
+            self._reply(user, f"Stopped: {detail}")
 
     def _append(self, entry: dict) -> dict:
         entry = self.store.append(entry)
@@ -195,7 +199,7 @@ class Engine:
             self._append({"kind": "status", "state": "running", "msg_id": msg_id})
             parts: list[str] = []
             prompt = f"[{user.get('source', 'web')}] {user['text']}"
-            self._cancelled = False
+            self._cancelled, self._cancel_via = False, None
 
             def emit(ev: dict) -> None:
                 if ev.get("type") == "delta":
@@ -213,7 +217,7 @@ class Engine:
             except asyncio.CancelledError:
                 if not self._cancelled:
                     raise  # the engine itself is stopping
-                self._error(user, "cancelled by operator")
+                self._error(user, "cancelled by operator", reply=self._cancel_via != "telegram")
                 return
             except asyncio.TimeoutError:
                 self._error(user, f"timed out after {self.turn_timeout_s:.0f}s; the turn was stopped")

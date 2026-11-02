@@ -86,7 +86,13 @@ def build_app(engine: Engine, manage_engine: bool = False, cards=None) -> Starle
         return JSONResponse({"imported": engine.terminal_left(entries)})
 
     async def cancel(req: Request):
-        return JSONResponse({"cancelled": engine.cancel()})
+        try:
+            body = await req.json()
+        except ValueError:
+            body = None
+        via = body.get("via") if isinstance(body, dict) else None
+        # via="telegram": Telegram's /stop (the bot answers it); anything else = no via, unchanged
+        return JSONResponse({"cancelled": engine.cancel(via="telegram" if via == "telegram" else None)})
 
     def _public(card: dict) -> dict:
         return {k: v for k, v in card.items() if k != "fingerprint"}

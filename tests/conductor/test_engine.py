@@ -345,3 +345,36 @@ async def test_turn_after_dead_terminal_clears_flag(tmp_path):
     notes = [e["text"] for e in eng.store.history() if e["kind"] == "note"]
     assert "Terminal session ended without saying goodbye; its turns aren't in this history." in notes
     assert eng.terminal is False and _status(eng.store, m["id"])[-1] == "done"
+
+
+# --- 2026-11-02 polish: one "Stopped" on Telegram after /stop ---
+
+@aio
+async def test_telegram_cancel_sends_no_second_reply(tmp_path):
+    sent = []; gate = asyncio.Event()
+    eng = _reng(tmp_path, FakeRunner(gate), sent); await eng.start()
+    m = eng.submit("aa", "telegram"); await asyncio.sleep(0.05)
+    assert eng.cancel(via="telegram") is True  # the bot already answered "Stopped."
+    gate.set(); await _drain(eng); await eng.stop()
+    assert sent == [] and _status(eng.store, m["id"])[-1] == "error"
+    assert any(e.get("detail") == "cancelled by operator" for e in eng.store.history() if e.get("msg_id") == m["id"])
+
+
+@aio
+async def test_web_cancel_of_telegram_turn_still_replies(tmp_path):
+    sent = []; gate = asyncio.Event()
+    eng = _reng(tmp_path, FakeRunner(gate), sent); await eng.start()
+    eng.submit("aa", "telegram"); await asyncio.sleep(0.05)
+    assert eng.cancel() is True  # no via (the web's Stop button): unchanged
+    gate.set(); await _drain(eng); await eng.stop()
+    assert sent == ["Stopped: cancelled by operator"]
+
+
+@aio
+async def test_telegram_cancel_flag_does_not_leak_to_next_turn(tmp_path):
+    sent = []; gate = asyncio.Event()
+    eng = _reng(tmp_path, FakeRunner(gate, fail={"bb": "boom"}), sent); await eng.start()
+    eng.submit("aa", "telegram"); await asyncio.sleep(0.05)
+    eng.cancel(via="telegram"); gate.set()
+    eng.submit("bb", "telegram"); await _drain(eng); await eng.stop()
+    assert sent == ["Stopped: RuntimeError: sdk exploded"]  # a real error after a /stop still replies
