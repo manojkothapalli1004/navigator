@@ -64,3 +64,17 @@ def test_missing_file_and_bad_lines(tmp_path):
     p = tmp_path / "s.jsonl"
     _w(p, "not json", _user("ok"), '{"type": "user", "message"')
     assert transcript.read_since(p, 0) == [{"kind": "user", "text": "ok"}]
+
+
+def test_terminal_command_output_never_imported(tmp_path):
+    # review 2026-11-01: `! cat .env` in the terminal is recorded as user text; it must not reach
+    # the web history (or anything else the conductor shows)
+    import json as _json
+    from navigator.conductor import transcript as t
+    p = tmp_path / "s.jsonl"
+    rows = ["<bash-input>cat .env</bash-input>", "<bash-stdout>TOKEN=abc</bash-stdout><bash-stderr></bash-stderr>",
+            "<local-command-stdout>x</local-command-stdout>", "<command-name>/model</command-name>",
+            "<task-notification>agent done</task-notification>", "  <bash-stdout>SECRET</bash-stdout>",
+            "what did we build?"]
+    p.write_text("".join(_json.dumps({"type": "user", "message": {"content": r}}) + "\n" for r in rows))
+    assert t.read_since(p, 0) == [{"kind": "user", "text": "what did we build?"}]

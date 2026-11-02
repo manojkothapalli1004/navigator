@@ -77,6 +77,8 @@ def _bash_reason(command: str) -> str | None:
             return r
         if prog == "launchctl" and nxt in LAUNCHCTL_GATED:
             return f"launchctl {nxt} installs or removes a service"
+        if prog == "claude":
+            return "starts another Claude, which runs outside this conversation's approval gate"
         if prog == "gh":
             return "gh talks to GitHub (git stays local)"
         if prog == "navigator" and nxt in NAVIGATOR_GATED:
