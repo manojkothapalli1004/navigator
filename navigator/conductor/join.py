@@ -23,6 +23,14 @@ WAITING = "The chat service is answering — waiting for it to finish (Ctrl-C to
 DOWN = "Chat service not running — this terminal session won't show in the web history."
 
 
+MAX_ENTRIES, MAX_TEXT = 500, 20000  # the conductor's /terminal limits
+
+
+def _clip(text: str) -> str:
+    # one over-long reply must not make the conductor reject the whole import
+    return text if len(text) <= MAX_TEXT else text[:MAX_TEXT - 1] + "…"
+
+
 def socket_poster(socket: Path = SOCKET) -> Callable[[dict], dict]:
     import httpx
 
@@ -38,8 +46,7 @@ def socket_poster(socket: Path = SOCKET) -> Callable[[dict], dict]:
 def join(root: Path = ROOT, socket: Path = SOCKET, run=subprocess.call, post=None, out=sys.stdout,
          home: Path | None = None) -> int:
     import httpx
-    sid = Store(root).session_id
-    if not sid:
+    if not Store(root).session_id:
         print(NO_SESSION, file=out)
         return 1
     post = post or socket_poster(socket)
@@ -53,6 +60,11 @@ def join(root: Path = ROOT, socket: Path = SOCKET, run=subprocess.call, post=Non
             except KeyboardInterrupt:
                 return 130
         try:
+            # read under the lock: a turn we waited out may have had to start a fresh session
+            sid = Store(root).session_id
+            if not sid:
+                print(NO_SESSION, file=out)
+                return 1
             try:
                 post({"state": "joined"})
                 reachable = True
@@ -66,7 +78,9 @@ def join(root: Path = ROOT, socket: Path = SOCKET, run=subprocess.call, post=Non
             finally:
                 if reachable:
                     try:
-                        post({"state": "left", "entries": transcript.read_since(path, offset)[-500:]})
+                        entries = [{**e, "text": _clip(e["text"])}
+                                   for e in transcript.read_since(path, offset)[-MAX_ENTRIES:]]
+                        post({"state": "left", "entries": entries})
                     except (httpx.HTTPError, OSError):
                         print(DOWN, file=out, flush=True)
         finally:

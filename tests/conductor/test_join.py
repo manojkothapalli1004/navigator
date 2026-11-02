@@ -126,6 +126,35 @@ def test_left_posted_even_if_claude_crashes(tmp_path):
         fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
 
+def test_long_entry_truncated_not_rejected(tmp_path):
+    # cold audit: one >20000-char reply made the server 422 the whole import
+    root, home, path = _setup(tmp_path)
+    post = Poster()
+
+    def run(argv, cwd):
+        _append(path, {"type": "assistant", "message": {"content": [{"type": "text", "text": "x" * 25000}]}})
+        return 0
+    _join(root, home, run, post=post)
+    entries = post.calls[-1]["entries"]
+    assert len(entries) == 1 and len(entries[0]["text"]) <= 20000 and entries[0]["text"].endswith("…")
+
+
+def test_session_id_read_after_waiting_for_lock(tmp_path):
+    # cold audit: a turn we waited out may have started a fresh session
+    root, home, _ = _setup(tmp_path)
+    fh = open(root / "turn.lock", "w")
+    fcntl.flock(fh, fcntl.LOCK_EX)
+
+    def turn_finishes_with_new_session():
+        time.sleep(0.2)
+        Store(root).set_session_id("sess-new")
+        fcntl.flock(fh, fcntl.LOCK_UN); fh.close()
+    threading.Thread(target=turn_finishes_with_new_session).start()
+    seen = []
+    _join(root, home, lambda argv, cwd: seen.append(argv) or 0)
+    assert seen == [["claude", "--resume", "sess-new"]]
+
+
 def test_returns_claude_exit_code(tmp_path):
     root, home, _ = _setup(tmp_path)
     assert _join(root, home, lambda argv, cwd: 3) == 3
