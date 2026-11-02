@@ -1,5 +1,6 @@
 """python -m navigator.conductor serve [--socket PATH] [--root DIR]
-python -m navigator.conductor cards | approve CODE | decline CODE   (the terminal's approval window)"""
+python -m navigator.conductor cards | approve CODE | decline CODE   (the terminal's approval window)
+python -m navigator.conductor join   (open Claude in this terminal on the shared conversation)"""
 from __future__ import annotations
 
 import asyncio
@@ -38,6 +39,9 @@ async def cards_cmd(argv: list[str], client: httpx.AsyncClient, out) -> int:
 
 def main(argv=None) -> int:
     argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ["join"]:
+        from navigator.conductor.join import join
+        return join(ROOT, SOCKET)
     if argv and argv[0] in ("cards", "approve", "decline"):
         async def run() -> int:
             transport = httpx.AsyncHTTPTransport(uds=str(SOCKET))

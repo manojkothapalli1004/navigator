@@ -30,7 +30,7 @@ _PROTECTED_TEXT = re.compile(
 # the conversation must never reach its own approval channels (approve its own card, read or
 # forge cards.json, restart the conductor to reload a forged file)
 _CONDUCTOR_TEXT = re.compile(r"navigator\.conductor|conductor\.sock|logs/conductor|com\.calwbot\.conductor"
-                             r"|api/v1/chat|cards\.json")
+                             r"|api/v1/chat|cards\.json|tools/chat\.sh")
 _TRADER = re.compile(r"(^|[\s/'\"=:])trader(/|\s|$)")
 _SPLIT = re.compile(r"[\s;&|(){}<>`$]+")
 _REVISION = re.compile(r"^(HEAD|@)([~^]\d*)+$|^[0-9a-f]{7,40}$")
