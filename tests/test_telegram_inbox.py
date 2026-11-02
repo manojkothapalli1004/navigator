@@ -653,3 +653,26 @@ def test_poll_once_still_uses_no_long_poll_and_the_client_timeout(tmp_path):
     assert timeouts[0] == inbox.client.timeout.as_dict()
     assert [l["text"] for l in _inbox_lines(tmp_path)] == ["/merge", "hello"]
     assert _offset(tmp_path) == "3"
+
+
+# ---- C3 card buttons: a tap on Approve/Reject arrives as a callback_query ----
+
+def _tap(uid, data, chat=CHAT, sender=None, chat_type="private"):
+    return {"update_id": uid, "callback_query": {
+        "id": f"cq{uid}", "data": data, "from": {"id": int(chat if sender is None else sender)},
+        "message": {"message_id": 77, "date": EPOCH, "chat": {"id": int(chat), "type": chat_type}}}}
+
+
+def test_card_button_tap_becomes_ok_code(tmp_path):
+    inbox = _inbox(tmp_path, [_tap(5, "card:approve:ABC234"), _tap(6, "card:decline:XYZ789")])
+    got = inbox.poll_updates(0)
+    assert [(u, m["text"]) for u, m in got] == [(5, "ok ABC234"), (6, "no XYZ789")]
+    assert got[0][1]["callback_query_id"] == "cq5" and got[0][1]["card_message_id"] == 77
+    assert got[0][1]["date"] == NOW  # the tap is now, not when the card was sent
+
+
+def test_card_button_tap_from_someone_else_or_odd_data_ignored(tmp_path):
+    inbox = _inbox(tmp_path, [_tap(5, "card:approve:ABC234", sender=999),
+                              _tap(6, "card:approve:ABC234", chat=999),
+                              _tap(7, "card:approve:abc; rm -rf"), _tap(8, "merge all")])
+    assert inbox.poll_updates(0) == []

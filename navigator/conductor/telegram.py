@@ -26,7 +26,13 @@ def load_creds(env_path: Path = ENV) -> tuple[str, str] | None:
 
 def card_text(card: dict) -> str:
     return (f"Approval needed\n{card['summary']}\nwhy: {card['reason']}\n"
-            f"Reply  ok {card['code']}  to run it, or  no {card['code']}. Expires in 60 min.")
+            f"Tap Approve or Reject (or reply  ok {card['code']}  /  no {card['code']}). Expires in 60 min.")
+
+
+def buttons(card: dict) -> dict:
+    # a tap arrives as a callback_query; the Telegram reader turns it into "ok CODE" / "no CODE"
+    return {"inline_keyboard": [[{"text": "Approve", "callback_data": f"card:approve:{card['code']}"},
+                                 {"text": "Reject", "callback_data": f"card:decline:{card['code']}"}]]}
 
 
 def send_card(card: dict, creds: tuple[str, str] | None, post=httpx.post) -> bool:
@@ -35,7 +41,8 @@ def send_card(card: dict, creds: tuple[str, str] | None, post=httpx.post) -> boo
     tok, chat = creds
     try:
         r = post(f"https://api.telegram.org/bot{tok}/sendMessage",
-                 json={"chat_id": chat, "text": card_text(card)[:4000]}, timeout=15)
+                 json={"chat_id": chat, "text": card_text(card)[:4000], "reply_markup": buttons(card)},
+                 timeout=15)
         return bool(r.json().get("ok"))
     except Exception as e:  # the URL holds the token: log the class name only
         _log.warning("conductor.telegram_send_failed: %s", type(e).__name__)
