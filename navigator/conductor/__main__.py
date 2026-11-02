@@ -37,8 +37,31 @@ async def cards_cmd(argv: list[str], client: httpx.AsyncClient, out) -> int:
     return 0
 
 
+async def autopilot_cmd(argv: list[str], client: httpx.AsyncClient, out) -> int:
+    """autopilot on | off | status | quiet-ok — the terminal's switch (same as the chat words)."""
+    action = (argv[1] if len(argv) > 1 else "status").replace("-", "_")
+    r = await client.post("/autopilot", json={"action": action, "via": "terminal"})
+    body = r.json()
+    if r.status_code != 200:
+        print(f"autopilot: {body.get('error')}", file=out)
+        return 1
+    print(f"autopilot {'on' if body['on'] else 'off'} — {body['consecutive']}/{body['max_consecutive']} in a row, "
+          f"{body['today']}/{body['max_per_day']} today; plan: {body['plan']}", file=out)
+    return 0
+
+
 def main(argv=None) -> int:
     argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ["autopilot"]:
+        async def run_ap() -> int:
+            transport = httpx.AsyncHTTPTransport(uds=str(SOCKET))
+            async with httpx.AsyncClient(transport=transport, base_url="http://conductor") as client:
+                return await autopilot_cmd(argv, client, sys.stdout)
+        try:
+            return asyncio.run(run_ap())
+        except (httpx.ConnectError, FileNotFoundError):
+            print("conductor not running", file=sys.stderr)
+            return 1
     if argv[:1] == ["join"]:
         from navigator.conductor.join import join
         return join(ROOT, SOCKET)

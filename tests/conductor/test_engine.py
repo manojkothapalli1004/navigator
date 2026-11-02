@@ -378,3 +378,137 @@ async def test_telegram_cancel_flag_does_not_leak_to_next_turn(tmp_path):
     eng.cancel(via="telegram"); gate.set()
     eng.submit("bb", "telegram"); await _drain(eng); await eng.stop()
     assert sent == ["Stopped: RuntimeError: sdk exploded"]  # a real error after a /stop still replies
+
+
+# --- 2026-11-02 autopilot wiring ---
+
+from datetime import datetime as _dt  # noqa: E402
+from zoneinfo import ZoneInfo as _Z  # noqa: E402
+from navigator.conductor.autopilot import Autopilot  # noqa: E402
+
+
+def _apeng(tmp_path, runner, sent=None, cards_pending=lambda: False, plan="- [ ] item one\n- [ ] item two\n"):
+    (tmp_path / "plan.md").write_text(plan)
+    ap = Autopilot(tmp_path / "ap.json", tmp_path / "plan.md",
+                   clock=lambda: _dt(2026, 11, 2, 12, 0, tzinfo=_Z("America/New_York")))
+    sent = [] if sent is None else sent
+    eng = Engine(Store(tmp_path / "c"), runner, lock_path=tmp_path / "c" / "turn.lock", reply=sent.append,
+                 autopilot=ap, cards_pending=cards_pending)
+    return eng, ap, sent
+
+
+@aio
+async def test_autopilot_off_queues_nothing(tmp_path):
+    r = FakeRunner(); eng, ap, sent = _apeng(tmp_path, r); await eng.start()
+    eng.submit("hello", "web"); await _drain(eng); await eng.stop()
+    assert len(r.calls) == 1
+
+
+@aio
+async def test_autopilot_continues_and_is_labeled(tmp_path):
+    r = FakeRunner(); eng, ap, sent = _apeng(tmp_path, r); ap.set(True); await eng.start()
+    eng.submit("hello", "web"); await _drain(eng)
+    ap.set(False); await _drain(eng); await eng.stop()
+    users = [e for e in eng.store.history() if e["kind"] == "user"]
+    assert users[1]["source"] == "autopilot" and "item one" in users[1]["text"]
+    assert r.raw[1].startswith("[autopilot] ")
+    assert any(s.startswith("Autopilot: ") for s in sent)  # labeled on Telegram
+
+
+@aio
+async def test_autopilot_not_after_error(tmp_path):
+    r = FakeRunner(fail={"boom it": "boom"}); eng, ap, sent = _apeng(tmp_path, r); ap.set(True); await eng.start()
+    eng.submit("boom it", "web"); await _drain(eng); await eng.stop()
+    assert [e["source"] for e in eng.store.history() if e["kind"] == "user"] == ["web"]
+
+
+@aio
+async def test_stop_turns_autopilot_off(tmp_path):
+    gate = asyncio.Event(); r = FakeRunner(gate); eng, ap, sent = _apeng(tmp_path, r); ap.set(True)
+    await eng.start(); eng.submit("aa", "web"); await asyncio.sleep(0.05)
+    eng.cancel(); gate.set(); await _drain(eng); await eng.stop()
+    assert ap.on is False
+    assert [e["source"] for e in eng.store.history() if e["kind"] == "user"] == ["web"]
+
+
+@aio
+async def test_autopilot_waits_for_pending_card(tmp_path):
+    r = FakeRunner(); eng, ap, sent = _apeng(tmp_path, r, cards_pending=lambda: True); ap.set(True)
+    await eng.start(); eng.submit("hello", "web"); await _drain(eng); await eng.stop()
+    assert len(r.calls) == 1 and ap.on is True
+
+
+@aio
+async def test_cap_turns_off_with_one_telegram_line(tmp_path):
+    r = FakeRunner(); eng, ap, sent = _apeng(tmp_path, r); ap.set(True); await eng.start()
+    eng.submit("hello", "web")
+    for _ in range(40):
+        await _drain(eng)
+    await eng.stop()
+    sources = [e["source"] for e in eng.store.history() if e["kind"] == "user"]
+    assert sources.count("autopilot") == 6 and ap.on is False
+    offs = [s for s in sent if "turned off" in s]
+    assert len(offs) == 1 and "6 autopilot turns in a row" in offs[0]
+
+
+@aio
+async def test_autopilot_words_never_become_turns(tmp_path):
+    r = FakeRunner(); eng, ap, sent = _apeng(tmp_path, r); await eng.start()
+    eng.submit("autopilot on", "telegram"); await _drain(eng)
+    assert ap.on is True and r.calls == []
+    eng.submit("autopilot status", "web"); eng.submit("autopilot off", "web"); await _drain(eng); await eng.stop()
+    assert ap.on is False and r.calls == []
+    notes = [e["text"] for e in eng.store.history() if e["kind"] == "note"]
+    assert any(n.startswith("Autopilot on") for n in notes) and any(n.startswith("Autopilot off") for n in notes)
+    assert any("Autopilot on" in s for s in sent)  # the Telegram sender hears its own toggle
+
+
+@aio
+async def test_internal_sources_cannot_toggle(tmp_path):
+    r = FakeRunner(); eng, ap, sent = _apeng(tmp_path, r); await eng.start()
+    eng.submit("autopilot on", "approval", internal=True); await _drain(eng); await eng.stop()
+    assert ap.on is False  # only the operator's windows switch it
+
+
+# --- autopilot cold-audit fixes ---
+
+@aio
+async def test_autopilot_never_piles_up_behind_operator_messages(tmp_path):
+    gate = asyncio.Event(); r = FakeRunner(gate); eng, ap, sent = _apeng(tmp_path, r); ap.set(True)
+    await eng.start()
+    eng.submit("m1", "web"); await asyncio.sleep(0.05)
+    eng.submit("m2", "web")          # queued while m1 runs
+    gate.set(); await _drain(eng)
+    ap.set(False); await _drain(eng); await eng.stop()
+    hist = eng.store.history(limit=1000)
+    users = [e for e in hist if e["kind"] == "user"]
+    assert [u["source"] for u in users][:3] == ["web", "web", "autopilot"]  # m1 done -> m2 first
+    ap_ids = {u["id"] for u in users if u["source"] == "autopilot"}
+    ahead = [e["detail"] for e in hist if e.get("state") == "queued" and e.get("msg_id") in ap_ids]
+    # queued from the finishing turn itself (counts as 1, busy) and never behind another waiting turn (would be 2+)
+    assert ahead and all(a == 1 for a in ahead)
+
+
+@aio
+async def test_autopilot_turn_rechecks_when_it_starts(tmp_path):
+    r = FakeRunner(); eng, ap, sent = _apeng(tmp_path, r); ap.set(True)
+    lock = open(tmp_path / "c" / "turn.lock", "w")
+    fcntl.flock(lock, fcntl.LOCK_EX)  # e.g. the operator is in the terminal: the turn waits on the lock
+    await eng.start()
+    eng._after_turn("done")           # queues one autopilot turn, which blocks on the lock
+    await asyncio.sleep(0.05)
+    ap.set(False)                      # switched off while it waits
+    fcntl.flock(lock, fcntl.LOCK_UN); lock.close()
+    await _drain(eng); await eng.stop()
+    assert not any(p.startswith("[autopilot]") for p in getattr(r, "raw", []))
+    skipped = [e for e in eng.store.history() if e.get("state") == "skipped"]
+    assert skipped and "autopilot is off" in skipped[0]["detail"]
+
+
+@aio
+async def test_autopilot_turn_gets_no_terminal_notice(tmp_path):
+    r = FakeRunner(); eng, ap, sent = _apeng(tmp_path, r); ap.set(True)
+    eng.terminal = True
+    await eng.start(); eng.submit(ap.prompt("x"), "autopilot", internal=True, reply_via="telegram")
+    eng.terminal = False; ap.set(False); await _drain(eng); await eng.stop()
+    assert not any("You're in the terminal" in s for s in sent)

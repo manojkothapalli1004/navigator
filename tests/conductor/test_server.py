@@ -63,7 +63,7 @@ def test_history_endpoint(tmp_path):
 def test_status(tmp_path):
     async def go(c, eng):
         s = (await c.get("/status")).json()
-        assert s == {"busy": False, "queue_len": 0, "session_id_set": False, "terminal": False}
+        assert s == {"busy": False, "queue_len": 0, "session_id_set": False, "terminal": False, "autopilot": None}
     asyncio.run(_with_app(tmp_path, go))
 
 
@@ -288,4 +288,25 @@ def test_refused_connection_closes_quietly(monkeypatch):
         assert t.closed
         proto.data_received(b"GET /cards HTTP/1.1\r\nHost: c\r\n\r\n")  # must not be parsed or raise
         proto.connection_lost(None)  # asyncio calls this after close(): must not raise
+    asyncio.run(go())
+
+
+def test_autopilot_endpoint_and_status(tmp_path):
+    from navigator.conductor.autopilot import Autopilot
+    (tmp_path / "plan.md").write_text("- [ ] x\n")
+    ap = Autopilot(tmp_path / "ap.json", tmp_path / "plan.md")
+    eng = Engine(Store(tmp_path / "c"), _runner, autopilot=ap)
+    app = server.build_app(eng)
+
+    async def go():
+        await eng.start()
+        try:
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://c") as c:
+                assert (await c.get("/status")).json()["autopilot"]["on"] is False
+                r = await c.post("/autopilot", json={"action": "on", "via": "terminal"})
+                assert r.status_code == 200 and r.json()["on"] is True
+                assert (await c.post("/autopilot", json={"action": "fly"})).status_code == 422
+                assert (await c.post("/autopilot", json={"action": "off", "via": "terminal"})).json()["on"] is False
+        finally:
+            await eng.stop()
     asyncio.run(go())
