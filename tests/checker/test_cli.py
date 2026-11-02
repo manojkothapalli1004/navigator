@@ -35,10 +35,10 @@ def snap(page, scroll=412):
              "combos": [], "interactions": {}}, f"/tmp/{page.strip('/') or 'home'}.png")
 
 
-def run(tmp_path, browse_fn, *args, act=None, notes=None):
+def run(tmp_path, browse_fn, *args, act=None, notes=None, wait_fn=lambda: None):
     notes = notes or Notes()
     code = cli.main(["run", *args], browse_fn=browse_fn, act=act or FakeACT(), notifier=notes,
-                    root=tmp_path, base_sha=lambda: "abc")
+                    root=tmp_path, base_sha=lambda: "abc", wait_fn=wait_fn)
     return code, notes
 
 
@@ -125,3 +125,28 @@ def test_preview_export_never_touches_the_live_index(monkeypatch, tmp_path):
     git_cmds = [c for c in calls if c and c[0] == "git"]
     assert git_cmds and all(c[1] not in ("reset", "checkout", "add") for c in git_cmds)
     assert any(c[1] == "archive" for c in git_cmds)
+
+
+# ---- 2026-11-02: wait for the live rebuild instead of reporting the old build as faults ----
+
+def test_live_run_skipped_when_console_not_rebuilt(tmp_path):
+    browsed = []
+    code, notes = run(tmp_path, lambda base, out: browsed.append(base) or [snap("/trader", scroll=900)],
+                      wait_fn=lambda: "the live console hasn't been rebuilt since the last frontend merge (waited 15 min)")
+    assert code == 0 and browsed == []
+    assert notes.sent == ["Site checker: skipped — the live console hasn't been rebuilt since the last "
+                          "frontend merge (waited 15 min)"]
+    assert not (tmp_path / "store.json").exists()  # nothing recorded, nothing cleared
+
+
+def test_live_run_waits_then_checks(tmp_path):
+    calls = []
+    code, notes = run(tmp_path, lambda base, out: [snap("/")], wait_fn=lambda: calls.append(1))
+    assert code == 0 and calls == [1]
+
+
+def test_other_base_never_waits(tmp_path):
+    def boom():
+        raise AssertionError("waited for a non-live base")
+    code, _ = run(tmp_path, lambda base, out: [snap("/")], "--base", "http://127.0.0.1:3001", wait_fn=boom)
+    assert code == 0
