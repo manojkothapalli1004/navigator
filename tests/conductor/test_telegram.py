@@ -127,3 +127,18 @@ def test_sender_survives_errors_and_no_creds():
     s.text("a"); s.text("b")
     assert done.wait(3)
     telegram.Sender(None).text("x")  # no creds: silently nothing
+
+
+def test_split_lone_surrogate_and_tiny_limit_terminate():
+    assert "".join(telegram.split_text("a\udcffb" * 10, limit=4)) == "a\udcffb" * 10
+    assert "".join(telegram.split_text("\U0001F600x", limit=1)) == "\U0001F600x"  # must not loop
+
+
+def test_card_text_cut_by_utf16_units():
+    sent = []
+
+    class R:
+        def json(self): return {"ok": True}
+    card = {"code": "ABC234", "summary": "\U0001F600" * 3000, "reason": "r"}
+    telegram.send_card(card, ("T", "1"), post=lambda url, **kw: sent.append(kw["json"]["text"]) or R())
+    assert _units(sent[0]) <= 4000

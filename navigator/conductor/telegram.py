@@ -41,7 +41,7 @@ def send_card(card: dict, creds: tuple[str, str] | None, post=httpx.post) -> boo
     tok, chat = creds
     try:
         r = post(f"https://api.telegram.org/bot{tok}/sendMessage",
-                 json={"chat_id": chat, "text": card_text(card)[:4000], "reply_markup": buttons(card)},
+                 json={"chat_id": chat, "text": split_text(card_text(card))[0], "reply_markup": buttons(card)},
                  timeout=15)
         return bool(r.json().get("ok"))
     except Exception as e:  # the URL holds the token: log the class name only
@@ -51,7 +51,7 @@ def send_card(card: dict, creds: tuple[str, str] | None, post=httpx.post) -> boo
 
 def _units(s: str) -> int:
     # Telegram's 4096 limit counts UTF-16 code units: an emoji is 2
-    return len(s.encode("utf-16-le")) // 2
+    return len(s.encode("utf-16-le", "surrogatepass")) // 2  # a stray surrogate must not raise
 
 
 def _fit(text: str, limit: int) -> int:
@@ -68,7 +68,7 @@ def split_text(text: str, limit: int = 4000) -> list[str]:
     """Telegram caps a message at 4096 UTF-16 units: cut at a newline in the back half, else hard."""
     parts: list[str] = []
     while _units(text) > limit:
-        end = _fit(text, limit)
+        end = max(_fit(text, limit), 1)  # always make progress, even with a tiny limit
         cut = text.rfind("\n", 0, end + 1)
         if cut > end // 2:
             parts.append(text[:cut])
