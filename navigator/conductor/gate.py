@@ -250,7 +250,7 @@ def make_hook(cards, on_card):
     """C3: a gated call raises an approval card instead of a plain deny; the one identical call
     after the operator approves it is allowed (explicitly, so no permission prompt can stop it)."""
     async def hook(input_data: dict, tool_use_id, context) -> dict:
-        from navigator.conductor.cards import CardError
+        from navigator.conductor.cards import CardError, Declined
         name, tool_input = input_data.get("tool_name", ""), input_data.get("tool_input") or {}
         cwd = str(input_data.get("cwd") or "/Users/Manoj/calwbot")
         reason = gated_reason(name, tool_input, Path(cwd))
@@ -263,6 +263,9 @@ def make_hook(cards, on_card):
                                            "permissionDecisionReason": f"approval card {used['code']} approved"}}
         try:
             card, new = cards.raise_card(name, tool_input, reason, cwd=cwd)
+        except Declined as d:
+            hint = (f"the operator declined this exact action {d.minutes_ago} min ago — don't retry, "
+                    "ask in chat")
         except CardError:
             hint = TOO_LONG_HINT
         else:

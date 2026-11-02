@@ -242,3 +242,75 @@ def test_bash_card_matches_on_command_not_label(tmp_path):
 def test_bash_cannot_start_another_claude(cmd):
     # review: a second claude runs under the operator's settings, outside this conversation's gate
     assert gate.gated_reason("Bash", {"command": cmd}, gate.Path("/Users/Manoj/calwbot")) is not None
+
+
+# ---- 2026-11-02 polish: a declined action can't pop a fresh card for 10 minutes ----
+
+from navigator.conductor.cards import DECLINE_COOLDOWN_S, Declined  # noqa: E402
+
+
+def test_decline_cooldown_constant():
+    assert DECLINE_COOLDOWN_S == 600
+
+
+def test_declined_retry_denied_without_card(tmp_path):
+    clock = Clock(); c = _cards(tmp_path, clock)
+    card, _ = c.raise_card("Bash", PUSH, "git push")
+    c.decline(card["code"], "web")
+    clock.t += 120
+    with pytest.raises(Declined) as e:
+        c.raise_card("Bash", {**PUSH, "description": "try again"}, "git push")
+    assert e.value.minutes_ago == 2
+    assert len(c.pending()) == 0 and len(c._cards) == 1  # no new card
+
+
+def test_cooldown_only_for_same_action_and_declines(tmp_path):
+    clock = Clock(); c = _cards(tmp_path, clock)
+    a, _ = c.raise_card("Bash", PUSH, "git push")
+    c.decline(a["code"], "web")
+    other, new = c.raise_card("Bash", {"command": "git push origin dev"}, "git push")
+    assert new  # a different action still gets a card
+    b, _ = c.raise_card("Bash", {"command": "git merge x"}, "git merge")
+    c.approve(b["code"], "web"); c.consume("Bash", {"command": "git merge x"})
+    again, new = c.raise_card("Bash", {"command": "git merge x"}, "git merge")
+    assert new  # approved before: no cooldown
+
+
+def test_cooldown_ends_after_10_minutes(tmp_path):
+    clock = Clock(); c = _cards(tmp_path, clock)
+    a, _ = c.raise_card("Bash", PUSH, "git push")
+    c.decline(a["code"], "web")
+    clock.t += 11 * 60
+    _, new = c.raise_card("Bash", PUSH, "git push")
+    assert new
+
+
+def test_expired_not_declined_gets_new_card(tmp_path):
+    clock = Clock(); c = _cards(tmp_path, clock)
+    c.raise_card("Bash", PUSH, "git push")
+    clock.t += 3601  # expired, never decided
+    _, new = c.raise_card("Bash", PUSH, "git push")
+    assert new
+
+
+def test_cooldown_survives_restart(tmp_path):
+    clock = Clock(); c = _cards(tmp_path, clock)
+    a, _ = c.raise_card("Bash", PUSH, "git push")
+    c.decline(a["code"], "telegram")
+    clock.t += 60
+    reloaded = _cards(tmp_path, clock)
+    with pytest.raises(Declined):
+        reloaded.raise_card("Bash", PUSH, "git push")
+
+
+def test_hook_declined_retry_reason_and_no_card(tmp_path):
+    clock = Clock(); c = _cards(tmp_path, clock); seen = []
+    hook = gate.make_hook(c, seen.append)
+    asyncio.run(hook(_hook_input("git push origin main"), "t1", None))
+    c.decline(seen[0]["code"], "web")
+    clock.t += 180
+    out = asyncio.run(hook(_hook_input("git push origin main"), "t2", None))
+    reason = out["hookSpecificOutput"]["permissionDecisionReason"]
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert "the operator declined this exact action 3 min ago — don't retry, ask in chat" in reason
+    assert seen[0]["code"] not in reason and len(seen) == 1  # no new card, code never shown

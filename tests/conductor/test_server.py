@@ -144,6 +144,18 @@ def test_post_cancel_endpoint(tmp_path):
     asyncio.run(_with_app(tmp_path, go))
 
 
+def test_cancel_passes_via(tmp_path):
+    async def go(c, eng):
+        seen = []
+        eng.cancel = lambda via=None: seen.append(via) or False
+        await c.post("/cancel", json={"via": "telegram"})
+        await c.post("/cancel")
+        await c.post("/cancel", json={"via": "fax"})  # unknown -> treated as no via
+        await c.post("/cancel", content=b"not json")
+        assert seen == ["telegram", None, None, None]
+    asyncio.run(_with_app(tmp_path, go))
+
+
 def _cards_app(tmp_path):
     from navigator.conductor.cards import Cards
     cards = Cards(tmp_path / "cards.json")
