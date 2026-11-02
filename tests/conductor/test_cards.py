@@ -303,6 +303,19 @@ def test_cooldown_survives_restart(tmp_path):
         reloaded.raise_card("Bash", PUSH, "git push")
 
 
+def test_cooldown_clock_step_back_and_first_minute(tmp_path):
+    clock = Clock(); c = _cards(tmp_path, clock); seen = []
+    hook = gate.make_hook(c, seen.append)
+    asyncio.run(hook(_hook_input("git push origin main"), "t1", None))
+    c.decline(seen[0]["code"], "web")
+    clock.t += 20
+    reason = asyncio.run(hook(_hook_input("git push origin main"), "t2", None))["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "the operator declined this exact action under a minute ago — don't retry, ask in chat" in reason
+    clock.t -= 300  # the Mac's clock stepped back
+    reason = asyncio.run(hook(_hook_input("git push origin main"), "t3", None))["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "under a minute ago" in reason and "-" not in reason.split("action")[1].split("ago")[0]
+
+
 def test_hook_declined_retry_reason_and_no_card(tmp_path):
     clock = Clock(); c = _cards(tmp_path, clock); seen = []
     hook = gate.make_hook(c, seen.append)

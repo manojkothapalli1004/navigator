@@ -264,8 +264,8 @@ def make_hook(cards, on_card):
         try:
             card, new = cards.raise_card(name, tool_input, reason, cwd=cwd)
         except Declined as d:
-            hint = (f"the operator declined this exact action {d.minutes_ago} min ago — don't retry, "
-                    "ask in chat")
+            ago = f"{d.minutes_ago} min ago" if d.minutes_ago else "under a minute ago"
+            hint = f"the operator declined this exact action {ago} — don't retry, ask in chat"
         except CardError:
             hint = TOO_LONG_HINT
         else:

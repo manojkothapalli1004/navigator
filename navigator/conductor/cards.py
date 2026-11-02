@@ -121,7 +121,8 @@ class Cards:
             if card["fingerprint"] != fp:
                 continue
             if card["state"] == "declined" and now - card.get("decided", 0) < DECLINE_COOLDOWN_S:
-                raise Declined(int((now - card["decided"]) // 60))  # no retry-until-yes pop-ups
+                # no retry-until-yes pop-ups; a clock stepping back reads as "just now", never negative
+                raise Declined(max(0, int((now - card["decided"]) // 60)))
             if card["state"] == "pending" and self._live(card):
                 return dict(card), False
         codes = {c["code"] for c in self._cards}
