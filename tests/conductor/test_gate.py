@@ -76,3 +76,84 @@ def test_bash_gated_review(cmd):
                                   ".claude/hooks/a.sh", "navigator/.claude/agents/x.md"])
 def test_write_gated_review(path):
     assert gated_reason("Write", {"file_path": path}, CWD)
+
+
+# ---- 2026-11-02: read-only looks at ~/.claude/plugins (skill helper files) pass; writes stay gated ----
+
+S = "~/.claude/plugins/cache/claude-plugins-official/superpowers/7.0.0/skills"
+C4_LS = (f"cd /Users/Manoj/calwbot/navigator && git status --short | head -5; git branch --show-current; "
+         f"git worktree list | head; S=/Users/Manoj/.claude/plugins/cache/claude-plugins-official/superpowers/"
+         f"7.0.0/skills; ls $S/executing-plans/scripts $S/subagent-driven-development/scripts")
+
+
+@pytest.mark.parametrize("cmd", [
+    C4_LS,
+    "cat ~/.claude/plugins/x/SKILL.md | head -40",
+    "grep -rn foo ~/.claude/plugins/cache",
+    "find ~/.claude/plugins -name '*.md'",
+    f"ls {S} 2>/dev/null | wc -l",
+    f"sed -n 1,40p {S}/brainstorming/SKILL.md",
+    f"awk '{{print $1}}' {S}/x/SKILL.md | sort | uniq",
+    f"test -d {S} && echo yes",
+])
+def test_plugins_reads_pass(cmd):
+    assert gated_reason("Bash", {"command": cmd}, CWD) is None, cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    "echo x > ~/.claude/plugins/a",
+    "cat a >> ~/.claude/plugins/b",
+    "echo x >| ~/.claude/plugins/a",
+    "ls ~/.claude/plugins &> out.txt",
+    "tee ~/.claude/plugins/a",
+    "cp x ~/.claude/plugins/",
+    "mv ~/.claude/plugins/a b",
+    "rm -rf ~/.claude/plugins/x",
+    "sed -i s/a/b/ ~/.claude/plugins/x",
+    "sed --in-place s/a/b/ ~/.claude/plugins/x",
+    "sed -ni p ~/.claude/plugins/x",
+    "sed 's/a/b/w /tmp/out' ~/.claude/plugins/x",
+    "sed -f evil.sed ~/.claude/plugins/x",
+    "find ~/.claude/plugins -delete",
+    "find ~/.claude/plugins -exec rm {} \\;",
+    "find ~/.claude/plugins -execdir rm {} +",
+    "find ~/.claude/plugins -fprint /tmp/x",
+    "ls ~/.claude/plugins | xargs rm",
+    "bash -c 'ls ~/.claude/plugins'",
+    "python3 ~/.claude/plugins/x.py",
+    "awk '{system(\"rm x\")}' ~/.claude/plugins/x",
+    "awk '{print > \"/tmp/x\"}' ~/.claude/plugins/x",
+    "awk -i inplace '{print}' ~/.claude/plugins/x",
+    "sort -o ~/.claude/plugins/x y",
+    "uniq a ~/.claude/plugins/out",
+    "rg --pre ./evil foo ~/.claude/plugins",
+    "ls ~/.claude/plugins ~/.claude/settings.json",
+    "ls ~/.claude/plugins; git push",
+    "ls ~/.claude/plugins && launchctl kickstart x",
+    "cat ~/.claude/hooks/x",
+    "ls ~/.claude/plugins; cat logs/conductor/cards.json",
+    "ls ~/.claude/plugins\nrm -rf ~/x",
+    "ls ~/.claude/plugins `rm -rf ~/x`",
+    "ls ~/.claude/plugins $(rm -rf ~/x)",
+    "(cd ~/.claude/plugins && rm x)",
+    "cat ~/.claude/plugins/../hooks/x",
+    "PATH=/tmp/evil ls ~/.claude/plugins",
+    "ls ~/.claude/plugins & rm -rf ~/x",
+    "ls ~/.claude/plugins || chmod 777 ~/.claude/plugins",
+    "ls ~/.claude/plugins; git -c core.pager=evil log",
+    "ls ~/.claude/plugins; git checkout x",
+    "ls ~/.claude/plugins; git diff --output=/tmp/x",
+    "ls ~/.claude/plugins; git worktree add x",
+    "ls ~/.claude/plugins; git branch newbranch",
+    "uniq ~/.claude/plugins/a 2",       # a bare '2' is uniq's output file, not a redirect
+    "sort -o 1 ~/.claude/plugins/a",
+    "uniq ~/.claude/plugins/a 2 >/dev/null",  # '2' then a space: stdout redirect, '2' is the output file
+    "ls ~/.claude/plugins x2>/dev/null",
+])
+def test_plugins_writes_and_others_stay_gated(cmd):
+    assert gated_reason("Bash", {"command": cmd}, CWD), cmd
+
+
+@pytest.mark.parametrize("tool", ["Write", "Edit"])
+def test_plugins_file_writes_still_gated(tool):
+    assert gated_reason(tool, {"file_path": str(HOME / ".claude/plugins/x")}, CWD)
