@@ -19,6 +19,7 @@ from navigator.conductor.engine import SOURCES, Engine
 from navigator.conductor.store import Store
 
 MAX_TEXT = 20000
+MAX_TERMINAL_ENTRIES = 500
 KEEPALIVE_S = 15.0
 
 
@@ -64,7 +65,25 @@ def build_app(engine: Engine, manage_engine: bool = False, cards=None) -> Starle
 
     async def status(req: Request):
         return JSONResponse({"busy": engine.busy, "queue_len": engine.queue_len,
-                             "session_id_set": engine.store.session_id is not None})
+                             "session_id_set": engine.store.session_id is not None,
+                             "terminal": engine.terminal})
+
+    async def terminal(req: Request):
+        try:
+            body = await req.json() or {}
+        except ValueError:
+            body = {}
+        state = body.get("state") if isinstance(body, dict) else None
+        if state == "joined":
+            engine.terminal_joined()
+            return JSONResponse({"terminal": True})
+        entries = body.get("entries", []) if state == "left" else None
+        if (not isinstance(entries, list) or len(entries) > MAX_TERMINAL_ENTRIES
+                or not all(isinstance(e, dict) and e.get("kind") in ("user", "assistant")
+                           and isinstance(e.get("text"), str) and len(e["text"]) <= MAX_TEXT for e in entries)):
+            return JSONResponse({"error": "state must be joined, or left with up to 500 user/assistant "
+                                          f"entries of at most {MAX_TEXT} characters"}, status_code=422)
+        return JSONResponse({"imported": engine.terminal_left(entries)})
 
     async def cancel(req: Request):
         return JSONResponse({"cancelled": engine.cancel()})
@@ -110,6 +129,7 @@ def build_app(engine: Engine, manage_engine: bool = False, cards=None) -> Starle
     return Starlette(routes=[Route("/messages", post_message, methods=["POST"]),
                              Route("/history", history), Route("/events", events),
                              Route("/status", status),
+                             Route("/terminal", terminal, methods=["POST"]),
                              Route("/cancel", cancel, methods=["POST"])]
                      + ([Route("/cards", list_cards),
                          Route("/cards/{key}/{action:str}", decide, methods=["POST"])] if cards else []),

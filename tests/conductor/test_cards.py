@@ -177,6 +177,9 @@ def test_hook_allows_after_approval_once(tmp_path):
     "cat logs/conductor/cards.json",
     "launchctl kickstart -k gui/504/com.calwbot.conductor",
     "pkill -f com.calwbot.conductor",
+    "python -m navigator.conductor join",  # C5: would block on the conductor's own turn lock
+    "bash /Users/Manoj/calwbot/logs/navigator/tools/chat.sh",
+    "bash logs/navigator/tools/chat.sh",
 ])
 def test_bash_cannot_reach_its_own_approvals(cmd):
     assert gate.gated_reason("Bash", {"command": cmd}, gate.Path("/Users/Manoj/calwbot")) is not None

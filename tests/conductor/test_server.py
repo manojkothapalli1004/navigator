@@ -63,7 +63,7 @@ def test_history_endpoint(tmp_path):
 def test_status(tmp_path):
     async def go(c, eng):
         s = (await c.get("/status")).json()
-        assert s == {"busy": False, "queue_len": 0, "session_id_set": False}
+        assert s == {"busy": False, "queue_len": 0, "session_id_set": False, "terminal": False}
     asyncio.run(_with_app(tmp_path, go))
 
 
@@ -228,3 +228,21 @@ def test_socket_refuses_the_conversations_own_tools():
             "  print('refused', type(e).__name__)\n")
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=30).stdout
     assert out.startswith("refused"), out
+
+
+def test_terminal_endpoint_and_status(tmp_path):
+    async def go(c, eng):
+        assert (await c.get("/status")).json()["terminal"] is False
+        assert (await c.post("/terminal", json={"state": "joined"})).json() == {"terminal": True}
+        assert (await c.get("/status")).json()["terminal"] is True
+        r = await c.post("/terminal", json={"state": "left", "entries": [{"kind": "user", "text": "hi"}]})
+        assert r.status_code == 200 and r.json() == {"imported": 1}
+        assert (await c.get("/status")).json()["terminal"] is False
+        bad = [{"state": "left", "entries": [{"kind": "note", "text": "x"}]},
+               {"state": "left", "entries": [{"kind": "user", "text": "x"}] * 501},
+               {"state": "left", "entries": [{"kind": "user", "text": "x" * 20001}]},
+               {"state": "left", "entries": "nope"},
+               {"state": "maybe"}]
+        for b in bad:
+            assert (await c.post("/terminal", json=b)).status_code == 422, b
+    asyncio.run(_with_app(tmp_path, go))

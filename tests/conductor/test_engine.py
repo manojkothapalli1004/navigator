@@ -290,3 +290,58 @@ async def test_reply_failure_does_not_break_turn(tmp_path):
     eng = Engine(Store(tmp_path / "c"), FakeRunner(), lock_path=tmp_path / "c" / "turn.lock", reply=bad)
     await eng.start(); m = eng.submit("hello", "telegram"); await _drain(eng); await eng.stop()
     assert _status(eng.store, m["id"])[-1] == "done"
+
+
+# --- C5: the terminal joins the shared conversation ---
+
+@aio
+async def test_terminal_join_left_imports_entries(tmp_path):
+    r = FakeRunner(); eng = _eng(tmp_path, r); await eng.start()
+    eng.terminal_joined()
+    assert eng.terminal is True
+    n = eng.terminal_left([{"kind": "user", "text": "hi"}, {"kind": "assistant", "text": "hello"}])
+    await _drain(eng); await eng.stop()
+    h = eng.store.history()
+    assert n == 2 and eng.terminal is False
+    assert h[0]["kind"] == "note" and h[0]["text"] == "Operator is in the terminal — replies wait until they leave."
+    assert (h[1]["kind"], h[1]["text"], h[1]["source"], h[1]["imported"]) == ("user", "hi", "terminal", True)
+    assert (h[2]["kind"], h[2]["text"], h[2]["imported"]) == ("assistant", "hello", True)
+    assert h[3]["text"] == "Operator left the terminal."
+    assert r.calls == []  # imported entries are never run as turns
+
+
+@aio
+async def test_message_while_terminal_queued_detail(tmp_path):
+    eng = _eng(tmp_path, FakeRunner()); await eng.start()
+    eng.terminal_joined()
+    with open(tmp_path / "c" / "turn.lock", "w") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)  # the terminal holds the lock
+        m = eng.submit("aa", "web"); await asyncio.sleep(0.05)
+        q = [e for e in eng.store.history() if e.get("msg_id") == m["id"] and e.get("state") == "queued"]
+        assert q[0]["detail"] == "waiting for the terminal session to end"
+        assert _status(eng.store, m["id"]) == ["queued"]
+        eng.terminal_left([])
+    await _drain(eng); await eng.stop()
+    assert _status(eng.store, m["id"])[-1] == "done"
+
+
+@aio
+async def test_telegram_message_while_terminal_notified(tmp_path):
+    sent = []; eng = _reng(tmp_path, FakeRunner(), sent); await eng.start()
+    eng.terminal_joined()
+    with open(tmp_path / "c" / "turn.lock", "w") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        eng.submit("aa", "telegram"); await asyncio.sleep(0.05)
+        assert sent == ["You're in the terminal — I'll answer this when you leave it."]
+        eng.terminal_left([])
+    await _drain(eng); await eng.stop()
+
+
+@aio
+async def test_turn_after_dead_terminal_clears_flag(tmp_path):
+    eng = _eng(tmp_path, FakeRunner()); await eng.start()
+    eng.terminal_joined()  # ...and the terminal died: no terminal_left, lock already free
+    m = eng.submit("aa", "web"); await _drain(eng); await eng.stop()
+    notes = [e["text"] for e in eng.store.history() if e["kind"] == "note"]
+    assert "Terminal session ended without saying goodbye; its turns aren't in this history." in notes
+    assert eng.terminal is False and _status(eng.store, m["id"])[-1] == "done"
