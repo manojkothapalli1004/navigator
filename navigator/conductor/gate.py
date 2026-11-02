@@ -30,101 +30,97 @@ _PROTECTED_TEXT = re.compile(
 # ~/.claude/plugins holds skill helper files the conversation reads a lot: a command that only
 # READS there passes (2026-11-02); anything that could write, run code or hide a command stays gated
 _PLUGINS_TEXT = re.compile(r"\.claude/plugins")
-_READ_PROGRAMS = {"ls", "cat", "head", "tail", "grep", "rg", "find", "wc", "file", "stat", "sed", "awk",
-                  "sort", "uniq", "cut", "echo", "test", "[", "cd", "pwd", "true", "git"}
-_FIND_WRITES = {"-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fprint0", "-fprintf", "-fls"}
-_SEPARATORS = {";", "&&", "||", "|", "&"}
-_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
-_STDERR_ONLY = re.compile(r"(?<=\s)2>(/dev/null|&1)(?=\s|$|[;&|])")
-_SED_WRITE = re.compile(r"[wWe](\s|$|;|\})")
+# Allowlist, not blocklist (cold audit 2026-11-02 found 12 ways past a blocklist): every word must
+# be a plain literal or single-quoted (bash never expands either), every program a bare name from
+# this list, and every option one we know only reads.
+_READ_PROGRAMS = {"ls", "cat", "head", "tail", "grep", "find", "wc", "stat", "sed", "cut", "echo",
+                  "test", "cd", "pwd", "true", "git"}
+_SEPARATORS = {";", "&&", "||", "|"}
+_PLAIN = re.compile(r"^[A-Za-z0-9_./~:=,+%@-]+$")  # no $ { } * ? [ ] \ " ! ` ( ) < > & | ;
+_STDERR_ONLY = re.compile(r"(?<=\s)2>(/dev/null|&1)(?=\s|$|;|\|)")
+_VAR_USE = re.compile(r"^\$([A-Za-z_][A-Za-z0-9_]*)(/[A-Za-z0-9_./~:=,+%@-]*)?$")
+_ASSIGN_LITERAL = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=([A-Za-z0-9_./~:,+%@][A-Za-z0-9_./~:=,+%@-]*)$")
+_FIND_OK = {"-name", "-iname", "-path", "-ipath", "-type", "-maxdepth", "-mindepth", "-size", "-mtime",
+            "-mmin", "-newer", "-print", "-print0", "-o", "-a", "-not", "-and", "-or", "-L", "-H"}
+_SED_SCRIPT = re.compile(r"^(\d+(,\d+)?|\$|\d+,\$)?p$")  # print lines: 1,40p  5p  $p  10,$p
+_GIT_READ = {"status", "log", "show", "diff", "rev-parse"}
+_GIT_ARG_BAD = re.compile(r"^--(output|ext-diff|textconv|git-dir|work-tree|exec|upload-pack|config)")
 
 
-def _git_read_only(args: list[str]) -> bool:
-    """Read-only git subcommands (already ungated elsewhere); never `-c` (it can set a pager/hook)."""
-    i = 0
-    while i < len(args) and args[i].startswith("-"):
-        if args[i] != "-C":
-            return False
-        i += 2
-    sub, rest = (args[i], args[i + 1:]) if i < len(args) else ("", [])
-    if sub in ("status", "log", "show", "diff", "rev-parse"):
-        return not any(a.startswith(("--output", "-o")) or a == "--ext-diff" for a in rest)
-    if sub == "branch":
-        return all(a in ("--show-current", "--list", "-a", "-r", "-v", "-vv") for a in rest)
-    if sub == "worktree":
-        return rest[:1] == ["list"]
-    return False
+def _word(tok: str) -> str | None:
+    """The literal value of a lexed word, or None when bash could expand or reinterpret it."""
+    if len(tok) >= 2 and tok[0] == tok[-1] == "'":
+        inner = tok[1:-1]
+        return inner if "'" not in inner else None
+    return tok if _PLAIN.match(tok) else None
 
 
 def _args_read_only(prog: str, args: list[str]) -> bool:
     if prog == "git":
-        return _git_read_only(args)
+        if not args or args[0].startswith("-"):
+            return False  # no -C / -c / --git-dir: only the workspace's own repo, its own config
+        sub, rest = args[0], args[1:]
+        if any(_GIT_ARG_BAD.match(a) for a in rest):
+            return False
+        if sub in _GIT_READ:
+            return True
+        if sub == "branch":
+            return all(a in ("--show-current", "--list", "-a", "-r", "-v", "-vv") for a in rest)
+        return sub == "worktree" and rest == ["list"]
     if prog == "find":
-        return not any(a in _FIND_WRITES for a in args)
+        return all(not a.startswith("-") or a in _FIND_OK for a in args)
     if prog == "sed":
-        scripts, expect_script = [], False
-        for a in args:
-            if expect_script:
-                scripts.append(a); expect_script = False
-            elif a in ("-e", "--expression"):
-                expect_script = True
-            elif a.startswith("--in-place") or a in ("-f", "--file") or a.startswith("--file="):
-                return False
-            elif a.startswith("-") and not a.startswith("--") and ("i" in a[1:] or "f" in a[1:]):
-                return False  # -i, -ni, -Ei, -f… : in-place edit or script from a file
-        if not scripts:
-            scripts = [a for a in args if not a.startswith("-")][:1]
-        return not any(_SED_WRITE.search(s) for s in scripts)  # w/W write files, e runs commands
-    if prog == "awk":
-        if any(a in ("-i", "--include") or a.startswith("--include=") for a in args):
-            return False  # gawk -i inplace edits files
-        return not any(re.search(r"system|getline|\||>", a) for a in args)
-    if prog == "sort":
-        return not any(a == "-o" or a.startswith("-o") and not a.startswith("--") or a.startswith("--output")
-                       for a in args)
-    if prog == "uniq":
-        return len([a for a in args if not a.startswith("-")]) <= 1  # a 2nd name is the output file
-    if prog == "rg":
-        return not any(a.startswith("--pre") for a in args)  # --pre runs a program on every file
-    return True
+        flags = [a for a in args if a.startswith("-")]
+        plain = [a for a in args if not a.startswith("-")]
+        return set(flags) <= {"-n", "-E"} and bool(plain) and bool(_SED_SCRIPT.match(plain[0]))
+    return True  # ls cat head tail grep wc stat cut echo test cd pwd true: no write/exec options
 
 
 def _plugins_read_only(command: str) -> bool:
-    """True only if every piece of the command is a known read-only program with no output
-    redirection, command substitution, subshell or path escape. Unsure = False (gated)."""
+    """True only if every piece of the command is a known read-only program with only literal
+    words, no output redirection, substitution, subshell or path escape. Unsure = False."""
     import shlex
-    if "\n" in command or "`" in command or "$(" in command or ".." in command:
+    if "\n" in command or "`" in command or "\\" in command or ".." in command:
         return False
-    # stderr-only redirects, written exactly as 2>/dev/null or 2>&1 (no space after a separate
-    # word '2'), are the only redirections allowed; everything else with < > stays a hard stop
+    # stderr-only redirects, written exactly as ' 2>/dev/null' or ' 2>&1', are the only ones allowed
     command = _STDERR_ONLY.sub(" ", command)
-    lex = shlex.shlex(command, posix=True, punctuation_chars=True)
+    lex = shlex.shlex(command, posix=False, punctuation_chars=True)
     lex.commenters = ""  # '#' is literal: a comment can't hide the rest of the command from us
+    lex.wordchars += "~-./=,+%@:$*?[]{}!"  # keep these inside one word, then judge the whole word
     try:
         tokens = list(lex)
     except ValueError:
         return False
     pieces: list[list[str]] = [[]]
+    known: dict[str, str] = {}  # NAME=literal set earlier in this command (S=/path; ls $S/x)
     for tok in tokens:
         if tok in _SEPARATORS:
+            if len(pieces[-1]) == 1 and (a := _ASSIGN_LITERAL.match(pieces[-1][0])):
+                known[a.group(1)] = a.group(2)  # usable by the pieces after this one
             pieces.append([])
-        elif tok == "<":
-            continue  # reading a file in is fine
-        elif any(c in tok for c in "<>()&|;"):
-            return False  # any other redirection, subshell or operator we don't know
-        else:
-            pieces[-1].append(tok)
+            continue
+        if m := _VAR_USE.match(tok):
+            if m.group(1) not in known:
+                return False  # $X we didn't see set to a plain literal: could be anything
+            tok = known[m.group(1)] + (m.group(2) or "")
+        word = _word(tok)
+        if word is None:
+            return False  # redirection, operator, expansion, double quotes, glob…
+        pieces[-1].append(word)
     for words in pieces:
         if not words:
             continue
-        if _ASSIGN.match(words[0]):
-            if any(not _ASSIGN.match(w) for w in words):
-                return False  # VAR=x prog … could swap PATH or the program's behaviour
+        if len(words) == 1 and (a := _ASSIGN_LITERAL.match(words[0])):
+            known[a.group(1)] = a.group(2)  # a plain literal not starting with '-': expands to itself
             continue
-        prog = words[0].rsplit("/", 1)[-1]
-        if prog not in _READ_PROGRAMS or not _args_read_only(prog, words[1:]):
+        prog = words[0]
+        if "/" in prog or "=" in prog or prog not in _READ_PROGRAMS:
+            return False  # a path (./ls, /tmp/x/cat), VAR=x, or a program we don't know
+        if not _args_read_only(prog, words[1:]):
             return False
     return True
+
+
 # the conversation must never reach its own approval channels (approve its own card, read or
 # forge cards.json, restart the conductor to reload a forged file)
 _CONDUCTOR_TEXT = re.compile(r"navigator\.conductor|conductor\.sock|logs/conductor|com\.calwbot\.conductor"

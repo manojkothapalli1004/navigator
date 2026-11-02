@@ -93,8 +93,9 @@ C4_LS = (f"cd /Users/Manoj/calwbot/navigator && git status --short | head -5; gi
     "find ~/.claude/plugins -name '*.md'",
     f"ls {S} 2>/dev/null | wc -l",
     f"sed -n 1,40p {S}/brainstorming/SKILL.md",
-    f"awk '{{print $1}}' {S}/x/SKILL.md | sort | uniq",
     f"test -d {S} && echo yes",
+    f"grep -rn 'def main' {S} | head -20",
+    f"find {S} -maxdepth 2 -type f -name 'SKILL.md'",
 ])
 def test_plugins_reads_pass(cmd):
     assert gated_reason("Bash", {"command": cmd}, CWD) is None, cmd
@@ -149,6 +150,35 @@ def test_plugins_reads_pass(cmd):
     "sort -o 1 ~/.claude/plugins/a",
     "uniq ~/.claude/plugins/a 2 >/dev/null",  # '2' then a space: stdout redirect, '2' is the output file
     "ls ~/.claude/plugins x2>/dev/null",
+    # cold audit 2026-11-02 bypasses (P = a plugin hook script Claude Code runs later)
+    "sort -uo ~/.claude/plugins/m/hooks/run.sh /tmp/payload",
+    "sort --out=~/.claude/plugins/m/hooks/run.sh /tmp/payload",
+    "sort --compress-program=/tmp/evil -S 1K ~/.claude/plugins/m/hooks/run.sh",
+    "cat /tmp/payload | uniq - ~/.claude/plugins/m/hooks/run.sh",
+    "O=-o; sort $O ~/.claude/plugins/m/hooks/run.sh /tmp/payload",
+    "X=-delete; find ~/.claude/plugins/m $X",
+    "find ~/.claude/plugins -name x $'\\x2dexec' /tmp/evil {} +",
+    "sed $'\\x2di.bak' s/a/b/ ~/.claude/plugins/m/hooks/run.sh",
+    "find ~/.claude/plugins/m -dele{t,t}e",
+    "sed -e'1w ~/.claude/plugins/m/hooks/run.sh' /tmp/payload",
+    "sed -n $'1w ~/.claude/plugins/m/hooks/run.sh' x",
+    "sed 's/a/b/w~/.claude/plugins/m/hooks/run.sh' x",
+    "sed -n --expression='1w /tmp/x' ~/.claude/plugins/m/x",
+    "/tmp/evil/cat ~/.claude/plugins/m/x",
+    "./ls ~/.claude/plugins",
+    "awk -f /tmp/e.awk ~/.claude/plugins/m/x",
+    "rg --hostname-bin=/tmp/evil --hyperlink-format=default x ~/.claude/plugins",
+    "cd ~/.claude/plugins/m && file -C -m hooks",
+    "ls ~/.claude/plugins/*",
+    "cat \"~/.claude/plugins/$X\"",
+    "ls ~/.claude/plugins; git -C /tmp/evilrepo status",
+    "ls ~/.claude/plugins; git --git-dir=/tmp/x log",
+    "find ~/.claude/plugins -newer x -fls /tmp/out",
+    "S=-delete; find ~/.claude/plugins $S",          # a variable may never carry an option
+    "ls ~/.claude/plugins $UNSET",                    # never-set variable: could be anything
+    "S=/tmp; ls ~/.claude/plugins ${S}",
+    "S=x ls ~/.claude/plugins",                       # VAR=x prog
+    "ls ~/.claude/plugins; S=/tmp/evil; $S/cat x",    # program from a variable
 ])
 def test_plugins_writes_and_others_stay_gated(cmd):
     assert gated_reason("Bash", {"command": cmd}, CWD), cmd
