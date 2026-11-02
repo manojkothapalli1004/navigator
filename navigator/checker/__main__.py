@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from navigator.checker import browse as browse_mod
+from navigator.checker import livebuild
 from navigator.checker import preview
 from navigator.checker.checks import Finding, check_page
 from navigator.checker.filing import ACT_REPO, file_findings
@@ -67,8 +68,14 @@ def _message(triage, filed: list[str], run_dir: Path) -> str:
     return "\n".join(lines)
 
 
-def cmd_run(args, *, browse_fn, act, notifier, root: Path, base_sha) -> int:
+def cmd_run(args, *, browse_fn, act, notifier, root: Path, base_sha, wait_fn=None) -> int:
     base = args[args.index("--base") + 1] if "--base" in args else LIVE
+    if base == LIVE:
+        # the scheduled run fires right after a merge: don't report the not-yet-rebuilt console
+        skip = (wait_fn or livebuild.wait_for_live_build)()
+        if skip:
+            notifier.send(f"Site checker: skipped — {skip}")
+            return 0
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     run_dir = root / stamp
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -148,7 +155,8 @@ def _verify_on_preview(source, work: Path, out: Path, wanted: dict) -> int:
     return 0 if ok else 1
 
 
-def main(argv=None, *, browse_fn=None, act=None, notifier=None, root: Path = ROOT, base_sha=_act_base_sha) -> int:
+def main(argv=None, *, browse_fn=None, act=None, notifier=None, root: Path = ROOT, base_sha=_act_base_sha,
+         wait_fn=None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     if not argv or argv[0] not in ("run", "verify"):
         print(__doc__, file=sys.stderr)
@@ -162,7 +170,7 @@ def main(argv=None, *, browse_fn=None, act=None, notifier=None, root: Path = ROO
         from navigator.observability.notify import make_notifier
         notifier = make_notifier()
     return cmd_run(argv[1:], browse_fn=browse_fn or browse_mod.browse, act=act, notifier=notifier,
-                   root=root, base_sha=base_sha)
+                   root=root, base_sha=base_sha, wait_fn=wait_fn)
 
 
 if __name__ == "__main__":
