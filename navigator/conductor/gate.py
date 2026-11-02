@@ -33,8 +33,11 @@ _PLUGINS_TEXT = re.compile(r"\.claude/plugins")
 # Allowlist, not blocklist (cold audit 2026-11-02 found 12 ways past a blocklist): every word must
 # be a plain literal or single-quoted (bash never expands either), every program a bare name from
 # this list, and every option one we know only reads.
+# no cd: the shell's cwd persists between Bash calls, so an allowed `cd ~/.claude/plugins/x` would
+# aim the NEXT, plugin-free command (echo x > SKILL.md) there unseen (terminal review 1). Without
+# cd, git also always runs in the conversation's own workspace repo with its own config.
 _READ_PROGRAMS = {"ls", "cat", "head", "tail", "grep", "find", "wc", "stat", "sed", "cut", "echo",
-                  "test", "cd", "pwd", "true", "git"}
+                  "test", "pwd", "true", "git"}
 _SEPARATORS = {";", "&&", "||", "|"}
 _PLAIN = re.compile(r"^[A-Za-z0-9_./~:=,+%@-]+$")  # no $ { } * ? [ ] \ " ! ` ( ) < > & | ;
 _STDERR_ONLY = re.compile(r"(?<=\s)2>(/dev/null|&1)(?=\s|$|;|\|)")
@@ -84,12 +87,20 @@ def _plugins_read_only(command: str) -> bool:
         return False
     # stderr-only redirects, written exactly as ' 2>/dev/null' or ' 2>&1', are the only ones allowed
     command = _STDERR_ONLY.sub(" ", command)
-    lex = shlex.shlex(command, posix=False, punctuation_chars=True)
-    lex.commenters = ""  # '#' is literal: a comment can't hide the rest of the command from us
-    lex.wordchars += "~-./=,+%@:$*?[]{}!"  # keep these inside one word, then judge the whole word
+    def lexed(posix: bool) -> list[str]:
+        lex = shlex.shlex(command, posix=posix, punctuation_chars=True)
+        lex.commenters = ""  # '#' is literal: a comment can't hide the rest of the command from us
+        lex.wordchars += "~-./=,+%@:$*?[]{}!"  # keep these inside one word, then judge the whole word
+        return list(lex)
     try:
-        tokens = list(lex)
+        tokens, joined = lexed(False), lexed(True)
     except ValueError:
+        return False
+    # bash glues adjacent words into ONE argument ('1p'';w FILE' is the single sed script
+    # "1p;w FILE"); posix=True does the same. If the two readings differ, bash would see words
+    # we never checked (terminal review 1, 2026-11-02)
+    unquoted = [t[1:-1] if len(t) >= 2 and t[0] == t[-1] == "'" else t for t in tokens]
+    if unquoted != joined:
         return False
     pieces: list[list[str]] = [[]]
     known: dict[str, str] = {}  # NAME=literal set earlier in this command (S=/path; ls $S/x)
@@ -107,9 +118,6 @@ def _plugins_read_only(command: str) -> bool:
         if word is None:
             return False  # redirection, operator, expansion, double quotes, glob…
         pieces[-1].append(word)
-    progs = {w[0] for w in pieces if w}
-    if "cd" in progs and "git" in progs:
-        return False  # git in a repo we cd'd into runs that repo's own config (diff drivers, pager…)
     for words in pieces:
         if not words:
             continue

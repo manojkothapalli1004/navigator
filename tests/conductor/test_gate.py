@@ -182,6 +182,16 @@ def test_plugins_reads_pass(cmd):
     "S=x ls ~/.claude/plugins",                       # VAR=x prog
     "ls ~/.claude/plugins; S=/tmp/evil; $S/cat x",    # program from a variable
     "cd /tmp/evilrepo && git log -p; ls ~/.claude/plugins",  # another repo's config can run programs
+    # terminal review 1 (2026-11-02): bash glues adjacent quoted/unquoted words into ONE argument
+    "sed -n '1p'';w ~/.claude/plugins/pwned' some.txt",
+    "ca't' ~/.claude/plugins/x",
+    "c'at' ~/.claude/plugins/x",
+    "ls ~/.claude/plugins; git log '--out''put=x'",
+    "ls 'a''b' ~/.claude/plugins",
+    "ls ~/.claude/plugins/'x'y",
+    # cwd persists between Bash calls: an allowed cd would aim the next, unchecked command there
+    "cd ~/.claude/plugins/x",
+    "cd ~/.claude/plugins && ls",
 ])
 def test_plugins_writes_and_others_stay_gated(cmd):
     assert gated_reason("Bash", {"command": cmd}, CWD), cmd
