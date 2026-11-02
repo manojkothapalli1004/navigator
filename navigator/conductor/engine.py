@@ -13,6 +13,7 @@ from navigator.conductor.store import Store
 _log = logging.getLogger(__name__)
 
 SOURCES = ("web", "telegram", "terminal")
+TERMINAL_WAIT = "waiting for the terminal session to end"
 TURN_TIMEOUT_S = 45 * 60  # a stuck turn (tool waiting on input, network stall) must not freeze every window
 TurnRunner = Callable[[str, "str | None", Callable[[dict], None]], Awaitable["str | None"]]
 
@@ -36,6 +37,7 @@ class Engine:
         self._turn_task: asyncio.Task | None = None
         self._cancelled = False
         self.busy = False
+        self.terminal = False  # the operator joined from the terminal (C5)
 
     @property
     def queue_len(self) -> int:
@@ -93,9 +95,27 @@ class Engine:
         user = self._append({"kind": "user", "text": text, "source": source,
                              **({"reply_via": reply_via} if reply_via else {})})
         ahead = self.queue_len + (1 if self.busy else 0)
-        self._append({"kind": "status", "state": "queued", "msg_id": user["id"], "detail": ahead})
+        detail = TERMINAL_WAIT if self.terminal else ahead
+        self._append({"kind": "status", "state": "queued", "msg_id": user["id"], "detail": detail})
+        if self.terminal:
+            self._reply(user, "You're in the terminal — I'll answer this when you leave it.")
         self._pending.put_nowait(user)
         return user
+
+    def terminal_joined(self) -> None:
+        self.terminal = True
+        self._append({"kind": "note", "text": "Operator is in the terminal — replies wait until they leave."})
+
+    def terminal_left(self, entries: list[dict]) -> int:
+        """The terminal session ended: show its exchanges in every window (never run as turns)."""
+        for e in entries:
+            if e["kind"] == "user":
+                self._append({"kind": "user", "text": e["text"], "source": "terminal", "imported": True})
+            else:
+                self._append({"kind": "assistant", "text": e["text"], "imported": True})
+        self._append({"kind": "note", "text": "Operator left the terminal."})
+        self.terminal = False
+        return len(entries)
 
     def on_card(self, card: dict) -> None:
         """A card was raised or changed state: every window sees it; a new one goes to the phone."""
@@ -168,6 +188,10 @@ class Engine:
         msg_id = user["id"]
         with open(self.lock_path, "w") as lock:
             await asyncio.to_thread(fcntl.flock, lock, fcntl.LOCK_EX)  # waits out a terminal turn (C5)
+            if self.terminal:  # we got the lock but the terminal never said it left: it died
+                self.terminal = False
+                self._append({"kind": "note", "text": "Terminal session ended without saying goodbye; "
+                                                      "its turns aren't in this history."})
             self._append({"kind": "status", "state": "running", "msg_id": msg_id})
             parts: list[str] = []
             prompt = f"[{user.get('source', 'web')}] {user['text']}"
