@@ -154,3 +154,75 @@ def test_rebase_keeps_the_exercise_result():
     out = carry_exercise(old, new)
     assert out[-1] == {"argv": "pytest -q", "returncode": 0} and out[0]["suite"] == "exercise"
     assert carry_exercise([{"argv": "x", "returncode": 0}], new) == new
+
+
+# ---- terminal review 1 (2026-11-02): the wiring itself must be tested ----
+
+def test_auto_merge_ok_refuses_a_run_whose_tests_were_not_exercised(monkeypatch):
+    from types import SimpleNamespace
+    from navigator.runtime import executor as ex
+    for name in ("is_audited", "base_on_head"):
+        monkeypatch.setattr(ex, name, lambda *a, **k: True)
+    monkeypatch.setattr(ex, "changed_files_for_run", lambda repo, run: ["pkg/mod.py", "tests/test_mod.py"])
+    monkeypatch.setattr(ex, "repo_config_for", lambda settings, repo: None)
+    monkeypatch.setattr(ex, "classify_for_repo", lambda *a, **k: "A")
+    monkeypatch.setattr(ex, "suite_green", lambda *a, **k: True)
+    act = SimpleNamespace(get_proposal=lambda pid: SimpleNamespace(origin="periodic"))
+    run = SimpleNamespace(proposal_id="p", verification=[{"suite": "exercise", "exercised": False, "returncode": 0}])
+    assert ex.auto_merge_ok(act, run, "/repo", None) is False
+    run.verification = [{"suite": "exercise", "exercised": True, "returncode": 1}]
+    assert ex.auto_merge_ok(act, run, "/repo", None) is True
+
+
+def test_attempt_hands_the_real_base_to_the_exercise_check(tmp_path, monkeypatch):
+    from navigator.config import DEFAULT_ALLOWLIST
+    from navigator.contracts.enums import Role
+    from navigator.runtime.drivers.base import DriverResult
+    from navigator.runtime.phases import run_build_and_verify
+    from navigator.runtime.worktree import create_worktree
+    from navigator.safety.command_runner import CommandResult, CommandRunner
+
+    repo = tmp_path / "repo"; (repo / "tests").mkdir(parents=True); (repo / "pkg").mkdir()
+    _git(repo, "init", "-q"); _git(repo, "config", "user.email", "t@t"); _git(repo, "config", "user.name", "t")
+    (repo / "pkg" / "mod.py").write_text("X = 1\n"); (repo / "tests" / "test_mod.py").write_text("def test_x():\n    pass\n")
+    _git(repo, "add", "-A"); _git(repo, "commit", "-qm", "base")
+    base = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True).stdout.strip()
+
+    class R(CommandRunner):
+        def run(self, argv, cwd, env=None):
+            return CommandResult(0, "1 passed", "")  # no real pytest; the spy below is what matters
+
+    class D:
+        def run_role(self, req):
+            if req.role == Role.builder:
+                return DriverResult(role=Role.builder, file_writes=[("pkg/mod.py", "X = 2\n"),
+                                                                     ("tests/test_mod.py", "def test_x():\n    assert 1\n")])
+            return DriverResult(role=Role.verifier, commands=[["pytest", "-q"]])
+
+    seen = {}
+    monkeypatch.setattr(phases, "_run_exercise_check",
+                        lambda runner, wt, run_dir, changed, res, base: seen.update(base=base, wt=wt))
+    h = create_worktree(repo=repo, base_commit_sha=base, run_id="run-x", worktree_root=tmp_path / "wt")
+    run_build_and_verify(driver=D(), worktree=h, run_id="run-x",
+                         runner=R(allowlist=DEFAULT_ALLOWLIST, worktree_root=tmp_path / "wt"))
+    assert seen, "the exercise check was never called"
+    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=seen["wt"], capture_output=True, text=True).stdout.strip()
+    assert seen["base"] == base and head != base  # the checkpointed HEAD already holds the new code
+
+
+def test_base_is_required():
+    import inspect
+    assert inspect.signature(_run_exercise_check).parameters["base"].default is inspect.Parameter.empty
+
+
+def test_verification_summary_labels_the_exercise_check():
+    from navigator.observability.notify import format_verification
+    out = format_verification([
+        {"argv": "pytest -q -p no:cacheprovider tests/test_mod.py", "returncode": 1, "output_tail": "1 failed",
+         "suite": "exercise", "exercised": True},
+        {"argv": "pytest -q", "returncode": 0, "output_tail": "5 passed"}])
+    assert "exercise check (new tests run against the base): failed as expected" in out
+    assert "1 failed" not in out.splitlines()[1]
+    out2 = format_verification([{"argv": "pytest x", "returncode": 0, "output_tail": "1 passed",
+                                 "suite": "exercise", "exercised": False}])
+    assert "exercise check (new tests run against the base): passed on the base — the tests don't exercise the change" in out2

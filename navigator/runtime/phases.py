@@ -1000,7 +1000,7 @@ def exercise_verdict(rc: int) -> bool | None:
 
 
 def _run_exercise_check(runner, wt: Path, run_dir: Path, changed: list[str], res: PhaseResult,
-                        base: str = "HEAD") -> None:
+                        base: str) -> None:
     """Does the run's new test exercise its change (2026-11-02)? Its changed test files are run
     against the BASE commit (`base`: the builder's edits are already checkpoint-committed by now,
     so HEAD is NOT the base) in a scratch worktree next to the run's. Recorded as

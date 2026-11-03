@@ -74,6 +74,12 @@ def format_verification(log: list[dict]) -> str:
         return "verification: (none recorded)"
     lines = ["verification:"]
     for c in log:
+        if c.get("suite") == "exercise":
+            # the run's new tests on the BASE code: failing there is the good outcome (2026-11-02)
+            verdict = {True: "failed as expected", False: "passed on the base — the tests don't exercise the change",
+                       None: "couldn't tell"}.get(c.get("exercised"), "couldn't tell")
+            lines.append(f"  exercise check (new tests run against the base): {verdict}")
+            continue
         tail = (c.get("output_tail") or "").strip().splitlines()
         # pytest's result line beats trailing stderr noise (uv's venv setup)
         result = next((l for l in reversed(tail) if _RESULT_LINE.search(l)), None)
