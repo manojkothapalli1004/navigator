@@ -25,5 +25,29 @@ def run_recheck(source: Path, fingerprints: list[str], timeout_s: float = RECHEC
         p = subprocess.run(argv, cwd=NAVIGATOR_REPO, capture_output=True, text=True,
                            timeout=timeout_s, env=sealed_verifier_env())
     except subprocess.TimeoutExpired:
-        return 126, f"checker re-check timed out after {timeout_s}s"
+        return 126, f"checker re-check timed out after {timeout_s}s" + _stop_orphaned_preview()
     return p.returncode, p.stdout + p.stderr
+
+
+def _stop_orphaned_preview() -> str:
+    """The timed-out checker was killed, but the `next start` it launched keeps :3001 (2026-11-02).
+    Stop it only when nobody holds the preview lock: if another checker run holds it, its preview
+    is in use and stays. Kills only the port's owner by PID (never a broad pkill; never :3000)."""
+    import fcntl
+    from navigator.checker import preview
+    try:
+        fh = open(preview.LOCK_PATH, "a")
+    except OSError:
+        return ""
+    with fh:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return "; another checker run holds the preview, left it running"
+        try:
+            preview.stop(preview.PREVIEW_PORT)
+        except Exception as e:
+            return f"; could not stop the leftover preview ({type(e).__name__})"
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+    return f"; stopped the leftover preview on :{preview.PREVIEW_PORT}"
