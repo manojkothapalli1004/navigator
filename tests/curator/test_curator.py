@@ -213,3 +213,13 @@ def test_identical_installed_copy_not_double_counted_in_overlap(tmp_path):
     skill(plug, "pkg/a", "alpha", "Audit a change with a cold reviewer before a merge")  # identical copy
     overlaps = [f for f in cscan.find(cscan.scan([own], [plug])) if f.kind == "overlap"]
     assert len(overlaps) == 1
+
+
+def test_empty_roots_are_not_replaced_by_the_live_ones(tmp_path, monkeypatch):
+    # terminal review 1: [] must mean "no roots", never "fall back to the real skill folders"
+    from navigator.curator import __main__ as cm
+    seen = []
+    monkeypatch.setattr(cm.cscan, "scan", lambda own, plug: seen.append((list(own), list(plug))) or [])
+    main(["run"], own_roots=[tmp_path / "x"], plugin_roots=[], root=tmp_path / "o", act=ACT(), notifier=Notes(),
+         repo_root=tmp_path, base_sha=lambda: "a")
+    assert seen == [([tmp_path / "x"], [])]

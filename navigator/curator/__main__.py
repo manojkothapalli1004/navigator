@@ -114,11 +114,13 @@ def main(argv=None, *, own_roots=None, plugin_roots=None, root: Path = ROOT, act
         return 2
     if act is None:
         from navigator.clients.act_client import HTTPACTClient
-        act = HTTPACTClient("http://127.0.0.1:8090")
+        import os
+        act = HTTPACTClient(os.getenv("NAVIGATOR_ACT_BASE_URL") or "http://127.0.0.1:8090")
     if notifier is None:
         from navigator.observability.notify import make_notifier
         notifier = make_notifier()
-    return cmd_run(argv[1:], own_roots=own_roots or OWN_ROOTS, plugin_roots=plugin_roots or PLUGIN_ROOTS,
+    return cmd_run(argv[1:], own_roots=OWN_ROOTS if own_roots is None else own_roots,
+                   plugin_roots=PLUGIN_ROOTS if plugin_roots is None else plugin_roots,
                    root=root, act=act, notifier=notifier, repo_root=repo_root, base_sha=base_sha,
                    local_prefixes=local_prefixes)
 
