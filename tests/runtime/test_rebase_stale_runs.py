@@ -53,7 +53,7 @@ class _Driver:
 
 
 def _setup(tmp_path, builds=DEFAULT_BUILDS, verifies=None, squash=False,
-           extra_base: dict[str, str] | None = None):
+           extra_base: dict[str, str] | None = None, per_tick: int = 100):
     """Two approved proposals A and B, built from one base in a single approval_poll.
     `extra_base` files (name -> content) are written and included in the base commit."""
     repo = tmp_path / "repo"; repo.mkdir()
@@ -66,7 +66,7 @@ def _setup(tmp_path, builds=DEFAULT_BUILDS, verifies=None, squash=False,
         _git(repo, "add", name)
     _git(repo, "commit", "-m", "base")
     s = Settings(mode="execute", worktree_root=str(tmp_path / "wt"),
-                 outcome_path=str(tmp_path / "outcomes.jsonl"))
+                 outcome_path=str(tmp_path / "outcomes.jsonl"), rebase_per_tick=per_tick)
     nav = Navigator(act=FakeACTClient(), orc=FakeORCClient(), driver=_Driver(builds, verifies or {}),
                     runner=CommandRunner(allowlist=s.allowed_commands, worktree_root=tmp_path / "wt"),
                     settings=s, repo=str(repo), lock_path=tmp_path / "nav.lock", squash=squash)
@@ -640,3 +640,51 @@ def test_rebased_sibling_tier_git_failure_never_loses_the_awaiting_review_event(
     assert sb.phase == RunPhase.awaiting_review and sb.base_commit_sha == _head(repo)
     ev = _events(nav, b, "run.awaiting_review")[-1].payload
     assert ev["rebased"] is True and ev["merge_tier"] is None
+
+
+# ---- 2026-11-02: at most one sibling re-verified per tick; a stale run is rebased before it merges ----
+
+THREE = {"A": [("a.py", "A = 1\n")], "B": [("b.py", "B = 1\n")], "C": [("c.py", "C = 1\n")]}
+
+
+def _by_title(nav, title):
+    return next(r for r in nav.act.runs.values() if nav.act.get_proposal(r.proposal_id).title == title)
+
+
+def test_one_sibling_rebased_per_tick_then_the_next(tmp_path):
+    nav, repo, a, b = _setup(tmp_path, builds=THREE, per_tick=1)
+    c = _by_title(nav, "C")
+    _merge(nav, a)
+    head = _head(repo)
+    rebased = [r for r in (nav.act.runs[b.id], nav.act.runs[c.id]) if r.base_commit_sha == head]
+    assert len(rebased) == 1  # only one suite re-run in this tick
+    nav.merge_poll()  # next tick: the other one
+    assert nav.act.runs[b.id].base_commit_sha == head and nav.act.runs[c.id].base_commit_sha == head
+    before = (list(nav.act.runs[b.id].verification), list(nav.act.runs[c.id].verification))
+    sha_b, sha_c = nav.act.runs[b.id].verified_sha, nav.act.runs[c.id].verified_sha
+    nav.merge_poll()  # nothing stale left: nothing re-verified again
+    assert (nav.act.runs[b.id].verified_sha, nav.act.runs[c.id].verified_sha) == (sha_b, sha_c)
+
+
+def test_stale_approved_run_is_rebased_before_it_can_merge(tmp_path):
+    # catch-up off (0 per tick): only the rebase-before-merge path can make it current
+    nav, repo, a, b = _setup(tmp_path, builds=THREE, per_tick=0)
+    c = _by_title(nav, "C")
+    _merge(nav, a)
+    head = _head(repo)
+    assert nav.act.runs[c.id].base_commit_sha != head  # stale, not rebased yet
+    appr = nav.act.list_approvals(target=c.id, gate=ApprovalGate.merge)[0]
+    nav.act.decide_approval(appr.id, ApprovalDecision.approved, actor=ACTOR)  # OK given while stale
+    nav.merge_poll()
+    sc = nav.act.runs[c.id]
+    assert sc.base_commit_sha == head and _head(repo) == head  # rebased + re-verified, NOT merged this tick
+    assert sc.verified_sha == _head(sc.worktree_path)
+    nav.merge_poll()  # next tick: the re-verified run merges (identical diff: the OK still counts)
+    assert nav.act.runs[c.id].status == RunStatus.completed and "c.py" in _git(repo, "ls-files")
+
+
+def test_needs_rebase_helper(tmp_path):
+    nav, repo, a, b = _setup(tmp_path)
+    assert ex.needs_rebase(str(repo), b) is False
+    _git(repo, "commit", "--allow-empty", "-m", "elsewhere")
+    assert ex.needs_rebase(str(repo), b) is True

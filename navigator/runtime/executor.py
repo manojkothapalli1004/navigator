@@ -752,10 +752,10 @@ def _rebase_one(run: Run, merged: Run, new_head: str, *, act, orc, runner, setti
         if status.returncode != 0 or status.stdout.strip():
             _log.warning("rebase_stale.worktree_dirty_after_abort", run_id=run.id)
         if "CONFLICT" in output:
-            summary = f"stale after merge of {merged.id}: rebase conflict"
+            summary = f"stale after merge of {merged.id or 'an earlier merge'}: rebase conflict"
         else:
             first = next((l.strip() for l in output.splitlines() if l.strip()), "")[:200]
-            summary = f"stale after merge of {merged.id}: rebase failed: {first}"
+            summary = f"stale after merge of {merged.id or 'an earlier merge'}: rebase failed: {first}"
         _fail_stale(act, orc, run, settings, summary=summary, notes=output[-1500:],
                     lessons=["a sibling merged first; rebuilt once against the new HEAD"])
         return False
@@ -771,11 +771,11 @@ def _rebase_one(run: Run, merged: Run, new_head: str, *, act, orc, runner, setti
                    **(_frontend_kwargs(settings, prop) if prop is not None else {}))
     if res.verify_returncode != 0:
         if res.no_change:
-            summary = f"stale after merge of {merged.id}: {NO_CHANGE_SUMMARY}"
+            summary = f"stale after merge of {merged.id or 'an earlier merge'}: {NO_CHANGE_SUMMARY}"
             lessons = [f"{NO_CHANGE_SUMMARY} after rebase: the sibling's change is already in "
-                       f"HEAD (merged by {merged.id}); rebuilt once against the new HEAD"]
+                       f"HEAD (merged by {merged.id or 'an earlier merge'}); rebuilt once against the new HEAD"]
         else:
-            summary = f"stale after merge of {merged.id}: re-verify failed"
+            summary = f"stale after merge of {merged.id or 'an earlier merge'}: re-verify failed"
             lessons = [f"re-verify rc={res.verify_returncode}: {res.verify_output[-300:]}"]
         _fail_stale(act, orc, run, settings, summary=summary, lessons=lessons,
                     notes=res.verify_output[-1500:])
@@ -827,8 +827,15 @@ def _rebase_one(run: Run, merged: Run, new_head: str, *, act, orc, runner, setti
     return True
 
 
-def rebase_stale_runs(merged: Run, *, act, orc, runner, settings, repo: str,
-                      workdir: str = ".", exclude_ids=()) -> list[Run]:
+def needs_rebase(repo, run) -> bool:
+    """The run was verified on an older main than the repo's HEAD (a sibling merged since)."""
+    head = _rev_parse(repo, "HEAD")
+    return bool(head) and getattr(run, "base_commit_sha", None) != head
+
+
+def rebase_stale_runs(merged: Run | None, *, act, orc, runner, settings, repo: str,
+                      workdir: str = ".", exclude_ids=(), limit: int | None = None,
+                      only_ids=None) -> list[Run]:
     """After `merged` landed in `repo`: rebase every other run of the repo parked at
     the merge gate onto the new HEAD and re-verify it (no model call). Returns the runs
     that failed (conflict, re-verify failure or bookkeeping error after a successful
@@ -846,10 +853,22 @@ def rebase_stale_runs(merged: Run, *, act, orc, runner, settings, repo: str,
     if not new_head:
         _log.warning("rebase_stale.no_head", repo=str(repo))
         return failed
-    skip = set(exclude_ids) | {merged.id}
+    # 2026-11-02: at most `limit` re-verifies per call (each one runs a suite); the rest wait for
+    # the next tick. A run already on HEAD is never re-verified again.
+    if merged is None:
+        from types import SimpleNamespace
+        merged = SimpleNamespace(id=None)
+    skip = set(exclude_ids) | ({merged.id} if merged.id else set())
+    done = 0
     for run in candidates:
         if run.id in skip or run.phase != RunPhase.awaiting_review:
             continue
+        if only_ids is not None and run.id not in only_ids:
+            continue
+        if run.base_commit_sha == new_head:
+            continue
+        if limit is not None and done >= limit:
+            break
         prop = act.get_proposal(run.proposal_id)
         if prop is None or prop.repo != repo:
             continue
@@ -860,6 +879,7 @@ def rebase_stale_runs(merged: Run, *, act, orc, runner, settings, repo: str,
                 _emit(act, run, "run.rebase_skipped", Severity.warning, reason=reason,
                       merged_run_id=merged.id)
                 continue
+            done += 1
             if not _rebase_one(run, merged, new_head, act=act, orc=orc, runner=runner,
                                settings=settings, workdir=workdir, state=state):
                 failed.append(run)
@@ -881,7 +901,7 @@ def rebase_stale_runs(merged: Run, *, act, orc, runner, settings, repo: str,
                     failed.append(run)
                 elif state["rebased"]:
                     _fail_stale(act, orc, run, settings,
-                                summary=f"stale after merge of {merged.id}: rebase bookkeeping failed",
+                                summary=f"stale after merge of {merged.id or 'an earlier merge'}: rebase bookkeeping failed",
                                 lessons=[f"rebase bookkeeping raised {type(e).__name__}"])
                     failed.append(run)
                 else:

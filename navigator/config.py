@@ -41,6 +41,8 @@ class Settings:
     # N12d: after a merge, rebase the repo's other runs parked at the merge gate onto the
     # new HEAD and re-verify them with their recorded commands (no model call)
     rebase_stale_runs: bool = True
+    # 2026-11-02: how many stale siblings are rebased + re-verified per tick (each runs a suite)
+    rebase_per_tick: int = 1
     # operator decision 2026-10-28 ('ask me less'): operator-origin proposals start approved;
     # periodic ones still need approve
     operator_preapprove: bool = False
@@ -108,6 +110,7 @@ class Settings:
             mode=os.getenv("NAVIGATOR_MODE", "dry_run"),
             merge_in_dry_run=_bool_env("NAVIGATOR_MERGE_IN_DRY_RUN", "0"),
             rebase_stale_runs=_bool_env("NAVIGATOR_REBASE_STALE_RUNS", "1"),
+            rebase_per_tick=max(0, int(os.getenv("NAVIGATOR_REBASE_PER_TICK", "1") or 1)),
             operator_preapprove=_bool_env("NAVIGATOR_OPERATOR_PREAPPROVE", "0"),
             act_base_url=os.getenv("NAVIGATOR_ACT_BASE_URL"),
             orc_base_url=os.getenv("NAVIGATOR_ORC_BASE_URL"),

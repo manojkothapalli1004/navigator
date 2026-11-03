@@ -11,7 +11,7 @@ from navigator.contracts.event import Event
 from navigator.contracts.enums import (ProposalStatus, RunStatus, RunPhase, ApprovalGate,
                                        ApprovalDecision)
 from navigator.runtime.executor import (execute_proposal, merge_after_approval, decline_run,
-                                        rebase_stale_runs, AUTO_ACTOR, auto_merge_ok, _as_utc)
+                                        rebase_stale_runs, needs_rebase, AUTO_ACTOR, auto_merge_ok, _as_utc)
 from navigator.runtime.lock import SingleFlightLock
 from navigator.runtime.outcome_store import OutcomeStore, title_lessons
 from navigator.observability.logging import get_logger
@@ -485,6 +485,16 @@ class Navigator:
                 log.info("merge_poll.deferred_lock_held", lock=str(self.lock.path))
                 return []
             seen: set[str] = set()
+            rebase_on = getattr(self.settings, "rebase_stale_runs", True)
+            per_tick = getattr(self.settings, "rebase_per_tick", 1)
+            if rebase_on:
+                # catch-up: siblings left stale by an earlier merge, `per_tick` per tick (each one
+                # runs a full suite; doing all of them at once stalled the daemon)
+                failed = rebase_stale_runs(None, act=self.act, orc=self.orc, runner=self.runner,
+                                           settings=self.settings, repo=self.repo, workdir=self.workdir,
+                                           limit=per_tick)
+                done.extend(failed)
+                seen.update(r.id for r in failed)
             pending = list(self.act.list_open_runs())
             while pending:
                 run = pending.pop(0)
@@ -502,20 +512,27 @@ class Navigator:
                 decisions = {a.decision for a in approvals}
                 if ApprovalDecision.declined in decisions:
                     done.append(decline_run(run, act=self.act, orc=self.orc, settings=self.settings))
+                elif ApprovalDecision.approved in decisions and rebase_on and needs_rebase(self.repo, run):
+                    # approved while stale: rebase + re-verify it first, never merge it unverified;
+                    # the rebase opens a fresh merge request, so the operator OKs the new diff
+                    failed = rebase_stale_runs(None, act=self.act, orc=self.orc, runner=self.runner,
+                                               settings=self.settings, repo=self.repo, workdir=self.workdir,
+                                               only_ids={run.id}, limit=1)
+                    done.extend(failed)
+                    log.info("merge_poll.rebased_before_merge", run=run.id, failed=[r.id for r in failed])
                 elif ApprovalDecision.approved in decisions:
                     run = merge_after_approval(run, act=self.act, orc=self.orc, driver=self.driver,
                                                runner=self.runner, settings=self.settings,
                                                squash=self.squash, allow_auto=True)
                     if run.status != RunStatus.executing:
                         done.append(run)
-                    if (run.status == RunStatus.completed
-                            and getattr(self.settings, "rebase_stale_runs", True)):
+                    if run.status == RunStatus.completed and rebase_on:
                         # N12d: the repo's other parked runs are now stale; rebase and
                         # re-verify them (no model call) while this process holds the lock
                         failed = rebase_stale_runs(run, act=self.act, orc=self.orc,
                                                    runner=self.runner, settings=self.settings,
                                                    repo=self.repo, workdir=self.workdir,
-                                                   exclude_ids={r.id for r in done})
+                                                   exclude_ids={r.id for r in done}, limit=per_tick)
                         done.extend(failed)
                         seen.update(r.id for r in failed)
                         log.info("merge_poll.rebased_stale", merged=run.id,
