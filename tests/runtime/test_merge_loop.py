@@ -73,6 +73,9 @@ def test_declined_merge_aborts_run_and_preserves_worktree(tmp_path):
 
 def test_merge_blocked_while_main_checkout_dirty(tmp_path):
     nav, repo, run = _setup(tmp_path)
+    # this test is about the dirty-checkout preflight; its extra commit makes the run stale, and the
+    # stale-run rebase (tested in test_rebase_stale_runs.py) would otherwise run first
+    nav.settings.rebase_stale_runs = False
     (repo/"tracked.txt").write_text("a")
     _git(repo, "add", "tracked.txt"); _git(repo, "commit", "-m", "t")
     (repo/"tracked.txt").write_text("operator's uncommitted edit")
@@ -455,6 +458,7 @@ def test_flag_off_never_auto_merges(tmp_path):
 
 def test_stale_auto_approval_does_not_block_reapproval(tmp_path):
     nav, repo, run = _docs_setup(tmp_path)
+    nav.settings.rebase_stale_runs = False  # about auto-approval staleness, not the sibling rebase
     _audit(nav, run)
     nav.settings.merge_tier_a_auto = True
     _dirty_checkout(repo)

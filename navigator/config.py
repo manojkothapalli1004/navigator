@@ -205,6 +205,7 @@ ENV_ONLY_FIELDS = frozenset({
     "max_tool_failures", "max_identical_failures", "max_run_duration_s", "max_cost_usd",
     "memory_chars_per_section", "command_timeout_s", "max_failed_tests", "repo", "repos",
     "lock_path", "outcome_path", "quota_pause_path", "sdk_model_fallbacks", "sdk_model_cooldown_s",
+    "rebase_per_tick",
 })
 
 _HOT_BOOL_FIELDS = frozenset({"merge_in_dry_run", "operator_preapprove", "merge_tier_a_auto",
