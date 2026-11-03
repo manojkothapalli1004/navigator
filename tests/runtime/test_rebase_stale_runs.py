@@ -53,7 +53,7 @@ class _Driver:
 
 
 def _setup(tmp_path, builds=DEFAULT_BUILDS, verifies=None, squash=False,
-           extra_base: dict[str, str] | None = None):
+           extra_base: dict[str, str] | None = None, per_tick: int = 100):
     """Two approved proposals A and B, built from one base in a single approval_poll.
     `extra_base` files (name -> content) are written and included in the base commit."""
     repo = tmp_path / "repo"; repo.mkdir()
@@ -66,7 +66,7 @@ def _setup(tmp_path, builds=DEFAULT_BUILDS, verifies=None, squash=False,
         _git(repo, "add", name)
     _git(repo, "commit", "-m", "base")
     s = Settings(mode="execute", worktree_root=str(tmp_path / "wt"),
-                 outcome_path=str(tmp_path / "outcomes.jsonl"))
+                 outcome_path=str(tmp_path / "outcomes.jsonl"), rebase_per_tick=per_tick)
     nav = Navigator(act=FakeACTClient(), orc=FakeORCClient(), driver=_Driver(builds, verifies or {}),
                     runner=CommandRunner(allowlist=s.allowed_commands, worktree_root=tmp_path / "wt"),
                     settings=s, repo=str(repo), lock_path=tmp_path / "nav.lock", squash=squash)
@@ -640,3 +640,105 @@ def test_rebased_sibling_tier_git_failure_never_loses_the_awaiting_review_event(
     assert sb.phase == RunPhase.awaiting_review and sb.base_commit_sha == _head(repo)
     ev = _events(nav, b, "run.awaiting_review")[-1].payload
     assert ev["rebased"] is True and ev["merge_tier"] is None
+
+
+# ---- 2026-11-02: at most one sibling re-verified per tick; a stale run is rebased before it merges ----
+
+THREE = {"A": [("a.py", "A = 1\n")], "B": [("b.py", "B = 1\n")], "C": [("c.py", "C = 1\n")]}
+
+
+def _by_title(nav, title):
+    return next(r for r in nav.act.runs.values() if nav.act.get_proposal(r.proposal_id).title == title)
+
+
+def test_one_sibling_rebased_per_tick_then_the_next(tmp_path):
+    nav, repo, a, b = _setup(tmp_path, builds=THREE, per_tick=1)
+    c = _by_title(nav, "C")
+    _merge(nav, a)
+    head = _head(repo)
+    rebased = [r for r in (nav.act.runs[b.id], nav.act.runs[c.id]) if r.base_commit_sha == head]
+    assert len(rebased) == 1  # only one suite re-run in this tick
+    nav.merge_poll()  # next tick: the other one
+    assert nav.act.runs[b.id].base_commit_sha == head and nav.act.runs[c.id].base_commit_sha == head
+    before = (list(nav.act.runs[b.id].verification), list(nav.act.runs[c.id].verification))
+    sha_b, sha_c = nav.act.runs[b.id].verified_sha, nav.act.runs[c.id].verified_sha
+    nav.merge_poll()  # nothing stale left: nothing re-verified again
+    assert (nav.act.runs[b.id].verified_sha, nav.act.runs[c.id].verified_sha) == (sha_b, sha_c)
+    assert (list(nav.act.runs[b.id].verification), list(nav.act.runs[c.id].verification)) == before
+
+
+def test_stale_approved_run_is_rebased_before_it_can_merge(tmp_path):
+    nav, repo, a, b = _setup(tmp_path, builds=THREE, per_tick=1)
+    c = _by_title(nav, "C")
+    _merge(nav, a)  # tick 1: A merges, ONE sibling is rebased
+    head = _head(repo)
+    stale = next(r for r in (nav.act.runs[b.id], nav.act.runs[c.id]) if r.base_commit_sha != head)
+    appr = nav.act.list_approvals(target=stale.id, gate=ApprovalGate.merge)[0]
+    nav.act.decide_approval(appr.id, ApprovalDecision.approved, actor=ACTOR)  # OK given while stale
+    nav.merge_poll()  # tick 2: approved-stale goes first: rebased + re-verified, NOT merged this tick
+    s2 = nav.act.runs[stale.id]
+    assert s2.base_commit_sha == head and _head(repo) == head
+    assert s2.verified_sha == _head(s2.worktree_path)
+    nav.merge_poll()  # tick 3: the re-verified run merges (identical diff: the OK still counts)
+    assert nav.act.runs[stale.id].status == RunStatus.completed
+
+
+def test_tick_budget_covers_approved_stale_runs(tmp_path, monkeypatch):
+    # several approved stale runs after a merge: still at most per_tick re-verifies per tick
+    nav, repo, a, b = _setup(tmp_path, builds={**THREE, "D": [("d.py", "D = 1\n")]}, per_tick=1)
+    others = [r for r in nav.act.list_open_runs() if r.id != a.id]
+    for r in others:
+        appr = nav.act.list_approvals(target=r.id, gate=ApprovalGate.merge)[0]
+        nav.act.decide_approval(appr.id, ApprovalDecision.approved, actor=ACTOR)
+    calls = []
+    real = ex._rebase_one
+    monkeypatch.setattr(ex, "_rebase_one", lambda *a, **k: calls.append(1) or real(*a, **k))
+    _merge(nav, a)
+    assert len(calls) == 1
+    calls.clear(); nav.merge_poll()
+    assert len(calls) <= 1
+
+
+def test_skipped_stale_approved_run_still_reaches_the_merge_path(tmp_path, monkeypatch):
+    nav, repo, a, b = _setup(tmp_path, per_tick=1)
+    _merge(nav, a)
+    monkeypatch.setattr(ex, "_stale_skip_reason", lambda repo, run: "branch moved")
+    import navigator.runtime.loop as loop_mod
+    monkeypatch.setattr(loop_mod, "_stale_skip_reason", lambda repo, run: "branch moved")
+    merged = []
+    monkeypatch.setattr(loop_mod, "merge_after_approval", lambda run, **k: merged.append(run.id) or run)
+    _git(repo, "commit", "--allow-empty", "-m", "elsewhere")  # b is stale again
+    appr = nav.act.list_approvals(target=b.id, gate=ApprovalGate.merge)
+    for x in appr:
+        if x.decision == ApprovalDecision.pending:
+            nav.act.decide_approval(x.id, ApprovalDecision.approved, actor=ACTOR)
+    nav.merge_poll()
+    assert merged == [b.id]  # not parked forever on the rebase path
+
+
+def test_needs_rebase_helper(tmp_path):
+    nav, repo, a, b = _setup(tmp_path)
+    assert ex.needs_rebase(str(repo), b) is False
+    _git(repo, "commit", "--allow-empty", "-m", "elsewhere")
+    assert ex.needs_rebase(str(repo), b) is True
+
+
+# ---- terminal review 1: parked runs nobody approved are never touched ----
+
+def test_unapproved_parked_run_is_not_rebased_after_a_terminal_commit(tmp_path):
+    nav, repo, a, b = _setup(tmp_path, per_tick=1)
+    before = {r.id: (nav.act.runs[r.id].base_commit_sha, nav.act.runs[r.id].verified_sha) for r in (a, b)}
+    _git(repo, "commit", "--allow-empty", "-m", "operator's own commit in the terminal")
+    for _ in range(3):
+        nav.merge_poll()
+    after = {r.id: (nav.act.runs[r.id].base_commit_sha, nav.act.runs[r.id].verified_sha) for r in (a, b)}
+    assert after == before  # parked runs stay parked (operator rule 2026-10-28)
+
+
+def test_navigator_merge_siblings_are_still_carried_over_across_ticks(tmp_path):
+    nav, repo, a, b = _setup(tmp_path, builds=THREE, per_tick=1)
+    c = _by_title(nav, "C")
+    _merge(nav, a)
+    nav.merge_poll()
+    head = _head(repo)
+    assert nav.act.runs[b.id].base_commit_sha == head and nav.act.runs[c.id].base_commit_sha == head

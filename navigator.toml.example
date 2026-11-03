@@ -61,6 +61,7 @@ lock_path = "/tmp/navigator.lock"              # NAVIGATOR_LOCK_PATH: single-fli
 outcome_path = "/tmp/navigator-outcomes.jsonl" # NAVIGATOR_OUTCOME_PATH: local outcome trail
 quota_pause_path = ""             # NAVIGATOR_QUOTA_PAUSE_PATH: JSON file {"until": ISO} shared by the daemon and once.sh; while until is in the future no planner call and no build starts; "" = off
 tick_interval_s = 900           # NAVIGATOR_TICK_INTERVAL_S
+rebase_per_tick = 1             # NAVIGATOR_REBASE_PER_TICK: stale siblings rebased + re-verified per tick (min 1); approved stale runs first, the rest wait
 rebase_stale_runs = true        # NAVIGATOR_REBASE_STALE_RUNS: after a merge, rebase the repo's other
                                 # runs parked at the merge gate onto the new HEAD and re-run their
                                 # recorded verification (no model call); an audit carries over when
