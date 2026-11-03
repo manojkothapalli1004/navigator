@@ -45,11 +45,55 @@ def test_preview_lock_is_exclusive(tmp_path):
         pass
 
 
-def test_recheck_timeout_is_126(tmp_path, monkeypatch):
+def _slow_checker(tmp_path, monkeypatch, stopped):
     py = tmp_path / "python"; py.write_text("#!/bin/sh\nsleep 5\n"); py.chmod(0o755)
     monkeypatch.setattr(recheck, "CHECKER_PYTHON", py)
+    monkeypatch.setattr(preview, "stop", lambda port=preview.PREVIEW_PORT: stopped.append(port))  # never a real kill
+    monkeypatch.setattr(preview, "LOCK_PATH", tmp_path / "preview.lock")
+
+
+def test_recheck_timeout_is_126(tmp_path, monkeypatch):
+    stopped = []
+    _slow_checker(tmp_path, monkeypatch, stopped)
     rc, out = recheck.run_recheck(tmp_path, ["abc"], timeout_s=0.3)
     assert rc == 126 and "timed out" in out
+
+
+def test_timeout_stops_the_orphaned_preview(tmp_path, monkeypatch):
+    # 2026-11-02: the killed checker left its `next start` on :3001
+    stopped = []
+    _slow_checker(tmp_path, monkeypatch, stopped)
+    rc, out = recheck.run_recheck(tmp_path, ["abc"], timeout_s=0.3)
+    assert rc == 126 and stopped == [3001] and "stopped the leftover preview" in out
+
+
+def test_timeout_leaves_another_runs_preview_alone(tmp_path, monkeypatch):
+    # timed out while ANOTHER checker run holds the preview lock: its :3001 is legitimately in use
+    import fcntl
+    stopped = []
+    _slow_checker(tmp_path, monkeypatch, stopped)
+    held = open(tmp_path / "preview.lock", "w"); fcntl.flock(held, fcntl.LOCK_EX)
+    try:
+        rc, out = recheck.run_recheck(tmp_path, ["abc"], timeout_s=0.3)
+    finally:
+        fcntl.flock(held, fcntl.LOCK_UN); held.close()
+    assert rc == 126 and stopped == []
+
+
+def test_no_timeout_no_stop(tmp_path, monkeypatch):
+    stopped = []
+    _slow_checker(tmp_path, monkeypatch, stopped)
+    fast = tmp_path / "fast"; fast.write_text("#!/bin/sh\nexit 0\n"); fast.chmod(0o755)
+    monkeypatch.setattr(recheck, "CHECKER_PYTHON", fast)
+    rc, _ = recheck.run_recheck(tmp_path, ["abc"], timeout_s=5)
+    assert rc == 0 and stopped == []
+
+
+def test_cleanup_never_targets_the_live_console(tmp_path, monkeypatch):
+    stopped = []
+    _slow_checker(tmp_path, monkeypatch, stopped)
+    recheck.run_recheck(tmp_path, ["abc"], timeout_s=0.3)
+    assert 3000 not in stopped
 
 
 def test_recheck_missing_venv(tmp_path, monkeypatch):
