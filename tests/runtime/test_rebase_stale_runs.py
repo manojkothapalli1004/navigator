@@ -721,3 +721,24 @@ def test_needs_rebase_helper(tmp_path):
     assert ex.needs_rebase(str(repo), b) is False
     _git(repo, "commit", "--allow-empty", "-m", "elsewhere")
     assert ex.needs_rebase(str(repo), b) is True
+
+
+# ---- terminal review 1: parked runs nobody approved are never touched ----
+
+def test_unapproved_parked_run_is_not_rebased_after_a_terminal_commit(tmp_path):
+    nav, repo, a, b = _setup(tmp_path, per_tick=1)
+    before = {r.id: (nav.act.runs[r.id].base_commit_sha, nav.act.runs[r.id].verified_sha) for r in (a, b)}
+    _git(repo, "commit", "--allow-empty", "-m", "operator's own commit in the terminal")
+    for _ in range(3):
+        nav.merge_poll()
+    after = {r.id: (nav.act.runs[r.id].base_commit_sha, nav.act.runs[r.id].verified_sha) for r in (a, b)}
+    assert after == before  # parked runs stay parked (operator rule 2026-10-28)
+
+
+def test_navigator_merge_siblings_are_still_carried_over_across_ticks(tmp_path):
+    nav, repo, a, b = _setup(tmp_path, builds=THREE, per_tick=1)
+    c = _by_title(nav, "C")
+    _merge(nav, a)
+    nav.merge_poll()
+    head = _head(repo)
+    assert nav.act.runs[b.id].base_commit_sha == head and nav.act.runs[c.id].base_commit_sha == head

@@ -583,3 +583,20 @@ def test_suite_green_rules():
     assert suite_green([{"argv": "pytest -q", "returncode": 0}], ["tests/test_a.py"]) is True
     assert suite_green([{"argv": "uv run pytest -q", "returncode": 0}], ["a.py"]) is True
     assert suite_green([{"argv": "python3 -m py_compile a.py", "returncode": 0}], ["a.py"]) is False
+
+
+def test_dirty_checkout_still_blocks_a_stale_run_after_its_rebase(tmp_path):
+    # terminal review 1: the same preflight, with the sibling rebase ON (the two tests above switch it off)
+    nav, repo, run = _setup(tmp_path)
+    (repo/"tracked.txt").write_text("a")
+    _git(repo, "add", "tracked.txt"); _git(repo, "commit", "-m", "t")  # the run is now stale
+    (repo/"tracked.txt").write_text("operator's uncommitted edit")
+    _decide(nav, run, ApprovalDecision.approved)
+    assert nav.merge_poll() == []  # tick 1: approved + stale -> rebased and re-verified, not merged
+    head = _git(repo, "rev-parse", "HEAD").strip()
+    assert nav.act.runs[run.id].base_commit_sha == head
+    assert nav.merge_poll() == []  # tick 2: the merge is tried and the dirty checkout blocks it
+    stored = nav.act.runs[run.id]
+    assert stored.phase == RunPhase.awaiting_review
+    assert (repo/"tracked.txt").read_text() == "operator's uncommitted edit"
+    assert any(e.kind == "run.merge_blocked" for e in nav.act.events)

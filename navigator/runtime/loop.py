@@ -500,6 +500,11 @@ class Navigator:
                 budget["left"] -= st.get("attempted", 0)
                 return failed
 
+            # siblings a NAVIGATOR merge left stale, still waiting for their rebase (in memory: after a
+            # restart they just stay parked until approved). Runs left stale by anything else - a
+            # commit in the terminal, a manual merge - are never touched unless approved for merge
+            # (operator rule 2026-10-28: parked runs stay parked).
+            queue: set = self.__dict__.setdefault("_rebase_queue", set())
             pending = list(self.act.list_open_runs())
             while pending:
                 run = pending.pop(0)
@@ -535,16 +540,24 @@ class Navigator:
                     if run.status == RunStatus.completed and rebase_on:
                         # N12d: the repo's other parked runs are now stale; rebase and re-verify
                         # them (no model call) within the tick's budget; the rest wait for later ticks
-                        failed = rebase(run, exclude_ids={r.id for r in done})
+                        queue.update(r.id for r in self.act.list_open_runs()
+                                     if r.id != run.id and r.phase == RunPhase.awaiting_review
+                                     and getattr(self.act.get_proposal(r.proposal_id), "repo", None) == self.repo
+                                     and needs_rebase(self.repo, r))
+                        failed = rebase(run, exclude_ids={r.id for r in done}, only_ids=set(queue))
                         done.extend(failed)
                         seen.update(r.id for r in failed)
                         log.info("merge_poll.rebased_stale", merged=run.id,
                                  failed=[r.id for r in failed])
                         # the rebase changed the runs' recorded state: re-read the rest
                         pending = [r for r in self.act.list_open_runs() if r.id not in seen]
-            if rebase_on:
-                # catch-up LAST (declines are already handled): siblings still stale from an earlier merge
-                done.extend(rebase(None, exclude_ids={r.id for r in done}))
+            if rebase_on and queue:
+                # catch-up LAST (declines are already handled): only the queued Navigator-merge siblings
+                done.extend(rebase(None, exclude_ids={r.id for r in done}, only_ids=set(queue)))
+            if queue:
+                still = {r.id for r in self.act.list_open_runs()
+                         if r.id in queue and r.phase == RunPhase.awaiting_review and needs_rebase(self.repo, r)}
+                queue.intersection_update(still)  # rebased, failed or finished: off the queue
         return done
 
     def _enter_lock(self, stack: ExitStack) -> bool:
