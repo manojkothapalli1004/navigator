@@ -835,7 +835,7 @@ def needs_rebase(repo, run) -> bool:
 
 def rebase_stale_runs(merged: Run | None, *, act, orc, runner, settings, repo: str,
                       workdir: str = ".", exclude_ids=(), limit: int | None = None,
-                      only_ids=None) -> list[Run]:
+                      only_ids=None, stats: dict | None = None) -> list[Run]:
     """After `merged` landed in `repo`: rebase every other run of the repo parked at
     the merge gate onto the new HEAD and re-verify it (no model call). Returns the runs
     that failed (conflict, re-verify failure or bookkeeping error after a successful
@@ -876,10 +876,13 @@ def rebase_stale_runs(merged: Run | None, *, act, orc, runner, settings, repo: s
         try:
             reason = _stale_skip_reason(repo, run)
             if reason:
-                _emit(act, run, "run.rebase_skipped", Severity.warning, reason=reason,
-                      merged_run_id=merged.id)
+                if merged.id:  # once, right after the merge; a catch-up tick doesn't repeat it
+                    _emit(act, run, "run.rebase_skipped", Severity.warning, reason=reason,
+                          merged_run_id=merged.id)
                 continue
             done += 1
+            if stats is not None:
+                stats["attempted"] = stats.get("attempted", 0) + 1
             if not _rebase_one(run, merged, new_head, act=act, orc=orc, runner=runner,
                                settings=settings, workdir=workdir, state=state):
                 failed.append(run)

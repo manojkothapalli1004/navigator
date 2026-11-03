@@ -664,23 +664,56 @@ def test_one_sibling_rebased_per_tick_then_the_next(tmp_path):
     sha_b, sha_c = nav.act.runs[b.id].verified_sha, nav.act.runs[c.id].verified_sha
     nav.merge_poll()  # nothing stale left: nothing re-verified again
     assert (nav.act.runs[b.id].verified_sha, nav.act.runs[c.id].verified_sha) == (sha_b, sha_c)
+    assert (list(nav.act.runs[b.id].verification), list(nav.act.runs[c.id].verification)) == before
 
 
 def test_stale_approved_run_is_rebased_before_it_can_merge(tmp_path):
-    # catch-up off (0 per tick): only the rebase-before-merge path can make it current
-    nav, repo, a, b = _setup(tmp_path, builds=THREE, per_tick=0)
+    nav, repo, a, b = _setup(tmp_path, builds=THREE, per_tick=1)
     c = _by_title(nav, "C")
-    _merge(nav, a)
+    _merge(nav, a)  # tick 1: A merges, ONE sibling is rebased
     head = _head(repo)
-    assert nav.act.runs[c.id].base_commit_sha != head  # stale, not rebased yet
-    appr = nav.act.list_approvals(target=c.id, gate=ApprovalGate.merge)[0]
+    stale = next(r for r in (nav.act.runs[b.id], nav.act.runs[c.id]) if r.base_commit_sha != head)
+    appr = nav.act.list_approvals(target=stale.id, gate=ApprovalGate.merge)[0]
     nav.act.decide_approval(appr.id, ApprovalDecision.approved, actor=ACTOR)  # OK given while stale
+    nav.merge_poll()  # tick 2: approved-stale goes first: rebased + re-verified, NOT merged this tick
+    s2 = nav.act.runs[stale.id]
+    assert s2.base_commit_sha == head and _head(repo) == head
+    assert s2.verified_sha == _head(s2.worktree_path)
+    nav.merge_poll()  # tick 3: the re-verified run merges (identical diff: the OK still counts)
+    assert nav.act.runs[stale.id].status == RunStatus.completed
+
+
+def test_tick_budget_covers_approved_stale_runs(tmp_path, monkeypatch):
+    # several approved stale runs after a merge: still at most per_tick re-verifies per tick
+    nav, repo, a, b = _setup(tmp_path, builds={**THREE, "D": [("d.py", "D = 1\n")]}, per_tick=1)
+    others = [r for r in nav.act.list_open_runs() if r.id != a.id]
+    for r in others:
+        appr = nav.act.list_approvals(target=r.id, gate=ApprovalGate.merge)[0]
+        nav.act.decide_approval(appr.id, ApprovalDecision.approved, actor=ACTOR)
+    calls = []
+    real = ex._rebase_one
+    monkeypatch.setattr(ex, "_rebase_one", lambda *a, **k: calls.append(1) or real(*a, **k))
+    _merge(nav, a)
+    assert len(calls) == 1
+    calls.clear(); nav.merge_poll()
+    assert len(calls) <= 1
+
+
+def test_skipped_stale_approved_run_still_reaches_the_merge_path(tmp_path, monkeypatch):
+    nav, repo, a, b = _setup(tmp_path, per_tick=1)
+    _merge(nav, a)
+    monkeypatch.setattr(ex, "_stale_skip_reason", lambda repo, run: "branch moved")
+    import navigator.runtime.loop as loop_mod
+    monkeypatch.setattr(loop_mod, "_stale_skip_reason", lambda repo, run: "branch moved")
+    merged = []
+    monkeypatch.setattr(loop_mod, "merge_after_approval", lambda run, **k: merged.append(run.id) or run)
+    _git(repo, "commit", "--allow-empty", "-m", "elsewhere")  # b is stale again
+    appr = nav.act.list_approvals(target=b.id, gate=ApprovalGate.merge)
+    for x in appr:
+        if x.decision == ApprovalDecision.pending:
+            nav.act.decide_approval(x.id, ApprovalDecision.approved, actor=ACTOR)
     nav.merge_poll()
-    sc = nav.act.runs[c.id]
-    assert sc.base_commit_sha == head and _head(repo) == head  # rebased + re-verified, NOT merged this tick
-    assert sc.verified_sha == _head(sc.worktree_path)
-    nav.merge_poll()  # next tick: the re-verified run merges (identical diff: the OK still counts)
-    assert nav.act.runs[c.id].status == RunStatus.completed and "c.py" in _git(repo, "ls-files")
+    assert merged == [b.id]  # not parked forever on the rebase path
 
 
 def test_needs_rebase_helper(tmp_path):

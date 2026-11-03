@@ -11,7 +11,7 @@ from navigator.contracts.event import Event
 from navigator.contracts.enums import (ProposalStatus, RunStatus, RunPhase, ApprovalGate,
                                        ApprovalDecision)
 from navigator.runtime.executor import (execute_proposal, merge_after_approval, decline_run,
-                                        rebase_stale_runs, needs_rebase, AUTO_ACTOR, auto_merge_ok, _as_utc)
+                                        rebase_stale_runs, needs_rebase, _stale_skip_reason, AUTO_ACTOR, auto_merge_ok, _as_utc)
 from navigator.runtime.lock import SingleFlightLock
 from navigator.runtime.outcome_store import OutcomeStore, title_lessons
 from navigator.observability.logging import get_logger
@@ -486,15 +486,20 @@ class Navigator:
                 return []
             seen: set[str] = set()
             rebase_on = getattr(self.settings, "rebase_stale_runs", True)
-            per_tick = getattr(self.settings, "rebase_per_tick", 1)
-            if rebase_on:
-                # catch-up: siblings left stale by an earlier merge, `per_tick` per tick (each one
-                # runs a full suite; doing all of them at once stalled the daemon)
-                failed = rebase_stale_runs(None, act=self.act, orc=self.orc, runner=self.runner,
+            # one budget per tick for every rebase + re-verify (each runs a full suite): approved
+            # stale runs first, then siblings after a merge, then a catch-up with what's left
+            budget = {"left": max(1, int(getattr(self.settings, "rebase_per_tick", 1) or 1))}
+
+            def rebase(merged, **kw) -> list:
+                if budget["left"] <= 0:
+                    return []
+                st: dict = {}
+                failed = rebase_stale_runs(merged, act=self.act, orc=self.orc, runner=self.runner,
                                            settings=self.settings, repo=self.repo, workdir=self.workdir,
-                                           limit=per_tick)
-                done.extend(failed)
-                seen.update(r.id for r in failed)
+                                           limit=budget["left"], stats=st, **kw)
+                budget["left"] -= st.get("attempted", 0)
+                return failed
+
             pending = list(self.act.list_open_runs())
             while pending:
                 run = pending.pop(0)
@@ -512,14 +517,15 @@ class Navigator:
                 decisions = {a.decision for a in approvals}
                 if ApprovalDecision.declined in decisions:
                     done.append(decline_run(run, act=self.act, orc=self.orc, settings=self.settings))
-                elif ApprovalDecision.approved in decisions and rebase_on and needs_rebase(self.repo, run):
-                    # approved while stale: rebase + re-verify it first, never merge it unverified;
-                    # the rebase opens a fresh merge request, so the operator OKs the new diff
-                    failed = rebase_stale_runs(None, act=self.act, orc=self.orc, runner=self.runner,
-                                               settings=self.settings, repo=self.repo, workdir=self.workdir,
-                                               only_ids={run.id}, limit=1)
+                elif (ApprovalDecision.approved in decisions and rebase_on and needs_rebase(self.repo, run)
+                      and not _stale_skip_reason(self.repo, run)):
+                    # approved while stale: rebase + re-verify it first (if the tick's budget allows),
+                    # never merge it unverified; it merges on a later tick. A run the rebase would
+                    # skip (branch gone/moved) falls through to the merge path as before.
+                    failed = rebase(None, only_ids={run.id})
                     done.extend(failed)
-                    log.info("merge_poll.rebased_before_merge", run=run.id, failed=[r.id for r in failed])
+                    log.info("merge_poll.rebased_before_merge", run=run.id, failed=[r.id for r in failed],
+                             budget_left=budget["left"])
                 elif ApprovalDecision.approved in decisions:
                     run = merge_after_approval(run, act=self.act, orc=self.orc, driver=self.driver,
                                                runner=self.runner, settings=self.settings,
@@ -527,18 +533,18 @@ class Navigator:
                     if run.status != RunStatus.executing:
                         done.append(run)
                     if run.status == RunStatus.completed and rebase_on:
-                        # N12d: the repo's other parked runs are now stale; rebase and
-                        # re-verify them (no model call) while this process holds the lock
-                        failed = rebase_stale_runs(run, act=self.act, orc=self.orc,
-                                                   runner=self.runner, settings=self.settings,
-                                                   repo=self.repo, workdir=self.workdir,
-                                                   exclude_ids={r.id for r in done}, limit=per_tick)
+                        # N12d: the repo's other parked runs are now stale; rebase and re-verify
+                        # them (no model call) within the tick's budget; the rest wait for later ticks
+                        failed = rebase(run, exclude_ids={r.id for r in done})
                         done.extend(failed)
                         seen.update(r.id for r in failed)
                         log.info("merge_poll.rebased_stale", merged=run.id,
                                  failed=[r.id for r in failed])
                         # the rebase changed the runs' recorded state: re-read the rest
                         pending = [r for r in self.act.list_open_runs() if r.id not in seen]
+            if rebase_on:
+                # catch-up LAST (declines are already handled): siblings still stale from an earlier merge
+                done.extend(rebase(None, exclude_ids={r.id for r in done}))
         return done
 
     def _enter_lock(self, stack: ExitStack) -> bool:

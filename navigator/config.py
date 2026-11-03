@@ -110,7 +110,7 @@ class Settings:
             mode=os.getenv("NAVIGATOR_MODE", "dry_run"),
             merge_in_dry_run=_bool_env("NAVIGATOR_MERGE_IN_DRY_RUN", "0"),
             rebase_stale_runs=_bool_env("NAVIGATOR_REBASE_STALE_RUNS", "1"),
-            rebase_per_tick=max(0, int(os.getenv("NAVIGATOR_REBASE_PER_TICK", "1") or 1)),
+            rebase_per_tick=max(1, _int_env("NAVIGATOR_REBASE_PER_TICK", "1")),
             operator_preapprove=_bool_env("NAVIGATOR_OPERATOR_PREAPPROVE", "0"),
             act_base_url=os.getenv("NAVIGATOR_ACT_BASE_URL"),
             orc_base_url=os.getenv("NAVIGATOR_ORC_BASE_URL"),
