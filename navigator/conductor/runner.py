@@ -4,9 +4,12 @@ from __future__ import annotations
 import re
 from typing import Callable
 
-from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient, HookMatcher, ResultMessage, StreamEvent
+from claude_agent_sdk import (
+    AssistantMessage, ClaudeAgentOptions, ClaudeSDKClient, HookMatcher, ResultMessage, StreamEvent,
+    ToolResultBlock, ToolUseBlock, UserMessage,
+)
 
-from navigator.conductor import gate
+from navigator.conductor import activity, gate
 from navigator.conductor.engine import ResumeFailed
 
 MODEL = "claude-opus-5-5"
@@ -53,6 +56,18 @@ async def sdk_turn(prompt: str, session_id: str | None, emit: Callable[[dict], N
                     elif ev.get("type") == "content_block_delta" and (ev.get("delta") or {}).get("type") == "text_delta":
                         seen_text = True
                         emit({"type": "delta", "text": ev["delta"]["text"]})
+                elif isinstance(m, AssistantMessage):
+                    # each tool call is a step on the website's crew screens; helpers get their own
+                    for b in m.content:
+                        if isinstance(b, ToolUseBlock):
+                            emit({"type": "activity", "id": b.id, "tool": b.name,
+                                  "title": activity.describe(b.name, b.input), "state": "running",
+                                  "parent": m.parent_tool_use_id, "helper": activity.is_helper(b.name)})
+                elif isinstance(m, UserMessage) and isinstance(m.content, list):
+                    for b in m.content:
+                        if isinstance(b, ToolResultBlock):
+                            emit({"type": "activity", "id": b.tool_use_id,
+                                  "state": "failed" if b.is_error else "done"})
                 elif isinstance(m, ResultMessage):
                     sid = m.session_id
                     if m.is_error:

@@ -63,7 +63,8 @@ def test_history_endpoint(tmp_path):
 def test_status(tmp_path):
     async def go(c, eng):
         s = (await c.get("/status")).json()
-        assert s == {"busy": False, "queue_len": 0, "session_id_set": False, "terminal": False, "autopilot": None}
+        assert s == {"busy": False, "queue_len": 0, "session_id_set": False, "terminal": False, "autopilot": None,
+                     "activity": {"msg_id": None, "items": []}}
     asyncio.run(_with_app(tmp_path, go))
 
 
