@@ -241,7 +241,7 @@ async def can_use_tool(tool_name: str, input_data: dict, context):
 
 # no code or id here: the model must never hold what approves its own card
 CARD_HINT = ("an approval card was sent to the operator (website, Telegram, terminal). Stop and wait; "
-             "if it is approved you will be told to run exactly the same command again, in the same folder.")
+             "if it is approved a helper will run exactly the same command, in the same folder, and report back.")
 TOO_LONG_HINT = ("too long to show the operator on an approval card; split it into shorter steps so the "
                  "gated part can be shown in full")
 

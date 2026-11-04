@@ -21,6 +21,15 @@ from navigator.conductor.store import Store
 MAX_TEXT = 20000
 MAX_TERMINAL_ENTRIES = 500
 KEEPALIVE_S = 15.0
+# the main turn has no gated tools any more: an approved card is run by a helper that may make
+# only this one call (helpers.sdk_helper with `exact`), and its card hook consumes the approval
+CARD_TASK = ("Card {0} was approved by the operator. Issue exactly this one tool call, unchanged, then "
+             "report its result in plain words: tool {1}, input {2}, folder {3}.")
+
+
+def _public(card: dict) -> dict:
+    # fingerprint, input, cwd stay inside: the summary is what the operator approves
+    return {k: v for k, v in card.items() if k not in ("fingerprint", "input", "cwd")}
 
 
 async def event_stream(engine: Engine, is_disconnected, keepalive_s: float = KEEPALIVE_S,
@@ -40,7 +49,7 @@ async def event_stream(engine: Engine, is_disconnected, keepalive_s: float = KEE
         engine.unsubscribe(q)
 
 
-def build_app(engine: Engine, manage_engine: bool = False, cards=None) -> Starlette:
+def build_app(engine: Engine, manage_engine: bool = False, cards=None, helpers=None) -> Starlette:
     async def post_message(req: Request):
         try:
             body = await req.json()
@@ -113,9 +122,6 @@ def build_app(engine: Engine, manage_engine: bool = False, cards=None) -> Starle
         # via="telegram": Telegram's /stop (the bot answers it); anything else = no via, unchanged
         return JSONResponse({"cancelled": engine.cancel(via="telegram" if via == "telegram" else None)})
 
-    def _public(card: dict) -> dict:
-        return {k: v for k, v in card.items() if k != "fingerprint"}
-
     async def list_cards(req: Request):
         return JSONResponse([_public(c) for c in cards.pending()])
 
@@ -136,10 +142,19 @@ def build_app(engine: Engine, manage_engine: bool = False, cards=None) -> Starle
             return JSONResponse({"error": str(e)}, status_code=404 if str(e) == "not found" else 409)
         engine.on_card(card)
         if card["state"] == "approved":
-            engine.submit(f"Card {card['code']} was approved by the operator via {via}. Run exactly this "
-                          f"now, unchanged: {card['summary']}", "approval", internal=True,
-                          reply_via=via)
+            if helpers is not None and "input" in card:
+                helpers.start(title=f"approved card {card['code']}",
+                              task=CARD_TASK.format(card["code"], card["tool"], json.dumps(card["input"]),
+                                                    card["cwd"]),
+                              exact={"tool": card["tool"], "input": card["input"], "cwd": card["cwd"]}, via=via)
+            else:  # no helpers, or a card raised before input/cwd were stored: the old path
+                engine.submit(f"Card {card['code']} was approved by the operator via {via}. Run exactly this "
+                              f"now, unchanged: {card['summary']}", "approval", internal=True,
+                              reply_via=via)
         return JSONResponse(_public(card))
+
+    async def cancel_helper(req: Request):
+        return JSONResponse({"cancelled": helpers.cancel(req.path_params["id"])})
 
     @asynccontextmanager
     async def lifespan(app):
@@ -158,7 +173,8 @@ def build_app(engine: Engine, manage_engine: bool = False, cards=None) -> Starle
                              Route("/autopilot", autopilot, methods=["POST"]),
                              Route("/cancel", cancel, methods=["POST"])]
                      + ([Route("/cards", list_cards),
-                         Route("/cards/{key}/{action:str}", decide, methods=["POST"])] if cards else []),
+                         Route("/cards/{key}/{action:str}", decide, methods=["POST"])] if cards else [])
+                     + ([Route("/helpers/{id}/cancel", cancel_helper, methods=["POST"])] if helpers else []),
                      lifespan=lifespan)
 
 
@@ -224,16 +240,22 @@ def serve(socket_path: Path, root: Path, runner=None) -> None:
     """Run the conductor on `socket_path` (replacing a stale file) with state in `root`."""
     import socket
     import uvicorn
+    from functools import partial
     from navigator.conductor import gate, telegram
     from navigator.conductor.cards import Cards
+    from navigator.conductor.helpers import Helpers, sdk_helper
+    from navigator.conductor.tools import make_conductor_server
     cards = Cards(Path(root) / "cards.json")
     creds = telegram.load_creds()
     engine_ref: list[Engine] = []
     hook = gate.make_hook(cards, lambda card: engine_ref[0].on_card(card))
+    # helpers use the same card hook: a gated action in a helper raises a card exactly as before
+    helpers = Helpers(Path(root) / "helpers.json", runner=partial(sdk_helper, hook=hook),
+                      on_event=lambda hid, ev: engine_ref[0].on_helper_event(hid, ev),
+                      on_finish=lambda rec: engine_ref[0].on_helper_finish(rec))
     if runner is None:
-        from functools import partial
         from navigator.conductor.runner import sdk_turn
-        runner = partial(sdk_turn, hook=hook)
+        runner = partial(sdk_turn, hook=hook, conductor_server=make_conductor_server(helpers))
     socket_path = Path(socket_path)
     socket_path.parent.mkdir(parents=True, exist_ok=True)
     os.chmod(socket_path.parent, 0o700)  # nobody else can even reach the socket's directory
@@ -245,11 +267,11 @@ def serve(socket_path: Path, root: Path, runner=None) -> None:
     from navigator.conductor.autopilot import Autopilot
     engine = Engine(Store(root), runner, notify=sender.card, reply=sender.text,
                     autopilot=Autopilot(Path(root) / "autopilot.json"),
-                    cards_pending=lambda: bool(cards.pending()))
+                    cards_pending=lambda: bool(cards.pending()), helpers=helpers)
     engine_ref.append(engine)
     # bound here, not by uvicorn: uvicorn chmods its own unix sockets to 0666
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     sock.bind(str(socket_path))
     os.chmod(socket_path, 0o600)
-    uvicorn.Server(uvicorn.Config(build_app(engine, manage_engine=True, cards=cards), log_level="warning",
-                                  http=_guarded_protocol())).run(sockets=[sock])
+    uvicorn.Server(uvicorn.Config(build_app(engine, manage_engine=True, cards=cards, helpers=helpers),
+                                  log_level="warning", http=_guarded_protocol())).run(sockets=[sock])

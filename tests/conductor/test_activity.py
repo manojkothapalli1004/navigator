@@ -166,7 +166,7 @@ async def test_a_new_turn_starts_empty_even_before_its_first_step(tmp_path):
     await eng.start()
     eng.submit("one", "web"); await _drain(eng)
     m2 = eng.submit("two", "web"); await _drain(eng)  # no tool calls at all
-    assert eng.activity_snapshot() == {"msg_id": m2["id"], "items": []}
+    assert eng.activity_snapshot() == {"msg_id": m2["id"], "items": [], "helpers": []}
     await eng.stop()
 
 

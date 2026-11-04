@@ -64,7 +64,7 @@ def test_status(tmp_path):
     async def go(c, eng):
         s = (await c.get("/status")).json()
         assert s == {"busy": False, "queue_len": 0, "session_id_set": False, "terminal": False, "autopilot": None,
-                     "activity": {"msg_id": None, "items": []}}
+                     "activity": {"msg_id": None, "items": [], "helpers": []}}
     asyncio.run(_with_app(tmp_path, go))
 
 
@@ -311,3 +311,65 @@ def test_autopilot_endpoint_and_status(tmp_path):
         finally:
             await eng.stop()
     asyncio.run(go())
+
+
+# ---- helpers stage 1 (2026-11-04): an approved card runs in a helper, never in the main turn ----
+
+class FakeHelpers:
+    def __init__(self):
+        self.started, self.cancelled = [], []
+    def start(self, title, task, *, exact=None, via=None):
+        self.started.append({"title": title, "task": task, "exact": exact, "via": via})
+        return {"id": "helper-F", "title": title, "state": "running", "started": 0.0}
+    def cancel(self, helper_id):
+        self.cancelled.append(helper_id)
+        return helper_id == "helper-F"
+    def mark_lost(self):
+        return []
+    def shutdown(self):
+        pass
+    def snapshot(self):
+        return []
+
+
+def test_approved_card_runs_in_helper(tmp_path):
+    async def go():
+        from navigator.conductor.cards import Cards
+        cards = Cards(tmp_path / "cards.json")
+        helpers = FakeHelpers()
+        eng = Engine(Store(tmp_path / "c"), _runner, helpers=helpers)
+        app = server.build_app(eng, cards=cards, helpers=helpers)
+        submitted = []
+        real_submit = eng.submit
+        eng.submit = lambda *a, **k: submitted.append((a, k)) or real_submit(*a, **k)
+        await eng.start()
+        a, _ = cards.raise_card("Bash", {"command": "git push origin main", "description": "Push"}, "git push",
+                                cwd="/Users/Manoj/calwbot/navigator")
+        b, _ = cards.raise_card("Bash", {"command": "git merge x"}, "git merge", cwd="/r")
+        try:
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://c") as c:
+                r = await c.post(f"/cards/{a['code']}/approve", json={"via": "telegram"})
+                assert r.status_code == 200 and r.json()["state"] == "approved"
+                assert "input" not in r.json() and "cwd" not in r.json()
+                assert (await c.post(f"/cards/{b['code']}/decline", json={"via": "web"})).json()["state"] == "declined"
+                assert (await c.post("/helpers/helper-F/cancel")).json() == {"cancelled": True}
+                assert (await c.post("/helpers/helper-Q/cancel")).json() == {"cancelled": False}
+        finally:
+            await asyncio.sleep(0.05); await eng.stop()
+        assert len(helpers.started) == 1
+        s = helpers.started[0]
+        assert s["exact"] == {"tool": "Bash", "input": {"command": "git push origin main", "description": "Push"},
+                              "cwd": "/Users/Manoj/calwbot/navigator"} and s["via"] == "telegram"
+        assert s["title"] == f"approved card {a['code']}" and a["code"] in s["task"]
+        assert "git push origin main" in s["task"] and "/Users/Manoj/calwbot/navigator" in s["task"]
+        assert not any(a_[1] == "approval" for a_, _ in submitted)
+        assert helpers.cancelled == ["helper-F", "helper-Q"]
+        assert [e["state"] for e in eng.store.history() if e["kind"] == "card"] == ["approved", "declined"]
+        assert all("input" not in e and "cwd" not in e for e in eng.store.history() if e["kind"] == "card")
+    asyncio.run(go())
+
+
+def test_helpers_cancel_route_absent_without_helpers(tmp_path):
+    async def go(c, eng):
+        assert (await c.post("/helpers/helper-F/cancel")).status_code == 404
+    asyncio.run(_with_app(tmp_path, go))

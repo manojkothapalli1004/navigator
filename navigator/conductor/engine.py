@@ -5,18 +5,24 @@ from __future__ import annotations
 import asyncio
 import fcntl
 import logging
+import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Awaitable, Callable
+from typing import TYPE_CHECKING, Awaitable, Callable
 
 from navigator.conductor import activity
 from navigator.conductor.store import Store
 
+if TYPE_CHECKING:  # helpers imports the runner, which imports this module
+    from navigator.conductor.helpers import Helpers
+
 _log = logging.getLogger(__name__)
 
 SOURCES = ("web", "telegram", "terminal")
+INTERNAL_SOURCES = ("approval", "autopilot", "helper")  # only the conductor itself submits these
 TERMINAL_WAIT = "waiting for the terminal session to end"
 TURN_TIMEOUT_S = 45 * 60  # a stuck turn (tool waiting on input, network stall) must not freeze every window
+HELPER_ITEMS_TTL_S = 600  # a finished helper's steps stay on the screens this long
 TurnRunner = Callable[[str, "str | None", Callable[[dict], None]], Awaitable["str | None"]]
 
 
@@ -28,9 +34,10 @@ class Engine:
     def __init__(self, store: Store, runner: TurnRunner, lock_path: Path | None = None,
                  turn_timeout_s: float = TURN_TIMEOUT_S, notify: Callable[[dict], None] | None = None,
                  reply: Callable[[str], None] | None = None, autopilot=None,
-                 cards_pending: Callable[[], bool] | None = None):
+                 cards_pending: Callable[[], bool] | None = None, helpers: "Helpers | None" = None):
         self.store, self.runner, self.turn_timeout_s = store, runner, turn_timeout_s
         self.autopilot = autopilot  # keeps working through the plan file between turns (off by default)
+        self.helpers = helpers  # the work a turn delegates instead of doing itself (2026-11-04)
         self.cards_pending = cards_pending or (lambda: False)
         self.notify = notify  # tells the operator's phone about a new approval card (C3)
         self.reply = reply  # sends a Telegram-originated turn's outcome back to Telegram (C4)
@@ -47,28 +54,60 @@ class Engine:
         # the latest turn's tool steps, for crew screens in a window that opens mid-turn (in memory only)
         self._activity_msg: str | None = None
         self._activity: dict[str, dict] = {}
+        # each helper's steps (its own screen), kept for a while after it ends
+        self._helper_activity: dict[str, dict[str, dict]] = {}
+        self._helper_ended: dict[str, float] = {}
 
     def activity_snapshot(self) -> dict:
-        return {"msg_id": self._activity_msg, "items": list(self._activity.values())}
+        now = self.helpers.clock() if self.helpers is not None else time.time()
+        for hid, ended in list(self._helper_ended.items()):
+            if now - ended > HELPER_ITEMS_TTL_S:
+                self._helper_ended.pop(hid)
+                self._helper_activity.pop(hid, None)
+        shown = self.helpers.snapshot() if self.helpers is not None else [{"id": h} for h in self._helper_activity]
+        return {"msg_id": self._activity_msg, "items": list(self._activity.values()),
+                "helpers": [{**h, "items": list(self._helper_activity.get(h["id"], {}).values())} for h in shown]}
+
+    @staticmethod
+    def _merge_step(items: dict[str, dict], ev: dict) -> dict | None:
+        """Fold one activity event into a step list; newer state wins; None when its start was never seen."""
+        item = items.get(ev.get("id", ""))
+        if item is None:
+            if ev.get("state") != "running":
+                return None  # a result whose start was never seen
+            item = {k: ev.get(k) for k in ("id", "tool", "title", "parent", "helper")}
+            item["state"] = "running"  # set before the cap runs, so the new step isn't the one evicted
+            items[item["id"]] = item
+            while len(items) > activity.MAX_ITEMS:
+                # the oldest finished plain step goes first; helpers and running steps are kept
+                old = next((k for k, v in items.items()
+                            if v.get("state") != "running" and not v.get("helper")), next(iter(items)))
+                items.pop(old)
+        item["state"] = ev.get("state")
+        item["ts"] = datetime.now(timezone.utc).isoformat()
+        return item
 
     def _on_activity(self, msg_id: str, ev: dict) -> None:
         if msg_id != self._activity_msg:
             self._activity_msg, self._activity = msg_id, {}
-        item = self._activity.get(ev.get("id", ""))
-        if item is None:
-            if ev.get("state") != "running":
-                return  # a result whose start was never seen
-            item = {k: ev.get(k) for k in ("id", "tool", "title", "parent", "helper")}
-            item["state"] = "running"  # set before the cap runs, so the new step isn't the one evicted
-            self._activity[item["id"]] = item
-            while len(self._activity) > activity.MAX_ITEMS:
-                # the oldest finished plain step goes first; helpers and running steps are kept
-                old = next((k for k, v in self._activity.items()
-                            if v.get("state") != "running" and not v.get("helper")), next(iter(self._activity)))
-                self._activity.pop(old)
-        item["state"] = ev.get("state")
-        item["ts"] = datetime.now(timezone.utc).isoformat()
-        self._publish({"type": "activity", "msg_id": msg_id, "item": dict(item)})
+        item = self._merge_step(self._activity, ev)
+        if item is not None:
+            self._publish({"type": "activity", "msg_id": msg_id, "item": dict(item)})
+
+    def on_helper_event(self, helper_id: str, ev: dict) -> None:
+        """A helper's tool step: its own screen, published in the turn-step shape plus helper_id."""
+        if ev.get("type") != "activity":
+            return
+        item = self._merge_step(self._helper_activity.setdefault(helper_id, {}), ev)
+        if item is not None:
+            self._publish({"type": "activity", "msg_id": None, "helper_id": helper_id, "item": dict(item)})
+
+    def on_helper_finish(self, rec: dict) -> None:
+        """A helper ended (done, failed, cancelled, timed out): its report becomes one internal turn, and
+        the main agent tells the operator in its own words, on the window the helper came from."""
+        self._helper_ended[rec["id"]] = rec.get("ended") or (self.helpers.clock() if self.helpers else time.time())
+        self.submit(f"[helper {rec['id']} {rec['state']}: {rec['title']}]\n{rec.get('result') or rec.get('error') or ''}",
+                    "helper", internal=True, reply_via=rec.get("reply_via"))
 
     def _close_activity(self, msg_id: str, state: str) -> None:
         """A turn ended: no step of it may keep saying it runs (Stop, timeout, error, or a lost result)."""
@@ -85,9 +124,16 @@ class Engine:
     async def start(self) -> None:
         self._pending = asyncio.Queue()
         self._mark_interrupted()
+        if self.helpers is not None:
+            lost = self.helpers.mark_lost()
+            if lost:
+                self.submit("[helpers lost on restart] " + ", ".join(f"{r['id']} {r['title']}" for r in lost),
+                            "helper", internal=True)
         self._task = asyncio.create_task(self._worker())
 
     async def stop(self) -> None:
+        if self.helpers is not None:
+            self.helpers.shutdown()  # nothing may be submitted to a stopped engine; the restart reports them
         if self._task:
             self._task.cancel()
             try:
@@ -130,8 +176,8 @@ class Engine:
 
     def submit(self, text: str, source: str, internal: bool = False,
                reply_via: str | None = None) -> dict:
-        # "approval" / "autopilot" messages come only from the conductor itself
-        if source not in SOURCES and not (internal and source in ("approval", "autopilot")):
+        # "approval" / "autopilot" / "helper" messages come only from the conductor itself
+        if source not in SOURCES and not (internal and source in INTERNAL_SOURCES):
             raise ValueError(f"unknown source {source!r}")
         if self.autopilot is not None and source in SOURCES:
             if cmd := self.autopilot.command(text):
@@ -142,7 +188,7 @@ class Engine:
         ahead = self.queue_len + (1 if self.busy else 0)
         detail = TERMINAL_WAIT if self.terminal else ahead
         self._append({"kind": "status", "state": "queued", "msg_id": user["id"], "detail": detail})
-        if self.terminal and source != "autopilot":
+        if self.terminal and source not in ("autopilot", "helper"):  # the notice is for the operator's own words
             self._reply(user, "You're in the terminal — I'll answer this when you leave it.")
         self._pending.put_nowait(user)
         return user
@@ -209,8 +255,9 @@ class Engine:
     def on_card(self, card: dict) -> None:
         """A card was raised or changed state: every window sees it; a new one goes to the phone."""
         # card_id, not id: each state change is its own history entry with its own id
+        # input/cwd are the helper's copy of the action; the summary already shows it to the operator
         self._append({"kind": "card", "card_id": card["id"],
-                      **{k: v for k, v in card.items() if k not in ("id", "fingerprint")}})
+                      **{k: v for k, v in card.items() if k not in ("id", "fingerprint", "input", "cwd")}})
         if card.get("state") == "pending" and self.notify:
             try:
                 self.notify(card)
@@ -296,6 +343,8 @@ class Engine:
                     return
             self._activity_msg, self._activity = msg_id, {}  # this turn's steps start empty
             self._append({"kind": "status", "state": "running", "msg_id": msg_id})
+            if self.helpers is not None:  # a helper started from a Telegram message reports back there
+                self.helpers.current_via = "telegram" if self._to_telegram(user) else None
             parts: list[str] = []
             prompt = f"[{user.get('source', 'web')}] {user['text']}"
             self._cancelled, self._cancel_via = False, None
