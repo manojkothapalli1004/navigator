@@ -36,6 +36,14 @@ def test_titles_are_one_short_line():
     assert activity.describe("Read", None) == "Reading a file"
 
 
+def test_a_bad_input_never_raises_and_token_shapes_are_hidden():
+    # urlsplit raises on a bracketed host; that must not end the turn
+    assert activity.describe("WebFetch", {"url": "http://[abc"}) == "WebFetch"
+    t = activity.describe("Bash", {"description": "Retry with ghp_abcdefghijklmnopqrstuvwxyz0123 now"})
+    assert "ghp_" not in t and t == "Retry with … now"
+    assert "123456789:" not in activity.describe("WebSearch", {"query": "bot 123456789:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw"})
+
+
 def test_helpers_are_the_agent_and_task_tools():
     assert activity.is_helper("Agent") and activity.is_helper("Task") and not activity.is_helper("Bash")
 
@@ -140,12 +148,63 @@ async def test_engine_publishes_activity_and_keeps_the_turns_steps(tmp_path):
     assert all(a["msg_id"] == m["id"] and a["item"]["id"] == "t1" and a["item"]["ts"] for a in acts)
     assert acts[1]["item"]["title"] == "Reading a.py"  # the finished step still carries its title
 
-    # the next turn starts a fresh list
-    gate.set()
-    m2 = eng.submit("again", "web"); await _drain(eng)
-    snap = eng.activity_snapshot()
-    assert snap["msg_id"] == m2["id"] and len(snap["items"]) == 1
     await eng.stop()
+
+
+@aio
+async def test_a_new_turn_starts_empty_even_before_its_first_step(tmp_path):
+    class Once:
+        n = 0
+        async def __call__(self, prompt, session_id, emit):
+            Once.n += 1
+            if Once.n == 1:
+                emit({"type": "activity", "id": "a1", "tool": "Read", "title": "Reading a", "state": "running",
+                      "parent": None, "helper": False})
+                emit({"type": "activity", "id": "a1", "state": "done"})
+            return "s"
+    eng = Engine(Store(tmp_path / "c"), Once(), lock_path=tmp_path / "c" / "turn.lock")
+    await eng.start()
+    eng.submit("one", "web"); await _drain(eng)
+    m2 = eng.submit("two", "web"); await _drain(eng)  # no tool calls at all
+    assert eng.activity_snapshot() == {"msg_id": m2["id"], "items": []}
+    await eng.stop()
+
+
+@aio
+async def test_steps_still_running_are_closed_when_the_turn_stops(tmp_path):
+    gate = asyncio.Event()
+    class Hang:
+        async def __call__(self, prompt, session_id, emit):
+            emit({"type": "activity", "id": "h1", "tool": "Agent", "title": "Helper", "state": "running",
+                  "parent": None, "helper": True})
+            if "stop" in prompt:
+                await gate.wait()  # cancelled while waiting
+            return "s"
+    eng = Engine(Store(tmp_path / "c"), Hang(), lock_path=tmp_path / "c" / "turn.lock")
+    await eng.start()
+    eng.submit("stop me", "web")
+    for _ in range(100):
+        await asyncio.sleep(0.01)
+        if eng.activity_snapshot()["items"]:
+            break
+    assert eng.cancel()
+    await _drain(eng)
+    assert [i["state"] for i in eng.activity_snapshot()["items"]] == ["failed"]
+    eng.submit("finish", "web"); await _drain(eng)  # a result never came back: closed as done with the turn
+    assert [i["state"] for i in eng.activity_snapshot()["items"]] == ["done"]
+    await eng.stop()
+
+
+@aio
+async def test_steps_leave_room_for_entries_in_a_slow_window(tmp_path):
+    eng = Engine(Store(tmp_path / "c"), StepRunner(), lock_path=tmp_path / "c" / "turn.lock")
+    q = eng.subscribe(maxsize=10)
+    for i in range(30):
+        eng._on_activity("m1", {"type": "activity", "id": f"t{i}", "tool": "Read", "title": "x",
+                                "state": "running", "parent": None, "helper": False})
+    assert not q.full()
+    eng._append({"kind": "note", "text": "an entry still fits"})
+    assert not eng.is_dropped(q)
 
 
 @aio
@@ -173,7 +232,7 @@ async def test_a_full_window_skips_steps_instead_of_being_dropped(tmp_path):
     for i in range(20):
         eng._on_activity("m1", {"type": "activity", "id": f"t{i}", "tool": "Read", "title": "Reading x",
                                 "state": "running", "parent": None, "helper": False})
-    assert q.full() and not eng.is_dropped(q) and len(eng.activity_snapshot()["items"]) == 20
+    assert not eng.is_dropped(q) and len(eng.activity_snapshot()["items"]) == 20
 
 
 @aio

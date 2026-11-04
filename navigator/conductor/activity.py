@@ -5,9 +5,13 @@ Titles never include a shell command or a tool's raw input — a command can car
 the call's own description, a file's name, a search query or a site's host."""
 from __future__ import annotations
 
+import re
 from urllib.parse import urlsplit
 
 MAX_TITLE = 100
+# token shapes the model might still write into a description or query: never shown
+_SECRET = re.compile(r"(sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9]{8,}|xox[a-z]-[A-Za-z0-9-]{8,}"
+                     r"|\d{6,}:[A-Za-z0-9_-]{25,}|AKIA[0-9A-Z]{12,}|[A-Fa-f0-9]{32,}|[A-Za-z0-9+/_-]{40,})")
 MAX_ITEMS = 200  # steps kept per turn for a window that opens mid-turn
 
 _FILE_VERBS = {"Read": "Reading", "Edit": "Editing", "MultiEdit": "Editing", "Write": "Writing",
@@ -21,7 +25,7 @@ def is_helper(tool: str) -> bool:
 
 
 def _one_line(text: str) -> str:
-    t = " ".join(str(text).split())
+    t = _SECRET.sub("…", " ".join(str(text).split()))
     return t if len(t) <= MAX_TITLE else t[: MAX_TITLE - 1].rstrip() + "…"
 
 
@@ -30,6 +34,14 @@ def _name(path: object) -> str:
 
 
 def describe(tool: str, data: object) -> str:
+    """Never raises: a title must not be able to end the turn it describes."""
+    try:
+        return _describe(str(tool), data)
+    except Exception:
+        return _one_line(tool)
+
+
+def _describe(tool: str, data: object) -> str:
     args = data if isinstance(data, dict) else {}
     if tool == "Bash":
         title = str(args.get("description") or "").strip()
@@ -44,7 +56,7 @@ def describe(tool: str, data: object) -> str:
         return _one_line(f"Searching the web: {q}") if q else "Searching the web"
     if tool == "WebFetch":
         host = urlsplit(str(args.get("url") or "")).hostname
-        return f"Reading {host}" if host else "Reading a web page"
+        return _one_line(f"Reading {host}") if host else "Reading a web page"
     if tool in _HELPERS:
         return _one_line(str(args.get("description") or "").strip() or "A helper is working")
     if tool == "Skill":

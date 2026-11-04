@@ -59,12 +59,24 @@ class Engine:
             if ev.get("state") != "running":
                 return  # a result whose start was never seen
             item = {k: ev.get(k) for k in ("id", "tool", "title", "parent", "helper")}
+            item["state"] = "running"  # set before the cap runs, so the new step isn't the one evicted
             self._activity[item["id"]] = item
             while len(self._activity) > activity.MAX_ITEMS:
-                self._activity.pop(next(iter(self._activity)))
+                # the oldest finished plain step goes first; helpers and running steps are kept
+                old = next((k for k, v in self._activity.items()
+                            if v.get("state") != "running" and not v.get("helper")), next(iter(self._activity)))
+                self._activity.pop(old)
         item["state"] = ev.get("state")
         item["ts"] = datetime.now(timezone.utc).isoformat()
         self._publish({"type": "activity", "msg_id": msg_id, "item": dict(item)})
+
+    def _close_activity(self, msg_id: str, state: str) -> None:
+        """A turn ended: no step of it may keep saying it runs (Stop, timeout, error, or a lost result)."""
+        if msg_id != self._activity_msg:
+            return
+        for item_id, item in list(self._activity.items()):
+            if item.get("state") == "running":
+                self._on_activity(msg_id, {"type": "activity", "id": item_id, "state": state})
 
     @property
     def queue_len(self) -> int:
@@ -231,6 +243,8 @@ class Engine:
 
     def _publish(self, ev: dict) -> None:
         for q in list(self._subs):
+            if ev["type"] == "activity" and q.maxsize and q.qsize() >= q.maxsize - max(1, q.maxsize // 10):
+                continue  # steps leave room at the top for entries, so they never get a window cut off
             if not q.full():
                 q.put_nowait(ev)
             elif ev["type"] not in ("delta", "activity"):  # live-only events may be skipped
@@ -280,6 +294,7 @@ class Engine:
                     self._append({"kind": "status", "state": "skipped", "msg_id": msg_id,
                                   "detail": f"autopilot turn skipped: {why}"})
                     return
+            self._activity_msg, self._activity = msg_id, {}  # this turn's steps start empty
             self._append({"kind": "status", "state": "running", "msg_id": msg_id})
             parts: list[str] = []
             prompt = f"[{user.get('source', 'web')}] {user['text']}"
@@ -303,14 +318,17 @@ class Engine:
             except asyncio.CancelledError:
                 if not self._cancelled:
                     raise  # the engine itself is stopping
+                self._close_activity(msg_id, "failed")
                 self._error(user, "cancelled by operator", reply=self._cancel_via != "telegram")
                 self._after_turn("cancelled")
                 return
             except asyncio.TimeoutError:
+                self._close_activity(msg_id, "failed")
                 self._error(user, f"timed out after {self.turn_timeout_s:.0f}s; the turn was stopped")
                 self._after_turn("timeout")
                 return
             except Exception as e:  # the worker must outlive any one turn
+                self._close_activity(msg_id, "failed")
                 self._error(user, f"{type(e).__name__}: {str(e)[:300]}")
                 self._after_turn("error")
                 return
@@ -319,6 +337,7 @@ class Engine:
             if sid:
                 self.store.set_session_id(sid)
             text = "".join(parts) or "(no reply text)"
+            self._close_activity(msg_id, "done")  # a step whose result never came back still ended with the turn
             self._append({"kind": "assistant", "text": text, "reply_to": msg_id})
             self._append({"kind": "status", "state": "done", "msg_id": msg_id})
             self._reply(user, text)
