@@ -68,6 +68,16 @@ _ACTIONS = {"/merge": "merge", "/reject": "reject"}
 # 'merge <name>': a proposal short name such as 'N5b' or 'S3a' (never a run id prefix)
 SHORT_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,31}")
 DEFAULT_OFFSET_PATH = "/Users/Manoj/calwbot/logs/navigator/telegram_offset"
+def _media_kind(msg: dict) -> str | None:
+    """'photo' for a Telegram photo or an image sent as a file; None for anything else."""
+    if isinstance(msg.get("photo"), list) and msg["photo"]:
+        return "photo"
+    doc = msg.get("document")
+    if isinstance(doc, dict) and str(doc.get("mime_type", "")).startswith("image/"):
+        return "photo"
+    return None
+
+
 DEFAULT_INBOX_PATH = "/Users/Manoj/calwbot/logs/navigator/telegram_inbox.jsonl"
 
 # a command older than this is not acted on (the daemon may have been down)
@@ -323,9 +333,15 @@ class TelegramInbox:
             if not isinstance(msg, dict) or not self._authorized(msg):
                 continue
             text = msg.get("text")
+            media = _media_kind(msg)
             if not isinstance(text, str):
-                continue
+                if media is None:
+                    continue
+                # 2026-11-03: a photo (or image file) reaches the bot with its caption as the text
+                text = msg.get("caption") if isinstance(msg.get("caption"), str) else ""
             entry = {"update_id": uid, "date": msg.get("date"), "text": text}
+            if media is not None:
+                entry["media"] = media
             ignored = self._ignored_reason(msg, now)
             if ignored is not None:
                 entry["ignored"] = ignored
@@ -340,8 +356,8 @@ class TelegramInbox:
         """One short poll (timeout=0) for the daemon cycle: the merge commands found."""
         commands: list[TelegramCommand] = []
         for entry, _msg in self._consume(0):
-            if "ignored" in entry:
-                continue
+            if "ignored" in entry or "media" in entry:
+                continue  # a photo caption is never a merge command
             cmd = parse_command(entry["text"], entry["update_id"])
             if cmd is not None:
                 commands.append(cmd)

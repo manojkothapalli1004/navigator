@@ -676,3 +676,47 @@ def test_card_button_tap_from_someone_else_or_odd_data_ignored(tmp_path):
                               _tap(6, "card:approve:ABC234", chat=999),
                               _tap(7, "card:approve:abc; rm -rf"), _tap(8, "merge all")])
     assert inbox.poll_updates(0) == []
+
+
+# ---- 2026-11-03: photos reach the bot (they were dropped: the operator's app-architecture picture) ----
+
+def _photo(uid, caption=None, **extra):
+    u = _update(uid, None, **extra)
+    msg = u["message"]; msg.pop("text")
+    msg["photo"] = [{"file_id": "small", "width": 90, "height": 90}, {"file_id": "big", "width": 1280, "height": 960}]
+    if caption is not None:
+        msg["caption"] = caption
+    return u
+
+
+def test_photo_is_passed_through_with_its_caption(tmp_path):
+    inbox = _inbox(tmp_path, [_photo(7, caption="the app architecture")])
+    got = inbox.poll_updates(0)
+    assert [uid for uid, _ in got] == [7] and got[0][1]["photo"][-1]["file_id"] == "big"
+    line = _inbox_lines(tmp_path)[-1]
+    assert line["text"] == "the app architecture" and line["media"] == "photo"
+
+
+def test_photo_without_caption_is_passed_through(tmp_path):
+    inbox = _inbox(tmp_path, [_photo(8)])
+    assert [uid for uid, _ in inbox.poll_updates(0)] == [8]
+    assert _inbox_lines(tmp_path)[-1]["text"] == ""
+
+
+def test_image_document_passes_other_documents_dont(tmp_path):
+    img = _update(9, None); img["message"].pop("text")
+    img["message"]["document"] = {"file_id": "d1", "mime_type": "image/png", "file_name": "arch.png"}
+    pdf = _update(10, None); pdf["message"].pop("text")
+    pdf["message"]["document"] = {"file_id": "d2", "mime_type": "application/pdf", "file_name": "x.pdf"}
+    inbox = _inbox(tmp_path, [img, pdf])
+    assert [uid for uid, _ in inbox.poll_updates(0)] == [9]
+
+
+def test_a_photo_caption_is_never_a_navigator_command(tmp_path):
+    inbox = _inbox(tmp_path, [_photo(11, caption="/merge all")])
+    assert inbox.poll_once() == []
+
+
+def test_photo_from_a_stranger_is_still_ignored(tmp_path):
+    inbox = _inbox(tmp_path, [_photo(12, caption="hi", chat="999")])
+    assert inbox.poll_updates(0) == []
