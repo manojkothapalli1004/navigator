@@ -399,6 +399,7 @@ sdk = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "claude-agent-sdk" },
     { name = "pytest" },
 ]
 
@@ -415,7 +416,10 @@ requires-dist = [
 provides-extras = ["sdk", "dev", "checker"]
 
 [package.metadata.requires-dev]
-dev = [{ name = "pytest", specifier = ">=9.0.3" }]
+dev = [
+    { name = "claude-agent-sdk", specifier = ">=0.1" },
+    { name = "pytest", specifier = ">=9.0.3" },
+]
 
 [[package]]
 name = "packaging"

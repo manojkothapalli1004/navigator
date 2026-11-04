@@ -19,6 +19,10 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [dependency-groups]
+# `uv run pytest` in a Navigator build folder installs only this group, and the conductor
+# tests import claude_agent_sdk (with its starlette/uvicorn/sse-starlette deps); without it
+# every full-suite verify failed (live 2026-11-04, 5 of 5 runs)
 dev = [
     "pytest>=9.0.3",
+    "claude-agent-sdk>=0.1",
 ]
