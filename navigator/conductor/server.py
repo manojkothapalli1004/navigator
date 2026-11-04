@@ -67,7 +67,9 @@ def build_app(engine: Engine, manage_engine: bool = False, cards=None) -> Starle
         return JSONResponse({"busy": engine.busy, "queue_len": engine.queue_len,
                              "session_id_set": engine.store.session_id is not None,
                              "terminal": engine.terminal,
-                             "autopilot": engine.autopilot.public() if engine.autopilot else None})
+                             "autopilot": engine.autopilot.public() if engine.autopilot else None,
+                             # the latest turn's steps: crew screens for a window opened mid-turn
+                             "activity": engine.activity_snapshot()})
 
     async def autopilot(req: Request):
         if engine.autopilot is None:
