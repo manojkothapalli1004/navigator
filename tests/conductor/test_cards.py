@@ -327,3 +327,14 @@ def test_hook_declined_retry_reason_and_no_card(tmp_path):
     assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
     assert "the operator declined this exact action 3 min ago — don't retry, ask in chat" in reason
     assert seen[0]["code"] not in reason and len(seen) == 1  # no new card, code never shown
+
+
+def test_card_record_keeps_input_and_cwd(tmp_path):
+    from navigator.conductor import server
+    c = _cards(tmp_path)
+    card, _ = c.raise_card("Bash", {**PUSH, "description": "Push main"}, "git push", cwd="/r")
+    assert card["input"] == {**PUSH, "description": "Push main"} and card["cwd"] == "/r"
+    saved = Cards(tmp_path / "cards.json")._cards[0]
+    assert saved["input"] == card["input"] and saved["cwd"] == "/r"
+    pub = server._public(card)
+    assert "input" not in pub and "cwd" not in pub and "fingerprint" not in pub and pub["code"] == card["code"]

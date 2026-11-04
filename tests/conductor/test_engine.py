@@ -512,3 +512,90 @@ async def test_autopilot_turn_gets_no_terminal_notice(tmp_path):
     await eng.start(); eng.submit(ap.prompt("x"), "autopilot", internal=True, reply_via="telegram")
     eng.terminal = False; ap.set(False); await _drain(eng); await eng.stop()
     assert not any("You're in the terminal" in s for s in sent)
+
+
+# --- helpers stage 1 (2026-11-04): helper reports are internal messages; helper steps have their own screens ---
+
+@aio
+async def test_helper_submit_source_is_internal_only(tmp_path):
+    eng = _eng(tmp_path, FakeRunner()); await eng.start()
+    with pytest.raises(ValueError):
+        eng.submit("x", "helper")
+    u = eng.submit("[helper helper-1 done: t]\nfound it", "helper", internal=True, reply_via="telegram")
+    await _drain(eng)
+    assert u["source"] == "helper" and u["reply_via"] == "telegram"
+    assert eng.runner.raw == ["[helper] [helper helper-1 done: t]\nfound it"]
+    await eng.stop()
+
+
+@aio
+async def test_snapshot_includes_helper_activity(tmp_path):
+    eng = _eng(tmp_path, FakeRunner()); await eng.start()
+    q = eng.subscribe()
+    hid = "helper-01ABC"
+    assert eng.activity_snapshot() == {"msg_id": None, "items": [], "helpers": []}
+    eng.on_helper_event(hid, {"type": "activity", "id": "t1", "tool": "Read", "title": "Reading x", "state": "running",
+                             "parent": None, "helper": False})
+    snap = eng.activity_snapshot()
+    assert snap["helpers"][0]["id"] == hid and snap["helpers"][0]["items"][0]["title"] == "Reading x"
+    assert snap["helpers"][0]["items"][0]["state"] == "running"
+    eng.on_helper_event(hid, {"type": "activity", "id": "t1", "state": "done"})
+    eng.on_helper_event(hid, {"type": "activity", "id": "stray", "state": "done"})  # start never seen: ignored
+    items = eng.activity_snapshot()["helpers"][0]["items"]
+    assert [(i["id"], i["state"], i["title"]) for i in items] == [("t1", "done", "Reading x")]
+    assert eng.activity_snapshot()["items"] == []  # the turn's own steps are untouched
+    evs = []
+    while not q.empty():
+        evs.append(q.get_nowait())
+    acts = [e for e in evs if e["type"] == "activity"]
+    assert [(e["helper_id"], e["msg_id"], e["item"]["state"]) for e in acts] == [(hid, None, "running"), (hid, None, "done")]
+    await eng.stop()
+
+
+@aio
+async def test_helper_items_are_dropped_ten_minutes_after_the_end(tmp_path, monkeypatch):
+    from navigator.conductor import engine as engine_mod
+    clock = {"t": 1000.0}
+    calls = []
+    monkeypatch.setattr(engine_mod.time, "time", lambda: clock["t"])
+    eng = Engine(Store(tmp_path / "c"), FakeRunner(), lock_path=tmp_path / "c" / "turn.lock")
+    eng.submit = lambda *a, **k: calls.append((a, k))
+    eng.on_helper_event("helper-X", {"type": "activity", "id": "t1", "tool": "Grep", "title": "Searching the code",
+                                     "state": "running"})
+    eng.on_helper_finish({"id": "helper-X", "title": "t", "state": "done", "result": "r", "ended": 1000.0,
+                          "reply_via": None})
+    assert calls[0][0] == ("[helper helper-X done: t]\nr", "helper")
+    assert [h["id"] for h in eng.activity_snapshot()["helpers"]] == ["helper-X"]
+    clock["t"] = 1000.0 + 599
+    assert [h["id"] for h in eng.activity_snapshot()["helpers"]] == ["helper-X"]
+    clock["t"] = 1000.0 + 601
+    assert eng.activity_snapshot()["helpers"] == []
+
+
+@aio
+async def test_turn_sets_helper_via_from_the_message_window(tmp_path):
+    from navigator.conductor.helpers import Helpers
+    hs = Helpers(tmp_path / "helpers.json", None, lambda *a: None, lambda r: None)
+    seen = []
+    class Peek(FakeRunner):
+        async def __call__(self, prompt, session_id, emit):
+            seen.append(hs.current_via)
+            return await super().__call__(prompt, session_id, emit)
+    eng = Engine(Store(tmp_path / "c"), Peek(), lock_path=tmp_path / "c" / "turn.lock", helpers=hs)
+    await eng.start()
+    eng.submit("aa", "telegram"); eng.submit("bb", "web")
+    eng.submit("cc", "approval", internal=True, reply_via="telegram"); await _drain(eng)
+    assert seen == ["telegram", None, "telegram"]
+    await eng.stop()
+
+
+@aio
+async def test_helper_report_while_in_terminal_sends_no_terminal_notice(tmp_path):
+    sent = []
+    eng = Engine(Store(tmp_path / "c"), FakeRunner(), lock_path=tmp_path / "c" / "turn.lock", reply=sent.append)
+    await eng.start()
+    eng.terminal_joined()
+    eng.submit("[helper helper-1 done: t]\nok", "helper", internal=True, reply_via="telegram")
+    assert sent == []
+    eng.terminal_left([]); await _drain(eng)
+    await eng.stop()

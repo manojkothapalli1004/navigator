@@ -90,3 +90,42 @@ def test_permission_mode_matches_terminal_auto():
     # the operator's terminal runs defaultMode "auto" (~/.claude/settings.json); "default" made
     # every prompt-worthy action (ORC read, ACT read, file write) a denial in a window with no human
     assert runner.options(None).permission_mode == "auto"
+
+
+# ---- helpers stage 1 (2026-11-04): the main turn only talks and delegates ----
+
+def test_main_turn_tools_are_restricted():
+    o = runner.options(None)
+    assert o.tools == runner.MAIN_TOOLS and o.allowed_tools == []
+    for t in ("Read", "Bash", "Agent", "Task", "Edit", "Write", "WebFetch", "Skill"):
+        assert t not in o.tools
+    assert {"mcp__conductor__delegate", "mcp__conductor__helpers", "mcp__conductor__cancel_helper",
+            "mcp__orchestrator__get_canonical_memory"} <= set(o.tools)
+    assert not any(t.startswith("mcp__alpaca") for t in o.tools)
+
+
+def test_main_turn_loads_only_named_mcp():
+    o = runner.options(None)
+    assert o.strict_mcp_config is True and set(o.mcp_servers) == {"orchestrator"}
+    assert o.mcp_servers["orchestrator"] == runner.ORC_MCP and runner.ORC_MCP["type"] == "stdio"
+    assert o.disallowed_tools == runner.ORC_WRITE_TOOLS
+    for name in ("apply_memory_update", "create_idea", "add_idea_note", "convert_idea", "finalize_idea",
+                 "save_prompt", "update_prompt_status"):
+        assert f"mcp__orchestrator__{name}" in runner.ORC_WRITE_TOOLS
+        assert f"mcp__orchestrator__{name}" not in runner.MAIN_TOOLS
+    fake = {"type": "sdk", "name": "conductor", "instance": object()}
+    with_server = runner.options("s-1", conductor_server=fake)
+    assert set(with_server.mcp_servers) == {"orchestrator", "conductor"} and with_server.mcp_servers["conductor"] is fake
+    assert with_server.resume == "s-1"
+
+
+def test_sdk_turn_passes_conductor_server_through():
+    FakeClient.messages = [_result("s-2")]
+    fake = {"type": "sdk", "name": "conductor", "instance": object()}
+    asyncio.run(runner.sdk_turn("hi", None, lambda e: None, conductor_server=fake))
+    assert FakeClient.seen_options.mcp_servers["conductor"] is fake
+
+
+def test_windows_prompt_tells_the_model_to_delegate():
+    for phrase in ("call delegate", "Check helpers first", "[helper", "Answer 'how is it going' from helpers"):
+        assert phrase in runner.WINDOWS_PROMPT

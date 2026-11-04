@@ -129,8 +129,9 @@ class Cards:
         code = "".join(secrets.choice(CODE_ALPHABET) for _ in range(CODE_LEN))
         while code in codes:
             code = "".join(secrets.choice(CODE_ALPHABET) for _ in range(CODE_LEN))
+        # input + cwd: what the helper that runs an approved card is handed (2026-11-04)
         card = {"id": secrets.token_urlsafe(16), "code": code, "tool": tool_name,
-                "summary": summary, "reason": reason, "fingerprint": fp,
+                "summary": summary, "reason": reason, "fingerprint": fp, "input": tool_input, "cwd": cwd,
                 "state": "pending", "created": now, "expires": now + self.ttl_s}
         self._cards.append(card)
         self._save()
