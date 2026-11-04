@@ -334,7 +334,7 @@ def test_helper_result_is_last_text_block(monkeypatch):
     assert "Agent" not in o.tools and "Task" not in o.tools
     assert str(o.cwd) == "/Users/Manoj/calwbot" and o.permission_mode == "auto" and o.can_use_tool is not None
     assert o.system_prompt == {"type": "preset", "preset": "claude_code", "append": H.HELPER_PROMPT}
-    assert o.hooks["PreToolUse"][0].hooks == [_hook, H.scratch_only_hook]
+    assert o.hooks["PreToolUse"][0].hooks == [H.scratch_only_hook, _hook]  # the fence runs first
 
 
 def test_helper_error_result_raises(monkeypatch):
@@ -351,7 +351,7 @@ def test_exact_helper_can_only_make_the_approved_call(monkeypatch):
     assert asyncio.run(H.sdk_helper(TASK, "helper-2", lambda e: None, hook=_hook, exact=exact)) == "pushed"
     o = FakeClient.seen_options
     assert o.tools == ["Bash"] and str(o.cwd) == "/r" and o.resume is None
-    fence = o.hooks["PreToolUse"][0].hooks[1]
+    fence = o.hooks["PreToolUse"][0].hooks[0]  # the fence runs before the card hook
     same = {"tool_name": "Bash", "tool_input": {"command": "git push origin main", "description": "Push"}, "cwd": "/r"}
     other = {"tool_name": "Bash", "tool_input": {"command": "git push origin dev"}, "cwd": "/r"}
     elsewhere = {"tool_name": "Bash", "tool_input": {"command": "git push origin main"}, "cwd": "/other"}
@@ -374,3 +374,12 @@ async def test_cancel_helper_tool_text(tmp_path):
     assert await tools.cancel_text(hs, {"id": rec["id"]}) == f"cancelled {rec['id']}"
     await _settle(3)
     assert await tools.cancel_text(hs, {"id": rec["id"]}) == f"not running: {rec['id']}"
+
+
+def test_helper_session_loads_no_mcp_servers():
+    """A helper's `tools` list says nothing about MCP tools, so the session must not load the
+    operator's settings servers (alpaca's order tools would need no card)."""
+    from navigator.conductor.helpers import helper_options
+    opts = helper_options(hook=lambda *a: {})
+    assert opts.strict_mcp_config is True and opts.mcp_servers == {}
+    assert opts.resume is None

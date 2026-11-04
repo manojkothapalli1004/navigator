@@ -87,8 +87,12 @@ def helper_options(hook, exact: dict | None = None) -> ClaudeAgentOptions:
         setting_sources=["user", "project", "local"],
         system_prompt={"type": "preset", "preset": "claude_code", "append": HELPER_PROMPT},
         permission_mode="auto", tools=[exact["tool"]] if exact else list(HELPER_TOOLS),
+        # no MCP servers at all: `tools` does not govern MCP tools and the gate knows nothing about
+        # them, so an operator-settings server (alpaca's order tools) would be one call away
+        strict_mcp_config=True, mcp_servers={},
         max_turns=HELPER_MAX_TURNS, include_partial_messages=True,
-        hooks={"PreToolUse": [HookMatcher(hooks=[hook, _only(exact) if exact else scratch_only_hook])]},
+        # the fence runs first: a call it refuses must not consume an approved card
+        hooks={"PreToolUse": [HookMatcher(hooks=[_only(exact) if exact else scratch_only_hook, hook])]},
         can_use_tool=gate.can_use_tool)
 
 
