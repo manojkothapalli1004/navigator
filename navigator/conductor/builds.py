@@ -140,18 +140,21 @@ class Builds:
         was_draft = (title or "").strip().lower().startswith(DRAFT_PREFIX)
         tier1 = (not was_draft) and project in BUILD_REPOS and self._tier1(project, fl)
         p = file_build(self.act, project, title, task, files=fl, base_sha_fn=self.base_sha_fn)
+        rec = {"proposal_id": p.id, "project": project, "title": _strip_draft(title), "files": fl,
+               "tier1": False, "state": "filed", "reply_via": via, "filed": time.time(), "ended": None,
+               "summary": "", "reported": []}
+        with self._lock:  # persisted BEFORE approving: a crash after approval must not leave it unwatched
+            self._records.append(rec)
+            self._save()
         if tier1:
             try:
                 self.act.set_proposal_status(p.id, ProposalStatus.approved)
+                with self._lock:
+                    rec["tier1"] = True
+                    self._save()
             except Exception as e:
                 log.warning("conductor.build_autoapprove_failed: %s", type(e).__name__)
-                tier1 = False
-        rec = {"proposal_id": p.id, "project": project, "title": _strip_draft(title), "files": fl,
-               "tier1": tier1, "state": "filed", "reply_via": via, "filed": time.time(), "ended": None,
-               "summary": "", "reported": []}
         with self._lock:
-            self._records.append(rec)
-            self._save()
             return dict(rec)
 
     def open(self) -> list[dict]:
@@ -159,11 +162,12 @@ class Builds:
             return [dict(r) for r in self._records if self._is_open(r)]
 
     def running_work(self) -> list:
-        """Open builds as WorkItems (a build in review frees its cap slot but keeps its files busy)."""
+        """Builds actively running as WorkItems; filed (awaiting approval) and review (awaiting merge) builds
+        live on their own branch and do not block new items."""
         from .autopilot import WorkItem
         with self._lock:
-            return [WorkItem("build", r["proposal_id"], frozenset(r["files"]) if r.get("files") else None,
-                             r.get("state") == "review") for r in self._records if r.get("state") in OPEN_STATES]
+            return [WorkItem("build", r["proposal_id"], frozenset(r["files"]) if r.get("files") else None)
+                    for r in self._records if r.get("state") == "running"]
 
     def snapshot(self) -> list[dict]:
         with self._lock:

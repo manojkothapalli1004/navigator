@@ -243,12 +243,16 @@ def make_builds(root: Path, on_finish=None):
     if not base:
         print("conductor: NAVIGATOR_ACT_BASE_URL unset - builds are not configured", file=sys.stderr)
         return None
-    from navigator.clients.act_client import HTTPACTClient
-    from navigator.config import Settings
-    from navigator.conductor.builds import Builds
-    # Settings.from_env reads NAVIGATOR_REPOS_FILE like the daemon, so tier-1 uses the daemon's repo config
-    return Builds(Path(root) / "builds.json", HTTPACTClient(base), settings=Settings.from_env(),
-                  on_finish=on_finish)
+    try:
+        from navigator.clients.act_client import HTTPACTClient
+        from navigator.config import Settings
+        from navigator.conductor.builds import Builds
+        # Settings.from_env reads NAVIGATOR_REPOS_FILE like the daemon, so tier-1 uses the daemon's repo config
+        return Builds(Path(root) / "builds.json", HTTPACTClient(base), settings=Settings.from_env(),
+                      on_finish=on_finish)
+    except Exception as e:  # the conductor must still start; builds are simply off
+        print(f"conductor: builds disabled, setup failed ({type(e).__name__}: {e})", file=sys.stderr)
+        return None
 
 
 def serve(socket_path: Path, root: Path, runner=None) -> None:

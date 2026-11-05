@@ -6,7 +6,10 @@ at once so the turn ends and the next operator message can be answered. Pattern:
 runtime/drivers/builder_tools.make_run_tests_server."""
 from __future__ import annotations
 
+import asyncio
 import time
+
+import httpx
 
 MIN_TASK_CHARS = 40  # "fix it" is not a task a helper can do alone
 TOOL_NAMES = ["delegate", "helpers", "cancel_helper"]
@@ -42,12 +45,15 @@ async def _delegate_build(builds, args, title: str, task: str) -> str:
     if builds is None:
         return NO_BUILDS
     project = str(args.get("project") or "").strip()
-    try:
-        rec = builds.file(project, title, task, _files(args) or [], getattr(builds, "current_via", None))
+    try:  # filing does blocking HTTP + git: off the event loop so a slow ACT can't freeze the conductor
+        rec = await asyncio.to_thread(builds.file, project, title, task, _files(args) or [],
+                                      getattr(builds, "current_via", None))
     except BuildRefused as e:
         return f"refused: {e}"
-    except Exception:  # ACT down, git missing: never a quick-helper fallback
+    except (httpx.TransportError, ConnectionError, TimeoutError):  # never a quick-helper fallback
         return ACT_DOWN
+    except Exception as e:
+        return f"refused: build filing failed ({type(e).__name__})"
     head = f"filed build {rec['proposal_id']} ({project}): {rec['title']} — "
     if rec.get("tier1"):
         return head + "tier 1 (docs/tests only), approved to start; it will not merge without your approval."

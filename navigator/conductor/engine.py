@@ -24,7 +24,7 @@ TERMINAL_WAIT = "waiting for the terminal session to end"
 TURN_TIMEOUT_S = 45 * 60  # a stuck turn (tool waiting on input, network stall) must not freeze every window
 HELPER_ITEMS_TTL_S = 600  # a finished helper's steps stay on the screens this long
 BUILD_POLL_S = 60
-TurnRunner =Callable[[str, "str | None", Callable[[dict], None]], Awaitable["str | None"]]
+TurnRunner = Callable[[str, "str | None", Callable[[dict], None]], Awaitable["str | None"]]
 
 
 class ResumeFailed(Exception):
@@ -118,7 +118,8 @@ class Engine:
         """A build reached a report point (review, done, failed, closed): one internal turn on the window it
         came from, so the main agent tells the operator."""
         summary = activity._SECRET.sub("…", str(rec.get("summary") or ""))[:1024]
-        self.submit(f"[build {rec['proposal_id']} {rec['state']}: {rec['title']}]\n{summary}",
+        title = activity._SECRET.sub("…", str(rec.get("title") or ""))
+        self.submit(f"[build {rec['proposal_id']} {rec['state']}: {title}]\n{summary}",
                     "helper", internal=True, reply_via=rec.get("reply_via"))
 
     def running_work(self) -> list:

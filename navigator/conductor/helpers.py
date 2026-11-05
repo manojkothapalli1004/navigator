@@ -282,12 +282,6 @@ class Helpers:
         return [WorkItem("helper", r["id"], frozenset(r["files"]) if r.get("files") else None)
                 for r in self._records if r.get("state") in ACTIVE]
 
-    def running_work(self) -> list:
-        """Every queued/running helper as a WorkItem; files None = undeclared."""
-        from navigator.conductor.autopilot import WorkItem
-        return [WorkItem("helper", r["id"], frozenset(r["files"]) if r.get("files") else None)
-                for r in self._records if r.get("state") in ACTIVE]
-
     def snapshot(self) -> list[dict]:
         active = [r for r in self._records if r.get("state") in ACTIVE]
         finished = [r for r in self._records if r.get("state") not in ACTIVE][-SNAPSHOT_FINISHED:]

@@ -150,8 +150,8 @@ def _ap(tmp_path, plan="- [ ] one\n  Files: a.py, b.py\n- [ ] two\n"):
     return Autopilot(tmp_path / "s.json", tmp_path / "plan.md", clock=lambda: NOON)
 
 
-def W(i, files, frees=False):
-    return WorkItem("build", i, None if files is None else frozenset(files), frees)
+def W(i, files):
+    return WorkItem("build", i, None if files is None else frozenset(files))
 
 
 def test_decide_compat_work_running(tmp_path):
@@ -185,12 +185,94 @@ def test_undeclared_waits():
     assert blocked_by(None, []) is None
 
 
-def test_cap_and_review_frees_slot():
+def test_cap_counts_running_work_only():
     three = [W(f"x{i}", {f"f{i}.py"}) for i in range(3)]
     assert blocked_by(frozenset({"z.py"}), three) == "3 helpers/builds already running"
     assert blocked_by(frozenset({"z.py"}), three[:2]) is None
-    assert blocked_by(frozenset({"z.py"}), three[:2] + [W("r", {"r.py"}, frees=True)]) is None
-    assert blocked_by(frozenset({"r.py"}), three[:2] + [W("r", {"r.py"}, frees=True)]).startswith("overlaps r")
+
+
+def test_filed_and_review_builds_do_not_block(tmp_path):
+    eng, ap, bs, act = mkeng(tmp_path, "- [ ] item\n")  # undeclared item
+    rec = bs.file("navigator", "T", SPEC, ["b.py"], None)
+    assert rec["state"] == "filed" and eng.running_work() == []
+    assert blocked_by(None, eng.running_work()) is None
+    bs._records[0]["state"] = "review"
+    assert eng.running_work() == []
+    bs._records[0]["state"] = "running"
+    assert [w.id for w in eng.running_work()] == [rec["proposal_id"]]
+
+
+def test_running_helper_still_blocks_undeclared_item():
+    assert "does not declare its files" in blocked_by(None, [WorkItem("helper", "h", frozenset({"a.py"}))])
+    assert blocked_by(None, []) is None
+
+
+@aio
+async def test_delegate_build_filing_runs_off_loop_and_errors_are_narrow(tmp_path):
+    import httpx
+    hs = FakeHelpers()
+    bs, act = mkbuilds(tmp_path)
+    seen = {}
+    orig = bs.file
+
+    def spy(*a, **k):
+        seen["t"] = threading.get_ident()
+        return orig(*a, **k)
+    bs.file = spy
+    args = {"kind": "build", "project": "navigator", "title": "t", "task": SPEC}
+    await tools.delegate_text(hs, args, bs)
+    assert seen["t"] != threading.get_ident()
+
+    def odd(p):
+        raise KeyError("x")
+    act.create_proposal = odd
+    assert await tools.delegate_text(hs, args, bs) == "refused: build filing failed (KeyError)"
+
+    def down(p):
+        raise httpx.ConnectError("down")
+    act.create_proposal = down
+    assert await tools.delegate_text(hs, args, bs) == tools.ACT_DOWN
+
+
+def test_make_builds_survives_bad_repos_file(tmp_path, monkeypatch, capsys):
+    from navigator.conductor import server
+    bad = tmp_path / "bad.json"
+    bad.write_text("{not json")
+    monkeypatch.setenv("NAVIGATOR_ACT_BASE_URL", "http://127.0.0.1:1")
+    monkeypatch.setenv("NAVIGATOR_REPOS_FILE", str(bad))
+    assert server.make_builds(tmp_path) is None
+    assert "builds" in capsys.readouterr().err
+
+
+def test_file_persists_record_before_approving(tmp_path):
+    bs, act = mkbuilds(tmp_path)
+    seen = {}
+    orig = act.set_proposal_status
+
+    def spy(pid, status):
+        seen["saved"] = [r["proposal_id"] for r in B.Builds(tmp_path / "builds.json", act)._records]
+        return orig(pid, status)
+    act.set_proposal_status = spy
+    rec = bs.file("navigator", "T", SPEC, ["docs/x.md"], None)
+    assert rec["tier1"] and seen["saved"] == [rec["proposal_id"]]
+
+
+@aio
+async def test_on_build_finish_masks_title(tmp_path):
+    eng, ap, bs, act = mkeng(tmp_path, "- [ ] x\n")
+    await eng.start()
+    eng.on_build_finish({"proposal_id": "p1", "state": "done", "summary": "ok",
+                         "title": "sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123456789"})
+    await _drain()
+    users = [e for e in eng.store.history(limit=50) if e.get("kind") == "user"]
+    assert "sk-ant" not in users[0]["text"]
+    await eng.stop()
+
+
+def test_helpers_has_one_running_work():
+    import inspect
+    from navigator.conductor import helpers as H
+    assert inspect.getsource(H).count("def running_work") == 1
 
 
 def test_decide_reads_plan_files(tmp_path):
@@ -236,14 +318,17 @@ async def test_engine_overlap_blocks_then_resume_on_finish(tmp_path):
     eng, ap, bs, act = mkeng(tmp_path, "- [ ] item\n  Files: b.py\n")
     ap.set(True)
     rec = bs.file("navigator", "T", SPEC, ["b.py"], None)
+    live = Run(proposal_id=rec["proposal_id"], base_commit_sha="a", branch="b", status=RunStatus.executing,
+               phase=RunPhase.building)
+    act.runs[live.id] = live
+    await asyncio.to_thread(bs.poll)
     assert [w.id for w in eng.running_work()] == [rec["proposal_id"]]
     await eng.start()
     eng.submit("hi", "web")
     await _drain()
     assert not any(p.startswith("[autopilot]") for p in eng.runner.raw)
-    r = Run(proposal_id=rec["proposal_id"], base_commit_sha="a", branch="b", status=RunStatus.completed,
-            phase=RunPhase.finalizing)
-    act.runs[r.id] = r
+    r = live
+    r.status, r.phase = RunStatus.completed, RunPhase.finalizing
     await asyncio.to_thread(bs.poll)
     await _drain()
     raws = eng.runner.raw
@@ -280,7 +365,7 @@ async def test_on_finish_reaches_telegram_window_failed_and_masked(tmp_path):
 
 
 @aio
-async def test_poll_off_loop_and_finish_on_loop_and_review_frees_slot(tmp_path):
+async def test_poll_off_loop_and_finish_on_loop_and_review_does_not_block(tmp_path):
     eng, ap, bs, act = mkeng(tmp_path, "- [ ] x\n")
     seen = {}
     orig = eng.on_build_finish
@@ -293,8 +378,7 @@ async def test_poll_off_loop_and_finish_on_loop_and_review_frees_slot(tmp_path):
     await eng.start()
     await _drain(30)
     assert bs.loop is asyncio.get_running_loop() and seen["t"] == threading.get_ident()
-    (w,) = [w for w in eng.running_work() if w.id == rec["proposal_id"]]
-    assert w.frees_slot is True and w.files is None
+    assert bs.snapshot()[0]["state"] == "review" and eng.running_work() == []
     await eng.stop()
 
 

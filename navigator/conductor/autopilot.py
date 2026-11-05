@@ -31,11 +31,10 @@ _FILES_LINE = re.compile(r"^\s*(?:[-*]\s*)?(?:Files|Create|Modify|Test):\s*(.*)$
 
 @dataclass(frozen=True)
 class WorkItem:
-    """One running helper or open build; files=None means it did not declare them."""
+    """One running helper or running build; files=None means it did not declare them."""
     kind: str
     id: str
     files: "frozenset[str] | None" = None
-    frees_slot: bool = False  # a build in review: its files stay busy, its cap slot is free
 
 
 def _norm(path: str) -> str:
@@ -51,7 +50,7 @@ def _overlap(a: str, b: str) -> bool:
 def blocked_by(item_files, running, cap: int = MAX_PARALLEL) -> str | None:
     """Why an item must wait for the work in `running`, or None. Undeclared files count as overlap."""
     running = list(running or ())
-    if sum(1 for w in running if not w.frees_slot) >= cap:
+    if len(running) >= cap:
         return f"{cap} helpers/builds already running"
     if not item_files:
         return "this item does not declare its files and work is running" if running else None
