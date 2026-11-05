@@ -23,7 +23,8 @@ INTERNAL_SOURCES = ("approval", "autopilot", "helper")  # only the conductor its
 TERMINAL_WAIT = "waiting for the terminal session to end"
 TURN_TIMEOUT_S = 45 * 60  # a stuck turn (tool waiting on input, network stall) must not freeze every window
 HELPER_ITEMS_TTL_S = 600  # a finished helper's steps stay on the screens this long
-TurnRunner = Callable[[str, "str | None", Callable[[dict], None]], Awaitable["str | None"]]
+BUILD_POLL_S = 60
+TurnRunner =Callable[[str, "str | None", Callable[[dict], None]], Awaitable["str | None"]]
 
 
 class ResumeFailed(Exception):
@@ -34,10 +35,14 @@ class Engine:
     def __init__(self, store: Store, runner: TurnRunner, lock_path: Path | None = None,
                  turn_timeout_s: float = TURN_TIMEOUT_S, notify: Callable[[dict], None] | None = None,
                  reply: Callable[[str], None] | None = None, autopilot=None,
-                 cards_pending: Callable[[], bool] | None = None, helpers: "Helpers | None" = None):
+                 cards_pending: Callable[[], bool] | None = None, helpers: "Helpers | None" = None,
+                 builds=None):
         self.store, self.runner, self.turn_timeout_s = store, runner, turn_timeout_s
         self.autopilot = autopilot  # keeps working through the plan file between turns (off by default)
         self.helpers = helpers  # the work a turn delegates instead of doing itself (2026-11-04)
+        self.builds = builds  # builds filed with Navigator, watched to the end (None = not configured)
+        self.build_poll_s = BUILD_POLL_S
+        self._poll_task: asyncio.Task | None = None
         self.cards_pending = cards_pending or (lambda: False)
         self.notify = notify  # tells the operator's phone about a new approval card (C3)
         self.reply = reply  # sends a Telegram-originated turn's outcome back to Telegram (C4)
@@ -109,6 +114,28 @@ class Engine:
         self.submit(f"[helper {rec['id']} {rec['state']}: {rec['title']}]\n{rec.get('result') or rec.get('error') or ''}",
                     "helper", internal=True, reply_via=rec.get("reply_via"))
 
+    def on_build_finish(self, rec: dict) -> None:
+        """A build reached a report point (review, done, failed, closed): one internal turn on the window it
+        came from, so the main agent tells the operator."""
+        summary = activity._SECRET.sub("…", str(rec.get("summary") or ""))[:1024]
+        self.submit(f"[build {rec['proposal_id']} {rec['state']}: {rec['title']}]\n{summary}",
+                    "helper", internal=True, reply_via=rec.get("reply_via"))
+
+    def running_work(self) -> list:
+        """Every running/queued helper and open build, with the files each declared (None = undeclared)."""
+        work = list(self.helpers.running_work()) if self.helpers is not None else []
+        if self.builds is not None:
+            work += self.builds.running_work()
+        return work
+
+    async def _poll_builds(self) -> None:
+        while True:
+            try:
+                await asyncio.to_thread(self.builds.poll)
+            except Exception as e:  # the poller must outlive any one pass
+                _log.warning("conductor.build_poll_failed: %s", type(e).__name__)
+            await asyncio.sleep(self.build_poll_s)
+
     def _close_activity(self, msg_id: str, state: str) -> None:
         """A turn ended: no step of it may keep saying it runs (Stop, timeout, error, or a lost result)."""
         if msg_id != self._activity_msg:
@@ -130,8 +157,19 @@ class Engine:
                 self.submit("[helpers lost on restart] " + ", ".join(f"{r['id']} {r['title']}" for r in lost),
                             "helper", internal=True)
         self._task = asyncio.create_task(self._worker())
+        if self.builds is not None:  # Navigator owns open builds: re-polled on restart, never marked lost
+            self.builds.loop = asyncio.get_running_loop()
+            if self.builds.on_finish is None:
+                self.builds.on_finish = self.on_build_finish
+            self._poll_task = asyncio.create_task(self._poll_builds())
 
     async def stop(self) -> None:
+        if self._poll_task:
+            self._poll_task.cancel()
+            try:
+                await self._poll_task
+            except asyncio.CancelledError:
+                pass
         if self.helpers is not None:
             self.helpers.shutdown()  # nothing may be submitted to a stopped engine; the restart reports them
         if self._task:
@@ -216,7 +254,8 @@ class Engine:
         if outcome != "cancelled" and self.queue_len > 0:
             return  # something is already waiting (an operator message): decide after it, never pile up
         try:
-            kind, what = self.autopilot.decide(outcome, cards_pending=bool(self.cards_pending()))
+            kind, what = self.autopilot.decide(outcome, cards_pending=bool(self.cards_pending()),
+                                               running=self.running_work())
         except Exception as e:  # the worker must outlive any autopilot hiccup
             _log.warning("conductor.autopilot_failed: %s", type(e).__name__)
             return
@@ -336,15 +375,18 @@ class Engine:
             if user.get("source") == "autopilot" and self.autopilot is not None:
                 # re-checked now, not only when queued: switched off, quiet hours or a card may have
                 # come up while it waited (behind other turns or the terminal's lock)
-                why = self.autopilot.runnable(cards_pending=bool(self.cards_pending()))
+                why = self.autopilot.runnable(cards_pending=bool(self.cards_pending()),
+                                              running=self.running_work())
                 if why:
                     self._append({"kind": "status", "state": "skipped", "msg_id": msg_id,
                                   "detail": f"autopilot turn skipped: {why}"})
                     return
             self._activity_msg, self._activity = msg_id, {}  # this turn's steps start empty
             self._append({"kind": "status", "state": "running", "msg_id": msg_id})
-            if self.helpers is not None:  # a helper started from a Telegram message reports back there
-                self.helpers.current_via = "telegram" if self._to_telegram(user) else None
+            via = "telegram" if self._to_telegram(user) else None
+            for reg in (self.helpers, self.builds):  # work started from a Telegram message reports back there
+                if reg is not None:
+                    reg.current_via = via
             parts: list[str] = []
             prompt = f"[{user.get('source', 'web')}] {user['text']}"
             self._cancelled, self._cancel_via = False, None

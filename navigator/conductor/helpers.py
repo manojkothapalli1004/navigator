@@ -181,10 +181,12 @@ class Helpers:
 
     # ---- lifecycle ----
 
-    def start(self, title: str, task: str, *, exact: dict | None = None, via: str | None = None) -> dict:
+    def start(self, title: str, task: str, *, exact: dict | None = None, via: str | None = None,
+              files: list[str] | None = None) -> dict:
         rec = {"id": new_id("helper"), "title": title, "task": task, "state": "queued",
                "started": self.clock(), "ended": None, "result": None, "error": None,
-               "reply_via": via if via is not None else self.current_via, "exact": exact}
+               "reply_via": via if via is not None else self.current_via, "exact": exact,
+               "files": [str(f).strip() for f in files if str(f).strip()] if files else None}
         self._records.append(rec)
         if self._running() < self.max_running:
             self._launch(rec)
@@ -273,6 +275,18 @@ class Helpers:
         for task in self._tasks.values():
             task.cancel()
         self._tasks.clear()
+
+    def running_work(self) -> list:
+        """Every queued/running helper as a WorkItem; files None = undeclared."""
+        from .autopilot import WorkItem
+        return [WorkItem("helper", r["id"], frozenset(r["files"]) if r.get("files") else None)
+                for r in self._records if r.get("state") in ACTIVE]
+
+    def running_work(self) -> list:
+        """Every queued/running helper as a WorkItem; files None = undeclared."""
+        from navigator.conductor.autopilot import WorkItem
+        return [WorkItem("helper", r["id"], frozenset(r["files"]) if r.get("files") else None)
+                for r in self._records if r.get("state") in ACTIVE]
 
     def snapshot(self) -> list[dict]:
         active = [r for r in self._records if r.get("state") in ACTIVE]

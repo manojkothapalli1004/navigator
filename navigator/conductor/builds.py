@@ -100,6 +100,7 @@ class Builds:
         self.on_finish = on_finish
         self.base_sha_fn = base_sha_fn
         self.loop = loop
+        self.current_via: str | None = None  # set by the engine at each turn start
         self._lock = threading.RLock()
         self._records: list[dict] = self._load()
 
@@ -157,6 +158,13 @@ class Builds:
     def open(self) -> list[dict]:
         with self._lock:
             return [dict(r) for r in self._records if self._is_open(r)]
+
+    def running_work(self) -> list:
+        """Open builds as WorkItems (a build in review frees its cap slot but keeps its files busy)."""
+        from .autopilot import WorkItem
+        with self._lock:
+            return [WorkItem("build", r["proposal_id"], frozenset(r["files"]) if r.get("files") else None,
+                             r.get("state") == "review") for r in self._records if r.get("state") in OPEN_STATES]
 
     def snapshot(self) -> list[dict]:
         with self._lock:
