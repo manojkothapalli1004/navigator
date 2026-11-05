@@ -15,6 +15,10 @@
 	<string>/Users/Manoj/calwbot/navigator</string>
 	<key>EnvironmentVariables</key>
 	<dict>
+		<key>NAVIGATOR_ACT_BASE_URL</key>
+		<string>http://127.0.0.1:8090</string>
+		<key>NAVIGATOR_REPOS_FILE</key>
+		<string>/Users/Manoj/calwbot/logs/navigator/repos.json</string>
 		<key>PATH</key>
 		<string>/Users/Manoj/.local/bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
 	</dict>

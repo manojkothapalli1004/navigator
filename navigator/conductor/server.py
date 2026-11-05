@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -236,6 +237,24 @@ def _guarded_protocol():
     return Guarded
 
 
+def make_builds(root: Path, on_finish=None):
+    """The builds registry, only when NAVIGATOR_ACT_BASE_URL is set (unset = builds are off)."""
+    base = os.getenv("NAVIGATOR_ACT_BASE_URL")
+    if not base:
+        print("conductor: NAVIGATOR_ACT_BASE_URL unset - builds are not configured", file=sys.stderr)
+        return None
+    try:
+        from navigator.clients.act_client import HTTPACTClient
+        from navigator.config import Settings
+        from navigator.conductor.builds import Builds
+        # Settings.from_env reads NAVIGATOR_REPOS_FILE like the daemon, so tier-1 uses the daemon's repo config
+        return Builds(Path(root) / "builds.json", HTTPACTClient(base), settings=Settings.from_env(),
+                      on_finish=on_finish)
+    except Exception as e:  # the conductor must still start; builds are simply off
+        print(f"conductor: builds disabled, setup failed ({type(e).__name__}: {e})", file=sys.stderr)
+        return None
+
+
 def serve(socket_path: Path, root: Path, runner=None) -> None:
     """Run the conductor on `socket_path` (replacing a stale file) with state in `root`."""
     import socket
@@ -253,9 +272,10 @@ def serve(socket_path: Path, root: Path, runner=None) -> None:
     helpers = Helpers(Path(root) / "helpers.json", runner=partial(sdk_helper, hook=hook),
                       on_event=lambda hid, ev: engine_ref[0].on_helper_event(hid, ev),
                       on_finish=lambda rec: engine_ref[0].on_helper_finish(rec))
+    builds = make_builds(root)
     if runner is None:
         from navigator.conductor.runner import sdk_turn
-        runner = partial(sdk_turn, hook=hook, conductor_server=make_conductor_server(helpers))
+        runner = partial(sdk_turn, hook=hook, conductor_server=make_conductor_server(helpers, builds))
     socket_path = Path(socket_path)
     socket_path.parent.mkdir(parents=True, exist_ok=True)
     os.chmod(socket_path.parent, 0o700)  # nobody else can even reach the socket's directory
@@ -267,7 +287,7 @@ def serve(socket_path: Path, root: Path, runner=None) -> None:
     from navigator.conductor.autopilot import Autopilot
     engine = Engine(Store(root), runner, notify=sender.card, reply=sender.text,
                     autopilot=Autopilot(Path(root) / "autopilot.json"),
-                    cards_pending=lambda: bool(cards.pending()), helpers=helpers)
+                    cards_pending=lambda: bool(cards.pending()), helpers=helpers, builds=builds)
     engine_ref.append(engine)
     # bound here, not by uvicorn: uvicorn chmods its own unix sockets to 0666
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)

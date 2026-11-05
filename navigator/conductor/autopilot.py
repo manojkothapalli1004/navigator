@@ -12,18 +12,56 @@ from __future__ import annotations
 import json
 import os
 import re
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 MAX_CONSECUTIVE = 6
 MAX_PER_DAY = 12
+MAX_PARALLEL = 3  # helpers + builds running at once
 QUIET_START, QUIET_END = 23, 7  # hours, America/New_York
 ET = ZoneInfo("America/New_York")
 PLAN_PATH = Path("/Users/Manoj/calwbot/logs/navigator/autopilot_plan.md")
 _ITEM = re.compile(r"^\s*[-*]\s*\[( |x|X)\]\s*(.+?)\s*$")
 _COMMANDS = {"autopilot on": "on", "autopilot off": "off", "autopilot status": "status",
              "autopilot quiet ok": "quiet_ok"}
+_FILES_LINE = re.compile(r"^\s*(?:[-*]\s*)?(?:Files|Create|Modify|Test):\s*(.*)$", re.I)
+
+
+@dataclass(frozen=True)
+class WorkItem:
+    """One running helper or running build; files=None means it did not declare them."""
+    kind: str
+    id: str
+    files: "frozenset[str] | None" = None
+
+
+def _norm(path: str) -> str:
+    p = path.strip().strip("`").strip().removeprefix("./").rstrip("/")
+    return "" if p == "." else p
+
+
+def _overlap(a: str, b: str) -> bool:
+    a, b = _norm(a), _norm(b)
+    return bool(a and b) and (a == b or a.startswith(b + "/") or b.startswith(a + "/"))
+
+
+def blocked_by(item_files, running, cap: int = MAX_PARALLEL) -> str | None:
+    """Why an item must wait for the work in `running`, or None. Undeclared files count as overlap."""
+    running = list(running or ())
+    if len(running) >= cap:
+        return f"{cap} helpers/builds already running"
+    if not item_files:
+        return "this item does not declare its files and work is running" if running else None
+    for w in running:
+        if not w.files:
+            return f"running work {w.id} does not declare its files"
+    for w in running:
+        for f in sorted(item_files):
+            if any(_overlap(f, g) for g in w.files):
+                return f"overlaps {w.id} on {f}"
+    return None
 
 
 class Autopilot:
@@ -94,8 +132,38 @@ class Autopilot:
                 return m.group(2)
         return None
 
+    def next_item_files(self) -> "frozenset[str] | None":
+        """Files the first unchecked item declares (its `Files:` / `- Create:` / `- Modify:` / `- Test:` lines
+        under it, comma separated, `:line-range` stripped); None when it declares none or the plan is unreadable."""
+        try:
+            lines = self.plan_path.read_text().splitlines()
+        except OSError:
+            return None
+        found, out = False, set()
+        for line in lines:
+            m = _ITEM.match(line)
+            if m:
+                if found:
+                    break
+                found = m.group(1) == " "
+                continue
+            if found and (f := _FILES_LINE.match(line)):
+                for part in f.group(1).split(","):
+                    part = re.sub(r":\d+(-\d+)?$", "", part.strip().strip("`").strip())
+                    if part:
+                        out.add(part)
+        return frozenset(out) or None
+
+    def _blocked(self, work_running, item_files, running) -> str | None:
+        if running:
+            return blocked_by(item_files if item_files is not None else self.next_item_files(), running)
+        if work_running:
+            return "a build or helper is still running"
+        return None
+
     # ---- the decision after every turn ----
-    def decide(self, outcome: str, cards_pending: bool) -> tuple[str, str | None]:
+    def decide(self, outcome: str, cards_pending: bool, work_running: bool = False,
+               item_files=None, running=()) -> tuple[str, str | None]:
         """("idle", None) off | ("off", reason) switched itself off | ("wait", reason) on but not now |
         ("queue", item) queue a turn for this plan item."""
         if not self.on:
@@ -107,6 +175,8 @@ class Autopilot:
             return "wait", f"the last turn ended with {outcome}; waiting for you"
         if cards_pending:
             return "wait", "an approval card is waiting for you"
+        if reason := self._blocked(work_running, item_files, running):
+            return "wait", reason
         self._roll_day()
         if self.state["today"] >= MAX_PER_DAY:
             self.set(False)
@@ -130,12 +200,14 @@ class Autopilot:
         hour = self.clock().astimezone(ET).hour
         return (hour >= QUIET_START or hour < QUIET_END) and not self.state["quiet_ok"]
 
-    def runnable(self, cards_pending: bool) -> str | None:
+    def runnable(self, cards_pending: bool, work_running: bool = False, item_files=None, running=()) -> str | None:
         """Re-checked when a queued autopilot turn is about to start: None = go, else why not."""
         if not self.on:
             return "autopilot is off"
         if cards_pending:
             return "an approval card is waiting for you"
+        if reason := self._blocked(work_running, item_files, running):
+            return reason
         if self._quiet():
             return "quiet hours (23:00-07:00 ET)"
         return None
