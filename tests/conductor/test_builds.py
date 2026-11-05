@@ -39,11 +39,11 @@ def run_for(act, pid, status=RunStatus.executing, phase=RunPhase.building):
 
 def test_file_build_shape_and_refusals():
     act = FakeACTClient()
-    p = B.file_build(act, "navigator", "[draft] T", SPEC, files=["navigator/a.py"], tier1=True,
+    p = B.file_build(act, "navigator", "[draft] T", SPEC, files=["navigator/a.py"],
                      base_sha_fn=lambda r: "s")
     assert p.origin == "operator" and p.repo == B.BUILD_REPOS["navigator"]
     assert p.intended_changes == SPEC and p.affected_files == ["navigator/a.py"]
-    assert p.title == "T" and p.base_commit_sha == "s" and p.id in act.proposals
+    assert p.title == "[draft] T" and p.base_commit_sha == "s" and p.id in act.proposals
     q = B.file_build(act, "navigator", "T2", SPEC, base_sha_fn=lambda r: "s")
     assert q.title == "[draft] T2"
     n = len(act.proposals)
@@ -61,7 +61,7 @@ def test_tier1_auto_approves_docs_only(tmp_path):
     b, act, _ = mk(tmp_path)
     rec = b.file("navigator", "Doc", SPEC, ["docs/a.md"], via="web")
     p = act.proposals[rec["proposal_id"]]
-    assert p.status == ProposalStatus.approved and rec["tier1"] and not p.title.startswith("[draft]")
+    assert p.status == ProposalStatus.approved and rec["tier1"] and p.title == "[draft] Doc"
     assert rec["title"] == "Doc"
 
 
@@ -88,7 +88,9 @@ def test_autoapprove_error_leaves_proposed(tmp_path, caplog):
     act.set_proposal_status = boom
     with caplog.at_level(logging.WARNING):
         rec = b.file("navigator", "Doc", SPEC, ["docs/a.md"], via="web")
-    assert act.proposals[rec["proposal_id"]].status == ProposalStatus.proposed
+    p = act.proposals[rec["proposal_id"]]
+    assert p.status == ProposalStatus.proposed and p.title == "[draft] Doc"  # daemon preapprove skips it
+    assert not rec["tier1"]
     assert "conductor.build_autoapprove_failed: RuntimeError" in caplog.text
     assert "secret-text" not in caplog.text
 

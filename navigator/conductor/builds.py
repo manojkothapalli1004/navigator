@@ -71,9 +71,8 @@ def _strip_draft(title: str) -> str:
     return t
 
 
-def file_build(act, project: str, title: str, task: str, files=(), tier1: bool = False,
-               base_sha_fn=_head_sha) -> Proposal:
-    """File one proposal `proposed`. Non-tier-1 titles get the [draft] prefix so the daemon's pre-approve skips them."""
+def file_build(act, project: str, title: str, task: str, files=(), base_sha_fn=_head_sha) -> Proposal:
+    """File one proposal `proposed`. Always [draft]-prefixed so the daemon's pre-approve skips it; an explicit approve is unaffected."""
     repo = BUILD_REPOS.get(project)
     if repo is None:
         raise BuildRefused(f"project must be one of {sorted(BUILD_REPOS)} (trader is not available)")
@@ -83,7 +82,7 @@ def file_build(act, project: str, title: str, task: str, files=(), tier1: bool =
     if len(task or "") < MIN_BUILD_CHARS:
         raise BuildRefused(f"a build spec must be complete (at least {MIN_BUILD_CHARS} characters)")
     fl = _clean_files(files)
-    filed_title = clean if tier1 else f"{DRAFT_PREFIX} {clean}"
+    filed_title = f"{DRAFT_PREFIX} {clean}"
     p = Proposal(
         origin=OPERATOR_ORIGIN,
         proposal_origin_hash=compute_origin_hash(repo, clean, [], OPERATOR_ORIGIN, task),
@@ -140,7 +139,7 @@ class Builds:
         fl = _clean_files(files)
         was_draft = (title or "").strip().lower().startswith(DRAFT_PREFIX)
         tier1 = (not was_draft) and project in BUILD_REPOS and self._tier1(project, fl)
-        p = file_build(self.act, project, title, task, files=fl, tier1=tier1, base_sha_fn=self.base_sha_fn)
+        p = file_build(self.act, project, title, task, files=fl, base_sha_fn=self.base_sha_fn)
         if tier1:
             try:
                 self.act.set_proposal_status(p.id, ProposalStatus.approved)
