@@ -221,3 +221,71 @@ def test_helper_can_read_attachment_path():
     from navigator.conductor import gate
     assert gate.gated_reason("Read", {"file_path": str(att.ATTACH_DIR / "x.pdf")},
                              Path("/Users/Manoj/calwbot")) is None
+
+
+def _patched_zip(central=None, local=None):
+    """DOCX bytes with fields rewritten in the first central ('PK\\x01\\x02') / local ('PK\\x03\\x04') header."""
+    import struct
+    b = bytearray(_docx())
+    if local:
+        off, fmt, val = local
+        struct.pack_into(fmt, b, off, val)
+    if central:
+        off, fmt, val = central
+        c = bytes(b).index(b"PK\x01\x02")
+        struct.pack_into(fmt, b, c + off, val)
+    return bytes(b)
+
+
+def test_status_answers_during_upload(tmp_path, monkeypatch):
+    import threading
+    import time
+    release = threading.Event()
+    real = att.check_content
+
+    def slow(ext, data):
+        release.wait(5)
+        return real(ext, data)
+    monkeypatch.setattr(att, "check_content", slow)
+
+    async def go(c, eng, d):
+        up = asyncio.create_task(c.post("/attachments", json={"name": "x.txt", "data": _b64(b"hi"),
+                                                              "source": "web"}))
+        await asyncio.sleep(0.2)
+        t0 = time.monotonic()
+        r = await asyncio.wait_for(c.get("/status"), 2)
+        assert r.status_code == 200 and time.monotonic() - t0 < 1 and not up.done()
+        release.set()
+        assert (await up).status_code == 202
+    asyncio.run(_with(tmp_path, go))
+
+
+def test_zip_bomb_large_declared_size_rejected_without_reading(tmp_path, monkeypatch):
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("word/document.xml", bytes(60 * 1024 * 1024))
+    data = buf.getvalue()
+    assert len(data) < att.MAX_BYTES
+    reads = []
+    real = zipfile.ZipExtFile.read
+    monkeypatch.setattr(zipfile.ZipExtFile, "read", lambda self, n=-1: (reads.append(n), real(self, n))[1])
+
+    async def go(c, eng, d):
+        r = await c.post("/attachments", json={"name": "bomb.docx", "data": _b64(data), "source": "web"})
+        assert r.status_code == 422 and "error" in r.json()
+        assert reads == [] and (not d.exists() or list(d.iterdir()) == [])
+    asyncio.run(_with(tmp_path, go))
+
+
+def test_forged_size_and_encrypted_member_422(tmp_path, monkeypatch):
+    monkeypatch.setattr(att, "MAX_ZIP_BYTES", 8)
+    forged = _patched_zip(central=(24, "<I", 4))  # declared uncompressed size 4, real is larger
+    monkeypatch.setattr(att, "MAX_ZIP_BYTES", 50 * 1024 * 1024)
+    encrypted = _patched_zip(central=(8, "<H", 1), local=(6, "<H", 1))
+
+    async def go(c, eng, d):
+        for blob in (forged, encrypted):
+            r = await c.post("/attachments", json={"name": "x.docx", "data": _b64(blob), "source": "web"})
+            assert r.status_code == 422 and "error" in r.json()
+        assert not d.exists() or list(d.iterdir()) == []
+    asyncio.run(_with(tmp_path, go))
