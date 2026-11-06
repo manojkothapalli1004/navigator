@@ -16,6 +16,7 @@ from pathlib import Path
 CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"  # no 0/O, 1/I/L: read off a phone
 CODE_LEN = 6
 TTL_S = 3600
+APPROVED_MIN_TTL_S = 600  # an approved card stays consumable at least this long (its helper needs time)
 MAX_SUMMARY = 2000
 DECLINE_COOLDOWN_S = 600  # a declined action can't raise a fresh card for 10 minutes
 
@@ -143,7 +144,10 @@ class Cards:
             raise CardError(f"already {card['state']}")
         if not self._live(card):
             raise CardError("expired")
-        card["state"], card["via"], card["decided"] = state, via, self.clock()
+        now = self.clock()
+        card["state"], card["via"], card["decided"] = state, via, now
+        if state == "approved":
+            card["expires"] = max(card["expires"], now + APPROVED_MIN_TTL_S)
         self._save()
         return dict(card)
 

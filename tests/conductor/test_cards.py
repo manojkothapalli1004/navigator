@@ -381,3 +381,42 @@ def test_cards_get(tmp_path):
     got["state"] = "x"
     assert c.get(card["id"])["state"] == "pending"
     assert c.get("NOPE22") is None
+
+
+# ---- stage 3 test 17: an approval stays consumable for at least 10 minutes
+def test_approved_card_stays_consumable_ten_minutes(tmp_path):
+    clk = Clock(); c = _cards(tmp_path, clk)
+    t0 = clk.t
+    card, _ = c.raise_card("Bash", PUSH, "x")
+    clk.t = t0 + 3590
+    out = c.approve(card["code"], "web")
+    assert out["expires"] == t0 + 3590 + 600
+    clk.t = t0 + 3890
+    got = c.consume("Bash", PUSH)
+    assert got is not None and got["state"] == "used"
+
+
+def test_approval_expiry_is_max_of_old_and_ten_minutes(tmp_path):
+    clk = Clock(); c = _cards(tmp_path, clk)
+    t0 = clk.t
+    card, _ = c.raise_card("Bash", PUSH, "x")
+    clk.t = t0 + 10
+    assert c.approve(card["code"], "web")["expires"] == t0 + 3600
+
+
+def test_declined_card_expiry_unchanged(tmp_path):
+    clk = Clock(); c = _cards(tmp_path, clk)
+    t0 = clk.t
+    card, _ = c.raise_card("Bash", PUSH, "x")
+    clk.t = t0 + 3590
+    assert c.decline(card["code"], "web")["expires"] == t0 + 3600
+
+
+def test_approved_card_expires_ten_minutes_after_approval(tmp_path):
+    clk = Clock(); c = _cards(tmp_path, clk)
+    t0 = clk.t
+    card, _ = c.raise_card("Bash", PUSH, "x")
+    clk.t = t0 + 3590
+    c.approve(card["code"], "web")
+    clk.t = t0 + 3590 + 601
+    assert c.consume("Bash", PUSH) is None
