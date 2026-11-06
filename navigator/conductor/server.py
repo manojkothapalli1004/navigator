@@ -1,9 +1,10 @@
 """HTTP API of the conductor, served only on a 0600 unix socket (no TCP port).
 
-POST /messages {text, source}  GET /history?after=&limit=  GET /events (SSE)  GET /status"""
+POST /messages {text, source}  POST /attachments {name, data(base64), text, source}  GET /history?after=&limit=  GET /events (SSE)  GET /status"""
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -17,6 +18,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
+from navigator.conductor import attachments
 from navigator.conductor.engine import SOURCES, Engine
 from navigator.conductor.store import Store
 
@@ -107,7 +109,8 @@ def start_card_helper(engine, helpers, card: dict, via: str) -> None:
         engine.note(f"Card {code} was approved; it is queued behind other helpers and will run when one ends.", via)
 
 
-def build_app(engine: Engine, manage_engine: bool = False, cards=None, helpers=None, builds=None) -> Starlette:
+def build_app(engine: Engine, manage_engine: bool = False, cards=None, helpers=None, builds=None,
+              attachments_dir=None) -> Starlette:
     build_lock = asyncio.Lock()
 
     async def post_message(req: Request):
@@ -121,6 +124,74 @@ def build_app(engine: Engine, manage_engine: bool = False, cards=None, helpers=N
         if source not in SOURCES:
             return JSONResponse({"error": f"source must be one of {', '.join(SOURCES)}"}, status_code=422)
         return JSONResponse(engine.submit(text, source), status_code=202)
+
+    def _store_attachment(name: str, data_b64: str, adir):
+        """Heavy part, runs in a worker thread: decode, check, save. Returns (display, path, copy)."""
+        try:
+            data = base64.b64decode(data_b64, validate=True)
+        except ValueError:
+            raise attachments.AttachmentError(422, "data must be base64") from None
+        if len(data) > attachments.MAX_BYTES:
+            raise attachments.AttachmentError(413, "file is over 10 MB")
+        if not data:
+            raise attachments.AttachmentError(422, "file is empty")
+        stem, ext = attachments.sanitize_name(name)
+        text = attachments.check_content(ext, data)
+        stored = attachments.stored_name(stem, ext)
+        path, copy = attachments.save(adir, stored, data, text=text if ext == ".docx" else None)
+        return f"{stem}{ext}", path, copy
+
+    async def post_attachment(req: Request):
+        if attachments_dir is None:
+            return JSONResponse({"error": "attachments are not configured"}, status_code=503)
+        limit = attachments.MAX_BYTES * 4 // 3 + 100_000
+        declared = req.headers.get("content-length")
+        if declared is not None:
+            try:
+                too_big = int(declared) > limit
+            except ValueError:
+                return JSONResponse({"error": "bad Content-Length"}, status_code=422)
+            if too_big:
+                return JSONResponse({"error": "file is over 10 MB"}, status_code=413)
+        raw = bytearray()
+        async for chunk in req.stream():
+            raw += chunk
+            if len(raw) > limit:
+                return JSONResponse({"error": "file is over 10 MB"}, status_code=413)
+        try:
+            body = json.loads(bytes(raw))
+        except ValueError:
+            return JSONResponse({"error": "body must be JSON"}, status_code=422)
+        if not isinstance(body, dict):
+            return JSONResponse({"error": "body must be a JSON object"}, status_code=422)
+        name, data, caption, source = body.get("name"), body.get("data"), body.get("text", ""), body.get("source")
+        if not isinstance(name, str) or not isinstance(data, str) or not isinstance(caption, str):
+            return JSONResponse({"error": "name, data and text must be strings"}, status_code=422)
+        if source not in SOURCES:
+            return JSONResponse({"error": f"source must be one of {', '.join(SOURCES)}"}, status_code=422)
+        caption = caption.strip()
+        if len(caption) > MAX_TEXT - 1500:
+            return JSONResponse({"error": f"text must be at most {MAX_TEXT - 1500} characters"},
+                                status_code=422)
+        if len(data) > attachments.MAX_BYTES * 4 // 3 + 4:
+            return JSONResponse({"error": "file is over 10 MB"}, status_code=413)
+        try:
+            display, path, copy = await asyncio.to_thread(_store_attachment, name, data, attachments_dir)
+        except attachments.AttachmentError as e:
+            return JSONResponse({"error": str(e)}, status_code=e.status)
+        except Exception:
+            return JSONResponse({"error": "could not read that file"}, status_code=422)
+        line = attachments.note(display, path, copy)
+        try:
+            entry = engine.submit(f"{caption}\n\n{line}" if caption else line, source)
+        except Exception:
+            def _undo():
+                for p in (path, copy):
+                    if p is not None:
+                        p.unlink(missing_ok=True)
+            await asyncio.to_thread(_undo)
+            return JSONResponse({"error": "could not queue that file"}, status_code=500)
+        return JSONResponse(entry, status_code=202)
 
     async def history(req: Request):
         try:
@@ -230,6 +301,7 @@ def build_app(engine: Engine, manage_engine: bool = False, cards=None, helpers=N
                 await engine.stop()
 
     return Starlette(routes=[Route("/messages", post_message, methods=["POST"]),
+                             Route("/attachments", post_attachment, methods=["POST"]),
                              Route("/history", history), Route("/events", events),
                              Route("/status", status),
                              Route("/terminal", terminal, methods=["POST"]),
@@ -358,5 +430,5 @@ def serve(socket_path: Path, root: Path, runner=None) -> None:
     sock.bind(str(socket_path))
     os.chmod(socket_path, 0o600)
     uvicorn.Server(uvicorn.Config(build_app(engine, manage_engine=True, cards=cards, helpers=helpers,
-                                                builds=builds),
+                                                builds=builds, attachments_dir=attachments.ATTACH_DIR),
                                   log_level="warning", http=_guarded_protocol())).run(sockets=[sock])
