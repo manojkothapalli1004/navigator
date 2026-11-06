@@ -119,6 +119,30 @@ async def test_save_failure_after_launch_does_not_raise(tmp_path, monkeypatch, c
     r.release(out["id"]); await _settle(5)
 
 
+# ---- greps (tests 8, 12) ----
+import re  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+_COND = Path(__file__).resolve().parents[2] / "navigator" / "conductor"
+
+
+def test_no_approval_submit_left():  # test 8
+    for f in sorted(_COND.glob("*.py")):
+        src = f.read_text()
+        assert '"approval", internal=True' not in src, f.name
+        if f.name != "engine.py":
+            assert '"approval"' not in src, f.name
+
+
+def test_only_decide_touches_cards_approve():  # test 12a
+    # one line: `(cards.approve if action == "approve" else cards.decline)(...)` in server.decide
+    hits = [(f.name, ln) for f in sorted(_COND.glob("*.py")) for ln in f.read_text().splitlines()
+            if re.search(r"cards\.(approve|decline)\b", ln)]
+    assert len(hits) == 1 and hits[0][0] == "server.py", hits
+    for name in ("tools.py", "helpers.py", "runner.py", "builds.py", "engine.py"):
+        assert not re.search(r"import[^\n]*\bCards\b", (_COND / name).read_text()), name
+
+
 # ---- §3f: a lost approved-card helper is flagged, never re-run (test 18) ----
 @aio
 async def test_restart_mid_run_flags_exact_helper(tmp_path):
