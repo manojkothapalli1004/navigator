@@ -570,3 +570,15 @@ def test_a_huge_integer_ts_does_not_crash_or_block(adir):
                   encoding="utf-8")
     assert actions.run_action("step1", now=NOW).startswith("ran step1")
     assert marker.exists()
+
+
+def test_document_with_merge_all_caption_is_not_a_command():
+    rec = []
+
+    class N:
+        def send(self, t):
+            rec.append(t)
+    m = _msg(None, caption="/merge all", document={"file_id": "f", "file_name": "cv.pdf"})
+    del m["text"]
+    assert handle_operator_message(m, FakeACTClient(), N(), CHAT, now=NOW) is False
+    assert rec == []

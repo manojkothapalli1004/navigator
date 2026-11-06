@@ -703,13 +703,39 @@ def test_photo_without_caption_is_passed_through(tmp_path):
     assert _inbox_lines(tmp_path)[-1]["text"] == ""
 
 
-def test_image_document_passes_other_documents_dont(tmp_path):
-    img = _update(9, None); img["message"].pop("text")
-    img["message"]["document"] = {"file_id": "d1", "mime_type": "image/png", "file_name": "arch.png"}
-    pdf = _update(10, None); pdf["message"].pop("text")
-    pdf["message"]["document"] = {"file_id": "d2", "mime_type": "application/pdf", "file_name": "x.pdf"}
-    inbox = _inbox(tmp_path, [img, pdf])
-    assert [uid for uid, _ in inbox.poll_updates(0)] == [9]
+def _doc(uid, mime, name="x.pdf", caption=None, **extra):
+    u = _update(uid, None, **extra); u["message"].pop("text")
+    u["message"]["document"] = {"file_id": f"d{uid}", "mime_type": mime, "file_name": name}
+    if caption is not None:
+        u["message"]["caption"] = caption
+    return u
+
+
+def test_image_document_is_photo_and_pdf_is_document(tmp_path):
+    inbox = _inbox(tmp_path, [_doc(9, "image/png", "arch.png"), _doc(10, "application/pdf", "secret.pdf")])
+    assert [uid for uid, _ in inbox.poll_updates(0)] == [9, 10]
+    lines = _inbox_lines(tmp_path)
+    assert [l["media"] for l in lines] == ["photo", "document"]
+    assert "secret.pdf" not in json.dumps(lines)
+
+
+def test_document_without_file_id_is_dropped(tmp_path):
+    u = _doc(13, "application/pdf"); u["message"]["document"].pop("file_id")
+    assert _inbox(tmp_path, [u]).poll_updates(0) == []
+
+
+def test_document_caption_is_never_a_navigator_command(tmp_path):
+    assert _inbox(tmp_path, [_doc(14, "application/pdf", caption="/merge all")]).poll_once() == []
+
+
+def test_document_from_a_stranger_is_still_ignored(tmp_path):
+    assert _inbox(tmp_path, [_doc(15, "application/pdf", chat="999")]).poll_updates(0) == []
+
+
+def test_forwarded_document_marked_ignored(tmp_path):
+    inbox = _inbox(tmp_path, [_doc(16, "application/pdf", forward_origin={"type": "hidden_user"})])
+    inbox.poll_updates(0)
+    assert _inbox_lines(tmp_path)[-1]["ignored"] == "forwarded"
 
 
 def test_a_photo_caption_is_never_a_navigator_command(tmp_path):
