@@ -397,3 +397,83 @@ def test_no_merge_or_approval_calls_in_conductor_package():
         assert "decide_approval" not in src, f
         if f.name != "builds.py":
             assert "set_proposal_status" not in src, f
+
+
+# ---- build cards (A, C): files reach the proposal, the reply names the reason
+def test_delegate_schema_files_is_array():
+    from claude_agent_sdk import _python_type_to_json_schema
+    assert _python_type_to_json_schema(tools.DELEGATE_SCHEMA["files"]) == {"type": "array",
+                                                                           "items": {"type": "string"}}
+
+
+def test_files_string_forms():
+    assert tools._files({"files": "docs/a.md, docs/b.md"}) == ["docs/a.md", "docs/b.md"]
+    assert tools._files({"files": '["x.py","y.py"]'}) == ["x.py", "y.py"]
+    assert tools._files({"files": "a.py\nb.py\n"}) == ["a.py", "b.py"]
+    assert tools._files({"files": ""}) is None and tools._files({}) is None and tools._files({"files": 7}) is None
+    assert tools._files({"files": ["p.py", " q.py "]}) == ["p.py", "q.py"]
+
+
+@aio
+async def test_delegate_build_string_files_reach_proposal(tmp_path):
+    bs, act = mkbuilds(tmp_path)
+    r = await tools.delegate_text(FakeHelpers(), {"kind": "build", "project": "navigator", "title": "T",
+                                                  "task": SPEC, "files": "docs/x.md"}, bs)
+    (p,) = act.proposals.values()
+    assert p.affected_files == ["docs/x.md"] and p.status.value == "approved" and "tier 1" in r
+
+
+@pytest.mark.parametrize("project,title,files,settings,want,not_want", [
+    ("navigator", "T", [], object(), "no files declared", None),
+    ("navigator", "T", ["navigator/a.py", "docs/b.md"], object(), "navigator/a.py", "docs/b.md"),
+    ("navigator", "[draft] T", ["docs/a.md"], object(), "[draft]", None),
+    ("navigator", "T", ["docs/a.md"], None, "no tier rules", None),
+    ("nope", "T", ["docs/a.md"], object(), "refused: project must be one of", None),
+])
+@aio
+async def test_delegate_reply_names_the_reason(tmp_path, project, title, files, settings, want, not_want):
+    from navigator.conductor.cards import Cards
+    cards = Cards(tmp_path / "c.json")
+    bs, act = mkbuilds(tmp_path, on_needs_approval=lambda rec: cards.raise_build_card(
+        rec["proposal_id"], rec["project"], rec["title"], rec["files"], rec["approval_reason"]))
+    bs.settings = settings
+    r = await tools.delegate_text(FakeHelpers(), {"kind": "build", "project": project, "title": title,
+                                                  "task": SPEC, "files": files}, bs)
+    assert want in r
+    if not_want:
+        assert not_want not in r
+    if project != "nope":
+        assert "waiting for operator approval" in r and "Approve/Decline card" in r
+        (card,) = cards._cards  # a never-filled store would make the next two asserts vacuous
+        assert card["code"] not in r and card["id"] not in r
+
+
+@aio
+async def test_plain_title_is_not_was_draft(tmp_path):
+    # regression guard: passes on main too
+    bs, act = mkbuilds(tmp_path)
+    rec = bs.file("navigator", "Doc", SPEC, ["docs/a.md"], via="web")
+    assert rec["tier1"] and act.proposals[rec["proposal_id"]].status.value == "approved"
+
+
+def test_reason_never_widens_tier1(tmp_path, monkeypatch):
+    class Floor(Cfg):
+        tier_floor = "B"
+    monkeypatch.setattr(B, "repo_config_for", lambda s, p: Floor())
+    bs, act = mkbuilds(tmp_path)
+    assert bs._tier1("navigator", ["docs/a.md"]) is False
+    rec = bs.file("navigator", "T", SPEC, ["docs/a.md"], via="web")  # a real floor raises every file
+    assert not rec["tier1"] and rec["approval_reason"] == "not docs/tests-only: docs/a.md"
+    assert act.proposals[rec["proposal_id"]].status.value == "proposed"
+    # every file alone is A but the set is not: the reason is the fallback text, never None, never tier 1
+    monkeypatch.setattr(B, "classify_for_repo", lambda ch, repo, cfg, origin=None: "A" if len(ch) == 1 else "B")
+    rec = bs.file("navigator", "T2", SPEC, ["docs/a.md", "docs/b.md"], via="web")
+    assert not rec["tier1"] and rec["approval_reason"] == "the file set as a whole is not docs/tests-only"
+    assert act.proposals[rec["proposal_id"]].status.value == "proposed"
+
+
+@aio
+async def test_quick_helper_gets_string_files():
+    hs = FakeHelpers()
+    await tools.delegate_text(hs, {"kind": "quick", "title": "t", "task": "y" * 50, "files": "a.py, b.py"})
+    assert hs.started[0][2]["files"] == ["a.py", "b.py"]

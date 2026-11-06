@@ -23,10 +23,10 @@ class _Recorder:
         self.sent.append(text)
 
 
-def _prop(act, title, status=ProposalStatus.proposed, repo="/r/navigator", rationale="r"):
+def _prop(act, title, status=ProposalStatus.proposed, repo="/r/navigator", rationale="r", origin="periodic"):
     n = next(_seq)
     p = act.create_proposal(Proposal(
-        origin="periodic", proposal_origin_hash=f"h-{n}", title=title, rationale=rationale,
+        origin=origin, proposal_origin_hash=f"h-{n}", title=title, rationale=rationale,
         repo=repo, base_commit_sha="abc", intended_changes="x", affected_files=["a.py"],
         created_at=T0 + timedelta(minutes=n)))
     if status != ProposalStatus.proposed:
@@ -331,3 +331,51 @@ def test_push_writes_shown_before_sending(tmp_path):
                now=lambda: T0 + timedelta(days=1))
     t.run()
     assert len(rec.sent) == 1 and "top 1-3 of 3" in rec.sent[0]
+
+
+def _drop_all(props):
+    def model(prompt):
+        return json.dumps({"ranked": [], "drop": [{"id": p.id, "why": "x"} for p in props]})
+    return model
+
+
+def test_model_cannot_drop_a_conductor_build(tmp_path):
+    act = FakeACTClient()
+    build = _prop(act, "[draft] Add the thing", origin="operator")
+    junk = _prop(act, "Unrelated junk idea about widgets")
+    t, rec = _triage(act, tmp_path, _drop_all([build, junk]))
+    out = t.run()
+    assert _st(act, build) == ProposalStatus.proposed and _st(act, junk) == ProposalStatus.declined
+    assert out["triage_dropped"] == 1
+    kept = [p.id for p, _ in triage.ordered(act.list_proposals(ProposalStatus.proposed), tmp_path / "triage.json")]
+    assert build.id in kept
+    assert not [e for e in act.events if e.kind == "proposal.triage_declined" and e.correlation_id == build.id]
+    retired = [m for m in rec.sent if m.startswith("Navigator triage: retired")]
+    assert len(retired) == 1 and "Add the thing" not in retired[0]
+
+
+def test_drop_protection_needs_both_operator_origin_and_draft(tmp_path):
+    act = FakeACTClient()
+    a = _prop(act, "Website idea number one", origin="operator")
+    b = _prop(act, "[draft] Periodic draft thing", origin="periodic")
+    t, _ = _triage(act, tmp_path, _drop_all([a, b]))
+    t.run()
+    assert _st(act, a) == ProposalStatus.declined and _st(act, b) == ProposalStatus.declined
+
+
+def test_protected_ids_do_not_use_the_drop_cap(tmp_path):
+    act = FakeACTClient()
+    builds = [_prop(act, f"[draft] Conductor build {i} zzz{i}", origin="operator") for i in range(3)]
+    plain = [_prop(act, f"Plain idea {i} about topic{i}") for i in range(10)]
+    t, _ = _triage(act, tmp_path, _drop_all(builds + plain))
+    t.run()
+    assert len([p for p in plain if _st(act, p) == ProposalStatus.declined]) == triage.MAX_DROPS_PER_PASS
+    assert all(_st(act, p) == ProposalStatus.proposed for p in builds)
+
+
+def test_marker_matches_what_the_conductor_files():
+    from navigator.conductor import builds as B
+    from navigator.runtime import loop
+    p = B.file_build(FakeACTClient(), "navigator", "T", "x" * 500, base_sha_fn=lambda r: "s")
+    assert triage.is_conductor_build(p)
+    assert triage.OPERATOR_ORIGIN == loop.OPERATOR_ORIGIN and triage.DRAFT_PREFIX == loop.DRAFT_PREFIX

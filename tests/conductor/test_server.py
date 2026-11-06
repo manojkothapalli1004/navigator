@@ -373,3 +373,186 @@ def test_helpers_cancel_route_absent_without_helpers(tmp_path):
     async def go(c, eng):
         assert (await c.post("/helpers/helper-F/cancel")).status_code == 404
     asyncio.run(_with_app(tmp_path, go))
+
+
+# ---- build cards: Approve/Decline on a build that waits for the operator ----
+SPEC = "x" * 500
+
+
+class _BCfg:
+    tier_c_paths = ()
+    tier_floor = "A"
+
+
+class _BClock:
+    def __init__(self):
+        self.t = 1000.0
+
+    def __call__(self):
+        return self.t
+
+
+def _build_env(tmp_path, monkeypatch, with_builds=True):
+    from navigator.clients.act_client import FakeACTClient
+    from navigator.conductor import builds as B
+    from navigator.conductor.cards import Cards
+    monkeypatch.setattr(B, "repo_config_for", lambda s, p: _BCfg())
+    clock = _BClock()
+    cards = Cards(tmp_path / "cards.json", clock=clock)
+    act = FakeACTClient()
+    bs = B.Builds(tmp_path / "builds.json", act, settings=object(), base_sha_fn=lambda r: "s")
+    eng = Engine(Store(tmp_path / "c"), _runner, builds=bs)
+    bs.on_needs_approval = lambda rec: cards.raise_build_card(
+        rec["proposal_id"], rec["project"], rec["title"], rec["files"], rec["approval_reason"])
+    helpers = FakeHelpers()
+    app = server.build_app(eng, cards=cards, helpers=helpers, builds=bs if with_builds else None)
+    rec = bs.file("navigator", "Code", SPEC, ["navigator/a.py"], via="web")
+    card = cards.pending()[0]
+    return eng, cards, act, bs, helpers, app, clock, rec["proposal_id"], card
+
+
+def _run_build(tmp_path, monkeypatch, body, **kw):
+    async def go():
+        env = _build_env(tmp_path, monkeypatch, **kw)
+        eng = env[0]
+        await eng.start()
+        try:
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=env[5]), base_url="http://c") as c:
+                await body(c, *env)
+        finally:
+            await asyncio.sleep(0.05)
+            await eng.stop()
+    asyncio.run(go())
+
+
+def _approved(act, pid):
+    from navigator.contracts.enums import ProposalStatus
+    return act.proposals[pid].status == ProposalStatus.approved
+
+
+def test_build_card_approve_sets_proposal_approved_no_helper_no_turn(tmp_path, monkeypatch):
+    async def body(c, eng, cards, act, bs, helpers, app, clock, pid, card):
+        eng.on_card(card)
+        r = await c.post(f"/cards/{card['code']}/approve", json={"via": "web"})
+        assert r.status_code == 200 and r.json()["state"] == "approved" and r.json()["build"] is True
+        assert _approved(act, pid) and helpers.started == []
+        h = eng.store.history()
+        assert not [e for e in h if e.get("source") == "approval"]
+        cs = [e for e in h if e["kind"] == "card"]
+        assert [e["state"] for e in cs] == ["pending", "approved"] and all(e["build"] is True for e in cs)
+    _run_build(tmp_path, monkeypatch, body)
+
+
+def test_build_card_decline_sets_declined(tmp_path, monkeypatch):
+    from navigator.contracts.enums import ProposalStatus
+    async def body(c, eng, cards, act, bs, helpers, app, clock, pid, card):
+        r = await c.post(f"/cards/{card['id']}/decline", json={"via": "telegram"})
+        assert r.status_code == 200 and r.json()["state"] == "declined"
+        assert act.proposals[pid].status == ProposalStatus.declined and helpers.started == []
+    _run_build(tmp_path, monkeypatch, body)
+
+
+def test_build_card_expiry_leaves_proposal_proposed(tmp_path, monkeypatch):
+    from navigator.contracts.enums import ProposalStatus
+    async def body(c, eng, cards, act, bs, helpers, app, clock, pid, card):
+        clock.t += 4000
+        r = await c.post(f"/cards/{card['code']}/approve", json={"via": "web"})
+        assert r.status_code == 409 and r.json()["error"] == "expired"
+        assert act.proposals[pid].status == ProposalStatus.proposed
+        bs.poll()
+        assert bs.snapshot()[0]["state"] == "filed" and len(cards._cards) == 1
+        assert cards.raise_build_card(pid, "navigator", "Code", ["navigator/a.py"], "r")[1] is False
+        bs.decide(pid, True)  # what Telegram "approve N" amounts to
+        assert _approved(act, pid)
+    _run_build(tmp_path, monkeypatch, body)
+
+
+def test_build_card_act_down_keeps_card_pending(tmp_path, monkeypatch):
+    async def body(c, eng, cards, act, bs, helpers, app, clock, pid, card):
+        real = act.set_proposal_status
+
+        def down(*a):
+            raise httpx.ConnectError("down")
+        act.set_proposal_status = down
+        r = await c.post(f"/cards/{card['code']}/approve", json={"via": "web"})
+        assert r.status_code == 502 and "ACT is not reachable" in r.json()["error"]
+        assert cards.get(card["code"])["state"] == "pending"
+        act.set_proposal_status = real
+        assert (await c.post(f"/cards/{card['code']}/approve", json={"via": "web"})).status_code == 200
+        assert _approved(act, pid)
+    _run_build(tmp_path, monkeypatch, body)
+
+
+def test_build_card_proposal_moved_on(tmp_path, monkeypatch):
+    from navigator.contracts.enums import ProposalStatus
+    async def body(c, eng, cards, act, bs, helpers, app, clock, pid, card):
+        act.proposals[pid].status = ProposalStatus.declined
+        r = await c.post(f"/cards/{card['code']}/approve", json={"via": "web"})
+        assert r.status_code == 409 and r.json()["error"] == "proposal already declined"
+        assert cards.get(card["code"])["state"] == "pending"
+    _run_build(tmp_path, monkeypatch, body)
+
+
+def test_build_card_with_builds_off_is_refused(tmp_path, monkeypatch):
+    async def body(c, eng, cards, act, bs, helpers, app, clock, pid, card):
+        r = await c.post(f"/cards/{card['code']}/approve", json={"via": "web"})
+        assert r.status_code == 503 and helpers.started == []
+        assert not [e for e in eng.store.history() if e.get("source") == "approval"]
+        assert cards.get(card["code"])["state"] == "pending"
+    _run_build(tmp_path, monkeypatch, body, with_builds=False)
+
+
+def test_build_card_double_tap(tmp_path, monkeypatch):
+    async def body(c, eng, cards, act, bs, helpers, app, clock, pid, card):
+        assert (await c.post(f"/cards/{card['code']}/approve", json={"via": "web"})).status_code == 200
+        r = await c.post(f"/cards/{card['code']}/approve", json={"via": "web"})
+        assert r.status_code == 409 and "already approved" in r.json()["error"]
+        bs.decide(pid, True)  # idempotent
+        assert _approved(act, pid)
+    _run_build(tmp_path, monkeypatch, body)
+
+
+def test_model_cannot_approve(tmp_path, monkeypatch):
+    from navigator.conductor import tools
+    from navigator.contracts.enums import ProposalStatus
+    assert tools.TOOL_NAMES == ["delegate", "helpers", "cancel_helper"]
+    tools.make_conductor_server(FakeHelpers(), None)  # builds with the array schema; exposes no approve tool
+
+    async def body(c, eng, cards, act, bs, helpers, app, clock, pid, card):
+        calls = []
+        real = act.set_proposal_status
+        act.set_proposal_status = lambda p, s: calls.append(s) or real(p, s)
+        r = await tools.delegate_text(helpers, {"kind": "build", "project": "navigator", "title": "Other",
+                                                "task": SPEC, "files": ["navigator/b.py"]}, bs)
+        assert ProposalStatus.approved not in calls
+        newest = cards.pending()[-1]
+        assert newest["code"] not in r and newest["id"] not in r
+    _run_build(tmp_path, monkeypatch, body)
+
+
+def test_telegram_notified_once_for_a_pending_build_card(tmp_path):
+    from navigator.conductor import telegram
+    from navigator.conductor.cards import Cards
+    sent = []
+    eng = Engine(Store(tmp_path / "c"), _runner, notify=sent.append)
+    card, _ = Cards(tmp_path / "k.json").raise_build_card("p1", "navigator", "T", ["a.py"], "why")
+    eng.on_card(card)
+    assert sent == [card]
+    text = telegram.card_text(card)
+    assert card["summary"] in text and f"ok {card['code']}" in text
+    eng.on_card({**card, "state": "approved"})
+    assert len(sent) == 1
+
+
+def test_serve_wiring_raises_one_card_and_one_history_entry(tmp_path, monkeypatch):
+    # what serve() installs as builds.on_needs_approval: raise once, tell the engine once
+    from navigator.conductor.cards import Cards
+    cards = Cards(tmp_path / "k.json")
+    eng = Engine(Store(tmp_path / "c"), _runner)
+    cb = server.make_build_card_callback(cards, [eng])
+    rec = {"proposal_id": "p1", "project": "navigator", "title": "T", "files": ["a.py"],
+           "approval_reason": "why"}
+    cb(rec)
+    cb(rec)
+    assert len(cards.pending()) == 1
+    assert len([e for e in eng.store.history() if e["kind"] == "card"]) == 1

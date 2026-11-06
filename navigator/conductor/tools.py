@@ -7,12 +7,16 @@ runtime/drivers/builder_tools.make_run_tests_server."""
 from __future__ import annotations
 
 import asyncio
+import json
+import re
 import time
 
 import httpx
 
 MIN_TASK_CHARS = 40  # "fix it" is not a task a helper can do alone
 TOOL_NAMES = ["delegate", "helpers", "cancel_helper"]
+# `[str]` (an instance, not a type) used to become {"type": "string"}; list[str] is a real array
+DELEGATE_SCHEMA = {"kind": str, "title": str, "task": str, "project": str, "files": list[str]}
 DELEGATE_DESCRIPTION = (
     "Hand work off. Returns at once; the result arrives later as a [helper …] or [build …] message. Check "
     "helpers first so the same work is never started twice. kind=\"quick\" (default): a helper does a lookup or "
@@ -35,6 +39,15 @@ def _text(text: str) -> dict:
 
 def _files(args) -> list[str] | None:
     raw = args.get("files")
+    if isinstance(raw, str):  # the model may send "a.py, b.py" or a JSON list in a string
+        raw = raw.strip()
+        parsed = None
+        if raw.startswith("["):
+            try:
+                parsed = json.loads(raw)
+            except ValueError:
+                parsed = None
+        raw = parsed if isinstance(parsed, list) else re.split(r"[,\n]", raw)
     if not isinstance(raw, (list, tuple)):
         return None
     return [str(f).strip() for f in raw if str(f).strip()] or None
@@ -57,7 +70,9 @@ async def _delegate_build(builds, args, title: str, task: str) -> str:
     head = f"filed build {rec['proposal_id']} ({project}): {rec['title']} — "
     if rec.get("tier1"):
         return head + "tier 1 (docs/tests only), approved to start; it will not merge without your approval."
-    return head + "waiting for operator approval; I'll tell you when it ends."
+    reason = rec.get("approval_reason") or "needs your approval"
+    return head + (f"waiting for operator approval: {reason}. An Approve/Decline card is in the chat; "
+                   "I'll tell you when it ends.")
 
 
 async def delegate_text(helpers, args, builds=None) -> str:
@@ -101,9 +116,7 @@ async def cancel_text(helpers, args) -> str:
 def make_conductor_server(helpers, builds=None):
     from claude_agent_sdk import create_sdk_mcp_server, tool
 
-    schema = {"kind": str, "title": str, "task": str, "project": str, "files": [str]}
-
-    @tool("delegate", DELEGATE_DESCRIPTION, schema)
+    @tool("delegate", DELEGATE_DESCRIPTION, DELEGATE_SCHEMA)
     async def delegate(args):
         return _text(await delegate_text(helpers, args, builds))
 

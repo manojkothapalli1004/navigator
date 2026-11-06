@@ -164,3 +164,42 @@ class Cards:
 
     def pending(self) -> list[dict]:
         return [dict(c) for c in self._cards if c["state"] == "pending" and self._live(c)]
+
+    def get(self, key: str) -> dict | None:
+        try:
+            return dict(self._find(key))
+        except CardError:
+            return None
+
+    def raise_build_card(self, proposal_id: str, project: str, title: str, files: list[str],
+                         reason: str) -> tuple[dict, bool]:
+        """An Approve/Decline card for a build that waits for the operator. One card per proposal, ever:
+        an expired or decided card is not raised again. Not an action card: no input, no cwd, and a
+        fingerprint that is not a sha256, so consume() can never match it."""
+        fp = f"build:{proposal_id}"
+        for card in reversed(self._cards):
+            if card["fingerprint"] == fp:
+                return dict(card), False
+        shown = list(files[:BUILD_FILES_SHOWN])
+        while True:
+            more = len(files) - len(shown)
+            summary = (f"Build {proposal_id}: {title}\nproject: {project}\n"
+                       f"files: {', '.join(shown) or 'none declared'}" + (f" (+{more} more)" if more else ""))
+            if len(summary) <= MAX_SUMMARY or not shown:
+                break
+            shown.pop()  # drop file names, never the title, project or the count
+        summary = summary[:MAX_SUMMARY]
+        now = self.clock()
+        codes = {c["code"] for c in self._cards}
+        code = "".join(secrets.choice(CODE_ALPHABET) for _ in range(CODE_LEN))
+        while code in codes:
+            code = "".join(secrets.choice(CODE_ALPHABET) for _ in range(CODE_LEN))
+        card = {"id": secrets.token_urlsafe(16), "code": code, "tool": "build", "summary": summary,
+                "reason": reason, "fingerprint": fp, "build": True, "proposal_id": proposal_id,
+                "state": "pending", "created": now, "expires": now + self.ttl_s}
+        self._cards.append(card)
+        self._save()
+        return dict(card), True
+
+
+BUILD_FILES_SHOWN = 12  # file names listed on a build card; the rest become "(+N more)"
