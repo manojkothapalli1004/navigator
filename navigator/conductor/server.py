@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import sys
 from contextlib import asynccontextmanager
@@ -19,6 +20,7 @@ from starlette.routing import Route
 from navigator.conductor.engine import SOURCES, Engine
 from navigator.conductor.store import Store
 
+_log = logging.getLogger(__name__)
 MAX_TEXT = 20000
 MAX_TERMINAL_ENTRIES = 500
 KEEPALIVE_S = 15.0
@@ -75,6 +77,34 @@ def make_build_card_callback(cards, engine_ref: list):
         if new:
             engine_ref[0].on_card(card)
     return _raise_build_card
+
+
+def start_card_helper(engine, helpers, card: dict, via: str) -> None:
+    """An approved card runs in a helper or not at all: never a main-conversation turn."""
+    code = card["code"]
+    why = None
+    if helpers is None:
+        why = "no helpers"
+    elif not isinstance(card.get("input"), dict):
+        why = "raised before approved cards ran in helpers"
+    elif not (isinstance(card.get("cwd"), str) and card["cwd"]):
+        why = "no folder recorded"
+    elif not isinstance(card.get("tool"), str):
+        why = "no tool recorded"
+    if why:
+        engine.note(f"Card {code} was approved but cannot be run automatically ({why}); ask for it again.", via)
+        return
+    try:
+        out = helpers.start(title=f"approved card {code}",
+                            task=CARD_TASK.format(code, card["tool"], json.dumps(card["input"]), card["cwd"]),
+                            exact={"tool": card["tool"], "input": card["input"], "cwd": card["cwd"]}, via=via)
+    except Exception as e:
+        name = type(e).__name__
+        _log.warning("conductor.card_helper_failed: %s", name)
+        engine.note(f"Card {code} was approved but its helper could not start ({name}); ask for it again.", via)
+        return
+    if isinstance(out, dict) and out.get("state") == "queued":
+        engine.note(f"Card {code} was approved; it is queued behind other helpers and will run when one ends.", via)
 
 
 def build_app(engine: Engine, manage_engine: bool = False, cards=None, helpers=None, builds=None) -> Starlette:
@@ -168,7 +198,7 @@ def build_app(engine: Engine, manage_engine: bool = False, cards=None, helpers=N
             return JSONResponse({"error": "not found"}, status_code=404)
         bc = cards.get(req.path_params["key"])
         if bc is not None and bc.get("build"):
-            if builds is None:  # builds switched off after the card was raised: never fall into the "approval" turn path
+            if builds is None:  # builds switched off after the card was raised: never start a card helper
                 return JSONResponse({"error": "builds are not configured; the card cannot be decided"},
                                     status_code=503)
             err = await _decide_build(cards, builds, build_lock, bc, action)  # None = ACT updated (or already in that state)
@@ -183,15 +213,7 @@ def build_app(engine: Engine, manage_engine: bool = False, cards=None, helpers=N
             return JSONResponse(_public(card))
         engine.on_card(card)
         if card["state"] == "approved":
-            if helpers is not None and "input" in card:
-                helpers.start(title=f"approved card {card['code']}",
-                              task=CARD_TASK.format(card["code"], card["tool"], json.dumps(card["input"]),
-                                                    card["cwd"]),
-                              exact={"tool": card["tool"], "input": card["input"], "cwd": card["cwd"]}, via=via)
-            else:  # no helpers, or a card raised before input/cwd were stored: the old path
-                engine.submit(f"Card {card['code']} was approved by the operator via {via}. Run exactly this "
-                              f"now, unchanged: {card['summary']}", "approval", internal=True,
-                              reply_via=via)
+            start_card_helper(engine, helpers, card, via)
         return JSONResponse(_public(card))
 
     async def cancel_helper(req: Request):

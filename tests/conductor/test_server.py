@@ -187,38 +187,6 @@ def test_cards_endpoints_approve_decline_404_409(tmp_path):
     asyncio.run(go())
 
 
-def test_approve_submits_internal_message(tmp_path):
-    async def go():
-        eng, cards, app = _cards_app(tmp_path); await eng.start()
-        a, _ = cards.raise_card("Bash", {"command": "git push origin main"}, "git push")
-        try:
-            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://c") as c:
-                await c.post(f"/cards/{a['code']}/approve", json={"via": "telegram"})
-        finally:
-            await asyncio.sleep(0.1); await eng.stop()
-        users = [e for e in eng.store.history() if e["kind"] == "user"]
-        assert users[-1]["source"] == "approval"
-        assert "git push origin main" in users[-1]["text"] and a["code"] in users[-1]["text"]
-        assert [e["state"] for e in eng.store.history() if e["kind"] == "card"] == ["approved"]
-    asyncio.run(go())
-
-
-def test_card_approved_via_telegram_submits_reply_via(tmp_path):
-    async def go():
-        eng, cards, app = _cards_app(tmp_path); await eng.start()
-        a, _ = cards.raise_card("Bash", {"command": "git push origin main"}, "git push")
-        b, _ = cards.raise_card("Bash", {"command": "git merge x"}, "git merge")
-        try:
-            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://c") as c:
-                await c.post(f"/cards/{a['code']}/approve", json={"via": "telegram"})
-                await c.post(f"/cards/{b['code']}/approve", json={"via": "web"})
-        finally:
-            await asyncio.sleep(0.1); await eng.stop()
-        users = [e for e in eng.store.history() if e["kind"] == "user"]
-        assert [u.get("reply_via") for u in users] == ["telegram", "web"]
-    asyncio.run(go())
-
-
 def test_peer_ancestry():
     parents = {50: 40, 40: 10, 10: 1, 60: 1}
     ppid = parents.get

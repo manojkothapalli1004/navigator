@@ -129,3 +129,7 @@ def test_sdk_turn_passes_conductor_server_through():
 def test_windows_prompt_tells_the_model_to_delegate():
     for phrase in ("call delegate", "Check helpers first", "[helper", "Answer 'how is it going' from helpers"):
         assert phrase in runner.WINDOWS_PROMPT
+
+
+def test_windows_prompt_says_a_helper_runs_approved_cards():  # stage 3 test 13
+    assert "a helper runs that one action by itself" in runner.WINDOWS_PROMPT

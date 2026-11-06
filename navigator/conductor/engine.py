@@ -155,7 +155,10 @@ class Engine:
         if self.helpers is not None:
             lost = self.helpers.mark_lost()
             if lost:
-                self.submit("[helpers lost on restart] " + ", ".join(f"{r['id']} {r['title']}" for r in lost),
+                def _lost(r: dict) -> str:  # an approved-card helper may have run: never re-run, say so
+                    tail = " (may not have run; check before re-approving)" if r.get("exact") else ""
+                    return f"{r['id']} {r['title']}{tail}"
+                self.submit("[helpers lost on restart] " + ", ".join(_lost(r) for r in lost),
                             "helper", internal=True)
         self._task = asyncio.create_task(self._worker())
         if self.builds is not None:  # Navigator owns open builds: re-polled on restart, never marked lost
@@ -269,6 +272,12 @@ class Engine:
             st = self.autopilot.public()
             self._send_telegram(f"Autopilot: turn {st['consecutive']}/{st['max_consecutive']} — {what}")
             self.submit(self.autopilot.prompt(what), "autopilot", internal=True, reply_via="telegram")
+
+    def note(self, text: str, via: str | None = None) -> None:
+        """Say something quietly: no turn, no queue entry, no model call."""
+        self._append({"kind": "note", "text": text})
+        if via == "telegram":
+            self._send_telegram(text)
 
     def _send_telegram(self, text: str) -> None:
         if self.reply:
