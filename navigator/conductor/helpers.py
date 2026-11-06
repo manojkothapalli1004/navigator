@@ -31,6 +31,7 @@ HELPER_MODEL = "claude-sonnet-5-5"
 HELPER_MAX_TURNS = 40
 HELPER_TIMEOUT_S = 600.0
 MAX_RUNNING = 3
+HARD_MAX_RUNNING = 8  # every running helper, approved-card ones included
 RESULT_CHARS = 4000
 SCRATCH = "/Users/Manoj/calwbot/tmp_claude"
 KEEP_FINISHED = 50  # finished records kept in the registry
@@ -177,7 +178,16 @@ class Helpers:
         return {k: rec.get(k) for k in ("id", "title", "state", "started")}
 
     def _running(self) -> int:
+        """Running helpers that count against max_running (approved-card helpers take no slot)."""
+        return sum(1 for r in self._records if r.get("state") == "running" and not r.get("exact"))
+
+    def _running_all(self) -> int:
         return sum(1 for r in self._records if r.get("state") == "running")
+
+    def _may_launch(self, rec: dict) -> bool:
+        if self._running_all() >= HARD_MAX_RUNNING:
+            return False
+        return bool(rec.get("exact")) or self._running() < self.max_running
 
     # ---- lifecycle ----
 
@@ -188,9 +198,12 @@ class Helpers:
                "reply_via": via if via is not None else self.current_via, "exact": exact,
                "files": [str(f).strip() for f in files if str(f).strip()] if files else None}
         self._records.append(rec)
-        if self._running() < self.max_running:
+        if self._may_launch(rec):
             self._launch(rec)
-        self._save()
+        try:
+            self._save()
+        except Exception as e:  # the helper is already running: never report a failed start for it
+            _log.warning("conductor.helpers_save_failed: %s", type(e).__name__)
         return self._public(rec)
 
     def _launch(self, rec: dict) -> None:
@@ -206,9 +219,7 @@ class Helpers:
 
     def _start_queued(self) -> None:
         for rec in self._records:
-            if self._running() >= self.max_running:
-                break
-            if rec.get("state") == "queued":
+            if rec.get("state") == "queued" and self._may_launch(rec):
                 self._launch(rec)
         self._save()
 
