@@ -69,12 +69,16 @@ _ACTIONS = {"/merge": "merge", "/reject": "reject"}
 SHORT_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,31}")
 DEFAULT_OFFSET_PATH = "/Users/Manoj/calwbot/logs/navigator/telegram_offset"
 def _media_kind(msg: dict) -> str | None:
-    """'photo' for a Telegram photo or an image sent as a file; None for anything else."""
+    """'photo' for a Telegram photo or an image sent as a file; 'document' for any other file
+    (the bot decides by extension whether it can take it); None for anything else."""
     if isinstance(msg.get("photo"), list) and msg["photo"]:
         return "photo"
     doc = msg.get("document")
-    if isinstance(doc, dict) and str(doc.get("mime_type", "")).startswith("image/"):
-        return "photo"
+    if isinstance(doc, dict):
+        if str(doc.get("mime_type", "")).startswith("image/"):
+            return "photo"
+        if isinstance(doc.get("file_id"), str) and doc["file_id"]:
+            return "document"
     return None
 
 
@@ -337,7 +341,7 @@ class TelegramInbox:
             if not isinstance(text, str):
                 if media is None:
                     continue
-                # 2026-11-03: a photo (or image file) reaches the bot with its caption as the text
+                # 2026-11-03: a photo or document (or image file) reaches the bot with its caption as the text
                 text = msg.get("caption") if isinstance(msg.get("caption"), str) else ""
             entry = {"update_id": uid, "date": msg.get("date"), "text": text}
             if media is not None:
