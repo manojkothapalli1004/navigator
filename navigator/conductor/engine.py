@@ -270,6 +270,12 @@ class Engine:
             self._send_telegram(f"Autopilot: turn {st['consecutive']}/{st['max_consecutive']} — {what}")
             self.submit(self.autopilot.prompt(what), "autopilot", internal=True, reply_via="telegram")
 
+    def note(self, text: str, via: str | None = None) -> None:
+        """Say something quietly: no turn, no queue entry, no model call."""
+        self._append({"kind": "note", "text": text})
+        if via == "telegram":
+            self._send_telegram(text)
+
     def _send_telegram(self, text: str) -> None:
         if self.reply:
             try:
