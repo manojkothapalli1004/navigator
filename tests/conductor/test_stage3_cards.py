@@ -1,4 +1,5 @@
 import asyncio
+import json
 
 from tests.conductor.test_engine import FakeRunner, _eng, _reng, aio
 
@@ -116,6 +117,35 @@ async def test_save_failure_after_launch_does_not_raise(tmp_path, monkeypatch, c
     assert r.calls == [out["id"]]
     assert "OSError" in caplog.text and "disk-secret-xyz" not in caplog.text
     r.release(out["id"]); await _settle(5)
+
+
+# ---- §3f: a lost approved-card helper is flagged, never re-run (test 18) ----
+@aio
+async def test_restart_mid_run_flags_exact_helper(tmp_path):
+    base = {"task": TASK, "state": "running", "started": 1.0, "ended": None, "result": None, "error": None,
+            "reply_via": None}
+    (tmp_path / "helpers.json").write_text(json.dumps({"helpers": [
+        {**base, "id": "helper-EX", "title": "approved card ABC234", "exact": EX},
+        {**base, "id": "helper-PL", "title": "plain job"}]}))
+    r = Gated()
+    hs = _helpers(tmp_path, r)
+    clock = [1000.0]
+    cards = Cards(tmp_path / "cards.json", clock=lambda: clock[0])
+    card, _ = cards.raise_card("Bash", EX["input"], "git merge", cwd="/r")
+    cards.approve(card["code"], "web")
+    eng = Engine(Store(tmp_path / "c"), CountingRunner(), lock_path=tmp_path / "turn.lock", helpers=hs)
+    await eng.start()
+    await asyncio.sleep(0.1)
+    await eng.stop()
+    lost = [e["text"] for e in eng.store.history(limit=100)
+            if e.get("kind") == "user" and e["text"].startswith("[helpers lost on restart]")]
+    assert len(lost) == 1
+    assert "helper-EX approved card ABC234 (may not have run; check before re-approving)" in lost[0]
+    assert "helper-PL plain job" in lost[0] and "helper-PL plain job (may" not in lost[0]
+    assert r.calls == []
+    assert cards._cards[0]["state"] == "approved"
+    clock[0] += 3601
+    assert cards.consume("Bash", EX["input"], "/r") is None
 
 
 # ---- §3b server: no main-turn fallback for an approved card (tests 1-5, 15/16 server level) ----
