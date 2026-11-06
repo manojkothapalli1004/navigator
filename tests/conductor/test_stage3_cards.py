@@ -302,3 +302,72 @@ async def test_save_failure_gives_no_ask_again_note(tmp_path, monkeypatch, caplo
     assert r.status_code == 200 and _no_approval_turn(h)
     assert not [n for n in _notes(h) if "ask again" in n]
     assert "OSError" in caplog.text and "disk-secret-xyz" not in caplog.text
+
+
+# ---- guards (pass on base): tests 9, 11 (new part), 12b ----
+from navigator.conductor import gate  # noqa: E402
+
+
+@aio
+async def test_main_stays_free_while_card_helper_is_gated(tmp_path):  # test 9
+    r = Gated(); runner = CountingRunner(); engine_ref = []
+    hs = H.Helpers(tmp_path / "helpers.json", r, on_event=lambda *a: None,
+                   on_finish=lambda rec: engine_ref[0].on_helper_finish(rec))
+    eng = Engine(Store(tmp_path / "c"), runner, helpers=hs, lock_path=tmp_path / "turn.lock")
+    engine_ref.append(eng)
+    cards = Cards(tmp_path / "cards.json")
+    app = server.build_app(eng, cards=cards, helpers=hs)
+    await eng.start()
+    card, _ = cards.raise_card("Bash", {"command": "git merge x"}, "git merge", cwd="/r")
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://c") as c:
+        resp = await c.post(f"/cards/{card['code']}/approve", json={"via": "telegram"})
+    assert resp.status_code == 200
+    await _settle(5)
+    assert eng.busy is False and eng.queue_len == 0 and len(r.calls) == 1
+    eng.submit("how is it going", "web")
+    await _settle(20)
+    users = [e for e in eng.store.history(limit=100) if e.get("kind") == "user"]
+    assert any(e["text"] == "how is it going" for e in users) and runner.n == 1
+    assert eng.busy is False and eng.queue_len == 0
+    r.release(r.calls[0])
+    await _settle(40)
+    rep = [e for e in eng.store.history(limit=100) if e.get("kind") == "user" and e.get("source") == "helper"]
+    assert len(rep) == 1 and f"done: approved card {card['code']}" in rep[0]["text"]
+    assert rep[0].get("reply_via") == "telegram"
+    assert runner.n == 2  # the main turn that answers the report
+    await eng.stop()
+
+
+@aio
+async def test_helper_for_a_cannot_use_card_b(tmp_path):  # test 11, new part
+    cards = Cards(tmp_path / "cards.json")
+    a, _ = cards.raise_card("Bash", {"command": "git merge a"}, "git merge", cwd="/r")
+    b, _ = cards.raise_card("Bash", {"command": "git merge b"}, "git merge", cwd="/r")
+    cards.approve(a["code"], "web")
+    exact = {"tool": "Bash", "input": {"command": "git merge a"}, "cwd": "/r"}
+    fence = H._only(exact)
+    hook = gate.make_hook(cards, lambda card: None)
+
+    def call(cmd):
+        return {"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": "/r"}
+
+    def state(code):
+        return next(c["state"] for c in cards._cards if c["code"] == code)
+
+    out = await fence(call("git merge b"), None, None)  # the fence runs first and refuses B's command
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert state(b["code"]) == "pending" and state(a["code"]) == "approved"
+    assert await fence(call("git merge a"), None, None) == {}
+    ok = await hook(call("git merge a"), None, None)
+    assert ok["hookSpecificOutput"]["permissionDecision"] == "allow" and state(a["code"]) == "used"
+    assert state(b["code"]) == "pending"
+    again = await hook(call("git merge a"), None, None)  # no reuse: a fresh card is raised
+    assert again["hookSpecificOutput"]["permissionDecision"] == "deny"
+    fresh = [c for c in cards._cards if c["code"] not in (a["code"], b["code"])]
+    assert len(fresh) == 1 and fresh[0]["state"] == "pending"
+
+
+def test_curl_to_conductor_socket_is_gated():  # test 12b
+    cmd = ("curl --unix-socket /Users/Manoj/calwbot/logs/conductor/conductor.sock "
+           "http://c/cards/ABC234/approve")
+    assert gate.gated_reason("Bash", {"command": cmd}, gate.Path("/Users/Manoj/calwbot")) is not None
