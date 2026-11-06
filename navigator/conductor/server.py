@@ -50,7 +50,36 @@ async def event_stream(engine: Engine, is_disconnected, keepalive_s: float = KEE
         engine.unsubscribe(q)
 
 
-def build_app(engine: Engine, manage_engine: bool = False, cards=None, helpers=None) -> Starlette:
+async def _decide_build(cards, builds, lock, bc: dict, action: str):
+    """Approve/Decline on a build card: ACT first, the card second. None = the proposal is updated."""
+    from navigator.conductor.builds import BuildRefused
+    if bc["state"] != "pending":
+        return JSONResponse({"error": f"already {bc['state']}"}, status_code=409)
+    if cards.clock() >= bc["expires"]:
+        return JSONResponse({"error": "expired"}, status_code=409)
+    async with lock:  # one ACT status change at a time
+        try:
+            await asyncio.to_thread(builds.decide, bc["proposal_id"], action == "approve")
+        except BuildRefused as e:
+            return JSONResponse({"error": str(e)}, status_code=409)
+        except Exception:
+            return JSONResponse({"error": "ACT is not reachable; the card stays pending"}, status_code=502)
+    return None
+
+
+def make_build_card_callback(cards, engine_ref: list):
+    """Builds.on_needs_approval: runs on the event loop; one card per proposal, chat + Telegram told once."""
+    def _raise_build_card(rec: dict) -> None:
+        card, new = cards.raise_build_card(rec["proposal_id"], rec["project"], rec["title"], rec["files"],
+                                           rec.get("approval_reason") or "needs your approval")
+        if new:
+            engine_ref[0].on_card(card)
+    return _raise_build_card
+
+
+def build_app(engine: Engine, manage_engine: bool = False, cards=None, helpers=None, builds=None) -> Starlette:
+    build_lock = asyncio.Lock()
+
     async def post_message(req: Request):
         try:
             body = await req.json()
@@ -137,10 +166,21 @@ def build_app(engine: Engine, manage_engine: bool = False, cards=None, helpers=N
         action = req.path_params["action"]
         if action not in ("approve", "decline"):
             return JSONResponse({"error": "not found"}, status_code=404)
+        bc = cards.get(req.path_params["key"])
+        if bc is not None and bc.get("build"):
+            if builds is None:  # builds switched off after the card was raised: never fall into the "approval" turn path
+                return JSONResponse({"error": "builds are not configured; the card cannot be decided"},
+                                    status_code=503)
+            err = await _decide_build(cards, builds, build_lock, bc, action)  # None = ACT updated (or already in that state)
+            if err is not None:
+                return err
         try:
             card = (cards.approve if action == "approve" else cards.decline)(req.path_params["key"], via)
         except CardError as e:
             return JSONResponse({"error": str(e)}, status_code=404 if str(e) == "not found" else 409)
+        if card.get("build"):
+            engine.on_card(card)
+            return JSONResponse(_public(card))
         engine.on_card(card)
         if card["state"] == "approved":
             if helpers is not None and "input" in card:
@@ -273,6 +313,8 @@ def serve(socket_path: Path, root: Path, runner=None) -> None:
                       on_event=lambda hid, ev: engine_ref[0].on_helper_event(hid, ev),
                       on_finish=lambda rec: engine_ref[0].on_helper_finish(rec))
     builds = make_builds(root)
+    if builds is not None:
+        builds.on_needs_approval = make_build_card_callback(cards, engine_ref)
     if runner is None:
         from navigator.conductor.runner import sdk_turn
         runner = partial(sdk_turn, hook=hook, conductor_server=make_conductor_server(helpers, builds))
@@ -293,5 +335,6 @@ def serve(socket_path: Path, root: Path, runner=None) -> None:
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     sock.bind(str(socket_path))
     os.chmod(socket_path, 0o600)
-    uvicorn.Server(uvicorn.Config(build_app(engine, manage_engine=True, cards=cards, helpers=helpers),
+    uvicorn.Server(uvicorn.Config(build_app(engine, manage_engine=True, cards=cards, helpers=helpers,
+                                                builds=builds),
                                   log_level="warning", http=_guarded_protocol())).run(sockets=[sock])

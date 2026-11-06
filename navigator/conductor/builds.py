@@ -92,11 +92,13 @@ def file_build(act, project: str, title: str, task: str, files=(), base_sha_fn=_
 
 
 class Builds:
-    def __init__(self, path, act, settings=None, on_finish=None, base_sha_fn=_head_sha, loop=None):
+    def __init__(self, path, act, settings=None, on_finish=None, base_sha_fn=_head_sha, loop=None,
+                 on_needs_approval=None):
         self.path = Path(path)
         self.act = act
         self.settings = settings
         self.on_finish = on_finish
+        self.on_needs_approval = on_needs_approval  # called (on the loop) with a record that waits for the operator
         self.base_sha_fn = base_sha_fn
         self.loop = loop
         self.current_via: str | None = None  # set by the engine at each turn start
@@ -135,14 +137,62 @@ class Builds:
             return False
         return classify_for_repo(files, repo, cfg, origin=OPERATOR_ORIGIN) == "A"
 
+    def _approval_reason(self, project: str, files: list[str], was_draft: bool) -> str:
+        """Why this build waits for the operator. Text only: tier 1 is decided by _tier1 alone."""
+        if was_draft:
+            return mask("the title started with [draft]; resend it without that so docs/tests-only builds "
+                        "can start by themselves")
+        if not files:
+            return mask("no files declared; list the repo-relative paths so docs/tests-only work can start "
+                        "by itself")
+        repo = BUILD_REPOS.get(project)
+        cfg = repo_config_for(self.settings, repo) if self.settings is not None and repo else None
+        if cfg is None:
+            return mask(f"no tier rules loaded for {project}, so it cannot be checked as docs/tests-only")
+        bad = [f for f in files if classify_for_repo([f], repo, cfg, origin=OPERATOR_ORIGIN) != "A"]
+        if not bad:
+            return "the file set as a whole is not docs/tests-only"
+        more = f" (+{len(bad) - 10} more)" if len(bad) > 10 else ""
+        return mask("not docs/tests-only: " + ", ".join(bad[:10]) + more)
+
+    def _notify_needs(self, rec: dict) -> None:
+        """Ask the card store for an Approve/Decline card, on the event loop. Never raises."""
+        cb = self.on_needs_approval
+        if cb is None:
+            return
+        try:
+            snap = dict(rec)
+            snap["title"] = mask(rec["title"])
+            snap["files"] = [mask(f) for f in rec["files"]]
+            if self.loop is not None:
+                self.loop.call_soon_threadsafe(cb, snap)
+            else:
+                cb(snap)
+        except Exception as e:
+            log.warning("conductor.build_card_failed: %s", type(e).__name__)
+
+    def decide(self, proposal_id: str, approve: bool) -> None:
+        """The operator's Approve/Decline on a build card (blocking). Starts nothing and merges nothing."""
+        p = self.act.get_proposal(proposal_id)
+        if p is None:
+            raise BuildRefused("proposal not found")
+        want = ProposalStatus.approved if approve else ProposalStatus.declined
+        if p.status == want:
+            return
+        if p.status != ProposalStatus.proposed:
+            raise BuildRefused(f"proposal already {p.status.value}")
+        self.act.set_proposal_status(proposal_id, want)
+
     def file(self, project: str, title: str, task: str, files, via) -> dict:
         fl = _clean_files(files)
         was_draft = (title or "").strip().lower().startswith(DRAFT_PREFIX)
         tier1 = (not was_draft) and project in BUILD_REPOS and self._tier1(project, fl)
+        reason = None if tier1 else (self._approval_reason(project, fl, was_draft) if project in BUILD_REPOS
+                                     else None)
         p = file_build(self.act, project, title, task, files=fl, base_sha_fn=self.base_sha_fn)
         rec = {"proposal_id": p.id, "project": project, "title": _strip_draft(title), "files": fl,
                "tier1": False, "state": "filed", "reply_via": via, "filed": time.time(), "ended": None,
-               "summary": "", "reported": []}
+               "summary": "", "reported": [], "approval_reason": reason}
         with self._lock:  # persisted BEFORE approving: a crash after approval must not leave it unwatched
             self._records.append(rec)
             self._save()
@@ -154,6 +204,11 @@ class Builds:
                     self._save()
             except Exception as e:
                 log.warning("conductor.build_autoapprove_failed: %s", type(e).__name__)
+                with self._lock:
+                    rec["approval_reason"] = f"auto-approve failed ({type(e).__name__}); waiting for you"
+                    self._save()
+        if not rec["tier1"]:
+            self._notify_needs(rec)
         with self._lock:
             return dict(rec)
 
@@ -221,6 +276,8 @@ class Builds:
             return
         if run is None:
             rec["state"] = "filed"
+            if p.status == ProposalStatus.proposed and not rec.get("tier1"):
+                self._notify_needs(rec)  # repair: a restart or a failed card request left it uncarded
             if time.time() - rec["filed"] > BUILD_STALE_S:
                 once(f"{pid}:stale", f"build {pid} is still waiting for approval: {title}")
             return

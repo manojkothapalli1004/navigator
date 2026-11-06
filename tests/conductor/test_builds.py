@@ -223,3 +223,63 @@ def test_crash_between_queue_and_save_duplicates_not_loses(tmp_path):
     assert len(got2) == 1
     b2.poll()
     assert len(got2) == 1
+
+
+# ---- build cards (D): the needs-approval callback, poll repair, decide
+def test_needs_approval_callback_once_with_reason(tmp_path):
+    b, act, _ = mk(tmp_path)
+    seen = []
+    b.on_needs_approval = seen.append
+    b.file("navigator", "Doc", SPEC, ["docs/a.md"], via="web")
+    assert seen == []
+    rec = b.file("navigator", "Code", SPEC, ["navigator/a.py"], via="web")
+    (s,) = seen
+    assert s["proposal_id"] == rec["proposal_id"] and "navigator/a.py" in s["approval_reason"]
+    assert s["title"] == "Code" and s["files"] == ["navigator/a.py"]
+
+    def boom(pid, status):
+        raise RuntimeError("x")
+    act.set_proposal_status = boom
+    b.file("navigator", "Doc2", SPEC, ["docs/b.md"], via="web")
+    assert seen[-1]["approval_reason"] == "auto-approve failed (RuntimeError); waiting for you"
+    assert len(seen) == 2
+
+
+def test_callback_error_does_not_fail_filing(tmp_path, caplog):
+    b, act, _ = mk(tmp_path)
+
+    def boom(rec):
+        raise RuntimeError("secret text in message")
+    b.on_needs_approval = boom
+    with caplog.at_level(logging.WARNING):
+        rec = b.file("navigator", "Code", SPEC, ["navigator/a.py"], via="web")
+    assert rec["proposal_id"] in act.proposals
+    assert "conductor.build_card_failed: RuntimeError" in caplog.text and "secret text" not in caplog.text
+
+
+def test_poll_reraises_card_request_for_uncarded_waiting_build(tmp_path):
+    b, act, _ = mk(tmp_path)
+
+    def boom(rec):
+        raise RuntimeError("x")
+    b.on_needs_approval = boom
+    pid = b.file("navigator", "Code", SPEC, ["navigator/a.py"], via="web")["proposal_id"]
+    seen = []
+    b.on_needs_approval = seen.append
+    b.poll()
+    assert [s["proposal_id"] for s in seen] == [pid]
+    act.proposals[pid].status = ProposalStatus.approved
+    b.poll()
+    assert len(seen) == 1
+
+
+def test_decide_idempotent_and_guarded(tmp_path):
+    b, act, _ = mk(tmp_path)
+    pid = b.file("navigator", "Code", SPEC, ["navigator/a.py"], via="web")["proposal_id"]
+    b.decide(pid, True)
+    assert act.proposals[pid].status == ProposalStatus.approved
+    b.decide(pid, True)
+    with pytest.raises(B.BuildRefused, match="proposal already approved"):
+        b.decide(pid, False)
+    with pytest.raises(B.BuildRefused):
+        b.decide("nope", True)

@@ -338,3 +338,46 @@ def test_card_record_keeps_input_and_cwd(tmp_path):
     assert saved["input"] == card["input"] and saved["cwd"] == "/r"
     pub = server._public(card)
     assert "input" not in pub and "cwd" not in pub and "fingerprint" not in pub and pub["code"] == card["code"]
+
+
+# ---- build cards
+def test_build_card_shape_and_dedupe(tmp_path):
+    clock = Clock(); c = _cards(tmp_path, clock)
+    files = [f"d/f{i}.py" for i in range(15)]
+    card, new = c.raise_build_card("prop-1", "navigator", "My title", files, "not docs/tests-only: d/f0.py")
+    assert new and card["build"] is True and "input" not in card and "cwd" not in card
+    assert card["tool"] == "build" and card["proposal_id"] == "prop-1" and card["fingerprint"] == "build:prop-1"
+    assert "My title" in card["summary"] and "navigator" in card["summary"] and "d/f11.py" in card["summary"]
+    assert "d/f12.py" not in card["summary"] and "+3 more" in card["summary"]
+    again, new2 = c.raise_build_card("prop-1", "navigator", "My title", files, "r")
+    assert not new2 and again["id"] == card["id"]
+    c.decline(card["code"], "web")
+    assert c.raise_build_card("prop-1", "navigator", "My title", files, "r")[1] is False
+    c2, n2 = c.raise_build_card("prop-2", "navigator", "T2", [], "r")
+    assert n2 and "none declared" in c2["summary"]
+    clock.t += 10_000  # an expired card is final too: no second one
+    assert c.raise_build_card("prop-2", "navigator", "T2", [], "r")[1] is False
+    clock.t = 1000.0
+    c3, _ = c.raise_build_card("prop-3", "navigator", "T3", [], "r")
+    c.approve(c3["code"], "web")
+    assert c.consume("build", {}, None) is None
+    assert c.consume("Bash", {"command": "ls"}) is None
+
+
+def test_build_card_summary_never_too_long(tmp_path):
+    from navigator.conductor.cards import MAX_SUMMARY
+    c = _cards(tmp_path)
+    files = [f"very/long/path/{'x' * 80}{i}.py" for i in range(500)]
+    card, new = c.raise_build_card("p9", "navigator", "Title here", files, "r")
+    assert new and len(card["summary"]) <= MAX_SUMMARY
+    assert "Title here" in card["summary"] and "navigator" in card["summary"] and "more)" in card["summary"]
+
+
+def test_cards_get(tmp_path):
+    c = _cards(tmp_path)
+    card, _ = c.raise_build_card("p1", "navigator", "T", [], "r")
+    got = c.get(card["code"])
+    assert got == card
+    got["state"] = "x"
+    assert c.get(card["id"])["state"] == "pending"
+    assert c.get("NOPE22") is None

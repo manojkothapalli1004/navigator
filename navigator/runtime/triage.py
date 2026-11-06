@@ -42,6 +42,15 @@ TOP_N = 3
 RERANK_AFTER_S = 24 * 3600
 DUPLICATE_THRESHOLD = 0.5
 MAX_DROPS_PER_PASS = 10
+# The pair the conductor files builds with (a test pins these equal to runtime.loop's; no import: it pulls
+# in the executor stack). A build the operator asked for in chat is never dropped by the ranking model.
+OPERATOR_ORIGIN = "operator"
+DRAFT_PREFIX = "[draft]"
+
+
+def is_conductor_build(p) -> bool:
+    return p.origin == OPERATOR_ORIGIN and (p.title or "").strip().lower().startswith(DRAFT_PREFIX)
+
 DEFAULT_BRIEF = ("Navigator is the #1 priority: work that makes navigator more autonomous, "
                  "reliable and self-improving ranks highest. Operational edge beats new "
                  "strategy combos. Trader is benched. Test-only proposals for side projects "
@@ -245,7 +254,8 @@ class Triage:
                 seen = {p.id for p, _ in ranked}
                 drop = [(by_id[d["id"]], str(d.get("why", ""))[:200])
                         for d in data.get("drop", [])
-                        if d.get("id") in by_id and d["id"] not in seen][:MAX_DROPS_PER_PASS]
+                        if d.get("id") in by_id and d["id"] not in seen
+                        and not is_conductor_build(by_id[d["id"]])][:MAX_DROPS_PER_PASS]
                 dropped = {p.id for p, _ in drop}
                 rest = [p for p in props if p.id not in seen and p.id not in dropped]
                 return ranked + [(p, "") for p in fallback_order(rest)], drop, "model"
