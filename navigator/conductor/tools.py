@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import re
 import time
 
@@ -16,7 +17,8 @@ import httpx
 MIN_TASK_CHARS = 40  # "fix it" is not a task a helper can do alone
 TOOL_NAMES = ["delegate", "helpers", "cancel_helper"]
 # `[str]` (an instance, not a type) used to become {"type": "string"}; list[str] is a real array
-DELEGATE_SCHEMA = {"kind": str, "title": str, "task": str, "project": str, "files": list[str]}
+DELEGATE_SCHEMA = {"kind": str, "title": str, "task": str, "project": str, "files": list[str],
+                   "spec_path": str, "timeout_s": int}
 DELEGATE_DESCRIPTION = (
     "Hand work off. Returns at once; the result arrives later as a [helper …] or [build …] message. Check "
     "helpers first so the same work is never started twice. kind=\"quick\" (default): a helper does a lookup or "
@@ -25,7 +27,11 @@ DELEGATE_DESCRIPTION = (
     "act, waker, orchestrator) and a COMPLETE spec, because the builder sees nothing else: repo, falsifiable "
     "problem, exact change, tests that fail first, must-not, rollback. Docs/tests-only builds start without "
     "approval, every other build waits for the operator, and nothing merges without the operator's OK. "
-    "List `files` precisely (repo-relative paths the work will touch): a vague or empty list makes autopilot wait.")
+    "List `files` precisely (repo-relative paths the work will touch): a vague or empty list makes autopilot wait. "
+    "For a long spec, write it to a .md file under /Users/Manoj/calwbot/tmp_claude/ (or a docs folder) with a "
+    "helper, then pass spec_path=<absolute path>; the conductor reads the file itself and files its text as the "
+    "build; task is then only a 20-2000 character summary. For long-running quick work (full test suite, "
+    "multi-part review) pass timeout_s (60-1800, default 600).")
 HELPERS_DESCRIPTION = ("List helpers and builds: running and queued first, then the last finished ones, "
                        "with their latest steps.")
 CANCEL_DESCRIPTION = "Stop a running or queued helper by id."
@@ -58,16 +64,23 @@ async def _delegate_build(builds, args, title: str, task: str) -> str:
     if builds is None:
         return NO_BUILDS
     project = str(args.get("project") or "").strip()
-    try:  # filing does blocking HTTP + git: off the event loop so a slow ACT can't freeze the conductor
+    if args.get("timeout_s") is not None:
+        return "refused: timeout_s is for quick helpers, not builds"
+    spec_path = str(args.get("spec_path") or "").strip()
+    kw = {"spec_path": spec_path} if spec_path else {}
+    try:  # filing does blocking HTTP + git + file reads: off the event loop
         rec = await asyncio.to_thread(builds.file, project, title, task, _files(args) or [],
-                                      getattr(builds, "current_via", None))
+                                      getattr(builds, "current_via", None), **kw)
     except BuildRefused as e:
         return f"refused: {e}"
     except (httpx.TransportError, ConnectionError, TimeoutError):  # never a quick-helper fallback
         return ACT_DOWN
     except Exception as e:
         return f"refused: build filing failed ({type(e).__name__})"
-    head = f"filed build {rec['proposal_id']} ({project}): {rec['title']} — "
+    head = f"filed build {rec['proposal_id']} ({project}): {rec['title']}"
+    if rec.get("spec_chars"):
+        head += f" — spec read from file ({rec['spec_chars']} chars)"
+    head += " — "
     if rec.get("tier1"):
         return head + "tier 1 (docs/tests only), approved to start; it will not merge without your approval."
     reason = rec.get("approval_reason") or "needs your approval"
@@ -89,9 +102,30 @@ async def delegate_text(helpers, args, builds=None) -> str:
     if len(task) < MIN_TASK_CHARS:
         return (f"refused: the task must be self-contained (at least {MIN_TASK_CHARS} characters: what, "
                 "where, what done looks like, what to report)")
+    if args.get("spec_path"):
+        return "refused: spec_path is only for kind=build"
     files = _files(args)
-    rec = helpers.start(title, task, **({"files": files} if files else {}))
-    return f"started {rec['id']} ({rec['state']}): {rec['title']}"
+    kw = {"files": files} if files else {}
+    note = ""
+    if args.get("timeout_s") is not None:
+        from navigator.conductor.helpers import (HELPER_MAX_TIMEOUT_S, HELPER_MIN_TIMEOUT_S, LONG_S,
+                                                 clamp_timeout)
+        raw = args["timeout_s"]
+        try:
+            val = None if isinstance(raw, bool) else float(raw)
+        except (TypeError, ValueError):
+            val = None
+        if val is None or not math.isfinite(val):
+            return "refused: timeout_s must be a number of seconds"
+        kw["timeout_s"] = clamp_timeout(val)
+        if val > HELPER_MAX_TIMEOUT_S:
+            note = f" (timeout capped at {HELPER_MAX_TIMEOUT_S:.0f}s)"
+        elif val < HELPER_MIN_TIMEOUT_S:
+            note = f" (raised to {HELPER_MIN_TIMEOUT_S:.0f}s)"
+    rec = helpers.start(title, task, **kw)
+    if rec["state"] == "queued" and (kw.get("timeout_s") or 0) > LONG_S:
+        note += " (queued: only one long helper runs at a time)"
+    return f"started {rec['id']} ({rec['state']}): {rec['title']}{note}"
 
 
 async def helpers_text(helpers, builds=None) -> str:

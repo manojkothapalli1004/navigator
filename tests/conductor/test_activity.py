@@ -250,3 +250,73 @@ async def test_an_unknown_finished_step_is_ignored(tmp_path):
         evs.append(q.get_nowait())
     assert not [e for e in evs if e["type"] == "activity"] and eng.activity_snapshot()["items"] == []
     await eng.stop()
+
+
+# ---- D2: the one shared mask keeps names, paths and shas, still masks real tokens ----
+
+def _same(s):
+    return activity._SECRET.sub("…", s) == s
+
+
+def test_mask_keeps_names_paths_shas():
+    for s in ["test_helper_result_is_scrubbed_and_capped_at_twelve_thousand",
+              "navigator/tests/conductor/test_stage3_cards.py",
+              "navigator/conductor/builds.py:186",
+              "c4576c4f0f3a9d0f1d2b3c4d5e6f708192a3b4c5",
+              "commit c4576c4f0f3a9d0f1d2b3c4d5e6f708192a3b4c5 merged",
+              "task-queue-runner", "risk-assessment-notes", "high_score_table"]:
+        assert _same(s), s
+    t = activity.describe("Bash", {"description": "Running tests/conductor/test_stage3_cards.py::test_long_named_case_here"})
+    assert "test_long_named_case_here" in t
+
+
+def test_mask_still_masks_real_tokens():
+    b64 = "Ab1" * 14
+    for tok in ["sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123456789", "sk-abcdefgh12345678",
+                "ghp_abcdefghijklmnopqrstuvwxyz0123456789",
+                "github_pat_11ABCDEFG0abcdefghij_klmnopqrstuvwxyz0123456789", "AKIAIOSFODNN7EXAMPLE",
+                "xoxb-123456789012-abcdefghijklmnop", "-----BEGIN RSA PRIVATE KEY-----",
+                "-----BEGIN OPENSSH PRIVATE KEY-----", "123456789:" + "Ab_-" * 8 + "Abc",
+                "api_key=" + "a1" * 16, "token: " + "0123456789abcdef" * 2 + "01234567",
+                "Authorization: Bearer " + b64[:40], 'password="' + b64 + '"']:
+        assert activity._SECRET.sub("…", tok) == "…", tok
+        assert activity._SECRET.sub("…", f"see {tok} now") == "see … now", tok
+
+
+def test_mask_key_context_edges_and_speed():
+    import time
+    assert _same("token=navigator/tests/conductor/test_stage3_cards_and_more")
+    assert _same("a" * 20 + "0123456789abcdef" * 4)
+    for s in ["a1B2" * 3000, "token=" + "A1b2" * 3000]:
+        t0 = time.time()
+        activity._SECRET.sub("…", s)
+        assert time.time() - t0 < 0.5
+
+
+# ---- bare unlabeled secrets are masked; names, paths, shas and ids stay readable ----
+
+BARE = ["Xk9fQ2LmP0aZrT7uV1wY3bN5cE8dH6gJ", "Xk9fQ2LmP-0aZrT7uV_1wY3bN5cE8dH6gJ", "Ab1" * 21 + "A",
+        "sk_live_" + "a1B2c3D4" * 3, "rk_live_" + "a1B2c3D4" * 3, "sk_test_" + "a1B2c3D4" * 3]
+
+
+def test_mask_bare_unlabeled_tokens():
+    for tok in BARE:
+        assert activity._SECRET.sub("…", tok) == "…", tok
+        assert activity._SECRET.sub("…", f"key is {tok} ok") == "key is … ok", tok
+        assert activity._SECRET.sub("…", f'"{tok}"') == '"…"', tok
+
+
+def test_mask_keeps_names_paths_shas_and_long_identifiers_ok():
+    for s in ["a" * 40, "0123456789abcdef0123456789abcdef01234567", "c4576c4", "c4576c4f0a1b",
+              "test_mask_keeps_names_paths_shas_and_long_identifiers_ok",
+              "navigator/conductor/test_stage3_cards.py", "/Users/Manoj/calwbot/tmp_claude/nav-specfile/Foo9bar",
+              "proposal-01M6VW8Z2N53Y6KTP6816QMTCA", "see proposal-01M6VW8Z2N53Y6KTP6816QMTCA now"]:
+        assert _same(s), s
+
+
+def test_mask_bare_speed_100kb():
+    import time
+    for s in ["Xk9fQ2LmP0aZrT7uV1wY3bN5cE8dH6gJ " * 3200, "a1B2" * 25000, "aB1:" * 25000, "a/B1" * 25000]:
+        t0 = time.time()
+        activity._SECRET.sub("…", s)
+        assert time.time() - t0 < 0.2
