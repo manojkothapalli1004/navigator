@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import time
 from collections import deque
@@ -32,7 +33,11 @@ HELPER_MAX_TURNS = 40
 HELPER_TIMEOUT_S = 600.0
 MAX_RUNNING = 3
 HARD_MAX_RUNNING = 8  # every running helper, approved-card ones included
-RESULT_CHARS = 4000
+HELPER_MIN_TIMEOUT_S = 60.0
+HELPER_MAX_TIMEOUT_S = 1800.0
+LONG_S = 600.0  # a helper with a longer timeout is "long": only one runs at a time
+RESULT_CHARS = 12000
+TRUNCATED = "\n[… report cut at {n} characters]"
 SCRATCH = "/Users/Manoj/calwbot/tmp_claude"
 KEEP_FINISHED = 50  # finished records kept in the registry
 SNAPSHOT_FINISHED = 10  # finished helpers shown to the conversation and the screens
@@ -42,7 +47,25 @@ HELPER_PROMPT = (
     "You are a helper the operator's conversation started. Do only the task below, in a worktree "
     "under /Users/Manoj/calwbot/tmp_claude when you must write files, never in a live checkout. "
     "Finish with a short plain report of what you found or did and anything that needs a decision; "
-    "that report is all the conversation will see.")
+    "that report is all the conversation will see. "
+    "A shell command that may run over 9 minutes (a full test suite): start it with nohup and an inner "
+    "`timeout 1500`, writing to a log file in the scratch folder and a DONE marker when it ends, then wait "
+    "with ONE Bash call that loops `until [ -f MARKER ]; do sleep 15; done` for at most 9 minutes, and "
+    "repeat that single wait call; never poll with many separate model turns. "
+    "Keep the closing report under 10000 characters.")
+
+
+def clamp_timeout(v) -> float | None:
+    """None when not given or not a finite number, else seconds within the helper bounds."""
+    if v is None or isinstance(v, bool):
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(f):
+        return None
+    return min(max(f, HELPER_MIN_TIMEOUT_S), HELPER_MAX_TIMEOUT_S)
 
 
 def _deny(reason: str) -> dict:
@@ -187,15 +210,21 @@ class Helpers:
     def _may_launch(self, rec: dict) -> bool:
         if self._running_all() >= HARD_MAX_RUNNING:
             return False
+        if (rec.get("timeout_s") or 0) > LONG_S and self._running_long() >= 1:
+            return False
         return bool(rec.get("exact")) or self._running() < self.max_running
+
+    def _running_long(self) -> int:
+        return sum(1 for r in self._records if r.get("state") == "running" and (r.get("timeout_s") or 0) > LONG_S)
 
     # ---- lifecycle ----
 
     def start(self, title: str, task: str, *, exact: dict | None = None, via: str | None = None,
-              files: list[str] | None = None) -> dict:
+              files: list[str] | None = None, timeout_s: float | None = None) -> dict:
         rec = {"id": new_id("helper"), "title": title, "task": task, "state": "queued",
                "started": self.clock(), "ended": None, "result": None, "error": None,
                "reply_via": via if via is not None else self.current_via, "exact": exact,
+               "timeout_s": None if exact else clamp_timeout(timeout_s),
                "files": [str(f).strip() for f in files if str(f).strip()] if files else None}
         self._records.append(rec)
         if self._may_launch(rec):
@@ -241,11 +270,13 @@ class Helpers:
                 self._titles.setdefault(hid, deque(maxlen=LAST_TITLES)).append(ev["title"])
             self.on_event(hid, ev)
 
-        timeout = HELPER_TIMEOUT_S  # read at call time: tests patch it
+        timeout = min(rec.get("timeout_s") or HELPER_TIMEOUT_S, HELPER_MAX_TIMEOUT_S)  # call time: tests patch
         try:
             text = await asyncio.wait_for(self.runner(rec["task"], hid, emit, exact=rec.get("exact")), timeout)
         except asyncio.TimeoutError:
-            self._end(rec, "failed", error=f"timed out after {timeout:.0f}s")
+            hint = (f" (delegate again with timeout_s up to {HELPER_MAX_TIMEOUT_S:.0f} if it needs longer)"
+                    if timeout < HELPER_MAX_TIMEOUT_S else "")
+            self._end(rec, "failed", error=f"timed out after {timeout:.0f}s{hint}")
         except asyncio.CancelledError:
             if self._stopping:
                 raise  # shutdown already marked it lost; the restart reports it
@@ -253,7 +284,10 @@ class Helpers:
         except Exception as e:
             self._end(rec, "failed", error=f"{type(e).__name__}: {str(e)[:300]}")
         else:
-            self._end(rec, "done", result=activity._SECRET.sub("…", text or "")[:RESULT_CHARS])
+            masked = activity._SECRET.sub("…", text or "")
+            if len(masked) > RESULT_CHARS:
+                masked = masked[:RESULT_CHARS] + TRUNCATED.format(n=len(masked))
+            self._end(rec, "done", result=masked)
 
     def cancel(self, helper_id: str) -> bool:
         rec = self._find(helper_id)

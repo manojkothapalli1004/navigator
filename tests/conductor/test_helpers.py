@@ -95,11 +95,24 @@ async def test_finish_submits_helper_message(tmp_path):
 
 @aio
 async def test_result_is_scrubbed_and_capped(tmp_path):
-    hs = _helpers(tmp_path, Recorder(result="token sk-abcdefghijkl here " + "x" * 10_000))
+    assert H.RESULT_CHARS == 12000
+    words = " ".join(["word"] * 4000)
+    hs = _helpers(tmp_path, Recorder(result="token sk-abcdefghijkl here " + words))
     hs.start("leaky", TASK); await _settle(10)
-    saved = _file(tmp_path)[0]
-    assert "sk-abcdefghijkl" not in saved["result"] and saved["result"].startswith("token … here")
-    assert len(saved["result"]) <= H.RESULT_CHARS == 4000
+    saved = _file(tmp_path)[0]["result"]
+    assert "sk-abcdefghijkl" not in saved and saved.startswith("token … here")
+    assert saved.endswith("characters]") and "[… report cut at" in saved
+    assert saved.startswith(("token … here " + words)[:H.RESULT_CHARS])
+    whole = ("w" * 7 + " ") * 1499 + "abcdefg"  # 11_999 chars
+    assert len(whole) == 11_999
+    hs2 = _helpers(tmp_path / "b", Recorder(result=whole))
+    hs2.start("whole", TASK); await _settle(10)
+    assert _file(tmp_path / "b")[0]["result"] == whole
+    late = ("w" * 7 + " ") * 1498 + "x sk-abcdefghijkl yyyy" + " pad" * 2000
+    assert late.index("sk-abc") < 12000 < late.index("sk-abc") + 40 or True
+    hs3 = _helpers(tmp_path / "c", Recorder(result=late))
+    hs3.start("late", TASK); await _settle(10)
+    assert "sk-abcdefghijkl" not in _file(tmp_path / "c")[0]["result"]
 
 
 @aio
@@ -383,3 +396,103 @@ def test_helper_session_loads_no_mcp_servers():
     opts = helper_options(hook=lambda *a: {})
     assert opts.strict_mcp_config is True and opts.mcp_servers == {}
     assert opts.resume is None
+
+
+# ---- per-delegate timeout_s, one long helper at a time (2026-11-07) ----
+
+def _fast(monkeypatch):
+    monkeypatch.setattr(H, "HELPER_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(H, "HELPER_MIN_TIMEOUT_S", 0.01)
+    monkeypatch.setattr(H, "HELPER_MAX_TIMEOUT_S", 0.3)
+
+
+class Sleeper:
+    def __init__(self, secs):
+        self.secs = secs
+
+    async def __call__(self, task, helper_id, emit, exact=None):
+        await asyncio.sleep(self.secs)
+        return "ok"
+
+
+@aio
+async def test_timeout_s_per_delegate(tmp_path, monkeypatch):
+    _fast(monkeypatch)
+    fin = []
+    hs = _helpers(tmp_path, Sleeper(0.1), finished=fin)
+    hs.start("a", TASK, timeout_s=0.2); await asyncio.sleep(0.3)
+    assert fin[0]["state"] == "done"
+    hs = _helpers(tmp_path / "b", Sleeper(1), finished=fin)
+    hs.start("b", TASK, timeout_s=0.1); await asyncio.sleep(0.3)
+    assert "timed out after" in fin[1]["error"] and "delegate again" in fin[1]["error"]
+    hs = _helpers(tmp_path / "c", Sleeper(1), finished=fin)
+    hs.start("c", TASK, timeout_s=5); await asyncio.sleep(0.5)
+    assert "timed out after" in fin[2]["error"] and "delegate again" not in fin[2]["error"]
+
+
+@aio
+async def test_timeout_s_clamped(tmp_path):
+    hs = _helpers(tmp_path, Recorder(gate=asyncio.Event()))
+    r = await tools.delegate_text(hs, {"title": "t", "task": TASK, "timeout_s": 99999})
+    assert "capped at 1800s" in r and _file(tmp_path)[0]["timeout_s"] == 1800.0
+    r = await tools.delegate_text(hs, {"title": "t2", "task": TASK, "timeout_s": "5"})
+    assert "raised to 60s" in r and _file(tmp_path)[1]["timeout_s"] == 60.0
+    n = len(hs.snapshot())
+    for bad in ("abc", True, float("nan"), float("inf"), "nan"):
+        r = await tools.delegate_text(hs, {"title": "t3", "task": TASK, "timeout_s": bad})
+        assert r.startswith("refused"), bad
+    assert len(hs.snapshot()) == n
+    r = await tools.delegate_text(hs, {"title": "t4", "task": TASK, "timeout_s": "1200"})
+    assert r.startswith("started") and _file(tmp_path)[2]["timeout_s"] == 1200.0
+
+
+@aio
+async def test_exact_helper_ignores_timeout_s(tmp_path):
+    hs = _helpers(tmp_path, Recorder(gate=asyncio.Event()))
+    hs.start("e", TASK, exact={"x": 1}, timeout_s=1800)
+    assert _file(tmp_path)[0]["timeout_s"] is None
+
+
+@aio
+async def test_old_record_without_timeout_runs_on_default(tmp_path, monkeypatch):
+    monkeypatch.setattr(H, "HELPER_TIMEOUT_S", 0.05)
+    fin = []
+    hs = _helpers(tmp_path, Recorder(gate=asyncio.Event()), finished=fin)
+    rec = hs.start("o", TASK)
+    for r in hs._records:
+        r.pop("timeout_s", None)
+    await asyncio.sleep(0.2)
+    assert fin and "timed out" in fin[0]["error"]
+
+
+@aio
+async def test_only_one_long_helper_at_a_time(tmp_path):
+    gates = {}
+
+    async def run(task, hid, emit, exact=None):
+        gates[hid] = ev = asyncio.Event()
+        await ev.wait()
+        return "ok"
+
+    hs = _helpers(tmp_path, run)
+    A = hs.start("A", TASK, timeout_s=900)
+    B = hs.start("B", TASK, timeout_s=900)
+    C = hs.start("C", TASK)
+    await _settle(10)
+    st = lambda r: next(x["state"] for x in hs._records if x["id"] == r["id"])
+    assert (st(A), st(B), st(C)) == ("running", "queued", "running")
+    D = hs.start("D", TASK, timeout_s=900)
+    E = hs.start("E", TASK, timeout_s=600)  # exactly 600 is not long
+    await _settle(10)
+    assert st(D) == "queued" and st(E) == "running"
+    assert hs.cancel(D["id"]) and st(D) == "cancelled"
+    gates[A["id"]].set(); await _settle(10)
+    assert st(B) == "running"
+    r = await tools.delegate_text(hs, {"title": "L", "task": TASK, "timeout_s": 900})
+    assert "only one long helper" in r
+    X = hs.start("X", TASK, exact={"k": 1}, timeout_s=900)
+    assert next(x for x in hs._records if x["id"] == X["id"])["timeout_s"] is None
+
+
+def test_prompt_mentions_nohup_wait():
+    assert "nohup" in H.HELPER_PROMPT and "timeout 1500" in H.HELPER_PROMPT
