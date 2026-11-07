@@ -398,6 +398,27 @@ def test_helper_session_loads_no_mcp_servers():
     assert opts.resume is None
 
 
+def test_helper_session_loads_no_plugin_injection():
+    from navigator.conductor import runner
+    from navigator.conductor.helpers import helper_options
+    for o in (helper_options(hook=lambda *a: {}),
+              helper_options(lambda *a: {}, exact={"tool": "Bash", "input": {"command": "x"}, "cwd": "/tmp"})):
+        s = json.loads(o.settings)
+        assert set(s["enabledPlugins"]) == set(runner._PLUGINS_OFF)
+        assert all(v is False for v in s["enabledPlugins"].values())
+        assert s["autoMemoryEnabled"] is False
+        assert o.setting_sources == ["user", "project", "local"]
+
+
+def test_helper_gate_hooks_intact():
+    from navigator.conductor import gate
+    from navigator.conductor.helpers import helper_options
+    o = helper_options(hook=lambda *a: {})
+    hooks = o.hooks["PreToolUse"][0].hooks
+    assert len(hooks) == 2 and all(callable(h) for h in hooks)
+    assert o.can_use_tool is gate.can_use_tool
+
+
 # ---- per-delegate timeout_s, one long helper at a time (2026-11-07) ----
 
 def _fast(monkeypatch):
