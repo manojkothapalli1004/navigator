@@ -60,16 +60,23 @@ async def _delegate_build(builds, args, title: str, task: str) -> str:
     if builds is None:
         return NO_BUILDS
     project = str(args.get("project") or "").strip()
-    try:  # filing does blocking HTTP + git: off the event loop so a slow ACT can't freeze the conductor
+    if args.get("timeout_s") is not None:
+        return "refused: timeout_s is for quick helpers, not builds"
+    spec_path = str(args.get("spec_path") or "").strip()
+    kw = {"spec_path": spec_path} if spec_path else {}
+    try:  # filing does blocking HTTP + git + file reads: off the event loop
         rec = await asyncio.to_thread(builds.file, project, title, task, _files(args) or [],
-                                      getattr(builds, "current_via", None))
+                                      getattr(builds, "current_via", None), **kw)
     except BuildRefused as e:
         return f"refused: {e}"
     except (httpx.TransportError, ConnectionError, TimeoutError):  # never a quick-helper fallback
         return ACT_DOWN
     except Exception as e:
         return f"refused: build filing failed ({type(e).__name__})"
-    head = f"filed build {rec['proposal_id']} ({project}): {rec['title']} — "
+    head = f"filed build {rec['proposal_id']} ({project}): {rec['title']}"
+    if rec.get("spec_chars"):
+        head += f" — spec read from file ({rec['spec_chars']} chars)"
+    head += " — "
     if rec.get("tier1"):
         return head + "tier 1 (docs/tests only), approved to start; it will not merge without your approval."
     reason = rec.get("approval_reason") or "needs your approval"
@@ -91,6 +98,8 @@ async def delegate_text(helpers, args, builds=None) -> str:
     if len(task) < MIN_TASK_CHARS:
         return (f"refused: the task must be self-contained (at least {MIN_TASK_CHARS} characters: what, "
                 "where, what done looks like, what to report)")
+    if args.get("spec_path"):
+        return "refused: spec_path is only for kind=build"
     files = _files(args)
     kw = {"files": files} if files else {}
     note = ""

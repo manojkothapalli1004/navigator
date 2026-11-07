@@ -2,9 +2,11 @@
 It never merges and never declines; the only approval it gives is the start of a tier-1 (docs/tests-only) build."""
 from __future__ import annotations
 
+import fcntl
 import json
 import logging
 import os
+import stat
 import subprocess
 import threading
 import time
@@ -39,12 +41,90 @@ BUILD_REPOS: dict[str, str] = {
 }
 
 
+SPEC_MAX_BYTES = 100_000
+SPEC_SUFFIXES = (".md", ".txt")
+SPEC_DENY_PARTS = ("tra" + "der", "lo" + "gs")  # compared case-folded against every path component
+RATIONALE = "Filed by the conductor on the operator's request."
+
+
 class BuildRefused(ValueError):
     """The request cannot become a build; the message says why (shown to the model)."""
 
 
 def mask(text: str) -> str:
     return _SECRET.sub("…", str(text))
+
+
+def spec_roots() -> list[str]:
+    """Where a spec file may live: the scratch folder, the workspace docs, each build repo's docs."""
+    return [f"{_ROOT}/tmp_claude", f"{_ROOT}/docs"] + [f"{p}/docs" for p in BUILD_REPOS.values()]
+
+
+def _spec_open(path: str) -> int:
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
+    try:
+        return os.open(path, flags)
+    except OSError:
+        raise BuildRefused("spec file not readable") from None
+
+
+def read_spec(path) -> tuple[str, int]:
+    """(masked text, number of masked tokens) of an allowlisted spec file; BuildRefused otherwise.
+    Blocking I/O: call it from a thread, as Builds.file already is."""
+    if not isinstance(path, str) or not path or "\0" in path or not os.path.isabs(path) \
+            or os.path.normpath(path) != path:
+        raise BuildRefused("spec_path must be a clean absolute path")
+    root = next((r for r in spec_roots() if path.startswith(r + "/")), None)
+    if root is None:
+        raise BuildRefused("spec_path is outside the allowed folders")
+    parts = path.split("/")[1:]
+    if any(p.startswith(".") for p in path[len(root) + 1:].split("/")) \
+            or any(p.casefold() in SPEC_DENY_PARTS for p in parts) \
+            or not path.lower().endswith(SPEC_SUFFIXES):
+        raise BuildRefused("spec_path is not an allowed spec file (.md or .txt, no hidden or private folders)")
+    if os.path.realpath(path) != path:
+        raise BuildRefused("spec_path must not go through a symlink")
+    fd = _spec_open(path)
+    try:
+        if hasattr(fcntl, "F_GETPATH"):
+            try:
+                got = fcntl.fcntl(fd, fcntl.F_GETPATH, b"\0" * 1024).split(b"\0", 1)[0].decode()
+            except OSError:
+                raise BuildRefused("spec file not readable") from None
+            if got != path:
+                raise BuildRefused("spec_path changed while opening")
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise BuildRefused("spec_path is not a regular file")
+        if st.st_nlink != 1:
+            raise BuildRefused("spec file must not be hard-linked")
+        if st.st_uid != os.getuid():
+            raise BuildRefused("spec file is not owned by the conductor's user")
+        if st.st_size > SPEC_MAX_BYTES:
+            raise BuildRefused(f"spec file is over {SPEC_MAX_BYTES} bytes")
+        try:
+            data = os.read(fd, SPEC_MAX_BYTES + 1)
+            while len(data) <= SPEC_MAX_BYTES:
+                more = os.read(fd, SPEC_MAX_BYTES + 1 - len(data))
+                if not more:
+                    break
+                data += more
+        except OSError:
+            raise BuildRefused("spec file not readable") from None
+    finally:
+        os.close(fd)
+    if len(data) > SPEC_MAX_BYTES:
+        raise BuildRefused(f"spec file is over {SPEC_MAX_BYTES} bytes")
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        raise BuildRefused("spec file is not valid UTF-8") from None
+    if "\0" in text:
+        raise BuildRefused("spec file has a NUL byte")
+    if len(text.strip()) < MIN_BUILD_CHARS:
+        raise BuildRefused(f"a build spec must be complete (at least {MIN_BUILD_CHARS} characters)")
+    masked, n = _SECRET.subn("…", text)
+    return masked, n
 
 
 def _head_sha(repo: str) -> str:
@@ -71,7 +151,8 @@ def _strip_draft(title: str) -> str:
     return t
 
 
-def file_build(act, project: str, title: str, task: str, files=(), base_sha_fn=_head_sha) -> Proposal:
+def file_build(act, project: str, title: str, task: str, files=(), base_sha_fn=_head_sha,
+               rationale: str = RATIONALE) -> Proposal:
     """File one proposal `proposed`. Always [draft]-prefixed so the daemon's pre-approve skips it; an explicit approve is unaffected."""
     repo = BUILD_REPOS.get(project)
     if repo is None:
@@ -86,7 +167,7 @@ def file_build(act, project: str, title: str, task: str, files=(), base_sha_fn=_
     p = Proposal(
         origin=OPERATOR_ORIGIN,
         proposal_origin_hash=compute_origin_hash(repo, clean, [], OPERATOR_ORIGIN, task),
-        title=filed_title, rationale="Filed by the conductor on the operator's request.", repo=repo,
+        title=filed_title, rationale=rationale, repo=repo,
         base_commit_sha=base_sha_fn(repo), intended_changes=task, affected_files=fl)
     return act.create_proposal(p)
 
@@ -183,14 +264,25 @@ class Builds:
             raise BuildRefused(f"proposal already {p.status.value}")
         self.act.set_proposal_status(proposal_id, want)
 
-    def file(self, project: str, title: str, task: str, files, via) -> dict:
+    def file(self, project: str, title: str, task: str, files, via, spec_path=None) -> dict:
+        rationale, spec_chars = RATIONALE, None
+        if spec_path:  # read BEFORE any ACT call: a refused path files nothing
+            if project not in BUILD_REPOS:
+                raise BuildRefused(f"project must be one of {sorted(BUILD_REPOS)} (trader is not available)")
+            summary = (task or "").strip()
+            if not 20 <= len(summary) <= 2000:
+                raise BuildRefused("with spec_path, task must be a 20-2000 character summary")
+            task, _n = read_spec(spec_path)
+            rationale = f"{RATIONALE} Summary: {mask(summary)[:500]}"
+            spec_chars = len(task)
         fl = _clean_files(files)
         was_draft = (title or "").strip().lower().startswith(DRAFT_PREFIX)
         tier1 = (not was_draft) and project in BUILD_REPOS and self._tier1(project, fl)
         reason = None if tier1 else (self._approval_reason(project, fl, was_draft) if project in BUILD_REPOS
                                      else None)
-        p = file_build(self.act, project, title, task, files=fl, base_sha_fn=self.base_sha_fn)
-        rec = {"proposal_id": p.id, "project": project, "title": _strip_draft(title), "files": fl,
+        p = file_build(self.act, project, title, task, files=fl, base_sha_fn=self.base_sha_fn,
+                       rationale=rationale)
+        rec = {"spec_chars": spec_chars,"proposal_id": p.id, "project": project, "title": _strip_draft(title), "files": fl,
                "tier1": False, "state": "filed", "reply_via": via, "filed": time.time(), "ended": None,
                "summary": "", "reported": [], "approval_reason": reason}
         with self._lock:  # persisted BEFORE approving: a crash after approval must not leave it unwatched
