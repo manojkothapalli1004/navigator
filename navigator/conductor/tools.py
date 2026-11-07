@@ -27,7 +27,11 @@ DELEGATE_DESCRIPTION = (
     "act, waker, orchestrator) and a COMPLETE spec, because the builder sees nothing else: repo, falsifiable "
     "problem, exact change, tests that fail first, must-not, rollback. Docs/tests-only builds start without "
     "approval, every other build waits for the operator, and nothing merges without the operator's OK. "
-    "List `files` precisely (repo-relative paths the work will touch): a vague or empty list makes autopilot wait.")
+    "List `files` precisely (repo-relative paths the work will touch): a vague or empty list makes autopilot wait. "
+    "For a long spec, write it to a .md file under /Users/Manoj/calwbot/tmp_claude/ (or a docs folder) with a "
+    "helper, then pass spec_path=<absolute path>; the conductor reads the file itself and files its text as the "
+    "build; task is then only a 20-2000 character summary. For long-running quick work (full test suite, "
+    "multi-part review) pass timeout_s (60-1800, default 600).")
 HELPERS_DESCRIPTION = ("List helpers and builds: running and queued first, then the last finished ones, "
                        "with their latest steps.")
 CANCEL_DESCRIPTION = "Stop a running or queued helper by id."
