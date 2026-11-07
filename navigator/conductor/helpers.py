@@ -108,7 +108,7 @@ def helper_options(hook, exact: dict | None = None) -> ClaudeAgentOptions:
     # never `resume`: a helper must not pull the shared conversation into its own session
     return ClaudeAgentOptions(
         model=HELPER_MODEL, cwd=exact["cwd"] if exact else runner.CWD,
-        setting_sources=["user", "project", "local"],
+        setting_sources=["user", "project", "local"], settings=runner.HELPER_LEAN_SETTINGS,
         system_prompt={"type": "preset", "preset": "claude_code", "append": HELPER_PROMPT},
         permission_mode="auto", tools=[exact["tool"]] if exact else list(HELPER_TOOLS),
         # no MCP servers at all: `tools` does not govern MCP tools and the gate knows nothing about

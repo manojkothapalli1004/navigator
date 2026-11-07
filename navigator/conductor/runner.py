@@ -1,6 +1,7 @@
 """One conductor turn through the Claude Agent SDK, resuming the shared session."""
 from __future__ import annotations
 
+import json
 import re
 from typing import Callable
 
@@ -14,7 +15,14 @@ from navigator.conductor.engine import ResumeFailed
 
 MODEL = "claude-opus-5-5"
 CWD = "/Users/Manoj/calwbot"
-_MISSING_SESSION = re.compile(r"no conversation found|session.{0,40}(not found|does not exist)", re.I)
+# plugin hooks (superpowers, claude-mem) inject 1.7-4.2K tokens into every session and no conversation
+# session has the Skill tool; the flag-settings layer overrides the user file's enabledPlugins
+_PLUGINS_OFF = {"claude-mem@thedotmack": False, "superpowers@claude-plugins-official": False,
+                "frontend-design@claude-plugins-official": False, "calwbot-skills@calwbot-local": False}
+LEAN_SETTINGS = json.dumps({"enabledPlugins": _PLUGINS_OFF})
+HELPER_LEAN_SETTINGS = json.dumps({"enabledPlugins": _PLUGINS_OFF, "autoMemoryEnabled": False})
+MAIN_AUTO_MEMORY = True
+_MISSING_SESSION =re.compile(r"no conversation found|session.{0,40}(not found|does not exist)", re.I)
 
 # The main turn only talks and delegates (2026-11-04): no built-in tool at all, its three conductor
 # tools and the orchestrator's READ tools. `tools` is the CLI's --tools (the base set), not
@@ -68,6 +76,7 @@ def options(session_id: str | None, hook=None, *, conductor_server=None) -> Clau
     # so only the servers named here load (no alpaca, plugin or settings-file server reaches the turn)
     return ClaudeAgentOptions(
         model=MODEL, cwd=CWD, setting_sources=["user", "project", "local"],
+        settings=LEAN_SETTINGS if MAIN_AUTO_MEMORY else HELPER_LEAN_SETTINGS,
         system_prompt={"type": "preset", "preset": "claude_code", "append": WINDOWS_PROMPT},
         permission_mode="auto", resume=session_id, include_partial_messages=True,
         hooks={"PreToolUse": [HookMatcher(hooks=[hook or gate.pre_tool_use_hook])]},
