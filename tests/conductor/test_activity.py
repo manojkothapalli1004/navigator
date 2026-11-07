@@ -287,8 +287,36 @@ def test_mask_key_context_edges_and_speed():
     import time
     assert _same("token=navigator/tests/conductor/test_stage3_cards_and_more")
     assert _same("a" * 20 + "0123456789abcdef" * 4)
-    assert _same("Ab1" * 21 + "A")
     for s in ["a1B2" * 3000, "token=" + "A1b2" * 3000]:
         t0 = time.time()
         activity._SECRET.sub("…", s)
         assert time.time() - t0 < 0.5
+
+
+# ---- bare unlabeled secrets are masked; names, paths, shas and ids stay readable ----
+
+BARE = ["Xk9fQ2LmP0aZrT7uV1wY3bN5cE8dH6gJ", "Xk9fQ2LmP-0aZrT7uV_1wY3bN5cE8dH6gJ", "Ab1" * 21 + "A",
+        "sk_live_" + "a1B2c3D4" * 3, "rk_live_" + "a1B2c3D4" * 3, "sk_test_" + "a1B2c3D4" * 3]
+
+
+def test_mask_bare_unlabeled_tokens():
+    for tok in BARE:
+        assert activity._SECRET.sub("…", tok) == "…", tok
+        assert activity._SECRET.sub("…", f"key is {tok} ok") == "key is … ok", tok
+        assert activity._SECRET.sub("…", f'"{tok}"') == '"…"', tok
+
+
+def test_mask_keeps_names_paths_shas_and_long_identifiers_ok():
+    for s in ["a" * 40, "0123456789abcdef0123456789abcdef01234567", "c4576c4", "c4576c4f0a1b",
+              "test_mask_keeps_names_paths_shas_and_long_identifiers_ok",
+              "navigator/conductor/test_stage3_cards.py", "/Users/Manoj/calwbot/tmp_claude/nav-specfile/Foo9bar",
+              "proposal-01M6VW8Z2N53Y6KTP6816QMTCA", "see proposal-01M6VW8Z2N53Y6KTP6816QMTCA now"]:
+        assert _same(s), s
+
+
+def test_mask_bare_speed_100kb():
+    import time
+    for s in ["Xk9fQ2LmP0aZrT7uV1wY3bN5cE8dH6gJ " * 3200, "a1B2" * 25000, "aB1:" * 25000, "a/B1" * 25000]:
+        t0 = time.time()
+        activity._SECRET.sub("…", s)
+        assert time.time() - t0 < 0.2

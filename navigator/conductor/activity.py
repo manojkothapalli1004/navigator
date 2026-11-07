@@ -14,7 +14,11 @@ MAX_TITLE = 100
 # alone test names, repo paths, git shas and words that merely contain a prefix (task-queue-runner).
 _SECRET = re.compile(
     r"(?<![A-Za-z0-9])(?:sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9]{8,}|github_pat_[A-Za-z0-9_]{8,}"
-    r"|xox[a-z]-[A-Za-z0-9-]{8,}|\d{6,}:[A-Za-z0-9_-]{25,}|AKIA[0-9A-Z]{12,})"
+    r"|xox[a-z]-[A-Za-z0-9-]{8,}|\d{6,}:[A-Za-z0-9_-]{25,}|AKIA[0-9A-Z]{12,}|[sr]k_(?:live|test)_[A-Za-z0-9]{8,})"
+    # a bare 32+ char run (start/space/quote on both sides, no "/" so never a path) holding an upper,
+    # a lower and a digit; a "word-" / "word_" prefix (proposal-01M6…) keeps ids readable
+    r"|(?<![^\s\"'])(?![a-z]{3,}[-_])(?=[A-Za-z0-9+=_-]{32,}(?![^\s\"']))"
+    r"(?=[A-Za-z0-9+=_-]*\d)(?=[A-Za-z0-9+=_-]*[A-Z])(?=[A-Za-z0-9+=_-]*[a-z])[A-Za-z0-9+=_-]+"
     r"|-----BEGIN [A-Z ]+-----"
     r"|(?i:(?:authorization[ \t]*[=:][ \t]*)?(?:[a-z_-]*(?:key|token|secret|password|passwd|authorization)|bearer|basic)[\"']?[ \t]*[=:]?[ \t]*[\"']?)"
     r"(?:[A-Fa-f0-9]{32,}|(?=[A-Za-z0-9+/]*\d)(?=[A-Za-z0-9+/]*[A-Z])(?=[A-Za-z0-9+/]*[a-z])[A-Za-z0-9+/]{32,}={0,2})"
