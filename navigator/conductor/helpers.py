@@ -12,6 +12,7 @@ import json
 import logging
 import math
 import os
+import shutil
 import signal
 import subprocess
 import threading
@@ -54,12 +55,14 @@ HELPER_PROMPT = (
     "under /Users/Manoj/calwbot/tmp_claude when you must write files, never in a live checkout. "
     "Finish with a short plain report of what you found or did and anything that needs a decision; "
     "that report is all the conversation will see. "
-    "A shell command that may run over 9 minutes (a full test suite): start it with nohup under a perl alarm "
-    "limit, e.g. `nohup sh -c \"perl -e 'alarm shift; exec @ARGV' 1500 CMD > LOG 2>&1; touch DONE_MARKER\" &` "
-    "(this Mac has no coreutils time-limit command, so use that perl form), writing to a log file in the scratch "
-    "folder and a DONE marker when it ends, then wait with ONE Bash call that loops "
-    "`until [ -f DONE_MARKER ]; do sleep 15; done` for at most 9 minutes, and repeat that single wait call; "
-    "never poll with many separate model turns. "
+    "A shell command that may run over 9 minutes (a full test suite): start it with nohup, as its own process "
+    "group under a perl alarm limit, and record its pid so it can be stopped if you are cancelled, e.g. "
+    "`nohup perl -e 'setpgrp; alarm shift; exec @ARGV' 1500 sh -c \"CMD; touch DONE_MARKER\" > LOG 2>&1 & "
+    "echo $! > \"$NAV_HELPER_PIDDIR/NAME.pid\"` (this Mac has no coreutils time-limit command, so use that "
+    "perl form; NAV_HELPER_PIDDIR is set for you; do the same for any server or loop you leave running), "
+    "writing to a log file in the scratch folder and a DONE marker when it ends, then wait with ONE Bash call "
+    "that loops `until [ -f DONE_MARKER ]; do sleep 15; done` for at most 9 minutes, and repeat that single "
+    "wait call; never poll with many separate model turns. "
     "Keep the closing report under 10000 characters.")
 # appended for a normal helper when CONDUCTOR_HELPER_ORC is on (never for an approved-card helper)
 HELPER_ORC_PROMPT = (
@@ -116,7 +119,8 @@ def _only(exact: dict):
     return hook
 
 
-def helper_options(hook, exact: dict | None = None, helper_id: str | None = None) -> ClaudeAgentOptions:
+def helper_options(hook, exact: dict | None = None, helper_id: str | None = None,
+                   pid_root: Path | None = None) -> ClaudeAgentOptions:
     from navigator.conductor import runner  # runner imports engine; a module-level import would cycle
     # Kill switch CONDUCTOR_HELPER_ORC, read at call time so a live engine follows a change without a
     # restart: unset or any value other than the exact string "0" = on; "0" = today's helper, byte for
@@ -126,6 +130,12 @@ def helper_options(hook, exact: dict | None = None, helper_id: str | None = None
     tools = [exact["tool"]] if exact else list(HELPER_TOOLS)
     if orc:  # explicit, as the main turn lists them: --tools is the base set, and these names are in it
         tools += [t for t in runner.MAIN_TOOLS if t.startswith("mcp__orchestrator__")]
+    env: dict[str, str] = {}
+    if helper_id and pid_root is not None and exact is None:
+        d = Path(pid_root) / helper_id
+        d.mkdir(parents=True, mode=0o700, exist_ok=True)
+        os.chmod(d, 0o700)
+        env["NAV_HELPER_PIDDIR"] = str(d)
     # never `resume`: a helper must not pull the shared conversation into its own session
     return ClaudeAgentOptions(
         model=HELPER_MODEL, cwd=exact["cwd"] if exact else runner.CWD,
@@ -145,63 +155,104 @@ def helper_options(hook, exact: dict | None = None, helper_id: str | None = None
         # the fence runs first: a call it refuses must not consume an approved card
         hooks={"PreToolUse": [HookMatcher(hooks=[_only(exact) if exact else scratch_only_hook, hook])]},
         can_use_tool=gate.can_use_tool,
-        # tags the whole process tree (children inherit it) so reap() can find what a dead helper left behind;
-        # never for an approved-card helper: its options stay as they were
-        env={"NAV_HELPER_ID": helper_id} if helper_id and exact is None else {})
+        # where the helper records the pids of background jobs it starts, so reap() can stop them if the helper
+        # is cancelled/times out/fails; never for an approved-card helper: its options stay as they were
+        env=env)
 
 
 MAX_REAP = 50
+TERM_WAIT_S = 5.0
 
 
-def _tagged_pids(helper_id: str) -> list[int]:
-    """Pids of this user's processes whose environment holds exactly NAV_HELPER_ID=<helper_id> (an exact
-    token, so helper-1 never matches helper-10). Not found: no env visible, other user, ours."""
-    out = subprocess.run(["/bin/ps", "-A", "-ww", "-E", "-o", "pid=,ppid=,uid=,command="],
-                         capture_output=True, text=True, timeout=10).stdout
-    rows, parent = [], {}
-    for line in out.splitlines():
-        f = line.split(None, 3)
-        if len(f) < 3 or not (f[0].isdigit() and f[1].isdigit() and f[2].isdigit()):
-            continue
-        pid, ppid, uid = int(f[0]), int(f[1]), int(f[2])
-        parent[pid] = ppid
-        rows.append((pid, uid, f[3] if len(f) > 3 else ""))
+def _pid_info(pid: int) -> tuple[int, str] | None:
+    """(uid, state) of a live pid, None when it is gone. A zombie counts as gone to the caller (state Z)."""
+    try:
+        out = subprocess.run(["/bin/ps", "-o", "uid=,stat=", "-p", str(pid)],
+                             capture_output=True, text=True, timeout=10).stdout.split()
+        return (int(out[0]), out[1]) if len(out) >= 2 else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def _protected() -> set[int]:
+    """The conductor's own pid and every ancestor: never signalled."""
     skip, p = {os.getpid()}, os.getpid()
-    while p in parent and parent[p] > 1 and parent[p] not in skip:
-        p = parent[p]
-        skip.add(p)
-    token = f" NAV_HELPER_ID={helper_id} "
-    return [pid for pid, uid, cmd in rows
-            if uid == os.getuid() and pid not in skip and token in f" {cmd} "]
-
-
-def reap(helper_id: str) -> int:
-    """Kill what a cancelled/timed-out/failed helper left running: SIGTERM, 3 s, SIGKILL for survivors, only
-    processes tagged with this helper's id (exact), same uid. Never by name or process group. Returns the count."""
-    pids = _tagged_pids(helper_id)[:MAX_REAP]
-    for pid in pids:
+    for _ in range(64):
         try:
-            os.kill(pid, signal.SIGTERM)
-        except OSError:
-            pass
-    if pids:
-        time.sleep(3)
-        for pid in set(_tagged_pids(helper_id)) & set(pids):  # re-matched now: a recycled pid is never hit
+            out = subprocess.run(["/bin/ps", "-o", "ppid=", "-p", str(p)],
+                                 capture_output=True, text=True, timeout=10).stdout.split()
+            p = int(out[0])
+        except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+            break
+        if p <= 1 or p in skip:
+            break
+        skip.add(p)
+    skip.add(os.getppid())
+    return skip
+
+
+def _mine(pid: int) -> bool:
+    info = _pid_info(pid)
+    return info is not None and info[0] == os.getuid() and not info[1].startswith("Z")
+
+
+def _signal(pid: int, sig: int, group: bool) -> None:
+    try:
+        os.killpg(pid, sig) if group else os.kill(pid, sig)
+    except OSError:
+        pass
+
+
+def reap(pid_dir: Path) -> int:
+    """Kill what a cancelled/timed-out/failed helper left running and recorded in its pid dir (cooperative:
+    the helper writes `<name>.pid` files, see HELPER_PROMPT). Same uid only; the process group when the pid
+    leads one (and it is not ours), else the pid alone. SIGTERM, TERM_WAIT_S, SIGKILL, then the dir is
+    removed. Never the conductor or its ancestors. Returns how many entries were signalled."""
+    pid_dir = Path(pid_dir)
+    pids: list[int] = []
+    try:
+        for f in sorted(pid_dir.glob("*.pid"))[:MAX_REAP]:
             try:
-                os.kill(pid, signal.SIGKILL)
-            except OSError:
-                pass
-        _log.warning("conductor.helper_reaped: %d", len(pids))
-    return len(pids)
+                n = int(f.read_text().strip().split()[0])
+            except (OSError, ValueError, IndexError):
+                continue
+            if n > 1 and n not in pids:
+                pids.append(n)
+    except OSError:
+        pass
+    skip = _protected() if pids else set()
+    own_pg = os.getpgrp()
+    targets: dict[int, bool] = {}  # pid -> signal its whole group
+    for pid in pids:
+        if pid in skip or not _mine(pid):
+            continue
+        try:
+            leader = os.getpgid(pid) == pid and pid != own_pg
+        except OSError:
+            continue
+        targets[pid] = leader
+    for pid, grp in targets.items():
+        _signal(pid, signal.SIGTERM, grp)
+    if targets:
+        end = time.monotonic() + TERM_WAIT_S
+        while time.monotonic() < end and any(_mine(p) for p in targets):
+            time.sleep(0.1)
+        for pid, grp in targets.items():
+            if _mine(pid):  # re-checked now: a recycled pid of another user is never hit
+                _signal(pid, signal.SIGKILL, grp)
+        _log.warning("conductor.helper_reaped: %d", len(targets))
+    shutil.rmtree(pid_dir, ignore_errors=True)
+    return len(targets)
 
 
-async def sdk_helper(task: str, helper_id: str, emit, *, hook, exact: dict | None = None) -> str:
+async def sdk_helper(task: str, helper_id: str, emit, *, hook, exact: dict | None = None,
+                     pid_root: Path | None = None) -> str:
     """One fresh SDK session for `task`; returns the text of its LAST assistant text block (the
     closing report), so that is what survives the result cap. `hook` is the card hook the main turn
     uses, so a gated action here raises a card exactly as before; `exact` (an approved card) narrows
     the session to that one call."""
     parts: list[str] = []
-    async with ClaudeSDKClient(options=helper_options(hook, exact, helper_id)) as client:
+    async with ClaudeSDKClient(options=helper_options(hook, exact, helper_id, pid_root)) as client:
         await client.query(task)
         async for m in client.receive_response():
             if isinstance(m, StreamEvent):
@@ -349,7 +400,9 @@ class Helpers:
         except Exception as e:  # the next helper must start even if the engine choked on the report
             _log.warning("conductor.helper_finish_failed: %s", type(e).__name__)
         self._start_queued()
-        if (state in ("cancelled", "failed") and rec.get("launched") and not rec.get("exact")
+        if state == "done" or state == "cancelled" and not rec.get("launched"):
+            shutil.rmtree(self._piddir(rec["id"]), ignore_errors=True)  # success: leave the processes alone
+        elif (state in ("cancelled", "failed") and rec.get("launched") and not rec.get("exact")
                 and os.environ.get("CONDUCTOR_HELPER_REAP", "1") != "0"):
             hid = rec["id"]
 
@@ -360,8 +413,11 @@ class Helpers:
                     _log.warning("conductor.helper_reap_failed: %s", type(e).__name__)
             threading.Thread(target=work, daemon=True).start()
 
+    def _piddir(self, helper_id: str) -> Path:
+        return self.path.parent / "helper-pids" / helper_id
+
     def _reap(self, helper_id: str) -> int:
-        return reap(helper_id)
+        return reap(self._piddir(helper_id))
 
     @staticmethod
     def _inner_done(t: asyncio.Task) -> None:

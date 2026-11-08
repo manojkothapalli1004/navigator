@@ -413,7 +413,7 @@ def serve(socket_path: Path, root: Path, runner=None) -> None:
     engine_ref: list[Engine] = []
     hook = gate.make_hook(cards, lambda card: engine_ref[0].on_card(card))
     # helpers use the same card hook: a gated action in a helper raises a card exactly as before
-    helpers = Helpers(Path(root) / "helpers.json", runner=partial(sdk_helper, hook=hook),
+    helpers = Helpers(Path(root) / "helpers.json", runner=partial(sdk_helper, hook=hook, pid_root=Path(root) / "helper-pids"),
                       on_event=lambda hid, ev: engine_ref[0].on_helper_event(hid, ev),
                       on_finish=lambda rec: engine_ref[0].on_helper_finish(rec))
     builds = make_builds(root)

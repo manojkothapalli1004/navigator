@@ -743,40 +743,107 @@ def _alive(p):
     return p.poll() is None
 
 
-def test_reap_kills_only_tagged():
-    import os
+_PROCS = []
+
+
+def _spawn(**kw):
     import subprocess
+    p = subprocess.Popen(["sleep", "300"], **kw)
+    _PROCS.append(p)
+    return p
+
+
+@pytest.fixture(autouse=True)
+def _cleanup_procs():
+    yield
+    while _PROCS:
+        p = _PROCS.pop()
+        p.kill(); p.wait()
+
+
+def _piddir(tmp_path, *pids, name="job"):
+    d = tmp_path / "pids"
+    d.mkdir(exist_ok=True)
+    for i, pid in enumerate(pids):
+        (d / f"{name}{i}.pid").write_text(f"{pid}\n")
+    return d
+
+
+def test_reap_kills_group_leader_and_removes_dir(tmp_path):
     import time
-    tagged = lambda v: subprocess.Popen(["sleep", "60"], env={**os.environ, **({"NAV_HELPER_ID": v} if v else {})})
-    procs = [tagged("helper-T1"), tagged("helper-T1"), tagged("helper-T10"), tagged(None)]
-    try:
-        time.sleep(0.5)
-        probe = subprocess.run(["/bin/ps", "-A", "-ww", "-E", "-o", "pid=,command="], capture_output=True, text=True)
-        if " NAV_HELPER_ID=helper-T1 " not in probe.stdout.replace("\n", " ") + " ":
-            pytest.skip("ps -E does not show the tag here")
-        H.reap("helper-T1")
-        time.sleep(0.5)
-        assert [_alive(p) for p in procs] == [False, False, True, True]
-    finally:
-        for p in procs:
-            p.kill(); p.wait()
+    p = _spawn(start_new_session=True)  # its own group leader, like `perl -e setpgrp`
+    kid = _spawn(start_new_session=False)
+    d = _piddir(tmp_path, p.pid)
+    time.sleep(0.2)
+    assert H.reap(d) == 1
+    assert p.wait(timeout=5) != 0
+    assert _alive(kid)  # not listed: untouched
+    assert not d.exists()
+
+
+def test_reap_kills_plain_pid(tmp_path):
+    p = _spawn()  # same process group as the tests: only the pid may be signalled
+    d = _piddir(tmp_path, p.pid)
+    assert H.reap(d) == 1
+    assert p.wait(timeout=5) != 0
+    assert not d.exists()
+
+
+def test_reap_skips_other_uid(tmp_path, monkeypatch):
+    import os
+    p = _spawn()
+    d = _piddir(tmp_path, p.pid)
+    monkeypatch.setattr(H, "_pid_info", lambda pid: (os.getuid() + 1, "S"))
+    assert H.reap(d) == 0
+    assert _alive(p)
+
+
+def test_reap_skips_self_and_ancestors(tmp_path, monkeypatch):
+    import os
+    sent = []
+    monkeypatch.setattr(H.os, "kill", lambda pid, sig: sent.append(pid))
+    monkeypatch.setattr(H.os, "killpg", lambda pg, sig: sent.append(-pg))
+    d = _piddir(tmp_path, os.getpid(), os.getppid(), 1, 0, -5, "junk")
+    assert H.reap(d) == 0
+    assert sent == []
+
+
+def test_reap_stale_pid_is_fine(tmp_path):
+    p = _spawn()
+    p.kill(); p.wait()
+    d = _piddir(tmp_path, p.pid)
+    assert H.reap(d) == 0
+    assert not d.exists()
+    assert H.reap(tmp_path / "never-made") == 0
 
 
 @aio
-async def test_tagged_pids_exact_match_same_uid_not_self(monkeypatch):
-    import os
-    import subprocess
-    me, uid = os.getpid(), os.getuid()
-    rows = [f"101 1 {uid} sleep 60 A=b NAV_HELPER_ID=helper-T1 C=d",
-            f"102 1 {uid} sleep 60 NAV_HELPER_ID=helper-T1",          # tag at end of line
-            f"103 1 {uid} sleep 60 NAV_HELPER_ID=helper-T10 X=y",     # prefix near-miss
-            f"104 1 {uid} sleep 60 XNAV_HELPER_ID=helper-T1 X=y",     # suffix near-miss
-            f"105 1 {uid + 1} sleep 60 NAV_HELPER_ID=helper-T1",      # another user
-            f"{me} 1 {uid} python NAV_HELPER_ID=helper-T1",           # ourselves
-            f"106 1 {uid} sleep 60"]                                  # untagged
-    fake = subprocess.CompletedProcess([], 0, stdout="\n".join(rows) + "\n", stderr="")
-    monkeypatch.setattr(H.subprocess, "run", lambda *a, **k: fake)
-    assert sorted(H._tagged_pids("helper-T1")) == [101, 102]
+async def test_success_leaves_processes_and_removes_dir(tmp_path):
+    p = _spawn()
+    hs = _helpers(tmp_path, Recorder(gate=asyncio.Event()))
+    A = hs.start("A", TASK)
+    await _settle(3)
+    d = hs._piddir(A["id"])
+    d.mkdir(parents=True)
+    (d / "j.pid").write_text(str(p.pid))
+    hs._end(_rec(hs, A), "done"); await _settle(5)
+    assert _alive(p) and not d.exists()
+    hs.shutdown(); await _settle(3)
+
+
+@aio
+async def test_end_failure_reaps_real_process(tmp_path):
+    p = _spawn()
+    hs = _helpers(tmp_path, Recorder(gate=asyncio.Event()))
+    A = hs.start("A", TASK)
+    await _settle(3)
+    d = hs._piddir(A["id"])
+    d.mkdir(parents=True)
+    (d / "j.pid").write_text(str(p.pid))
+    hs._end(_rec(hs, A), "cancelled")
+    assert p.wait(timeout=10) != 0
+    hs.shutdown(); await _settle(3)
+
 
 
 @aio
@@ -841,13 +908,20 @@ async def test_reap_off_switch(tmp_path, monkeypatch):
     hs.shutdown(); await _settle(3)
 
 
-def test_helper_options_sets_env_tag():
-    base = H.helper_options(None)
-    assert not base.env
-    tagged = H.helper_options(None, helper_id="helper-X")
-    assert tagged.env == {"NAV_HELPER_ID": "helper-X"}
+def test_helper_options_sets_piddir_env(tmp_path):
+    import os
+    assert not H.helper_options(None).env
+    assert not H.helper_options(None, helper_id="helper-X").env  # no root given
+    o = H.helper_options(None, helper_id="helper-X", pid_root=tmp_path / "helper-pids")
+    d = tmp_path / "helper-pids" / "helper-X"
+    assert o.env == {"NAV_HELPER_PIDDIR": str(d)} and d.is_dir() and (d.stat().st_mode & 0o777) == 0o700
     exact = {"tool": "Bash", "input": {"command": "ls"}, "cwd": "/Users/Manoj/calwbot"}
-    assert not H.helper_options(None, exact=exact, helper_id="helper-X").env
+    assert not H.helper_options(None, exact=exact, helper_id="helper-Y", pid_root=tmp_path / "hp2").env
+    assert not (tmp_path / "hp2").exists()
+
+
+def test_prompt_asks_for_pidfile():
+    assert "NAV_HELPER_PIDDIR" in H.HELPER_PROMPT and "setpgrp" in H.HELPER_PROMPT
 
 
 def test_prompt_is_portable_on_macos():
