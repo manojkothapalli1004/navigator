@@ -3,6 +3,7 @@ runs the turns against the persisted Agent SDK session and publishes events to s
 from __future__ import annotations
 
 import asyncio
+import collections
 import fcntl
 import logging
 import time
@@ -24,6 +25,9 @@ TERMINAL_WAIT = "waiting for the terminal session to end"
 TURN_TIMEOUT_S = 45 * 60  # a stuck turn (tool waiting on input, network stall) must not freeze every window
 HELPER_ITEMS_TTL_S = 600  # a finished helper's steps stay on the screens this long
 BUILD_POLL_S = 60
+INTERNAL_MAX_AGE_S = 600  # an internal report that waited this long goes before operator messages
+BATCH_MAX_ITEMS = 8
+BATCH_MAX_BYTES = 24 * 1024
 TurnRunner = Callable[[str, "str | None", Callable[[dict], None]], Awaitable["str | None"]]
 
 
@@ -36,7 +40,9 @@ class Engine:
                  turn_timeout_s: float = TURN_TIMEOUT_S, notify: Callable[[dict], None] | None = None,
                  reply: Callable[[str], None] | None = None, autopilot=None,
                  cards_pending: Callable[[], bool] | None = None, helpers: "Helpers | None" = None,
-                 builds=None):
+                 builds=None, clock: Callable[[], float] = time.monotonic,
+                 internal_max_age_s: float = INTERNAL_MAX_AGE_S, batch_max_items: int = BATCH_MAX_ITEMS,
+                 batch_max_bytes: int = BATCH_MAX_BYTES):
         self.store, self.runner, self.turn_timeout_s = store, runner, turn_timeout_s
         self.autopilot = autopilot  # keeps working through the plan file between turns (off by default)
         self.helpers = helpers  # the work a turn delegates instead of doing itself (2026-11-04)
@@ -48,7 +54,14 @@ class Engine:
         self.reply = reply  # sends a Telegram-originated turn's outcome back to Telegram (C4)
         self._dropped: set[int] = set()
         self.lock_path = Path(lock_path) if lock_path else store.root / "turn.lock"
-        self._pending: asyncio.Queue | None = None
+        # two lanes: operator messages first, internal reports batched. Plain deques and an Event are not
+        # thread-safe: submit() runs on the event-loop thread only (other threads use call_soon_threadsafe)
+        self._ops: collections.deque[dict] = collections.deque()
+        self._internal: collections.deque[tuple[dict, float]] = collections.deque()  # (entry, enqueued_at)
+        self._wake = asyncio.Event()
+        self._clock = clock  # monotonic: the starvation age never reads wall-clock time
+        self._max_age, self._max_items, self._max_bytes = internal_max_age_s, batch_max_items, batch_max_bytes
+        self._started = False
         self._subs: list[asyncio.Queue] = []
         self._task: asyncio.Task | None = None
         self._turn_task: asyncio.Task | None = None
@@ -147,10 +160,12 @@ class Engine:
 
     @property
     def queue_len(self) -> int:
-        return self._pending.qsize() if self._pending else 0
+        if not self._started:
+            return 0
+        return len(self._ops) + len(self._internal)
 
     async def start(self) -> None:
-        self._pending = asyncio.Queue()
+        self._started = True  # first: the lost-helpers submit below runs inside start()
         self._mark_interrupted()
         if self.helpers is not None:
             lost = self.helpers.mark_lost()
@@ -227,12 +242,17 @@ class Engine:
             self.autopilot.operator_turn()
         user = self._append({"kind": "user", "text": text, "source": source,
                              **({"reply_via": reply_via} if reply_via else {})})
-        ahead = self.queue_len + (1 if self.busy else 0)
+        lane_internal = source in INTERNAL_SOURCES
+        ahead = (1 if self.busy else 0) + len(self._ops) + (len(self._internal) if lane_internal else 0)
         detail = TERMINAL_WAIT if self.terminal else ahead
         self._append({"kind": "status", "state": "queued", "msg_id": user["id"], "detail": detail})
         if self.terminal and source not in ("autopilot", "helper"):  # the notice is for the operator's own words
             self._reply(user, "You're in the terminal — I'll answer this when you leave it.")
-        self._pending.put_nowait(user)
+        if lane_internal:
+            self._internal.append((user, self._clock()))
+        else:
+            self._ops.append(user)
+        self._wake.set()
         return user
 
     def _autopilot_command(self, cmd: str, source: str) -> dict:
@@ -327,10 +347,23 @@ class Engine:
         except Exception as e:  # a Telegram hiccup never breaks a turn
             _log.warning("conductor.telegram_reply_failed: %s", type(e).__name__)
 
-    def _error(self, user: dict, detail: str, reply: bool = True) -> None:
-        self._append({"kind": "status", "state": "error", "msg_id": user["id"], "detail": detail})
+    def _reply_batch(self, members: list[dict], text: str) -> None:
+        """Telegram gets the reply iff any member is Telegram-bound; windows always see it in history."""
+        if len(members) == 1:
+            self._reply(members[0], text)
+            return
+        if not any(self._to_telegram(m) for m in members):
+            return
+        if all(self._to_telegram(m) for m in members):
+            self._reply({"reply_via": "telegram"}, text)
+            return
+        self._reply({"reply_via": "telegram"}, f"(covers {len(members)} reports, some from other windows) {text}")
+
+    def _error(self, members: list[dict], detail: str, reply: bool = True) -> None:
+        for m in members:
+            self._append({"kind": "status", "state": "error", "msg_id": m["id"], "detail": detail})
         if reply:
-            self._reply(user, f"Stopped: {detail}")
+            self._reply_batch(members, f"Stopped: {detail}")
 
     def _append(self, entry: dict) -> dict:
         entry = self.store.append(entry)
@@ -365,24 +398,54 @@ class Engine:
                 self._append({"kind": "status", "state": "interrupted", "msg_id": msg_id, "detail": detail})
                 self._reply(users.get(msg_id, {}), f"Interrupted: {detail}")
 
+    def _next_batch(self) -> list[dict]:
+        """The next turn's members: an operator message, unless the oldest internal item has waited too long."""
+        aged = bool(self._internal) and self._clock() - self._internal[0][1] >= self._max_age
+        if self._ops and not aged:
+            return [self._ops.popleft()]
+        if self._internal:
+            return self._take_internal()
+        return [self._ops.popleft()]
+
+    def _take_internal(self) -> list[dict]:
+        first = self._internal.popleft()[0]
+        if first["source"] == "autopilot":
+            return [first]  # never merged
+        members, size = [first], len(first["text"].encode())
+        while self._internal and len(members) < self._max_items:
+            nxt = self._internal[0][0]
+            n = len(nxt["text"].encode())
+            if nxt["source"] != "helper" or size + n > self._max_bytes:
+                break  # stop, never skip past: internal order is kept and nothing is dropped
+            members.append(self._internal.popleft()[0])
+            size += n
+        return members
+
     async def _worker(self) -> None:
         while True:
-            user = await self._pending.get()
+            while not (self._ops or self._internal):
+                self._wake.clear()
+                if self._ops or self._internal:
+                    break
+                await self._wake.wait()
+            members = self._next_batch()
             self.busy = True
             try:
-                await self._turn(user)
+                await self._turn(members)
             finally:
                 self.busy = False
 
-    async def _turn(self, user: dict) -> None:
-        msg_id = user["id"]
+    async def _turn(self, members: list[dict]) -> None:
+        lead = members[0]
+        msg_id = lead["id"]
+        mixed = len(members) > 1 and len({self._to_telegram(m) for m in members}) > 1
         with open(self.lock_path, "w") as lock:
             await asyncio.to_thread(fcntl.flock, lock, fcntl.LOCK_EX)  # waits out a terminal turn (C5)
             if self.terminal:  # we got the lock but the terminal never said it left: it died
                 self.terminal = False
                 self._append({"kind": "note", "text": "Terminal session ended without saying goodbye; "
                                                       "its turns aren't in this history."})
-            if user.get("source") == "autopilot" and self.autopilot is not None:
+            if lead.get("source") == "autopilot" and self.autopilot is not None:
                 # re-checked now, not only when queued: switched off, quiet hours or a card may have
                 # come up while it waited (behind other turns or the terminal's lock)
                 why = self.autopilot.runnable(cards_pending=bool(self.cards_pending()),
@@ -392,13 +455,20 @@ class Engine:
                                   "detail": f"autopilot turn skipped: {why}"})
                     return
             self._activity_msg, self._activity = msg_id, {}  # this turn's steps start empty
-            self._append({"kind": "status", "state": "running", "msg_id": msg_id})
-            via = "telegram" if self._to_telegram(user) else None
+            for m in members:
+                self._append({"kind": "status", "state": "running", "msg_id": m["id"]})
+            via = "telegram" if any(self._to_telegram(m) for m in members) else None
             for reg in (self.helpers, self.builds):  # work started from a Telegram message reports back there
                 if reg is not None:
                     reg.current_via = via
             parts: list[str] = []
-            prompt = f"[{user.get('source', 'web')}] {user['text']}"
+            if len(members) == 1:
+                prompt = f"[{lead.get('source', 'web')}] {lead['text']}"
+            else:
+                prompt = (f"[helper] {len(members)} reports arrived together, oldest first. "
+                          "Answer them in one reply.\n\n" + "\n\n".join(m["text"] for m in members))
+                if mixed:
+                    prompt += "\n\nYour reply goes to: web/terminal windows and Telegram."
             self._cancelled, self._cancel_via = False, None
 
             def emit(ev: dict) -> None:
@@ -420,17 +490,17 @@ class Engine:
                 if not self._cancelled:
                     raise  # the engine itself is stopping
                 self._close_activity(msg_id, "failed")
-                self._error(user, "cancelled by operator", reply=self._cancel_via != "telegram")
+                self._error(members, "cancelled by operator", reply=self._cancel_via != "telegram")
                 self._after_turn("cancelled")
                 return
             except asyncio.TimeoutError:
                 self._close_activity(msg_id, "failed")
-                self._error(user, f"timed out after {self.turn_timeout_s:.0f}s; the turn was stopped")
+                self._error(members, f"timed out after {self.turn_timeout_s:.0f}s; the turn was stopped")
                 self._after_turn("timeout")
                 return
             except Exception as e:  # the worker must outlive any one turn
                 self._close_activity(msg_id, "failed")
-                self._error(user, f"{type(e).__name__}: {str(e)[:300]}")
+                self._error(members, f"{type(e).__name__}: {str(e)[:300]}")
                 self._after_turn("error")
                 return
             finally:
@@ -439,7 +509,12 @@ class Engine:
                 self.store.set_session_id(sid)
             text = "".join(parts) or "(no reply text)"
             self._close_activity(msg_id, "done")  # a step whose result never came back still ended with the turn
-            self._append({"kind": "assistant", "text": text, "reply_to": msg_id})
-            self._append({"kind": "status", "state": "done", "msg_id": msg_id})
-            self._reply(user, text)
+            self._append({"kind": "assistant", "text": text, "reply_to": msg_id,
+                          **({"covers": [m["id"] for m in members]} if len(members) > 1 else {})})
+            for m in members:
+                self._append({"kind": "status", "state": "done", "msg_id": m["id"]})
+            if mixed:
+                self._append({"kind": "note", "text": f"One reply covers {len(members)} reports; "
+                                                      "sent to the web/terminal windows and to Telegram."})
+            self._reply_batch(members, text)
             self._after_turn("done")
