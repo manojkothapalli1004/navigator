@@ -120,7 +120,10 @@ def _parse_reset(text: str, now: float) -> float | None:
     except Exception:
         tz = None
     base = dt.datetime.fromtimestamp(now, tz)
-    cand = base.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    try:
+        cand = base.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    except ValueError:
+        return None
     if cand.timestamp() <= now:
         cand += dt.timedelta(days=1)
     return cand.timestamp()

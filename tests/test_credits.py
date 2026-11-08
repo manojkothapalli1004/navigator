@@ -346,3 +346,7 @@ def test_cli_verify_stubbed(env, capsys):
     assert credits.main(["verify"], query=login) == 1
     assert credits.state(now=NOW)["verified"] is False
     assert KEY not in capsys.readouterr().out
+
+
+def test_parse_reset_invalid_time_returns_none():
+    assert credits._parse_reset("limit hit, resets 25:99pm", 1_700_000_000.0) is None
