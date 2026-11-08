@@ -161,3 +161,99 @@ def test_plugin_list_names_every_enabled_plugin():
     enabled = json.load(open(path)).get("enabledPlugins", {})
     missing = [k for k, v in enabled.items() if v and k not in runner._PLUGINS_OFF]
     assert not missing, f"enabled plugin(s) not listed in _PLUGINS_OFF: {missing}"
+
+
+# ---- credits fallback (2026-11-08): the main turn only ----
+
+import json as _json
+import logging
+import time as _time
+
+from navigator import credits
+
+KEY = "sk-ant-TEST-KEY-main"
+LIMIT = "You've hit your limit · resets 4:20am"
+
+
+@pytest.fixture
+def cred(tmp_path, monkeypatch):
+    envf = tmp_path / ".env"
+    envf.write_text(f'ANTHROPIC_API_KEY="{KEY}"\n')
+    st = tmp_path / "credits.json"
+    st.write_text(_json.dumps({"verified": True, "day": credits._today(_time.time()), "est_balance": 83.58}))
+    monkeypatch.setenv("NAVIGATOR_CREDITS_STATE", str(st))
+    monkeypatch.setenv("NAVIGATOR_CREDITS_ENV_FILE", str(envf))
+    for k in ("CREDITS_FALLBACK", "CREDITS_DAILY_CAP_USD", "CREDITS_FLOOR_USD", "CREDITS_START_BALANCE_USD",
+              "CREDITS_EXPIRES", "CREDITS_CALL_RESERVE_USD", "ANTHROPIC_API_KEY"):
+        monkeypatch.delenv(k, raising=False)
+    msgs = []
+    credits.set_notifier(msgs.append)
+    yield type("C", (), {"state": st, "msgs": msgs})
+    credits.set_notifier(None)
+
+
+class AttemptClient(FakeClient):
+    attempts: list = []
+    envs: list = []
+    def __init__(self, options):
+        AttemptClient.envs.append(dict(options.env))
+        self._m = AttemptClient.attempts.pop(0)
+    async def receive_response(self):
+        for m in self._m:
+            if isinstance(m, Exception):
+                raise m
+            yield m
+
+
+def _attempts(monkeypatch, *atts):
+    AttemptClient.attempts, AttemptClient.envs = list(atts), []
+    monkeypatch.setattr(runner, "ClaudeSDKClient", AttemptClient)
+
+
+def test_limit_before_content_retries_once_with_credits_env(cred, monkeypatch):
+    _attempts(monkeypatch, [_result(is_error=True, result=LIMIT)], [_delta("hi"), _result("s-c")])
+    out = []
+    sid = asyncio.run(runner.sdk_turn("hi", None, out.append))
+    assert sid == "s-c" and [e["text"] for e in out] == ["hi"]
+    assert "ANTHROPIC_API_KEY" not in AttemptClient.envs[0]
+    assert AttemptClient.envs[1]["ANTHROPIC_API_KEY"] == KEY
+    assert any("API credits" in m for m in cred.msgs)
+
+
+def test_limit_after_content_does_not_retry(cred, monkeypatch):
+    _attempts(monkeypatch, [_delta("partial"), _result(is_error=True, result=LIMIT)], [_result()])
+    with pytest.raises(RuntimeError, match="resend"):
+        asyncio.run(runner.sdk_turn("hi", None, lambda e: None))
+    assert len(AttemptClient.envs) == 1 and len(AttemptClient.attempts) == 1
+    assert _json.loads(cred.state.read_text())["until"] > 0  # the next send routes to credits
+
+
+def test_key_never_in_errors_or_logs(cred, monkeypatch, caplog, capsys):
+    caplog.set_level(logging.DEBUG)
+    _attempts(monkeypatch, [_result(is_error=True, result=LIMIT)],
+              [_result(is_error=True, result=f"boom {KEY} leaked")])
+    with pytest.raises(RuntimeError) as ei:
+        asyncio.run(runner.sdk_turn("hi", None, lambda e: None))
+    assert KEY not in str(ei.value) and "[redacted]" in str(ei.value)
+    out = capsys.readouterr()
+    assert KEY not in caplog.text and KEY not in out.out + out.err
+
+
+def test_reservation_released_when_no_result(cred, monkeypatch):
+    # route() already reserved; a crash with no ResultMessage must release it
+    st = _json.loads(cred.state.read_text())
+    st["until"] = _time.time() + 3600
+    cred.state.write_text(_json.dumps(st))
+    _attempts(monkeypatch, [RuntimeError("crash")])
+    with pytest.raises(RuntimeError):
+        asyncio.run(runner.sdk_turn("hi", None, lambda e: None))
+    assert AttemptClient.envs[0]["ANTHROPIC_API_KEY"] == KEY
+    assert _json.loads(cred.state.read_text())["reserved"] == []
+
+
+def test_engine_notice_notes_history(tmp_path):
+    from navigator.conductor.engine import Engine
+    from navigator.conductor.store import Store
+    e = Engine(Store(tmp_path), runner=None)
+    e.notice("credits on")
+    assert any(x.get("kind") == "note" and x.get("text") == "credits on" for x in e.store.history(limit=10))

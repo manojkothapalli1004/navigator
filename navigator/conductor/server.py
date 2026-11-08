@@ -435,6 +435,8 @@ def serve(socket_path: Path, root: Path, runner=None) -> None:
                     autopilot=Autopilot(Path(root) / "autopilot.json"),
                     cards_pending=lambda: bool(cards.pending()), helpers=helpers, builds=builds)
     engine_ref.append(engine)
+    from navigator import credits
+    credits.set_notifier(engine.notice)
     # bound here, not by uvicorn: uvicorn chmods its own unix sockets to 0666
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     sock.bind(str(socket_path))
