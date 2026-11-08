@@ -347,26 +347,36 @@ def _guarded_protocol():
         _refused = False
 
         def connection_made(self, transport):
-            sock = transport.get_extra_info("socket")
-            pid = _peer_pid(sock) if sock is not None else None
-            if pid is not None and is_descendant(pid, os.getpid()):
+            try:
+                sock = transport.get_extra_info("socket")
+                pid = _peer_pid(sock) if sock is not None else None
+                refuse = pid is not None and is_descendant(pid, os.getpid())
+            except Exception as exc:  # the check itself failed (e.g. /bin/ps could not be spawned):
+                # fail closed, and never raise into asyncio's callback (2026-11-07 audit)
+                self.logger.warning("conductor: refused a connection whose peer could not be checked: %r", exc)
+                refuse = True
+            if refuse:
                 self._refused = True
                 transport.close()
                 return
             super().connection_made(transport)
 
-        # a refused connection never ran uvicorn's setup: its own callbacks would raise
-        # AttributeError into the log every time (2026-11-02 log noise), so they do nothing
+        # a refused connection never ran uvicorn's setup (nor did one whose connection_made did not
+        # complete): its own callbacks would raise AttributeError into the log every time
+        # (2026-11-02 log noise), so they do nothing unless uvicorn's transport is in place
+        def _live(self):
+            return not self._refused and getattr(self, "transport", None) is not None
+
         def data_received(self, data):
-            if not self._refused:
+            if self._live():
                 super().data_received(data)
 
         def connection_lost(self, exc):
-            if not self._refused:
+            if self._live():
                 super().connection_lost(exc)
 
         def eof_received(self):
-            if not self._refused:
+            if self._live():
                 return super().eof_received()
     return Guarded
 

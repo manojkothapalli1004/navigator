@@ -231,11 +231,11 @@ def test_terminal_endpoint_and_status(tmp_path):
 
 # --- 2026-11-02: a refused connection must not log an AttributeError from uvicorn ---
 
-def _refused_protocol(monkeypatch):
+def _refused_protocol(monkeypatch, is_descendant=lambda pid, root: True):
     import uvicorn
     from uvicorn.server import ServerState
     monkeypatch.setattr(server, "_peer_pid", lambda sock: 12345)
-    monkeypatch.setattr(server, "is_descendant", lambda pid, root: True)
+    monkeypatch.setattr(server, "is_descendant", is_descendant)
     cfg = uvicorn.Config(app=lambda scope, receive, send: None, log_level="warning")
     cfg.load()
     proto = server._guarded_protocol()(config=cfg, server_state=ServerState(), app_state={})
@@ -257,6 +257,38 @@ def test_refused_connection_closes_quietly(monkeypatch):
         assert t.closed
         proto.data_received(b"GET /cards HTTP/1.1\r\nHost: c\r\n\r\n")  # must not be parsed or raise
         proto.connection_lost(None)  # asyncio calls this after close(): must not raise
+    asyncio.run(go())
+
+
+# --- 2026-11-07: the peer check itself can fail (/bin/ps could not be spawned); the guard must never
+# raise into asyncio's callback, must fail closed, and a half-built protocol's callbacks stay quiet ---
+
+def test_peer_check_failure_refuses_without_raising(monkeypatch):
+    def boom(pid, root):
+        raise BlockingIOError(35, "Resource temporarily unavailable")  # fork of /bin/ps failed
+
+    async def go():
+        proto, t = _refused_protocol(monkeypatch, is_descendant=boom)  # connection_made must not raise
+        assert t.closed  # fail closed: a peer that cannot be checked is treated as the conversation's tool
+        proto.data_received(b"POST /cards/K/approve HTTP/1.1\r\nHost: c\r\n\r\n")
+        assert proto.cycle is None  # the request was never parsed, so the app never ran
+        proto.connection_lost(None)
+    asyncio.run(go())
+
+
+def test_half_built_protocol_callbacks_are_noops():
+    import uvicorn
+    from uvicorn.server import ServerState
+
+    async def go():
+        cfg = uvicorn.Config(app=lambda scope, receive, send: None, log_level="warning")
+        cfg.load()
+        proto = server._guarded_protocol()(config=cfg, server_state=ServerState(), app_state={})
+        # uvicorn's connection_made never completed: transport and flow were never set
+        proto.data_received(b"GET /cards HTTP/1.1\r\nHost: c\r\n\r\n")
+        assert proto.cycle is None
+        assert proto.eof_received() is None
+        proto.connection_lost(None)  # the err.log traceback: 'NoneType' object has no attribute 'close'
     asyncio.run(go())
 
 
