@@ -60,17 +60,144 @@ def _resolve_write_target(wt: Path, relpath: str) -> Path:
 
 _MAX_FILE_CHARS = 60_000
 
-def _read_affected(wt: Path, relpaths: list[str]) -> dict[str, str | None]:
+_LARGE_DIGEST_BUDGET = 40_000
+_LARGE_TOTAL_BUDGET = 80_000
+_IDENT = re.compile(r"[A-Za-z_]\w{2,}")
+_DEF_LINE = re.compile(
+    r"^\s*(?:export\s+|pub\s+|async\s+)*(def|class|function|func|fn|interface|struct|impl|type)\b[ \t]*([A-Za-z_]\w*)?")
+
+def _is_large(text: str) -> bool:
+    # the driver refuses a base of >= _MAX_FILE_CHARS, so exactly the cap is large too
+    return len(text) >= _MAX_FILE_CHARS
+
+def _py_symbols(text: str):
+    """[(start, end, kind, qualname)] for top-level and class-method defs, or None if unparseable."""
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError, RecursionError, MemoryError):
+        return None
+    out = []
+    kinds = {ast.FunctionDef: "def", ast.AsyncFunctionDef: "async def", ast.ClassDef: "class"}
+    for node in tree.body:
+        if type(node) not in kinds:
+            continue
+        out.append((node.lineno, node.end_lineno or node.lineno, kinds[type(node)], node.name))
+        if isinstance(node, ast.ClassDef):
+            for sub in node.body:
+                if type(sub) in kinds and not isinstance(sub, ast.ClassDef):
+                    out.append((sub.lineno, sub.end_lineno or sub.lineno, kinds[type(sub)],
+                                f"{node.name}.{sub.name}"))
+    return out
+
+def _large_digest(rel: str, text: str, mention_text: str = "", budget: int = _LARGE_DIGEST_BUDGET) -> str:
+    """Orientation digest for a file too big to hand over whole: header, outline, then
+    verbatim excerpts (imports, plus windows aimed at identifiers in mention_text). Never a
+    write base; edits are matched against the real file by the driver."""
+    lines = text.split("\n")
+    header = (f"[LARGE FILE {rel}: {len(text)} chars, {len(lines)} lines. Below: outline, then "
+              f"verbatim excerpts. The full file is on disk; file_edits are matched against the whole "
+              f"file and old must occur exactly once in it. Never use file_writes for this file.]")
+    marker = "# [digest truncated by navigator]"
+    syms = _py_symbols(text) if rel.endswith(".py") else None
+    outline: list[str] = []
+    if syms is not None:
+        for a, b, kind, q in syms[:400]:
+            outline.append(f"L{a}-{b} {kind} {q}")
+    else:
+        for n, ln in enumerate(lines, 1):
+            m = _DEF_LINE.match(ln)
+            if m:
+                outline.append(f"L{n} {ln.strip()[:70]}")
+                if len(outline) >= 400:
+                    break
+    out = header + "\n"
+    skipped = False
+    outline_cap = len(out) + budget // 2   # leave room for the excerpts
+    for o in outline:
+        if len(out) + len(o) + 1 + len(marker) > min(budget, outline_cap):
+            skipped = True
+            break
+        out += o + "\n"
+    by_name: dict[str, tuple[int, int]] = {}
+    for a, b, _k, q in (syms or []):
+        by_name.setdefault(q, (a, b))
+        by_name.setdefault(q.rsplit(".", 1)[-1], (a, b))
+    cands: list[tuple[int, int]] = [(1, min(40, len(lines)))]
+    seen: set[str] = set()
+    for tok in _IDENT.findall(mention_text or ""):
+        if tok in seen:
+            continue
+        seen.add(tok)
+        if tok in by_name:
+            a, b = by_name[tok]
+            cands.append((a, min(b, a + 199)))
+            continue
+        pat = re.compile(rf"\b{re.escape(tok)}\b")
+        hits = 0
+        for n, ln in enumerate(lines, 1):
+            if pat.search(ln):
+                cands.append((max(1, n - 25), min(len(lines), n + 25)))
+                hits += 1
+                if hits >= 5:
+                    break
+        if len(cands) > 300:
+            break
+
+    def render(ranges):
+        merged: list[list[int]] = []
+        for a, b in sorted(ranges):
+            if merged and a <= merged[-1][1] + 1:
+                merged[-1][1] = max(merged[-1][1], b)
+            else:
+                merged.append([a, b])
+        parts, prev = [], 0
+        for a, b in merged:
+            parts.append(f"# --- lines {a}-{b} (omitted {a - prev - 1} lines) ---\n" + "\n".join(lines[a - 1:b]))
+            prev = b
+        return "\n".join(parts)
+
+    chosen: list[tuple[int, int]] = []
+    for c in cands:
+        body = render(chosen + [c])
+        if len(out) + len(body) + 1 + len(marker) > budget:
+            skipped = True
+            continue
+        chosen.append(c)
+    out += render(chosen)
+    if skipped:
+        out += "\n" + marker
+    return out
+
+def _read_affected(wt: Path, relpaths: list[str], mention_text: str = "",
+                   ) -> tuple[dict[str, str | None], dict[str, dict]]:
     # tools are disabled for subagents, so the builder only sees what we hand it;
-    # None marks a file the proposal expects to create
+    # None marks a file the proposal expects to create. A file of >= _MAX_FILE_CHARS is shown
+    # as a digest and declared in `large` ({rel: chars, lines, sha256}); the driver resolves
+    # its edits against the real file on disk
+    import hashlib
     files: dict[str, str | None] = {}
+    large: dict[str, dict] = {}
+    used = 0
     for rel in relpaths:
         try:
             target = _resolve_write_target(wt, rel)
         except ValueError:
             continue
-        files[rel] = target.read_text()[:_MAX_FILE_CHARS] if target.is_file() else None
-    return files
+        if not target.is_file():
+            files[rel] = None
+            continue
+        raw = target.read_bytes()
+        text = raw.decode()
+        if not _is_large(text):
+            files[rel] = target.read_text()
+            continue
+        digest = _large_digest(rel, text, mention_text,
+                               budget=min(_LARGE_DIGEST_BUDGET, max(0, _LARGE_TOTAL_BUDGET - used)))
+        used += len(digest)
+        files[rel] = digest
+        large[rel] = {"chars": len(text), "lines": text.count("\n") + 1,
+                      "sha256": hashlib.sha256(raw).hexdigest()}
+    return files, large
 
 def _is_test_file(rel: str) -> bool:
     # tests may be added beyond the approved list: they can't change runtime behaviour
@@ -774,10 +901,12 @@ def _attempt(driver: SubagentDriver, wt: Path, base: str, run_id: str, runner: C
     shown to the builder and every gate judges prior_writes + this attempt's writes
     against the base commit."""
     failing = _failing_test_files(proposal.get("previous_attempt_failure", ""), wt, workdir)
-    files = _read_affected(wt, list(dict.fromkeys(proposal.get("affected_files", [])
-                                                   + list(prior_writes) + failing)))
     mention_text = f"{proposal.get('intended_changes') or ''} {proposal.get('rationale') or ''}"
-    build_ctx = {"proposal": proposal, "files": files,
+    digest_text = (f"{proposal.get('title') or ''} {mention_text} "
+                   f"{(proposal.get('previous_attempt_failure') or '')[-2000:]}")
+    files, large = _read_affected(wt, list(dict.fromkeys(proposal.get("affected_files", [])
+                                                         + list(prior_writes) + failing)), digest_text)
+    build_ctx = {"proposal": proposal, "files": files, "large_files": large,
                  "test_files": [f for f in tracked if _is_test_file(f)][:200],
                  "related_files": _related_files(wt, tracked, set(files),
                                                  mention_text=mention_text,
