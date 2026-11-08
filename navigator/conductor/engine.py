@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Awaitable, Callable
 
+from navigator import credits
 from navigator.conductor import activity
 from navigator.conductor.store import Store
 
@@ -319,6 +320,10 @@ class Engine:
         if via == "telegram":
             self._send_telegram(text)
 
+    def notice(self, text: str) -> None:
+        """A system notice (credits fallback): a note in history and on Telegram."""
+        self.note(text, via="telegram")
+
     def _send_telegram(self, text: str) -> None:
         if self.reply:
             try:
@@ -520,7 +525,7 @@ class Engine:
                 return
             except Exception as e:  # the worker must outlive any one turn
                 self._close_activity(msg_id, "failed")
-                self._error(members, f"{type(e).__name__}: {str(e)[:300]}")
+                self._error(members, credits.redact(f"{type(e).__name__}: {str(e)[:300]}"))
                 self._after_turn("error")
                 return
             finally:
