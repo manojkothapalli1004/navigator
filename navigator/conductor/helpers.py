@@ -48,10 +48,12 @@ HELPER_PROMPT = (
     "under /Users/Manoj/calwbot/tmp_claude when you must write files, never in a live checkout. "
     "Finish with a short plain report of what you found or did and anything that needs a decision; "
     "that report is all the conversation will see. "
-    "A shell command that may run over 9 minutes (a full test suite): start it with nohup and an inner "
-    "`timeout 1500`, writing to a log file in the scratch folder and a DONE marker when it ends, then wait "
-    "with ONE Bash call that loops `until [ -f MARKER ]; do sleep 15; done` for at most 9 minutes, and "
-    "repeat that single wait call; never poll with many separate model turns. "
+    "A shell command that may run over 9 minutes (a full test suite): start it with nohup under a perl alarm "
+    "limit, e.g. `nohup sh -c \"perl -e 'alarm shift; exec @ARGV' 1500 CMD > LOG 2>&1; touch DONE_MARKER\" &` "
+    "(this Mac has no coreutils time-limit command, so use that perl form), writing to a log file in the scratch "
+    "folder and a DONE marker when it ends, then wait with ONE Bash call that loops "
+    "`until [ -f DONE_MARKER ]; do sleep 15; done` for at most 9 minutes, and repeat that single wait call; "
+    "never poll with many separate model turns. "
     "Keep the closing report under 10000 characters.")
 # appended for a normal helper when CONDUCTOR_HELPER_ORC is on (never for an approved-card helper)
 HELPER_ORC_PROMPT = (

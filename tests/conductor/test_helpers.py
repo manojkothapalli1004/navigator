@@ -574,5 +574,19 @@ async def test_only_one_long_helper_at_a_time(tmp_path):
     assert next(x for x in hs._records if x["id"] == X["id"])["timeout_s"] is None
 
 
-def test_prompt_mentions_nohup_wait():
-    assert "nohup" in H.HELPER_PROMPT and "timeout 1500" in H.HELPER_PROMPT
+def test_prompt_is_portable_on_macos():
+    import re
+    P = H.HELPER_PROMPT
+    assert "nohup" in P and "alarm shift" in P and "1500" in P and "DONE" in P
+    assert re.search(r"(?<![\w-])g?timeout\b", P) is None
+
+
+def test_prompt_pattern_really_times_out():
+    import os
+    import subprocess
+    import time
+    if not os.path.exists("/usr/bin/perl"):
+        pytest.skip("no perl")
+    t = time.monotonic()
+    r = subprocess.run(["/usr/bin/perl", "-e", "alarm shift; exec @ARGV", "1", "sleep", "30"], timeout=10)
+    assert time.monotonic() - t < 5 and r.returncode != 0
