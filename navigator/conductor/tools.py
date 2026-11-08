@@ -128,13 +128,15 @@ async def delegate_text(helpers, args, builds=None) -> str:
             note = f" (raised to {HELPER_MIN_TIMEOUT_S:.0f}s)"
     rec = helpers.start(title, task, **kw)
     if rec["state"] == "queued" and (kw.get("timeout_s") or 0) > LONG_S:
-        note += " (queued: only one long helper runs at a time)"
+        note += " (queued: only one long helper runs at a time; it expires after 2 h in the queue)"
     return f"started {rec['id']} ({rec['state']}): {rec['title']}{note}"
 
 
 async def helpers_text(helpers, builds=None) -> str:
-    lines = [f"{s['id']} {s['state']} {s['age']:.0f}s — {s['title']} | {', '.join(s['last'])}"
-             for s in helpers.snapshot()]
+    lines = []
+    for s in helpers.snapshot():
+        waited = f" (queued {s['queued_s']:.0f}s)" if s.get("queued_s", 0) >= 1 else ""
+        lines.append(f"{s['id']} {s['state']} {s['age']:.0f}s{waited} — {s['title']} | {', '.join(s['last'])}")
     if builds is not None:
         now = time.time()
         recs = builds.snapshot()

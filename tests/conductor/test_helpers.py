@@ -230,7 +230,7 @@ async def test_snapshot_lists_running_first_with_last_titles(tmp_path):
         await gate.wait()
         return "ok"
     events = []
-    hs = _helpers(tmp_path, run, events=events, clock=lambda: clock["t"], max_running=1)
+    hs = _helpers(tmp_path, run, events=events, clock=lambda: clock["t"], mono=lambda: clock["t"], max_running=1)
     a = hs.start("slow", TASK); b = hs.start("waiting", TASK)
     clock["t"] = 107.0
     await _settle(2)
@@ -250,7 +250,7 @@ async def test_registry_keeps_running_plus_fifty_finished(tmp_path):
     hs = _helpers(tmp_path, Recorder())
     for i in range(60):
         hs.start(f"job {i}", TASK)
-    await _settle(10)
+    await _settle(100)  # 60 helpers x two file writes: 50 ms was a coin flip on a loaded machine
     recs = _file(tmp_path)
     assert len(recs) == 50 and recs[0]["title"] == "job 10" and recs[-1]["title"] == "job 59"
     assert hs.start("one more", TASK)["state"] == "running"
@@ -574,5 +574,295 @@ async def test_only_one_long_helper_at_a_time(tmp_path):
     assert next(x for x in hs._records if x["id"] == X["id"])["timeout_s"] is None
 
 
-def test_prompt_mentions_nohup_wait():
-    assert "nohup" in H.HELPER_PROMPT and "timeout 1500" in H.HELPER_PROMPT
+# ---- queue / watchdog fixes (2026-11-08) ----
+
+def _rec(hs, r):
+    return next(x for x in hs._records if x["id"] == r["id"])
+
+
+def _snap(hs, r):
+    return next(x for x in hs.snapshot() if x["id"] == r["id"])
+
+
+@aio
+async def test_snapshot_age_counts_from_launch_not_queue(tmp_path):
+    now = [1000.0]
+    gate = asyncio.Event()
+    hs = _helpers(tmp_path, Recorder(gate=gate), clock=lambda: now[0])
+    hs.start("A", TASK, timeout_s=900)
+    B = hs.start("B", TASK, timeout_s=900)
+    assert _rec(hs, B)["state"] == "queued"
+    now[0] += 1000
+    await _settle(3)  # A's task must start with the old runner
+    hs.runner = Recorder(gate=asyncio.Event())  # B's own run waits on a fresh gate
+    gate.set(); await _settle(10)
+    assert _rec(hs, B)["state"] == "running"
+    s = _snap(hs, B)
+    assert s["age"] < 5 and abs(s["queued_s"] - 1000) < 5
+    hs.shutdown(); await _settle(5)
+
+
+@aio
+async def test_helpers_text_shows_queue_wait(tmp_path):
+    now = [1000.0]
+    gate = asyncio.Event()
+    hs = _helpers(tmp_path, Recorder(gate=gate), clock=lambda: now[0])
+    hs.start("A", TASK, timeout_s=900)
+    B = hs.start("B", TASK, timeout_s=900)
+    now[0] += 1000
+    txt = await tools.helpers_text(hs)
+    assert f"{B['id']} queued 1000s" in txt
+    await _settle(3)  # A's task must start with the old runner
+    hs.runner = Recorder(gate=asyncio.Event())
+    gate.set(); await _settle(10)
+    txt = await tools.helpers_text(hs)
+    assert f"{B['id']} running 0s (queued 1000s)" in txt
+    hs.shutdown(); await _settle(5)
+
+
+@aio
+async def test_end_save_failure_still_starts_queue(tmp_path):
+    gate = asyncio.Event()
+    finished = []
+    hs = _helpers(tmp_path, Recorder(gate=gate), finished=finished)
+    A = hs.start("A", TASK, timeout_s=900)
+    B = hs.start("B", TASK, timeout_s=900)
+    orig, calls = hs._save, []
+
+    def flaky():
+        calls.append(1)
+        if len(calls) == 1:
+            raise OSError("disk full")
+        orig()
+    hs._save = flaky
+    await _settle(3)  # A's task must start with the old runner
+    hs.runner = Recorder(gate=asyncio.Event())
+    gate.set(); await _settle(10)
+    assert [f["id"] for f in finished][:1] == [A["id"]]
+    assert _rec(hs, B)["state"] == "running"
+    hs.shutdown(); await _settle(5)
+
+
+@aio
+async def test_timeout_fires_even_if_runner_swallows_cancel(tmp_path, monkeypatch):
+    monkeypatch.setattr(H, "CANCEL_GRACE_S", 0.05, raising=False)
+    monkeypatch.setattr(H, "HELPER_MIN_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(H, "LONG_S", 0.01)
+
+    async def stubborn(task, helper_id, emit, exact=None):
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            await asyncio.sleep(60)
+    hs = _helpers(tmp_path, stubborn)
+    A = hs.start("A", TASK, timeout_s=0.05)
+    B = hs.start("B", TASK, timeout_s=0.05)
+    assert _rec(hs, B)["state"] == "queued"
+    try:
+        for _ in range(100):
+            await asyncio.sleep(0.01)
+            if _rec(hs, A)["state"] == "failed":
+                break
+        assert _rec(hs, A)["state"] == "failed" and "timed out" in _rec(hs, A)["error"]
+        assert _rec(hs, B).get("launched")
+    finally:
+        for t in asyncio.all_tasks():
+            if t is not asyncio.current_task():
+                t.cancel()
+        await asyncio.sleep(0.05)
+
+
+@aio
+async def test_queued_helper_expires(tmp_path):
+    now = [1000.0]
+    finished = []
+    hs = _helpers(tmp_path, Recorder(gate=asyncio.Event()), finished=finished, clock=lambda: now[0])
+    A = hs.start("A", TASK, timeout_s=900)
+    B = hs.start("B", TASK, timeout_s=900)
+    now[0] += H.QUEUE_MAX_S + 1
+    hs.expire_queued()
+    r = _rec(hs, B)
+    assert r["state"] == "failed" and "in the queue" in r["error"] and "waited" in r["error"]
+    assert [f["id"] for f in finished] == [B["id"]]
+    assert _rec(hs, A)["state"] == "running"
+    hs.shutdown(); await _settle(5)
+
+
+@aio
+async def test_no_stale_long_count_after_end(tmp_path):
+    gate = asyncio.Event()
+    hs = _helpers(tmp_path, Recorder(gate=gate))
+    hs.start("A", TASK, timeout_s=900)
+    B = hs.start("B", TASK, timeout_s=900)
+    await _settle(3)  # A's task must start with the old runner
+    hs.runner = Recorder(gate=asyncio.Event())
+    gate.set(); await _settle(10)
+    assert hs._running_long() == 1 and _rec(hs, B)["state"] == "running"
+    hs.shutdown(); await _settle(5)
+
+
+@aio
+async def test_tick_uses_monotonic_for_run_not_wall(tmp_path):
+    now, m = [1000.0], [50.0]
+    hs = _helpers(tmp_path, Recorder(gate=asyncio.Event()), clock=lambda: now[0], mono=lambda: m[0])
+    A = hs.start("A", TASK, timeout_s=900)
+    now[0] += 36000  # the Mac slept
+    hs.tick()
+    assert _rec(hs, A)["state"] == "running" and _snap(hs, A)["age"] < 5
+    m[0] += 900 + H.CANCEL_GRACE_S + H.TICK_S + 1
+    hs.tick()
+    r = _rec(hs, A)
+    assert r["state"] == "failed" and "timed out" in r["error"]
+    await _settle(5)
+
+
+@aio
+async def test_end_is_idempotent(tmp_path):
+    finished = []
+    hs = _helpers(tmp_path, Recorder(gate=asyncio.Event()), finished=finished)
+    A = hs.start("A", TASK)
+    r = _rec(hs, A)
+    hs._end(r, "failed", error="x")
+    hs._end(r, "cancelled")
+    assert len(finished) == 1 and r["state"] == "failed"
+    hs.shutdown(); await _settle(5)
+
+
+@aio
+async def test_shutdown_cancels_inner_runner_task(tmp_path):
+    hs = _helpers(tmp_path, Recorder(gate=asyncio.Event()))
+    hs.start("A", TASK)
+    await _settle(3)
+    hs.shutdown(); await _settle(5)
+    assert [t for t in asyncio.all_tasks() if t is not asyncio.current_task()] == []
+
+
+# ---- reaping a dead helper's tagged children (2026-11-08) ----
+
+def _alive(p):
+    return p.poll() is None
+
+
+def test_reap_kills_only_tagged():
+    import os
+    import subprocess
+    import time
+    tagged = lambda v: subprocess.Popen(["sleep", "60"], env={**os.environ, **({"NAV_HELPER_ID": v} if v else {})})
+    procs = [tagged("helper-T1"), tagged("helper-T1"), tagged("helper-T10"), tagged(None)]
+    try:
+        time.sleep(0.5)
+        probe = subprocess.run(["/bin/ps", "-A", "-ww", "-E", "-o", "pid=,command="], capture_output=True, text=True)
+        if " NAV_HELPER_ID=helper-T1 " not in probe.stdout.replace("\n", " ") + " ":
+            pytest.skip("ps -E does not show the tag here")
+        H.reap("helper-T1")
+        time.sleep(0.5)
+        assert [_alive(p) for p in procs] == [False, False, True, True]
+    finally:
+        for p in procs:
+            p.kill(); p.wait()
+
+
+@aio
+async def test_tagged_pids_exact_match_same_uid_not_self(monkeypatch):
+    import os
+    import subprocess
+    me, uid = os.getpid(), os.getuid()
+    rows = [f"101 1 {uid} sleep 60 A=b NAV_HELPER_ID=helper-T1 C=d",
+            f"102 1 {uid} sleep 60 NAV_HELPER_ID=helper-T1",          # tag at end of line
+            f"103 1 {uid} sleep 60 NAV_HELPER_ID=helper-T10 X=y",     # prefix near-miss
+            f"104 1 {uid} sleep 60 XNAV_HELPER_ID=helper-T1 X=y",     # suffix near-miss
+            f"105 1 {uid + 1} sleep 60 NAV_HELPER_ID=helper-T1",      # another user
+            f"{me} 1 {uid} python NAV_HELPER_ID=helper-T1",           # ourselves
+            f"106 1 {uid} sleep 60"]                                  # untagged
+    fake = subprocess.CompletedProcess([], 0, stdout="\n".join(rows) + "\n", stderr="")
+    monkeypatch.setattr(H.subprocess, "run", lambda *a, **k: fake)
+    assert sorted(H._tagged_pids("helper-T1")) == [101, 102]
+
+
+@aio
+async def test_end_reap_policy(tmp_path, monkeypatch):
+    # cancelled and failed (timed out) launched helpers reap once; done / exact / never-launched do not
+    for state in ("cancelled", "failed", "done"):
+        calls = []
+        hs = _helpers(tmp_path / state, Recorder(gate=asyncio.Event()))
+        hs._reap = calls.append
+        A = hs.start("A", TASK)
+        await _settle(3)
+        r = _rec(hs, A)
+        hs._end(r, state, **({"error": "timed out"} if state == "failed" else {}))
+        await _settle(5)
+        assert calls == ([A["id"]] if state != "done" else []), state
+        hs._end(r, "failed")  # idempotent: no second reap
+        await _settle(5)
+        assert len(calls) == (0 if state == "done" else 1)
+        hs.shutdown(); await _settle(3)
+    calls = []
+    hs = _helpers(tmp_path / "exact", Recorder(gate=asyncio.Event()))
+    hs._reap = calls.append
+    X = hs.start("X", TASK, exact={"tool": "Bash", "input": {}, "cwd": "/"})
+    await _settle(3)
+    hs._end(_rec(hs, X), "cancelled"); await _settle(5)
+    assert calls == []
+    hs.shutdown(); await _settle(3)
+    # queued then cancelled: nothing ran
+    calls = []
+    hs = _helpers(tmp_path / "queued", Recorder(gate=asyncio.Event()))
+    hs._reap = calls.append
+    hs.start("L1", TASK, timeout_s=900)
+    Q = hs.start("L2", TASK, timeout_s=900)
+    assert hs.cancel(Q["id"]); await _settle(5)
+    assert calls == []
+    hs.shutdown(); await _settle(3)
+    # a raising reap never stops the report or the queue
+    finished = []
+    hs = _helpers(tmp_path / "raises", Recorder(gate=asyncio.Event()), finished=finished)
+
+    def boom(hid):
+        raise RuntimeError("boom")
+    hs._reap = boom
+    L1 = hs.start("L1", TASK, timeout_s=900)
+    L2 = hs.start("L2", TASK, timeout_s=900)
+    await _settle(3)
+    hs._end(_rec(hs, L1), "cancelled"); await _settle(5)
+    assert [f["id"] for f in finished] == [L1["id"]] and _rec(hs, L2)["state"] == "running"
+    hs.shutdown(); await _settle(3)
+
+
+@aio
+async def test_reap_off_switch(tmp_path, monkeypatch):
+    monkeypatch.setenv("CONDUCTOR_HELPER_REAP", "0")
+    calls = []
+    hs = _helpers(tmp_path, Recorder(gate=asyncio.Event()))
+    hs._reap = calls.append
+    A = hs.start("A", TASK)
+    await _settle(3)
+    hs._end(_rec(hs, A), "cancelled"); await _settle(5)
+    assert calls == []
+    hs.shutdown(); await _settle(3)
+
+
+def test_helper_options_sets_env_tag():
+    base = H.helper_options(None)
+    assert not base.env
+    tagged = H.helper_options(None, helper_id="helper-X")
+    assert tagged.env == {"NAV_HELPER_ID": "helper-X"}
+    exact = {"tool": "Bash", "input": {"command": "ls"}, "cwd": "/Users/Manoj/calwbot"}
+    assert not H.helper_options(None, exact=exact, helper_id="helper-X").env
+
+
+def test_prompt_is_portable_on_macos():
+    import re
+    P = H.HELPER_PROMPT
+    assert "nohup" in P and "alarm shift" in P and "1500" in P and "DONE" in P
+    assert re.search(r"(?<![\w-])g?timeout\b", P) is None
+
+
+def test_prompt_pattern_really_times_out():
+    import os
+    import subprocess
+    import time
+    if not os.path.exists("/usr/bin/perl"):
+        pytest.skip("no perl")
+    t = time.monotonic()
+    r = subprocess.run(["/usr/bin/perl", "-e", "alarm shift; exec @ARGV", "1", "sleep", "30"], timeout=10)
+    assert time.monotonic() - t < 5 and r.returncode != 0

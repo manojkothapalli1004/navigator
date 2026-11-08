@@ -168,6 +168,25 @@ def test_stale_filed_reported_once(tmp_path):
     assert b.open()
 
 
+def test_stale_approved_no_run_says_dry_run(tmp_path):
+    b, act, got = mk(tmp_path)
+    b.file("navigator", "Doc", SPEC, ["docs/a.md"], via="web")  # tier 1: auto-approved, no run
+    b._records[0]["filed"] -= B.BUILD_STALE_S + 5
+    b.poll(); b.poll()
+    assert len(got) == 1
+    assert "approved" in got[0]["summary"] and "dry-run" in got[0]["summary"]
+    assert "still waiting for approval" not in got[0]["summary"]
+    assert b.open()
+
+
+def test_stale_key_unchanged(tmp_path):
+    b, act, got = mk(tmp_path)
+    pid = b.file("navigator", "Doc", SPEC, ["docs/a.md"], via="web")["proposal_id"]
+    b._records[0]["filed"] -= B.BUILD_STALE_S + 5
+    b.poll()
+    assert got[0]["key"] == f"{pid}:stale"
+
+
 def test_secret_masked_and_reply_via(tmp_path):
     b, act, got = mk(tmp_path)
     pid = b.file("navigator", "Doc", SPEC, ["docs/a.md"], via="telegram:5")["proposal_id"]

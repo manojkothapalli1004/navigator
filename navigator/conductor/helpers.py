@@ -12,6 +12,9 @@ import json
 import logging
 import math
 import os
+import signal
+import subprocess
+import threading
 import time
 from collections import deque
 from pathlib import Path
@@ -43,15 +46,20 @@ KEEP_FINISHED = 50  # finished records kept in the registry
 SNAPSHOT_FINISHED = 10  # finished helpers shown to the conversation and the screens
 LAST_TITLES = 50  # step titles remembered per helper (the snapshot shows the last two)
 ACTIVE = ("running", "queued")
+QUEUE_MAX_S = 2 * 3600.0  # a queued helper older than this (wall clock) is ended with a "delegate again" report
+CANCEL_GRACE_S = 15.0  # how long a cancelled/timed-out runner gets to unwind before the helper is ended anyway
+TICK_S = 30.0  # the engine's watchdog period
 HELPER_PROMPT = (
     "You are a helper the operator's conversation started. Do only the task below, in a worktree "
     "under /Users/Manoj/calwbot/tmp_claude when you must write files, never in a live checkout. "
     "Finish with a short plain report of what you found or did and anything that needs a decision; "
     "that report is all the conversation will see. "
-    "A shell command that may run over 9 minutes (a full test suite): start it with nohup and an inner "
-    "`timeout 1500`, writing to a log file in the scratch folder and a DONE marker when it ends, then wait "
-    "with ONE Bash call that loops `until [ -f MARKER ]; do sleep 15; done` for at most 9 minutes, and "
-    "repeat that single wait call; never poll with many separate model turns. "
+    "A shell command that may run over 9 minutes (a full test suite): start it with nohup under a perl alarm "
+    "limit, e.g. `nohup sh -c \"perl -e 'alarm shift; exec @ARGV' 1500 CMD > LOG 2>&1; touch DONE_MARKER\" &` "
+    "(this Mac has no coreutils time-limit command, so use that perl form), writing to a log file in the scratch "
+    "folder and a DONE marker when it ends, then wait with ONE Bash call that loops "
+    "`until [ -f DONE_MARKER ]; do sleep 15; done` for at most 9 minutes, and repeat that single wait call; "
+    "never poll with many separate model turns. "
     "Keep the closing report under 10000 characters.")
 # appended for a normal helper when CONDUCTOR_HELPER_ORC is on (never for an approved-card helper)
 HELPER_ORC_PROMPT = (
@@ -108,7 +116,7 @@ def _only(exact: dict):
     return hook
 
 
-def helper_options(hook, exact: dict | None = None) -> ClaudeAgentOptions:
+def helper_options(hook, exact: dict | None = None, helper_id: str | None = None) -> ClaudeAgentOptions:
     from navigator.conductor import runner  # runner imports engine; a module-level import would cycle
     # Kill switch CONDUCTOR_HELPER_ORC, read at call time so a live engine follows a change without a
     # restart: unset or any value other than the exact string "0" = on; "0" = today's helper, byte for
@@ -136,7 +144,55 @@ def helper_options(hook, exact: dict | None = None) -> ClaudeAgentOptions:
         max_turns=HELPER_MAX_TURNS, include_partial_messages=True,
         # the fence runs first: a call it refuses must not consume an approved card
         hooks={"PreToolUse": [HookMatcher(hooks=[_only(exact) if exact else scratch_only_hook, hook])]},
-        can_use_tool=gate.can_use_tool)
+        can_use_tool=gate.can_use_tool,
+        # tags the whole process tree (children inherit it) so reap() can find what a dead helper left behind;
+        # never for an approved-card helper: its options stay as they were
+        env={"NAV_HELPER_ID": helper_id} if helper_id and exact is None else {})
+
+
+MAX_REAP = 50
+
+
+def _tagged_pids(helper_id: str) -> list[int]:
+    """Pids of this user's processes whose environment holds exactly NAV_HELPER_ID=<helper_id> (an exact
+    token, so helper-1 never matches helper-10). Not found: no env visible, other user, ours."""
+    out = subprocess.run(["/bin/ps", "-A", "-ww", "-E", "-o", "pid=,ppid=,uid=,command="],
+                         capture_output=True, text=True, timeout=10).stdout
+    rows, parent = [], {}
+    for line in out.splitlines():
+        f = line.split(None, 3)
+        if len(f) < 3 or not (f[0].isdigit() and f[1].isdigit() and f[2].isdigit()):
+            continue
+        pid, ppid, uid = int(f[0]), int(f[1]), int(f[2])
+        parent[pid] = ppid
+        rows.append((pid, uid, f[3] if len(f) > 3 else ""))
+    skip, p = {os.getpid()}, os.getpid()
+    while p in parent and parent[p] > 1 and parent[p] not in skip:
+        p = parent[p]
+        skip.add(p)
+    token = f" NAV_HELPER_ID={helper_id} "
+    return [pid for pid, uid, cmd in rows
+            if uid == os.getuid() and pid not in skip and token in f" {cmd} "]
+
+
+def reap(helper_id: str) -> int:
+    """Kill what a cancelled/timed-out/failed helper left running: SIGTERM, 3 s, SIGKILL for survivors, only
+    processes tagged with this helper's id (exact), same uid. Never by name or process group. Returns the count."""
+    pids = _tagged_pids(helper_id)[:MAX_REAP]
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+    if pids:
+        time.sleep(3)
+        for pid in set(_tagged_pids(helper_id)) & set(pids):  # re-matched now: a recycled pid is never hit
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+        _log.warning("conductor.helper_reaped: %d", len(pids))
+    return len(pids)
 
 
 async def sdk_helper(task: str, helper_id: str, emit, *, hook, exact: dict | None = None) -> str:
@@ -145,7 +201,7 @@ async def sdk_helper(task: str, helper_id: str, emit, *, hook, exact: dict | Non
     uses, so a gated action here raises a card exactly as before; `exact` (an approved card) narrows
     the session to that one call."""
     parts: list[str] = []
-    async with ClaudeSDKClient(options=helper_options(hook, exact)) as client:
+    async with ClaudeSDKClient(options=helper_options(hook, exact, helper_id)) as client:
         await client.query(task)
         async for m in client.receive_response():
             if isinstance(m, StreamEvent):
@@ -176,10 +232,11 @@ class Helpers:
     `on_finish(record)` its end, whatever the end was."""
 
     def __init__(self, path: Path, runner, on_event, on_finish, *, clock=time.time,
-                 max_running: int = MAX_RUNNING):
+                 max_running: int = MAX_RUNNING, mono=time.monotonic):
         self.path = Path(path)
         self.runner, self.on_event, self.on_finish = runner, on_event, on_finish
-        self.clock, self.max_running = clock, max_running
+        self.clock, self.max_running, self.mono = clock, max_running, mono
+        self._mono_launch: dict[str, float] = {}  # in memory only: run time is monotonic (no Mac sleep)
         self.current_via: str | None = None  # set by the engine at each turn start
         self._records: list[dict] = self._load()
         # still running/queued in the file when we started: a previous process died with them
@@ -256,6 +313,8 @@ class Helpers:
 
     def _launch(self, rec: dict) -> None:
         rec["state"] = "running"
+        rec["launched"] = self.clock()
+        self._mono_launch[rec["id"]] = self.mono()
         task = asyncio.create_task(self._run(rec))
 
         def closed(_task) -> None:
@@ -266,20 +325,57 @@ class Helpers:
         self._tasks[rec["id"]] = task
 
     def _start_queued(self) -> None:
-        for rec in self._records:
-            if rec.get("state") == "queued" and self._may_launch(rec):
-                self._launch(rec)
-        self._save()
+        try:
+            for rec in self._records:
+                if rec.get("state") == "queued" and self._may_launch(rec):
+                    self._launch(rec)
+            self._save()
+        except Exception as e:  # never strand the queue behind a failed save
+            _log.warning("conductor.helper_save_failed: %s", type(e).__name__)
 
     def _end(self, rec: dict, state: str, **fields) -> None:
+        """One end, one report: idempotent, and it never raises (save, report and queue are each guarded)."""
+        if rec.get("state") not in ACTIVE:
+            return
         rec.update(state=state, ended=self.clock(), **fields)
         self._tasks.pop(rec["id"], None)
-        self._save()
+        self._mono_launch.pop(rec["id"], None)
+        try:
+            self._save()
+        except Exception as e:
+            _log.warning("conductor.helper_save_failed: %s", type(e).__name__)
         try:
             self.on_finish(rec)
         except Exception as e:  # the next helper must start even if the engine choked on the report
             _log.warning("conductor.helper_finish_failed: %s", type(e).__name__)
         self._start_queued()
+        if (state in ("cancelled", "failed") and rec.get("launched") and not rec.get("exact")
+                and os.environ.get("CONDUCTOR_HELPER_REAP", "1") != "0"):
+            hid = rec["id"]
+
+            def work() -> None:
+                try:
+                    self._reap(hid)
+                except Exception as e:
+                    _log.warning("conductor.helper_reap_failed: %s", type(e).__name__)
+            threading.Thread(target=work, daemon=True).start()
+
+    def _reap(self, helper_id: str) -> int:
+        return reap(helper_id)
+
+    @staticmethod
+    def _inner_done(t: asyncio.Task) -> None:
+        if not t.cancelled():
+            t.exception()  # an orphaned runner never logs "exception was never retrieved"
+
+    @staticmethod
+    async def _stop_inner(t: asyncio.Task) -> None:
+        """Cancel the runner and give it CANCEL_GRACE_S to unwind; never wait on it unbounded."""
+        if not t.done():
+            t.cancel()
+            await asyncio.wait({t}, timeout=CANCEL_GRACE_S)
+        if not t.done():
+            _log.warning("conductor.helper_cancel_slow")
 
     async def _run(self, rec: dict) -> None:
         hid = rec["id"]
@@ -290,23 +386,34 @@ class Helpers:
             self.on_event(hid, ev)
 
         timeout = min(rec.get("timeout_s") or HELPER_TIMEOUT_S, HELPER_MAX_TIMEOUT_S)  # call time: tests patch
+        t = asyncio.ensure_future(self.runner(rec["task"], hid, emit, exact=rec.get("exact")))
+        t.add_done_callback(self._inner_done)
+        state, fields, skip_end = "cancelled", {}, False
         try:
-            text = await asyncio.wait_for(self.runner(rec["task"], hid, emit, exact=rec.get("exact")), timeout)
-        except asyncio.TimeoutError:
-            hint = (f" (delegate again with timeout_s up to {HELPER_MAX_TIMEOUT_S:.0f} if it needs longer)"
-                    if timeout < HELPER_MAX_TIMEOUT_S else "")
-            self._end(rec, "failed", error=f"timed out after {timeout:.0f}s{hint}")
+            done, _ = await asyncio.wait({t}, timeout=timeout)
+            if not done:
+                hint = (f" (delegate again with timeout_s up to {HELPER_MAX_TIMEOUT_S:.0f} if it needs longer)"
+                        if timeout < HELPER_MAX_TIMEOUT_S else "")
+                state, fields = "failed", {"error": f"timed out after {timeout:.0f}s{hint}"}
+                await self._stop_inner(t)
+            else:
+                text = t.result()
+                masked = activity._SECRET.sub("…", text or "")
+                if len(masked) > RESULT_CHARS:
+                    masked = masked[:RESULT_CHARS] + TRUNCATED.format(n=len(masked))
+                state, fields = "done", {"result": masked}
         except asyncio.CancelledError:
             if self._stopping:
-                raise  # shutdown already marked it lost; the restart reports it
-            self._end(rec, "cancelled")
+                t.cancel()
+                skip_end = True  # shutdown already marked it lost; the restart reports it
+                raise
+            state, fields = "cancelled", {}
+            await self._stop_inner(t)
         except Exception as e:
-            self._end(rec, "failed", error=f"{type(e).__name__}: {str(e)[:300]}")
-        else:
-            masked = activity._SECRET.sub("…", text or "")
-            if len(masked) > RESULT_CHARS:
-                masked = masked[:RESULT_CHARS] + TRUNCATED.format(n=len(masked))
-            self._end(rec, "done", result=masked)
+            state, fields = "failed", {"error": f"{type(e).__name__}: {str(e)[:300]}"}
+        finally:
+            if not skip_end:
+                self._end(rec, state, **fields)
 
     def cancel(self, helper_id: str) -> bool:
         rec = self._find(helper_id)
@@ -346,10 +453,46 @@ class Helpers:
         return [WorkItem("helper", r["id"], frozenset(r["files"]) if r.get("files") else None)
                 for r in self._records if r.get("state") in ACTIVE]
 
+    def expire_queued(self) -> None:
+        """A helper that waited QUEUE_MAX_S (wall clock) behind a long one ends with a delegate-again report."""
+        now = self.clock()
+        for rec in list(self._records):
+            if rec.get("state") == "queued" and now - (rec.get("started") or now) > QUEUE_MAX_S:
+                self._end(rec, "failed", error=f"waited {now - rec['started']:.0f}s in the queue behind a "
+                                               f"long helper; delegate again")
+
+    def tick(self) -> None:
+        """Watchdog (the engine calls it every TICK_S): end a running helper whose own timeout did not
+        (monotonic clock: a sleeping Mac does not run the helper), expire stale queued ones, restart the queue."""
+        try:
+            for rec in list(self._records):
+                lm = self._mono_launch.get(rec["id"])
+                if rec.get("state") != "running" or rec.get("exact") or lm is None:
+                    continue
+                timeout = min(rec.get("timeout_s") or HELPER_TIMEOUT_S, HELPER_MAX_TIMEOUT_S)
+                if self.mono() - lm > timeout + CANCEL_GRACE_S + TICK_S:
+                    task = self._tasks.get(rec["id"])
+                    self._end(rec, "failed", error=f"timed out after {timeout:.0f}s")
+                    if task is not None:
+                        task.cancel()
+            self.expire_queued()
+            self._start_queued()
+        except Exception as e:
+            _log.warning("conductor.helper_tick_failed: %s", type(e).__name__)
+
     def snapshot(self) -> list[dict]:
         active = [r for r in self._records if r.get("state") in ACTIVE]
         finished = [r for r in self._records if r.get("state") not in ACTIVE][-SNAPSHOT_FINISHED:]
         now = self.clock()
-        return [{"id": r["id"], "title": r.get("title"), "state": r.get("state"),
-                 "age": now - (r.get("started") or now), "ended": r.get("ended"),
-                 "last": list(self._titles.get(r["id"], ()))[-2:]} for r in active + finished]
+        out = []
+        for r in active + finished:
+            lm = self._mono_launch.get(r["id"])
+            if r.get("state") == "running":
+                age = self.mono() - lm if lm is not None else now - (r.get("launched") or r.get("started") or now)
+            else:
+                age = now - (r.get("started") or now)
+            queued_s = (r["launched"] - r["started"]) if r.get("launched") and r.get("started") else 0
+            out.append({"id": r["id"], "title": r.get("title"), "state": r.get("state"), "age": age,
+                        "queued_s": max(queued_s, 0), "ended": r.get("ended"),
+                        "last": list(self._titles.get(r["id"], ()))[-2:]})
+        return out
