@@ -512,3 +512,22 @@ async def test_quick_helper_gets_string_files():
     hs = FakeHelpers()
     await tools.delegate_text(hs, {"kind": "quick", "title": "t", "task": "y" * 50, "files": "a.py, b.py"})
     assert hs.started[0][2]["files"] == ["a.py", "b.py"]
+
+
+@aio
+async def test_helper_tick_task_starts_and_stops(tmp_path):
+    from navigator.conductor.helpers import Helpers
+    eng, ap, bs, act = mkeng(tmp_path, "- [ ] x\n")
+    eng.helpers = Helpers(tmp_path / "h.json", runner=None, on_event=lambda *a: None, on_finish=lambda r: None)
+    ticks = []
+    eng.helpers.tick = lambda: ticks.append(1)
+    eng.helper_tick_s = 0.01
+    await eng.start()
+    await _drain(30)
+    assert ticks
+    await eng.stop()
+    assert eng._tick_task is None or eng._tick_task.done()
+    await asyncio.sleep(0.05)
+    n = len(ticks)
+    await asyncio.sleep(0.05)
+    assert len(ticks) == n

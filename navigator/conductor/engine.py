@@ -25,6 +25,7 @@ TERMINAL_WAIT = "waiting for the terminal session to end"
 TURN_TIMEOUT_S = 45 * 60  # a stuck turn (tool waiting on input, network stall) must not freeze every window
 HELPER_ITEMS_TTL_S = 600  # a finished helper's steps stay on the screens this long
 BUILD_POLL_S = 60
+TICK_S = 30.0  # helper watchdog period (same value as helpers.TICK_S; not imported: helpers imports the runner)
 INTERNAL_MAX_AGE_S = 600  # an internal report that waited this long goes before operator messages
 BATCH_MAX_ITEMS = 8
 BATCH_MAX_BYTES = 24 * 1024
@@ -49,6 +50,8 @@ class Engine:
         self.builds = builds  # builds filed with Navigator, watched to the end (None = not configured)
         self.build_poll_s = BUILD_POLL_S
         self._poll_task: asyncio.Task | None = None
+        self.helper_tick_s = TICK_S
+        self._tick_task: asyncio.Task | None = None
         self.cards_pending = cards_pending or (lambda: False)
         self.notify = notify  # tells the operator's phone about a new approval card (C3)
         self.reply = reply  # sends a Telegram-originated turn's outcome back to Telegram (C4)
@@ -150,6 +153,14 @@ class Engine:
                 _log.warning("conductor.build_poll_failed: %s", type(e).__name__)
             await asyncio.sleep(self.build_poll_s)
 
+    async def _tick_helpers(self) -> None:
+        while True:
+            await asyncio.sleep(self.helper_tick_s)
+            try:
+                self.helpers.tick()
+            except Exception as e:  # the watchdog must outlive any one pass
+                _log.warning("conductor.helper_tick_failed: %s", type(e).__name__)
+
     def _close_activity(self, msg_id: str, state: str) -> None:
         """A turn ended: no step of it may keep saying it runs (Stop, timeout, error, or a lost result)."""
         if msg_id != self._activity_msg:
@@ -176,6 +187,8 @@ class Engine:
                 self.submit("[helpers lost on restart] " + ", ".join(_lost(r) for r in lost),
                             "helper", internal=True)
         self._task = asyncio.create_task(self._worker())
+        if self.helpers is not None:
+            self._tick_task = asyncio.create_task(self._tick_helpers())
         if self.builds is not None:  # Navigator owns open builds: re-polled on restart, never marked lost
             self.builds.loop = asyncio.get_running_loop()
             if self.builds.on_finish is None:
@@ -183,6 +196,13 @@ class Engine:
             self._poll_task = asyncio.create_task(self._poll_builds())
 
     async def stop(self) -> None:
+        if self._tick_task:
+            self._tick_task.cancel()
+            try:
+                await self._tick_task
+            except asyncio.CancelledError:
+                pass
+            self._tick_task = None
         if self._poll_task:
             self._poll_task.cancel()
             try:

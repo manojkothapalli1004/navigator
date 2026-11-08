@@ -230,7 +230,7 @@ async def test_snapshot_lists_running_first_with_last_titles(tmp_path):
         await gate.wait()
         return "ok"
     events = []
-    hs = _helpers(tmp_path, run, events=events, clock=lambda: clock["t"], max_running=1)
+    hs = _helpers(tmp_path, run, events=events, clock=lambda: clock["t"], mono=lambda: clock["t"], max_running=1)
     a = hs.start("slow", TASK); b = hs.start("waiting", TASK)
     clock["t"] = 107.0
     await _settle(2)
@@ -572,6 +572,169 @@ async def test_only_one_long_helper_at_a_time(tmp_path):
     assert "only one long helper" in r
     X = hs.start("X", TASK, exact={"k": 1}, timeout_s=900)
     assert next(x for x in hs._records if x["id"] == X["id"])["timeout_s"] is None
+
+
+# ---- queue / watchdog fixes (2026-11-08) ----
+
+def _rec(hs, r):
+    return next(x for x in hs._records if x["id"] == r["id"])
+
+
+def _snap(hs, r):
+    return next(x for x in hs.snapshot() if x["id"] == r["id"])
+
+
+@aio
+async def test_snapshot_age_counts_from_launch_not_queue(tmp_path):
+    now = [1000.0]
+    gate = asyncio.Event()
+    hs = _helpers(tmp_path, Recorder(gate=gate), clock=lambda: now[0])
+    hs.start("A", TASK, timeout_s=900)
+    B = hs.start("B", TASK, timeout_s=900)
+    assert _rec(hs, B)["state"] == "queued"
+    now[0] += 1000
+    await _settle(3)  # A's task must start with the old runner
+    hs.runner = Recorder(gate=asyncio.Event())  # B's own run waits on a fresh gate
+    gate.set(); await _settle(10)
+    assert _rec(hs, B)["state"] == "running"
+    s = _snap(hs, B)
+    assert s["age"] < 5 and abs(s["queued_s"] - 1000) < 5
+    hs.shutdown(); await _settle(5)
+
+
+@aio
+async def test_helpers_text_shows_queue_wait(tmp_path):
+    now = [1000.0]
+    gate = asyncio.Event()
+    hs = _helpers(tmp_path, Recorder(gate=gate), clock=lambda: now[0])
+    hs.start("A", TASK, timeout_s=900)
+    B = hs.start("B", TASK, timeout_s=900)
+    now[0] += 1000
+    txt = await tools.helpers_text(hs)
+    assert f"{B['id']} queued 1000s" in txt
+    await _settle(3)  # A's task must start with the old runner
+    hs.runner = Recorder(gate=asyncio.Event())
+    gate.set(); await _settle(10)
+    txt = await tools.helpers_text(hs)
+    assert f"{B['id']} running 0s (queued 1000s)" in txt
+    hs.shutdown(); await _settle(5)
+
+
+@aio
+async def test_end_save_failure_still_starts_queue(tmp_path):
+    gate = asyncio.Event()
+    finished = []
+    hs = _helpers(tmp_path, Recorder(gate=gate), finished=finished)
+    A = hs.start("A", TASK, timeout_s=900)
+    B = hs.start("B", TASK, timeout_s=900)
+    orig, calls = hs._save, []
+
+    def flaky():
+        calls.append(1)
+        if len(calls) == 1:
+            raise OSError("disk full")
+        orig()
+    hs._save = flaky
+    await _settle(3)  # A's task must start with the old runner
+    hs.runner = Recorder(gate=asyncio.Event())
+    gate.set(); await _settle(10)
+    assert [f["id"] for f in finished][:1] == [A["id"]]
+    assert _rec(hs, B)["state"] == "running"
+    hs.shutdown(); await _settle(5)
+
+
+@aio
+async def test_timeout_fires_even_if_runner_swallows_cancel(tmp_path, monkeypatch):
+    monkeypatch.setattr(H, "CANCEL_GRACE_S", 0.05, raising=False)
+    monkeypatch.setattr(H, "HELPER_MIN_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(H, "LONG_S", 0.01)
+
+    async def stubborn(task, helper_id, emit, exact=None):
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            await asyncio.sleep(60)
+    hs = _helpers(tmp_path, stubborn)
+    A = hs.start("A", TASK, timeout_s=0.05)
+    B = hs.start("B", TASK, timeout_s=0.05)
+    assert _rec(hs, B)["state"] == "queued"
+    try:
+        for _ in range(100):
+            await asyncio.sleep(0.01)
+            if _rec(hs, A)["state"] == "failed":
+                break
+        assert _rec(hs, A)["state"] == "failed" and "timed out" in _rec(hs, A)["error"]
+        assert _rec(hs, B).get("launched")
+    finally:
+        for t in asyncio.all_tasks():
+            if t is not asyncio.current_task():
+                t.cancel()
+        await asyncio.sleep(0.05)
+
+
+@aio
+async def test_queued_helper_expires(tmp_path):
+    now = [1000.0]
+    finished = []
+    hs = _helpers(tmp_path, Recorder(gate=asyncio.Event()), finished=finished, clock=lambda: now[0])
+    A = hs.start("A", TASK, timeout_s=900)
+    B = hs.start("B", TASK, timeout_s=900)
+    now[0] += H.QUEUE_MAX_S + 1
+    hs.expire_queued()
+    r = _rec(hs, B)
+    assert r["state"] == "failed" and "in the queue" in r["error"] and "waited" in r["error"]
+    assert [f["id"] for f in finished] == [B["id"]]
+    assert _rec(hs, A)["state"] == "running"
+    hs.shutdown(); await _settle(5)
+
+
+@aio
+async def test_no_stale_long_count_after_end(tmp_path):
+    gate = asyncio.Event()
+    hs = _helpers(tmp_path, Recorder(gate=gate))
+    hs.start("A", TASK, timeout_s=900)
+    B = hs.start("B", TASK, timeout_s=900)
+    await _settle(3)  # A's task must start with the old runner
+    hs.runner = Recorder(gate=asyncio.Event())
+    gate.set(); await _settle(10)
+    assert hs._running_long() == 1 and _rec(hs, B)["state"] == "running"
+    hs.shutdown(); await _settle(5)
+
+
+@aio
+async def test_tick_uses_monotonic_for_run_not_wall(tmp_path):
+    now, m = [1000.0], [50.0]
+    hs = _helpers(tmp_path, Recorder(gate=asyncio.Event()), clock=lambda: now[0], mono=lambda: m[0])
+    A = hs.start("A", TASK, timeout_s=900)
+    now[0] += 36000  # the Mac slept
+    hs.tick()
+    assert _rec(hs, A)["state"] == "running" and _snap(hs, A)["age"] < 5
+    m[0] += 900 + H.CANCEL_GRACE_S + H.TICK_S + 1
+    hs.tick()
+    r = _rec(hs, A)
+    assert r["state"] == "failed" and "timed out" in r["error"]
+    await _settle(5)
+
+
+@aio
+async def test_end_is_idempotent(tmp_path):
+    finished = []
+    hs = _helpers(tmp_path, Recorder(gate=asyncio.Event()), finished=finished)
+    A = hs.start("A", TASK)
+    r = _rec(hs, A)
+    hs._end(r, "failed", error="x")
+    hs._end(r, "cancelled")
+    assert len(finished) == 1 and r["state"] == "failed"
+    hs.shutdown(); await _settle(5)
+
+
+@aio
+async def test_shutdown_cancels_inner_runner_task(tmp_path):
+    hs = _helpers(tmp_path, Recorder(gate=asyncio.Event()))
+    hs.start("A", TASK)
+    await _settle(3)
+    hs.shutdown(); await _settle(5)
+    assert [t for t in asyncio.all_tasks() if t is not asyncio.current_task()] == []
 
 
 def test_prompt_is_portable_on_macos():
