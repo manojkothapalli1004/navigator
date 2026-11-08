@@ -371,7 +371,11 @@ class Builds:
             if p.status == ProposalStatus.proposed and not rec.get("tier1"):
                 self._notify_needs(rec)  # repair: a restart or a failed card request left it uncarded
             if time.time() - rec["filed"] > BUILD_STALE_S:
-                once(f"{pid}:stale", f"build {pid} is still waiting for approval: {title}")
+                if p.status == ProposalStatus.approved:
+                    once(f"{pid}:stale", f"build {pid} is approved but has no run yet (Navigator may be in "
+                         f"dry-run, which does not build until mode is execute): {title}")
+                else:
+                    once(f"{pid}:stale", f"build {pid} is still waiting for approval: {title}")
             return
         if run.status == RunStatus.completed:
             rec["state"], rec["ended"] = "done", time.time()
