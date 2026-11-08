@@ -25,6 +25,7 @@ from claude_agent_sdk import (
     ToolResultBlock, ToolUseBlock, UserMessage,
 )
 
+from navigator import credits
 from navigator.conductor import activity, gate
 from navigator.conductor.cards import fingerprint
 from navigator.ids import new_id
@@ -120,7 +121,7 @@ def _only(exact: dict):
 
 
 def helper_options(hook, exact: dict | None = None, helper_id: str | None = None,
-                   pid_root: Path | None = None) -> ClaudeAgentOptions:
+                   pid_root: Path | None = None, extra_env: dict | None = None) -> ClaudeAgentOptions:
     from navigator.conductor import runner  # runner imports engine; a module-level import would cycle
     # Kill switch CONDUCTOR_HELPER_ORC, read at call time so a live engine follows a change without a
     # restart: unset or any value other than the exact string "0" = on; "0" = today's helper, byte for
@@ -136,6 +137,7 @@ def helper_options(hook, exact: dict | None = None, helper_id: str | None = None
         d.mkdir(parents=True, mode=0o700, exist_ok=True)
         os.chmod(d, 0o700)
         env["NAV_HELPER_PIDDIR"] = str(d)
+    env = {**env, **(extra_env or {})}  # the credits key (if any) rides along; never logged or repr'd
     # never `resume`: a helper must not pull the shared conversation into its own session
     return ClaudeAgentOptions(
         model=HELPER_MODEL, cwd=exact["cwd"] if exact else runner.CWD,
@@ -270,30 +272,90 @@ async def sdk_helper(task: str, helper_id: str, emit, *, hook, exact: dict | Non
     closing report), so that is what survives the result cap. `hook` is the card hook the main turn
     uses, so a gated action here raises a card exactly as before; `exact` (an approved card) narrows
     the session to that one call."""
+    rt = credits.route()
+    retried = False
+    while True:
+        try:
+            out = await _attempt(task, helper_id, emit, hook, exact, pid_root, rt)
+        except _Limited as lim:
+            if retried or lim.started:
+                raise RuntimeError(
+                    "stopped: the subscription limit was reached"
+                    + (" after work had begun, so it was not retried" if lim.started else " again")) from None
+            retried = True
+            rt = credits.on_limit(lim.limit)
+            if rt is None:
+                raise RuntimeError("stopped: the subscription limit was reached and API credits "
+                                   "are not available") from None
+            continue
+        return credits.redact(out)
+
+
+class _Limited(Exception):
+    def __init__(self, limit, started: bool):
+        super().__init__("limit")
+        self.limit, self.started = limit, started
+
+
+async def _attempt(task, helper_id, emit, hook, exact, pid_root, rt) -> str:
+    """One session. Raises _Limited on an account-wide limit (started = something ran), else
+    RuntimeError with redacted text. It holds one reservation: recorded on the ResultMessage,
+    released otherwise. Never formats the options (their env may hold the key)."""
     parts: list[str] = []
-    async with ClaudeSDKClient(options=helper_options(hook, exact, helper_id, pid_root)) as client:
-        await client.query(task)
-        async for m in client.receive_response():
-            if isinstance(m, StreamEvent):
-                ev = m.event
-                if ev.get("type") == "content_block_start" and (ev.get("content_block") or {}).get("type") == "text":
-                    parts = []
-                elif ev.get("type") == "content_block_delta" and (ev.get("delta") or {}).get("type") == "text_delta":
-                    parts.append(ev["delta"]["text"])
-            elif isinstance(m, AssistantMessage):
-                for b in m.content:
-                    if isinstance(b, ToolUseBlock):
-                        emit({"type": "activity", "id": b.id, "tool": b.name,
-                              "title": activity.describe(b.name, b.input), "state": "running",
-                              "parent": m.parent_tool_use_id, "helper": activity.is_helper(b.name)})
-            elif isinstance(m, UserMessage) and isinstance(m.content, list):
-                for b in m.content:
-                    if isinstance(b, ToolResultBlock):
-                        emit({"type": "activity", "id": b.tool_use_id,
-                              "state": "failed" if b.is_error else "done"})
-            elif isinstance(m, ResultMessage) and m.is_error:
-                raise RuntimeError(m.result or m.subtype or "helper failed")
+    started = False  # any content block or text delta; for an approved card only a tool use counts
+    limit = None
+    done = False
+    try:
+        try:
+            async with ClaudeSDKClient(options=helper_options(
+                    hook, exact, helper_id, pid_root, rt.env or None)) as client:
+                await client.query(task)
+                async for m in client.receive_response():
+                    if isinstance(m, StreamEvent):
+                        ev = m.event
+                        if ev.get("type") == "content_block_start" and (ev.get("content_block") or {}).get("type") == "text":
+                            parts = []
+                        elif ev.get("type") == "content_block_delta" and (ev.get("delta") or {}).get("type") == "text_delta":
+                            parts.append(ev["delta"]["text"])
+                            started = started or exact is None
+                    elif isinstance(m, AssistantMessage):
+                        started = started or exact is None or any(isinstance(b, ToolUseBlock) for b in m.content)
+                        for b in m.content:
+                            if isinstance(b, ToolUseBlock):
+                                emit({"type": "activity", "id": b.id, "tool": b.name,
+                                      "title": activity.describe(b.name, b.input), "state": "running",
+                                      "parent": m.parent_tool_use_id, "helper": activity.is_helper(b.name)})
+                    elif isinstance(m, UserMessage) and isinstance(m.content, list):
+                        for b in m.content:
+                            if isinstance(b, ToolResultBlock):
+                                emit({"type": "activity", "id": b.tool_use_id,
+                                      "state": "failed" if b.is_error else "done"})
+                    elif isinstance(m, ResultMessage):
+                        done = True
+                        credits.record(getattr(m, "total_cost_usd", None), rt.reservation,
+                                       model=HELPER_MODEL, usage=getattr(m, "usage", None))
+                        if m.is_error:
+                            limit = limit or credits.classify(m.result)
+                            if limit is None:
+                                raise _Failed(credits.redact(m.result or m.subtype or "helper failed"))
+                    elif type(m).__name__ == "RateLimitEvent":
+                        limit = limit or credits.classify(None, event=m)
+        except _Failed as e:
+            raise RuntimeError(str(e)) from None
+        except Exception as e:  # noqa: BLE001
+            limit = limit or credits.classify(str(e))
+            if limit is None:
+                raise RuntimeError(credits.redact(f"{type(e).__name__}: {e}")) from None
+        if limit is not None:
+            raise _Limited(limit, started)
+    finally:
+        if not done:
+            credits.release(rt.reservation)
     return "".join(parts)
+
+
+class _Failed(Exception):
+    pass
 
 
 class Helpers:

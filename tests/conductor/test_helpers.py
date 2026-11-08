@@ -968,3 +968,175 @@ def test_prompt_pattern_really_times_out():
     t = time.monotonic()
     r = subprocess.run(["/usr/bin/perl", "-e", "alarm shift; exec @ARGV", "1", "sleep", "30"], timeout=10)
     assert time.monotonic() - t < 5 and r.returncode != 0
+
+
+# ---- credits fallback (2026-11-08): route before launch, one retry on a limit only if nothing ran ----
+
+from navigator import credits as C  # noqa: E402
+
+LIMIT_TEXT = "You've hit your limit · resets 3pm (America/Los_Angeles)"
+KEY = "sk-ant-SENTINELKEY123456"
+CARD_CMD = "make deploy-site"
+
+
+class AttemptClient:
+    attempts: list = []
+    opts: list = []
+    n = 0
+
+    def __init__(self, options):
+        AttemptClient.opts.append(options)
+        self.i = AttemptClient.n
+        AttemptClient.n += 1
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+    async def query(self, prompt):
+        pass
+
+    async def receive_response(self):
+        for m in AttemptClient.attempts[self.i]:
+            if isinstance(m, Exception):
+                raise m
+            yield m
+
+
+class Fake:
+    def __init__(self, routes):
+        self.routes, self.calls = list(routes), []
+        self.released, self.recorded, self.limits = [], [], []
+
+    def install(self, monkeypatch, attempts):
+        AttemptClient.attempts, AttemptClient.opts, AttemptClient.n = attempts, [], 0
+        monkeypatch.setattr(H, "ClaudeSDKClient", AttemptClient)
+        monkeypatch.setattr(C, "route", lambda *a, **k: self.routes.pop(0) if self.routes else C.Route())
+        monkeypatch.setattr(C, "on_limit", lambda lim, *a, **k: (self.limits.append(lim), self.routes.pop(0) if self.routes else None)[1])
+        monkeypatch.setattr(C, "record", lambda cost, res, **k: self.recorded.append((cost, res)))
+        monkeypatch.setattr(C, "release", lambda res, *a, **k: self.released.append(res))
+        monkeypatch.setattr(C, "load_key", lambda: KEY)
+
+
+def _limit_result():
+    return _result(is_error=True, result=LIMIT_TEXT)
+
+
+def _asst(*blocks):
+    return AssistantMessage(content=list(blocks), model="m", parent_tool_use_id=None)
+
+
+def _creds_route(res="r1"):
+    return C.Route({"ANTHROPIC_API_KEY": KEY}, None, C.Reservation(res, 2.0, 0.0))
+
+
+def test_limit_before_anything_retries_once_with_credits_env(monkeypatch):
+    f = Fake([C.Route(), _creds_route()])
+    f.install(monkeypatch, [[_limit_result()], [_start(), _delta("fine"), _result()]])
+    assert asyncio.run(H.sdk_helper(TASK, "helper-1", lambda e: None, hook=_hook)) == "fine"
+    assert len(AttemptClient.opts) == 2 and len(f.limits) == 1
+    assert "ANTHROPIC_API_KEY" not in (AttemptClient.opts[0].env or {})
+    assert AttemptClient.opts[1].env["ANTHROPIC_API_KEY"] == KEY
+    assert [r.id for _, r in f.recorded if r] == ["r1"]
+
+
+def test_route_before_launch_uses_credits_env_first(monkeypatch):
+    f = Fake([_creds_route()])
+    f.install(monkeypatch, [[_start(), _delta("ok"), _result()]])
+    asyncio.run(H.sdk_helper(TASK, "helper-1", lambda e: None, hook=_hook))
+    assert len(AttemptClient.opts) == 1 and AttemptClient.opts[0].env["ANTHROPIC_API_KEY"] == KEY and not f.limits
+
+
+def test_limit_after_text_or_tool_is_not_retried(monkeypatch):
+    for first in ([_start(), _delta("partial")],
+                  [_asst(ToolUseBlock(id="t", name="Read", input={"file_path": "/a"}))]):
+        f = Fake([C.Route(), _creds_route()])
+        f.install(monkeypatch, [first + [_limit_result()], [_result()]])
+        with pytest.raises(RuntimeError) as ei:
+            asyncio.run(H.sdk_helper(TASK, "helper-1", lambda e: None, hook=_hook))
+        assert len(AttemptClient.opts) == 1 and not f.limits
+        assert "limit" in str(ei.value) and KEY not in str(ei.value)
+
+
+def test_limit_twice_ends_without_third_attempt(monkeypatch):
+    f = Fake([C.Route(), _creds_route()])
+    f.install(monkeypatch, [[_limit_result()], [_limit_result()], [_result()]])
+    with pytest.raises(RuntimeError):
+        asyncio.run(H.sdk_helper(TASK, "helper-1", lambda e: None, hook=_hook))
+    assert len(AttemptClient.opts) == 2 and len(f.limits) == 1
+
+
+def test_no_credits_route_ends_with_note(monkeypatch):
+    f = Fake([C.Route()])
+    f.install(monkeypatch, [[_limit_result()], [_result()]])
+    with pytest.raises(RuntimeError, match="limit"):
+        asyncio.run(H.sdk_helper(TASK, "helper-1", lambda e: None, hook=_hook))
+    assert len(AttemptClient.opts) == 1
+
+
+def test_rate_limit_event_alone_then_retry(monkeypatch):
+    from claude_agent_sdk import RateLimitEvent, RateLimitInfo
+    ev = RateLimitEvent(rate_limit_info=RateLimitInfo(status="rejected", resets_at=None, rate_limit_type="five_hour",
+                                                      utilization=1.0, overage_status=None, overage_resets_at=None,
+                                                      overage_disabled_reason=None, raw={}),
+                        uuid="u", session_id="s")
+    f = Fake([C.Route(), _creds_route()])
+    f.install(monkeypatch, [[ev, _result(is_error=True, result="x")], [_start(), _delta("go"), _result()]])
+    assert asyncio.run(H.sdk_helper(TASK, "helper-1", lambda e: None, hook=_hook)) == "go"
+    assert len(f.limits) == 1
+
+
+def test_exact_helper_retries_only_before_its_call(monkeypatch):
+    exact = {"tool": "Bash", "input": {"command": CARD_CMD}, "cwd": "/r"}
+    f = Fake([C.Route(), _creds_route()])
+    f.install(monkeypatch, [[_limit_result()], [_start(), _delta("done"), _result()]])
+    assert asyncio.run(H.sdk_helper(TASK, "helper-2", lambda e: None, hook=_hook, exact=exact)) == "done"
+    assert len(AttemptClient.opts) == 2 and AttemptClient.opts[1].tools == ["Bash"]
+    f = Fake([C.Route(), _creds_route()])
+    f.install(monkeypatch, [[_asst(ToolUseBlock(id="t", name="Bash", input={"command": CARD_CMD})),
+                             _limit_result()], [_result()]])
+    with pytest.raises(RuntimeError):
+        asyncio.run(H.sdk_helper(TASK, "helper-2", lambda e: None, hook=_hook, exact=exact))
+    assert len(AttemptClient.opts) == 1
+
+
+def test_reservation_released_on_crash_and_recorded_on_result(monkeypatch):
+    res = C.Reservation("r9", 2.0, 0.0)
+    f = Fake([C.Route({"ANTHROPIC_API_KEY": KEY}, None, res)])
+    f.install(monkeypatch, [[ValueError("boom " + KEY)]])
+    with pytest.raises(RuntimeError) as ei:
+        asyncio.run(H.sdk_helper(TASK, "helper-1", lambda e: None, hook=_hook))
+    assert KEY not in str(ei.value) and f.released == [res] and not f.recorded
+    f = Fake([C.Route({"ANTHROPIC_API_KEY": KEY}, None, res)])
+    f.install(monkeypatch, [[_start(), _delta("x"), _result()]])
+    asyncio.run(H.sdk_helper(TASK, "helper-1", lambda e: None, hook=_hook))
+    assert [r for _, r in f.recorded] == [res] and f.released in ([], [res])
+
+
+def test_results_and_error_results_are_redacted(monkeypatch):
+    f = Fake([C.Route()])
+    f.install(monkeypatch, [[_start(), _delta("key is " + KEY), _result()]])
+    out = asyncio.run(H.sdk_helper(TASK, "helper-1", lambda e: None, hook=_hook))
+    assert KEY not in out and "[redacted]" in out
+    f = Fake([C.Route()])
+    f.install(monkeypatch, [[_result(is_error=True, result="bad " + KEY)]])
+    with pytest.raises(RuntimeError) as ei:
+        asyncio.run(H.sdk_helper(TASK, "helper-1", lambda e: None, hook=_hook))
+    assert KEY not in str(ei.value)
+
+
+def test_options_equal_apart_from_env_and_piddir_kept(tmp_path, monkeypatch):
+    import dataclasses
+    monkeypatch.delenv("CONDUCTOR_HELPER_ORC", raising=False)
+    base = H.helper_options(_hook, None, "helper-Z", tmp_path)
+    withc = H.helper_options(_hook, None, "helper-Z", tmp_path, extra_env={"ANTHROPIC_API_KEY": KEY})
+    assert withc.env == {**base.env, "ANTHROPIC_API_KEY": KEY} and "NAV_HELPER_PIDDIR" in withc.env
+    names = [x.name for x in dataclasses.fields(base) if x.name != "env"]
+    assert [getattr(base, n) for n in names] == [getattr(withc, n) for n in names]
+    f = Fake([_creds_route()])
+    f.install(monkeypatch, [[_result()]])
+    asyncio.run(H.sdk_helper(TASK, "helper-Z", lambda e: None, hook=_hook, pid_root=tmp_path))
+    e = AttemptClient.opts[0].env
+    assert e["ANTHROPIC_API_KEY"] == KEY and e["NAV_HELPER_PIDDIR"].endswith("helper-Z")
