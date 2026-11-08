@@ -2,6 +2,7 @@
 import asyncio
 import functools
 import json
+import time
 
 import pytest
 from claude_agent_sdk import AssistantMessage, ResultMessage, StreamEvent, ToolUseBlock
@@ -769,13 +770,40 @@ def _piddir(tmp_path, *pids, name="job"):
     return d
 
 
+def test_reap_spares_older_same_uid_process(tmp_path):
+    old = _spawn()  # a recycled pid owned by the same user: started BEFORE the helper launched
+    time.sleep(3.2)
+    launched = time.time()
+    d = _piddir(tmp_path, old.pid)
+    assert H.reap(d, launched) == 0
+    assert _alive(old)
+    assert not d.exists()
+
+
+def test_reap_kills_process_started_after_launch(tmp_path):
+    launched = time.time()
+    time.sleep(1.1)
+    new = _spawn()
+    d = _piddir(tmp_path, new.pid)
+    assert H.reap(d, launched) == 1
+    assert new.wait(timeout=5) != 0
+
+
+def test_reap_skips_when_start_time_unreadable(tmp_path, monkeypatch):
+    p = _spawn()
+    d = _piddir(tmp_path, p.pid)
+    monkeypatch.setattr(H, "_start_time", lambda pid: None)
+    assert H.reap(d, time.time() - 5) == 0
+    assert _alive(p)
+
+
 def test_reap_kills_group_leader_and_removes_dir(tmp_path):
     import time
     p = _spawn(start_new_session=True)  # its own group leader, like `perl -e setpgrp`
     kid = _spawn(start_new_session=False)
     d = _piddir(tmp_path, p.pid)
     time.sleep(0.2)
-    assert H.reap(d) == 1
+    assert H.reap(d, time.time() - 5) == 1
     assert p.wait(timeout=5) != 0
     assert _alive(kid)  # not listed: untouched
     assert not d.exists()
@@ -784,7 +812,7 @@ def test_reap_kills_group_leader_and_removes_dir(tmp_path):
 def test_reap_kills_plain_pid(tmp_path):
     p = _spawn()  # same process group as the tests: only the pid may be signalled
     d = _piddir(tmp_path, p.pid)
-    assert H.reap(d) == 1
+    assert H.reap(d, time.time() - 5) == 1
     assert p.wait(timeout=5) != 0
     assert not d.exists()
 
@@ -794,7 +822,7 @@ def test_reap_skips_other_uid(tmp_path, monkeypatch):
     p = _spawn()
     d = _piddir(tmp_path, p.pid)
     monkeypatch.setattr(H, "_pid_info", lambda pid: (os.getuid() + 1, "S"))
-    assert H.reap(d) == 0
+    assert H.reap(d, time.time() - 5) == 0
     assert _alive(p)
 
 
@@ -804,7 +832,7 @@ def test_reap_skips_self_and_ancestors(tmp_path, monkeypatch):
     monkeypatch.setattr(H.os, "kill", lambda pid, sig: sent.append(pid))
     monkeypatch.setattr(H.os, "killpg", lambda pg, sig: sent.append(-pg))
     d = _piddir(tmp_path, os.getpid(), os.getppid(), 1, 0, -5, "junk")
-    assert H.reap(d) == 0
+    assert H.reap(d, time.time() - 5) == 0
     assert sent == []
 
 
@@ -812,9 +840,9 @@ def test_reap_stale_pid_is_fine(tmp_path):
     p = _spawn()
     p.kill(); p.wait()
     d = _piddir(tmp_path, p.pid)
-    assert H.reap(d) == 0
+    assert H.reap(d, time.time() - 5) == 0
     assert not d.exists()
-    assert H.reap(tmp_path / "never-made") == 0
+    assert H.reap(tmp_path / "never-made", time.time()) == 0
 
 
 @aio

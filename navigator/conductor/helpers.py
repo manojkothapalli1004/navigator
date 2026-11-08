@@ -191,9 +191,27 @@ def _protected() -> set[int]:
     return skip
 
 
-def _mine(pid: int) -> bool:
+START_SLACK_S = 2.0  # ps lstart has whole-second resolution and the clocks differ a little
+
+
+def _start_time(pid: int) -> float | None:
+    """Wall-clock start of a live pid (ps lstart, C locale), None when it cannot be read."""
+    try:
+        out = subprocess.run(["/bin/ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True,
+                             timeout=10, env={**os.environ, "LC_ALL": "C", "LANG": "C"}).stdout.split()
+        return time.mktime(time.strptime(" ".join(out), "%a %b %d %H:%M:%S %Y")) if out else None
+    except (OSError, ValueError, OverflowError, subprocess.SubprocessError):
+        return None
+
+
+def _mine(pid: int, launched: float) -> bool:
+    """Ours to signal: same uid, not a zombie, and started no earlier than the helper's launch (minus slack),
+    so a recycled pid of an older same-user process is never hit. An unreadable start time means no."""
     info = _pid_info(pid)
-    return info is not None and info[0] == os.getuid() and not info[1].startswith("Z")
+    if info is None or info[0] != os.getuid() or info[1].startswith("Z"):
+        return False
+    started = _start_time(pid)
+    return started is not None and started >= launched - START_SLACK_S
 
 
 def _signal(pid: int, sig: int, group: bool) -> None:
@@ -203,11 +221,12 @@ def _signal(pid: int, sig: int, group: bool) -> None:
         pass
 
 
-def reap(pid_dir: Path) -> int:
+def reap(pid_dir: Path, launched: float) -> int:
     """Kill what a cancelled/timed-out/failed helper left running and recorded in its pid dir (cooperative:
     the helper writes `<name>.pid` files, see HELPER_PROMPT). Same uid only; the process group when the pid
     leads one (and it is not ours), else the pid alone. SIGTERM, TERM_WAIT_S, SIGKILL, then the dir is
-    removed. Never the conductor or its ancestors. Returns how many entries were signalled."""
+    removed. Only processes started at or after `launched` (the helper's wall launch time, 2 s slack). Never
+    the conductor or its ancestors. Returns how many entries were signalled."""
     pid_dir = Path(pid_dir)
     pids: list[int] = []
     try:
@@ -224,7 +243,7 @@ def reap(pid_dir: Path) -> int:
     own_pg = os.getpgrp()
     targets: dict[int, bool] = {}  # pid -> signal its whole group
     for pid in pids:
-        if pid in skip or not _mine(pid):
+        if pid in skip or not _mine(pid, launched):
             continue
         try:
             leader = os.getpgid(pid) == pid and pid != own_pg
@@ -235,10 +254,10 @@ def reap(pid_dir: Path) -> int:
         _signal(pid, signal.SIGTERM, grp)
     if targets:
         end = time.monotonic() + TERM_WAIT_S
-        while time.monotonic() < end and any(_mine(p) for p in targets):
+        while time.monotonic() < end and any(_mine(p, launched) for p in targets):
             time.sleep(0.1)
         for pid, grp in targets.items():
-            if _mine(pid):  # re-checked now: a recycled pid of another user is never hit
+            if _mine(pid, launched):  # re-checked now: a recycled pid is never hit
                 _signal(pid, signal.SIGKILL, grp)
         _log.warning("conductor.helper_reaped: %d", len(targets))
     shutil.rmtree(pid_dir, ignore_errors=True)
@@ -417,7 +436,8 @@ class Helpers:
         return self.path.parent / "helper-pids" / helper_id
 
     def _reap(self, helper_id: str) -> int:
-        return reap(self._piddir(helper_id))
+        rec = self.get(helper_id) or {}
+        return reap(self._piddir(helper_id), rec.get("launched") or self.clock())
 
     @staticmethod
     def _inner_done(t: asyncio.Task) -> None:
