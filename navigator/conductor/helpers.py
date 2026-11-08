@@ -53,6 +53,11 @@ HELPER_PROMPT = (
     "with ONE Bash call that loops `until [ -f MARKER ]; do sleep 15; done` for at most 9 minutes, and "
     "repeat that single wait call; never poll with many separate model turns. "
     "Keep the closing report under 10000 characters.")
+# appended for a normal helper when CONDUCTOR_HELPER_ORC is on (never for an approved-card helper)
+HELPER_ORC_PROMPT = (
+    "Read-only ORC project-memory tools are available (mcp__orchestrator__get_canonical_memory with "
+    "level='auto' or since=<ISO date>; mcp__orchestrator__search). Use them only when the task needs "
+    "project state; they cost tokens. If they are absent, continue without them. Never call ORC write tools.")
 
 
 def clamp_timeout(v) -> float | None:
@@ -105,15 +110,29 @@ def _only(exact: dict):
 
 def helper_options(hook, exact: dict | None = None) -> ClaudeAgentOptions:
     from navigator.conductor import runner  # runner imports engine; a module-level import would cycle
+    # Kill switch CONDUCTOR_HELPER_ORC, read at call time so a live engine follows a change without a
+    # restart: unset or any value other than the exact string "0" = on; "0" = today's helper, byte for
+    # byte (no MCP server, HELPER_TOOLS only, nothing disallowed, HELPER_PROMPT alone). An approved-card
+    # helper never gets ORC: its one approved call is all it may make.
+    orc = exact is None and os.environ.get("CONDUCTOR_HELPER_ORC", "1") != "0"
+    tools = [exact["tool"]] if exact else list(HELPER_TOOLS)
+    if orc:  # explicit, as the main turn lists them: --tools is the base set, and these names are in it
+        tools += [t for t in runner.MAIN_TOOLS if t.startswith("mcp__orchestrator__")]
     # never `resume`: a helper must not pull the shared conversation into its own session
     return ClaudeAgentOptions(
         model=HELPER_MODEL, cwd=exact["cwd"] if exact else runner.CWD,
         setting_sources=["user", "project", "local"], settings=runner.HELPER_LEAN_SETTINGS,
-        system_prompt={"type": "preset", "preset": "claude_code", "append": HELPER_PROMPT},
-        permission_mode="auto", tools=[exact["tool"]] if exact else list(HELPER_TOOLS),
-        # no MCP servers at all: `tools` does not govern MCP tools and the gate knows nothing about
-        # them, so an operator-settings server (alpaca's order tools) would be one call away
-        strict_mcp_config=True, mcp_servers={},
+        system_prompt={"type": "preset", "preset": "claude_code",
+                       "append": HELPER_PROMPT + " " + HELPER_ORC_PROMPT if orc else HELPER_PROMPT},
+        permission_mode="auto", tools=tools,
+        # strict_mcp_config: no server from the operator's settings files loads (`tools` does not govern
+        # MCP tools and the gate knows nothing about them, so alpaca's order tools would be one call
+        # away). The ONLY server a normal helper gets is the orchestrator's, named here exactly as the
+        # main turn names it, so a helper can read canonical project memory instead of re-exploring;
+        # its write tools are blocked by name through disallowed_tools, the one option that does govern
+        # MCP tools. Never the conductor server (a helper must not delegate). A card helper gets none.
+        strict_mcp_config=True, mcp_servers={"orchestrator": runner.ORC_MCP} if orc else {},
+        disallowed_tools=list(runner.ORC_WRITE_TOOLS) if orc else [],
         max_turns=HELPER_MAX_TURNS, include_partial_messages=True,
         # the fence runs first: a call it refuses must not consume an approved card
         hooks={"PreToolUse": [HookMatcher(hooks=[_only(exact) if exact else scratch_only_hook, hook])]},

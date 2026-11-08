@@ -330,6 +330,7 @@ async def _hook(input_data, tool_use_id, context):
 
 
 def test_helper_result_is_last_text_block(monkeypatch):
+    monkeypatch.delenv("CONDUCTOR_HELPER_ORC", raising=False)
     monkeypatch.setattr(H, "ClaudeSDKClient", FakeClient)
     FakeClient.prompts = []
     FakeClient.messages = [_start(), _delta("thin"), _delta("king…"),
@@ -343,10 +344,11 @@ def test_helper_result_is_last_text_block(monkeypatch):
                        "parent": None, "helper": False}]
     o = FakeClient.seen_options
     assert o.resume is None and o.continue_conversation is False
-    assert o.model == H.HELPER_MODEL and o.tools == H.HELPER_TOOLS and o.max_turns == H.HELPER_MAX_TURNS
+    assert o.model == H.HELPER_MODEL and set(H.HELPER_TOOLS) <= set(o.tools) and o.max_turns == H.HELPER_MAX_TURNS
     assert "Agent" not in o.tools and "Task" not in o.tools
     assert str(o.cwd) == "/Users/Manoj/calwbot" and o.permission_mode == "auto" and o.can_use_tool is not None
-    assert o.system_prompt == {"type": "preset", "preset": "claude_code", "append": H.HELPER_PROMPT}
+    assert o.system_prompt["type"] == "preset" and o.system_prompt["preset"] == "claude_code"
+    assert o.system_prompt["append"].startswith(H.HELPER_PROMPT)
     assert o.hooks["PreToolUse"][0].hooks == [H.scratch_only_hook, _hook]  # the fence runs first
 
 
@@ -389,13 +391,70 @@ async def test_cancel_helper_tool_text(tmp_path):
     assert await tools.cancel_text(hs, {"id": rec["id"]}) == f"not running: {rec['id']}"
 
 
-def test_helper_session_loads_no_mcp_servers():
-    """A helper's `tools` list says nothing about MCP tools, so the session must not load the
-    operator's settings servers (alpaca's order tools would need no card)."""
+# ---- helpers read ORC project memory (2026-11-07) ----
+
+def _orc_read_tools():
+    from navigator.conductor import runner
+    return [t for t in runner.MAIN_TOOLS if t.startswith("mcp__orchestrator__")]
+
+
+def test_helper_session_loads_only_orc_read(monkeypatch):
+    """A normal helper loads exactly one MCP server, the orchestrator's (named here, as the main turn
+    names it: nothing from the operator's settings files, so alpaca's order tools stay out), with the
+    ORC write tools disallowed by name — `tools` does not govern MCP tools — and the ORC read tools
+    in `tools` beside the helper's own. Never the conductor server."""
+    monkeypatch.delenv("CONDUCTOR_HELPER_ORC", raising=False)
+    from navigator.conductor import runner
+    from navigator.conductor.helpers import helper_options
+    opts = helper_options(hook=lambda *a: {})
+    assert opts.strict_mcp_config is True and set(opts.mcp_servers) == {"orchestrator"}
+    assert opts.mcp_servers["orchestrator"] == runner.ORC_MCP
+    assert "conductor" not in opts.mcp_servers and "alpaca" not in opts.mcp_servers
+    assert opts.disallowed_tools == list(runner.ORC_WRITE_TOOLS)
+    assert all(t in opts.tools for t in H.HELPER_TOOLS)
+    reads = _orc_read_tools()
+    assert reads and all(t in opts.tools for t in reads)
+    assert "mcp__orchestrator__get_canonical_memory" in opts.tools
+    assert not any(t in opts.tools for t in runner.ORC_WRITE_TOOLS)
+    assert not any(t.startswith("mcp__conductor__") or t.startswith("mcp__alpaca") for t in opts.tools)
+    assert opts.resume is None
+
+
+def test_card_helper_still_has_no_mcp(monkeypatch):
+    """GUARD (passes on main too): an approved-card helper is unchanged by the ORC read access: no
+    MCP server at all, only the one approved tool, today's prompt byte for byte."""
+    monkeypatch.delenv("CONDUCTOR_HELPER_ORC", raising=False)
+    from navigator.conductor.helpers import helper_options
+    exact = {"tool": "Bash", "input": {"command": "git push origin main"}, "cwd": "/r"}
+    opts = helper_options(lambda *a: {}, exact=exact)
+    assert opts.strict_mcp_config is True and opts.mcp_servers == {}
+    assert opts.tools == ["Bash"] and opts.disallowed_tools == []
+    assert opts.system_prompt == {"type": "preset", "preset": "claude_code", "append": H.HELPER_PROMPT}
+    assert "get_canonical_memory" not in opts.system_prompt["append"]
+
+
+def test_helper_orc_switch_off_restores_old_options(monkeypatch):
+    """GUARD (passes on main too): CONDUCTOR_HELPER_ORC="0" is today's helper, byte for byte: no MCP
+    server, the eight helper tools only, nothing disallowed, today's prompt."""
+    monkeypatch.setenv("CONDUCTOR_HELPER_ORC", "0")
     from navigator.conductor.helpers import helper_options
     opts = helper_options(hook=lambda *a: {})
     assert opts.strict_mcp_config is True and opts.mcp_servers == {}
-    assert opts.resume is None
+    assert opts.tools == list(H.HELPER_TOOLS)
+    assert opts.disallowed_tools == []  # the SDK default: today passes none
+    assert not any(t.startswith("mcp__orchestrator__") for t in opts.disallowed_tools)
+    assert opts.system_prompt == {"type": "preset", "preset": "claude_code", "append": H.HELPER_PROMPT}
+    assert "get_canonical_memory" not in opts.system_prompt["append"]
+
+
+def test_helper_prompt_mentions_orc_read_only(monkeypatch):
+    monkeypatch.delenv("CONDUCTOR_HELPER_ORC", raising=False)
+    from navigator.conductor.helpers import helper_options
+    append = helper_options(hook=lambda *a: {}).system_prompt["append"]
+    assert append.startswith(H.HELPER_PROMPT)
+    assert "get_canonical_memory" in append and "mcp__orchestrator__search" in append
+    assert "Never call ORC write" in append
+    assert "If they are absent, continue without them." in append
 
 
 def test_helper_session_loads_no_plugin_injection():
