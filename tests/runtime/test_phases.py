@@ -332,7 +332,7 @@ def test_previous_failure_test_files_are_given_to_the_builder_in_full(tmp_path):
                                    "previous_attempt_failure": "verification failed: "
                                    "FAILED tests/test_pings.py::test_ack - assert 422 == 200"})
     files = drv.requests[Role.builder].context["files"]
-    assert files["backend/tests/test_pings.py"].startswith("def test_ack")
+    assert "def test_ack(): pass\n" in files["backend/tests/test_pings.py"]  # now a large-file digest (head excerpt)
 
 
 # live 2026-10-12: a run added 11 tests that bail out when a guessed API is missing;

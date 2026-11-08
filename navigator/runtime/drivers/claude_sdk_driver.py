@@ -1,6 +1,9 @@
+import hashlib
 import inspect
 import json
+import os
 import shlex
+import stat
 from pathlib import Path
 from typing import Callable
 from navigator.config import Settings
@@ -8,11 +11,75 @@ from navigator.runtime.drivers.base import ROLE_PERMISSIONS, DriverRequest, Driv
 from navigator.runtime.drivers.builder_tools import QUALIFIED_TOOL, make_run_tests_server
 # N9b: phases._read_affected cuts context.files at this many chars with no marker; an
 # edit resolved against such a base would silently drop the rest of the file
-from navigator.runtime.phases import _MAX_FILE_CHARS
+from navigator.runtime.phases import _MAX_FILE_CHARS, _is_large, _large_digest, _is_test_file
 from navigator.contracts.enums import Role
 from navigator.safety.budget_guard import BudgetGuard
 from navigator.safety.command_runner import git_flag_allowlist_text
 from navigator.safety.errors import DriverParseError
+
+class _EditApplyError(DriverParseError):
+    """A file_edits entry that could not be applied (absent/duplicate old, unloadable file).
+    rel, index and old ride as attributes for the repair turn, never in the message."""
+    def __init__(self, message: str, rel: str | None = None, index: int | None = None,
+                 old: str | None = None):
+        super().__init__(message)
+        self.rel, self.index, self.old = rel, index, old
+
+
+class _UnsafeRead(Exception):
+    """_safe_read refused a path; the message carries no file text."""
+
+
+def _safe_read(wt, rel) -> tuple[str, bytes, tuple[int, int]]:
+    """(text, raw bytes, (st_dev, st_ino)) of an existing regular, single-link, LF-only UTF-8
+    file at wt/rel. No symlink in any component, nothing outside the worktree, no .git component,
+    every component's case must match the directory listing. Raises _UnsafeRead otherwise."""
+    if not isinstance(rel, str) or not rel or "\x00" in rel or Path(rel).is_absolute():
+        raise _UnsafeRead("bad path")
+    parts = Path(rel).parts
+    if not parts or ".." in parts or ".git" in parts:
+        raise _UnsafeRead("path not allowed")
+    try:
+        wt_real = os.path.realpath(str(wt))
+        target = os.path.join(wt_real, *parts)
+        if os.path.realpath(target) != target:
+            raise _UnsafeRead("symlink or non-canonical path")
+        cur = wt_real
+        for part in parts:
+            if part not in os.listdir(cur):
+                raise _UnsafeRead("path case mismatch")
+            cur = os.path.join(cur, part)
+        st = os.lstat(target)
+        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+            raise _UnsafeRead("not a plain regular file")
+        with open(target, "rb") as fh:
+            raw = fh.read()
+        text = raw.decode("utf-8")
+    except (OSError, ValueError) as e:     # UnicodeDecodeError is a ValueError
+        raise _UnsafeRead("unreadable") from e
+    if "\r" in text:
+        raise _UnsafeRead("CRLF line endings")
+    return text, raw, (st.st_dev, st.st_ino)
+
+
+def _load_unshown(wt, rel, affected) -> tuple[str, tuple[int, int]]:
+    """Disk text of an existing in-scope file the builder was not shown (spec Part C): in
+    affected_files or a test file by phases._is_test_file, <= _MAX_FILE_CHARS, plus every
+    _safe_read rule. Returns (text, inode id); raises _UnsafeRead."""
+    if not isinstance(rel, str) or not rel:
+        raise _UnsafeRead("bad path")
+    if Path(rel).as_posix() not in (affected or ()) and not _is_test_file(rel):
+        raise _UnsafeRead("not in scope")
+    text, _raw, ident = _safe_read(wt, rel)
+    if len(text) > _MAX_FILE_CHARS:
+        raise _UnsafeRead("file too large to edit unshown")
+    return text, ident
+
+
+def _norm_large(large) -> dict:
+    return ({Path(k).as_posix(): v for k, v in large.items() if isinstance(k, str) and isinstance(v, dict)}
+            if isinstance(large, dict) else {})
+
 
 _PROPOSAL_KEYS = {"title": str, "rationale": str, "intended_changes": str, "affected_files": list}
 
@@ -38,6 +105,12 @@ _ROLE_OUTPUT_SPEC = {
                    'when a full rewrite is genuinely shorter than the edits; a file_writes content '
                    'replaces the whole file \u2014 never elide unchanged code. Never list one path in '
                    'both file_edits and file_writes. '
+                   'A file listed in context.large_files is shown as an outline plus excerpts; use '
+                   'file_edits only, with old copied verbatim from an excerpt (or from Read if you have '
+                   'a Read tool: offset/limit) and unique in the whole file; if unsure, include more '
+                   'surrounding lines. '
+                   'You may also edit an existing file not in context.files if it is a test file or is '
+                   'listed in affected_files; old must occur exactly once in the real file. '
                    'Only write paths listed in context.files, plus test files; when context.editable_dir '
                    'is set you may instead edit or write any file under that directory (find it with '
                    'your tools) and nothing outside it. '
@@ -94,7 +167,7 @@ def _shape(value) -> str:
     return type(value).__name__
 
 
-def _with_editable(files, raw: str, wt: Path, editable_dir: str) -> dict:
+def _with_editable(files, raw: str, wt: Path, editable_dir: str, large: dict | None = None) -> dict:
     """context.files plus the worktree text of every file_edits path that resolves to an
     existing regular file inside wt/editable_dir (site-checker proposals name no files,
     so the builder finds them with its tools). Anything else stays unknown and is
@@ -114,7 +187,16 @@ def _with_editable(files, raw: str, wt: Path, editable_dir: str) -> dict:
             real = target.resolve()
             if target.is_symlink() or not real.is_relative_to(root) or not real.is_file():
                 continue
-            out[rel] = real.read_text()[:_MAX_FILE_CHARS]
+            data = real.read_bytes()
+            text = data.decode()
+            if _is_large(text):
+                # same declaration phases makes: digest in context, edits resolved on disk
+                out[rel] = _large_digest(rel, text)
+                if large is not None:
+                    large[rel] = {"chars": len(text), "lines": text.count("\n") + 1,
+                                  "sha256": hashlib.sha256(data).hexdigest()}
+            else:
+                out[rel] = real.read_text()
         except (OSError, ValueError):
             # NUL bytes, over-long names, unreadable or non-UTF-8 files: left unknown
             continue
@@ -200,10 +282,9 @@ class ClaudeSDKDriver:
         driver.cooldowns = cooldowns
         return driver
 
-    def run_role(self, request: DriverRequest) -> DriverResult:
-        self.budget_guard.check_before_call(self.estimated_cost_per_call_usd)
-        query_fn = self.role_query_fns.get(request.role, self.query_fn)
-        prompt = self._build_prompt(request)
+    def _query_kwargs(self, request: DriverRequest, query_fn) -> dict:
+        """Keyword args for query_fn, built ONCE per run_role so a repair turn reuses the same
+        run_tests server and calls record (the per-build test_budget is never reset)."""
         if request.role == Role.builder and request.worktree_path is not None and _accepts_cwd(query_fn):
             # tooled builder: the SDK session's cwd is the run worktree (read-only tools stay inside it)
             if (self.builder_tests and request.runner is not None and request.run_dir
@@ -218,22 +299,86 @@ class ClaudeSDKDriver:
                                                       budget=request.test_budget,
                                                       worktree=request.worktree_path)
                 self.last_test_runs = calls
-                raw = query_fn(prompt, cwd=request.worktree_path, mcp_servers={"navigator": server},
-                               mcp_tools=(QUALIFIED_TOOL,))
-            else:
-                raw = query_fn(prompt, cwd=request.worktree_path)
-        else:
-            raw = query_fn(prompt)
+                return {"cwd": request.worktree_path, "mcp_servers": {"navigator": server},
+                        "mcp_tools": (QUALIFIED_TOOL,)}
+            return {"cwd": request.worktree_path}
+        return {}
+
+    def run_role(self, request: DriverRequest) -> DriverResult:
+        self.budget_guard.check_before_call(self.estimated_cost_per_call_usd)
+        query_fn = self.role_query_fns.get(request.role, self.query_fn)
+        prompt = self._build_prompt(request)
+        kwargs = self._query_kwargs(request, query_fn)
+        raw = query_fn(prompt, **kwargs)
         self.budget_guard.record_spend(self.estimated_cost_per_call_usd)
+        try:
+            return self._parse_reply(request, raw)
+        except _EditApplyError as e:
+            # ONE repair turn (spec 2026-11-08): the same call, the error and an excerpt of the
+            # current file; any error from the second parse propagates unchanged
+            self.budget_guard.check_before_call(self.estimated_cost_per_call_usd)
+            raw2 = query_fn(self._repair_prompt(request, prompt, raw, e), **kwargs)
+            self.budget_guard.record_spend(self.estimated_cost_per_call_usd)
+            return self._parse_reply(request, raw2)
+
+    def _parse_reply(self, request: DriverRequest, raw: str) -> DriverResult:
         # N9: the builder's file_edits are resolved against the file contents it was
         # shown (context.files: relpath -> current text, None for a new file)
-        files = None
+        files, large, wt, affected = None, {}, None, set()
         if request.role == Role.builder and isinstance(request.context, dict):
             files = request.context.get("files")
+            large = dict(request.context.get("large_files") or {})
+            prop = request.context.get("proposal")
+            aff = prop.get("affected_files") if isinstance(prop, dict) else None
+            affected = ({Path(a).as_posix() for a in aff if isinstance(a, str)}
+                        if isinstance(aff, list) else set())
+            wt = Path(request.worktree_path) if request.worktree_path else None
             editable = request.context.get("editable_dir")
-            if isinstance(editable, str) and editable and request.worktree_path:
-                files = _with_editable(files, raw, Path(request.worktree_path), editable)
-        return self._parse(request.role, raw, files=files)
+            if isinstance(editable, str) and editable and wt:
+                files = _with_editable(files, raw, wt, editable, large)
+        return self._parse(request.role, raw, files=files, large=large, wt=wt, affected=affected)
+
+    @staticmethod
+    def _repair_excerpt(request: DriverRequest, err: _EditApplyError) -> str:
+        """Verbatim lines of the CURRENT file near the failed edit, only for a path that passes
+        the same gate as an edit (shown, large, affected, test file, or under editable_dir) and
+        _safe_read. Model-only: never logged, never in an exception."""
+        ctx = request.context if isinstance(request.context, dict) else {}
+        if not err.rel or not err.old or not request.worktree_path:
+            return ""
+        key = Path(err.rel).as_posix()
+        prop = ctx.get("proposal")
+        aff = prop.get("affected_files") if isinstance(prop, dict) else None
+        affected = {Path(a).as_posix() for a in aff if isinstance(a, str)} if isinstance(aff, list) else set()
+        shown = {Path(k).as_posix() for k in (ctx.get("files") or {}) if isinstance(k, str)}
+        editable = ctx.get("editable_dir")
+        in_editable = isinstance(editable, str) and bool(editable) and key.startswith(editable.rstrip("/") + "/")
+        if not (key in shown or key in _norm_large(ctx.get("large_files")) or key in affected
+                or _is_test_file(key) or in_editable):
+            return ""
+        try:
+            text, _raw, _ident = _safe_read(Path(request.worktree_path), key)
+        except _UnsafeRead:
+            return ""
+        first = err.old.split("\n", 1)[0]
+        pos = text.find(first) if first.strip() else -1
+        if pos < 0:
+            for ln in sorted(err.old.split("\n"), key=len, reverse=True):
+                if ln.strip() and ln in text:
+                    pos = text.find(ln)
+                    break
+        if pos < 0:
+            return ""
+        lines = text.split("\n")
+        centre = text.count("\n", 0, pos)
+        start = max(0, centre - 30)
+        body = "\n".join(lines[start:start + 60])[:4000]
+        return f"\ncurrent text of {key} near the failed edit (lines {start + 1}-{min(len(lines), start + 60)}):\n{body}"
+
+    def _repair_prompt(self, request: DriverRequest, prompt: str, raw: str, err: _EditApplyError) -> str:
+        return (f"{prompt}\nyour previous reply:\n{raw[:20000]}\n"
+                f"edit-application error (fix only the edits; reply with the full JSON object again): "
+                f"{err}{self._repair_excerpt(request, err)}")
 
     def _build_prompt(self, request: DriverRequest) -> str:
         lines = [f"role: {request.role.value}", f"context: {json.dumps(request.context)}"]
@@ -244,7 +389,8 @@ class ClaudeSDKDriver:
         lines.append(_ROLE_OUTPUT_SPEC[request.role])
         return "\n".join(lines)
 
-    def _parse(self, role: Role, raw: str, files: dict | None = None) -> DriverResult:
+    def _parse(self, role: Role, raw: str, files: dict | None = None, large: dict | None = None,
+               wt: Path | None = None, affected: set | None = None) -> DriverResult:
         try:
             payload = json.loads(raw)
         except (ValueError, TypeError) as e:
@@ -278,6 +424,12 @@ class ClaudeSDKDriver:
                     raise DriverParseError(f"affected_files must be a list of strings: {p['affected_files']!r}")
 
         file_writes = [self._parse_file_write(entry) for entry in payload.get("file_writes", [])]
+        norm_large = _norm_large(large)
+        for i, (wrel, _c) in enumerate(file_writes):
+            if Path(wrel).as_posix() in norm_large:
+                raise DriverParseError(
+                    f"file_writes[{i}]: {wrel} is a large file the builder only saw in part; "
+                    f"use file_edits")
         raw_edits = payload.get("file_edits") or []
         if not isinstance(raw_edits, list):
             raise DriverParseError(
@@ -288,7 +440,8 @@ class ClaudeSDKDriver:
             # N9: search/replace edits become full-content writes here, so phases.py
             # and every downstream check (scope, skip gate, checkpoints, verification)
             # see exactly what a whole-file rewrite would have produced
-            file_writes += self._apply_file_edits(file_edits, files, {rel for rel, _ in file_writes})
+            file_writes += self._apply_file_edits(file_edits, files, {rel for rel, _ in file_writes},
+                                                 large=large, wt=wt, affected=affected)
         commands = [self._parse_command(entry) for entry in payload.get("commands", [])]
         return DriverResult(role=role, proposals=proposals,
                             file_writes=file_writes, commands=commands, summary=summary)
@@ -311,7 +464,8 @@ class ClaudeSDKDriver:
 
     @staticmethod
     def _apply_file_edits(edits: list[tuple[str, str, str]], files: dict | None,
-                          written: set[str]) -> list[tuple[str, str]]:
+                          written: set[str], large: dict | None = None,
+                          wt: Path | None = None, affected: set | None = None) -> list[tuple[str, str]]:
         """Resolve [relpath, old, new] edits into (relpath, full new content) pairs.
 
         `files` is context.files (relpath -> current text, None for a new file).
@@ -326,6 +480,8 @@ class ClaudeSDKDriver:
         base_files = files if isinstance(files, dict) else {}
         norm_base = {Path(k).as_posix(): v for k, v in base_files.items() if isinstance(k, str)}
         written_norm = {Path(w).as_posix() for w in written}
+        norm_large = _norm_large(large)
+        idents: dict[tuple[int, int], str] = {}   # disk-loaded inode -> the key that loaded it
         texts: dict[str, str] = {}   # normalised key -> progressively edited text
         names: dict[str, str] = {}   # normalised key -> relpath as the builder wrote it
         for i, (rel, old, new) in enumerate(edits):
@@ -333,24 +489,59 @@ class ClaudeSDKDriver:
             if key in written_norm:
                 raise DriverParseError(
                     f"file_edits[{i}]: {rel!r} appears in both file_edits and file_writes; use one")
-            if key not in texts:
+            if key not in texts and key in norm_large:
+                # a large file: files[rel] holds the digest, never a base. The base is the real
+                # disk text, valid only if it is still the file the context described
+                info = norm_large[key]
+                if wt is None:
+                    raise _EditApplyError(f"file_edits[{i}]: {rel!r}: large file cannot be read; "
+                                          f"edit refused", rel, i, old)
+                try:
+                    text, raw, ident = _safe_read(wt, key)
+                except _UnsafeRead as e:
+                    raise _EditApplyError(f"file_edits[{i}]: {rel!r}: large file cannot be read safely "
+                                          f"({e}); edit refused", rel, i, old) from e
+                if (len(text) != info.get("chars") or not info.get("sha256")
+                        or hashlib.sha256(raw).hexdigest() != info["sha256"]):
+                    raise _EditApplyError(f"file_edits[{i}]: {rel!r}: large file changed since the "
+                                          f"context was built; edit refused", rel, i, old)
+                if ident in idents:
+                    raise _EditApplyError(f"file_edits[{i}]: {rel!r} is the same file as "
+                                          f"{idents[ident]!r}; edit refused", rel, i, old)
+                idents[ident] = key
+                texts[key] = text
+                names[key] = rel
+            elif key not in texts:
                 if rel in base_files:
                     base = base_files[rel]
                 elif key in norm_base:
                     base = norm_base[key]
+                elif wt is not None:
+                    try:
+                        base, ident = _load_unshown(wt, key, affected)
+                    except _UnsafeRead as e:
+                        raise _EditApplyError(
+                            f"file_edits[{i}]: {rel!r} is not in context.files and cannot be loaded "
+                            f"from disk ({e}); only an existing test file or a file in affected_files "
+                            f"under {_MAX_FILE_CHARS} chars can be edited unshown (new files need "
+                            f"file_writes)", rel, i, old) from e
+                    if ident in idents:
+                        raise _EditApplyError(f"file_edits[{i}]: {rel!r} is the same file as "
+                                              f"{idents[ident]!r}; edit refused", rel, i, old)
+                    idents[ident] = key
                 else:
-                    raise DriverParseError(
+                    raise _EditApplyError(
                         f"file_edits[{i}]: {rel!r} is not in context.files; only files the builder "
-                        f"was shown can be edited (new files need file_writes)")
+                        f"was shown can be edited (new files need file_writes)", rel, i, old)
                 if not isinstance(base, str):
                     raise DriverParseError(
                         f"file_edits[{i}]: {rel!r} is a new file (null in context.files); "
                         f"use file_writes with the full content")
                 if len(base) >= _MAX_FILE_CHARS:
-                    raise DriverParseError(
+                    raise _EditApplyError(
                         f"file_edits[{i}]: {rel!r}: file is truncated in context "
                         f"(>= {_MAX_FILE_CHARS} chars); edits refused - this file cannot be "
-                        f"safely changed by the builder")
+                        f"safely changed by the builder", rel, i, old)
                 texts[key] = base
                 names[key] = rel
             if not old:
@@ -358,9 +549,9 @@ class ClaudeSDKDriver:
                     f"file_edits[{i}] for {rel!r}: old must be a non-empty string copied from the file")
             n = texts[key].count(old)
             if n != 1:
-                raise DriverParseError(
+                raise _EditApplyError(
                     f"file_edits[{i}] for {rel!r}: old text occurs {n} times (must be exactly 1); "
-                    f"len(old)={len(old)} len(new)={len(new)}")
+                    f"len(old)={len(old)} len(new)={len(new)}", rel, i, old)
             texts[key] = texts[key].replace(old, new, 1)
         return [(names[key], text) for key, text in texts.items()]
 
