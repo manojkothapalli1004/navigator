@@ -21,7 +21,7 @@ class FakeRunner:
         self.calls, self.gate, self.fail = [], gate, fail or {}
     async def __call__(self, prompt, session_id, emit):
         self.raw = getattr(self, "raw", []) + [prompt]
-        prompt = re.sub(r"^\[(web|telegram|terminal)\] ", "", prompt)  # the engine's source prefix
+        prompt = re.sub(r"^\[(web|telegram|terminal|helper)\] ", "", prompt)  # the engine's source prefix
         self.calls.append((prompt, session_id))
         if self.gate is not None:
             await self.gate.wait()
@@ -598,4 +598,340 @@ async def test_helper_report_while_in_terminal_sends_no_terminal_notice(tmp_path
     eng.submit("[helper helper-1 done: t]\nok", "helper", internal=True, reply_via="telegram")
     assert sent == []
     eng.terminal_left([]); await _drain(eng)
+    await eng.stop()
+
+
+# --- 2026-11-08 queue priority: operator lane first, internal reports batched ---
+import threading  # noqa: E402
+
+
+def _rep(n: int, pad: str = "") -> str:
+    return f"[helper h{n} done: x]\nr{n}{pad}"
+
+
+def _qeng(tmp_path, runner, sent=None, **kw):
+    return Engine(Store(tmp_path / "c"), runner, lock_path=tmp_path / "c" / "turn.lock",
+                  reply=None if sent is None else sent.append, **kw)
+
+
+def _ids(eng, kind="user"):
+    return {e["text"]: e["id"] for e in eng.store.history(limit=1000) if e["kind"] == kind}
+
+
+def _terminal_states(eng):
+    last = {}
+    for e in eng.store.history(limit=10000):
+        if e.get("kind") == "status":
+            last[e["msg_id"]] = e["state"]
+    return last
+
+
+class BoomRunner(FakeRunner):
+    async def __call__(self, prompt, session_id, emit):
+        self.calls.append((prompt, session_id))
+        raise RuntimeError("sdk exploded")
+
+
+@aio
+async def test_t1_operator_jumps_ahead_of_reports(tmp_path):
+    for src in ("web", "telegram", "terminal"):
+        gate = asyncio.Event(); r = FakeRunner(gate)
+        eng = _qeng(tmp_path / src, r) if False else _qeng(tmp_path, r) if src == "web" else None
+        if eng is None:
+            (tmp_path / src).mkdir()
+            eng = _qeng(tmp_path / src, r)
+        await eng.start()
+        eng.submit("A", "web"); await asyncio.sleep(0.03)
+        for i in (1, 2, 3):
+            eng.submit(_rep(i), "helper", internal=True)
+        eng.submit("hello", src)
+        gate.set(); await _drain(eng)
+        got = [c[0] for c in r.calls]
+        assert got[:2] == ["A", "hello"] and len(got) == 3, got
+        assert all(f"[helper h{i} done: x]" in got[2] for i in (1, 2, 3))
+        await eng.stop()
+
+
+@aio
+async def test_t2_reports_batched_one_turn(tmp_path):
+    gate = asyncio.Event(); r = FakeRunner(gate); eng = _qeng(tmp_path, r); await eng.start()
+    eng.submit("A", "web"); await asyncio.sleep(0.03)
+    ms = [eng.submit(_rep(i), "helper", internal=True) for i in (1, 2, 3)]
+    gate.set(); await _drain(eng)
+    assert len(r.calls) == 2
+    p = r.calls[1][0]
+    assert p.startswith("3 reports arrived together, oldest first. Answer them in one reply.")
+    assert p.index("h1 done") < p.index("h2 done") < p.index("h3 done")
+    for m in ms:
+        assert _status(eng.store, m["id"]) == ["queued", "running", "done"]
+    asst = [e for e in eng.store.history() if e["kind"] == "assistant"][1]
+    assert asst["reply_to"] == ms[0]["id"] and asst["covers"] == [m["id"] for m in ms]
+    assert "covers" not in [e for e in eng.store.history() if e["kind"] == "assistant"][0]
+    await eng.stop()
+
+
+@aio
+async def test_t3_caps_items_and_bytes(tmp_path):
+    gate = asyncio.Event(); r = FakeRunner(gate)
+    eng = _qeng(tmp_path, r, batch_max_items=8); await eng.start()
+    eng.submit("A", "web"); await asyncio.sleep(0.03)
+    for i in range(10):
+        eng.submit(_rep(i), "helper", internal=True)
+    gate.set(); await _drain(eng)
+    assert len(r.calls) == 3
+    assert r.calls[1][0].startswith("8 reports") and r.calls[2][0].startswith("2 reports")
+    assert "h7 done" in r.calls[1][0] and "h8 done" in r.calls[2][0]
+    await eng.stop()
+
+
+@aio
+async def test_t3_byte_cap_and_oversized_first(tmp_path):
+    gate = asyncio.Event(); r = FakeRunner(gate)
+    one = len(_rep(1).encode())
+    eng = _qeng(tmp_path / "x" if False else tmp_path, r, batch_max_bytes=one * 2 + 2); await eng.start()
+    eng.submit("A", "web"); await asyncio.sleep(0.03)
+    for i in (1, 2, 3):
+        eng.submit(_rep(i), "helper", internal=True)
+    gate.set(); await _drain(eng)
+    assert r.calls[1][0].startswith("2 reports") and "h3 done" in r.calls[2][0] and len(r.calls) == 3
+    await eng.stop()
+    (tmp_path / "o").mkdir()
+    gate2 = asyncio.Event(); r2 = FakeRunner(gate2)
+    eng2 = _qeng(tmp_path / "o", r2, batch_max_bytes=10); await eng2.start()
+    eng2.submit("A", "web"); await asyncio.sleep(0.03)
+    big = eng2.submit(_rep(1, "y" * 100), "helper", internal=True)
+    eng2.submit(_rep(2), "helper", internal=True)
+    gate2.set(); await _drain(eng2)
+    assert len(r2.calls) == 3 and "h1 done" in r2.calls[1][0] and "h2" not in r2.calls[1][0]
+    assert _status(eng2.store, big["id"])[-1] == "done"
+    await eng2.stop()
+
+
+@aio
+async def test_t4_starvation_age_uses_injected_clock(tmp_path):
+    t = [1000.0]
+    gate = asyncio.Event(); r = FakeRunner(gate)
+    eng = _qeng(tmp_path, r, clock=lambda: t[0], internal_max_age_s=600); await eng.start()
+    eng.submit("A", "web"); await asyncio.sleep(0.03)
+    eng.submit(_rep(1), "helper", internal=True); eng.submit(_rep(2), "helper", internal=True)
+    eng.submit("hello", "web")
+    gate.set(); await _drain(eng)
+    assert [c[0] for c in r.calls][:2] == ["A", "hello"]
+    await eng.stop()
+    # aged: the internal batch goes before the waiting operator message
+    (tmp_path / "b").mkdir(); t2 = [1000.0]
+    gate = asyncio.Event(); r = FakeRunner(gate)
+    eng = _qeng(tmp_path / "b", r, clock=lambda: t2[0], internal_max_age_s=600); await eng.start()
+    eng.submit("A", "web"); await asyncio.sleep(0.03)
+    eng.submit(_rep(1), "helper", internal=True); eng.submit(_rep(2), "helper", internal=True)
+    t2[0] += 601
+    eng.submit("hello", "web")
+    gate.set(); await _drain(eng)
+    got = [c[0] for c in r.calls]
+    assert got[0] == "A" and got[1].startswith("2 reports") and got[2] == "hello", got
+    await eng.stop()
+
+
+@aio
+async def test_t4_no_operator_waiting_internals_run_at_once(tmp_path):
+    r = FakeRunner(); eng = _qeng(tmp_path, r); await eng.start()
+    eng.submit(_rep(1), "helper", internal=True); await _drain(eng)
+    assert len(r.calls) == 1 and "h1 done" in r.calls[0][0]
+    await eng.stop()
+
+
+@aio
+async def test_t5_routing(tmp_path):
+    async def run(sub, runner=None):
+        d = tmp_path / sub; d.mkdir()
+        gate = asyncio.Event(); sent = []
+        r = runner or FakeRunner(gate)
+        eng = _qeng(d, r, sent); await eng.start()
+        eng.submit("A", "web"); await asyncio.sleep(0.03)
+        return eng, gate, sent
+    # windows only: no Telegram send
+    eng, gate, sent = await run("w")
+    eng.submit(_rep(1), "helper", internal=True); eng.submit(_rep(2), "helper", internal=True)
+    gate.set(); await _drain(eng)
+    assert sent == []
+    await eng.stop()
+    # all telegram-bound: one send, no prefix
+    eng, gate, sent = await run("t")
+    eng.submit(_rep(1), "helper", internal=True, reply_via="telegram")
+    eng.submit(_rep(2), "helper", internal=True, reply_via="telegram")
+    gate.set(); await _drain(eng)
+    assert len(sent) == 1 and not sent[0].startswith("(covers")
+    await eng.stop()
+    # mixed: one send with the prefix and a history note; model told in the prompt
+    eng, gate, sent = await run("m")
+    eng.submit(_rep(1), "helper", internal=True, reply_via="telegram")
+    eng.submit(_rep(2), "helper", internal=True)
+    gate.set(); await _drain(eng)
+    assert len(sent) == 1 and sent[0].startswith("(covers 2 reports, some from other windows) ")
+    notes = [e["text"] for e in eng.store.history() if e["kind"] == "note"]
+    assert "One reply covers 2 reports; sent to the web/terminal windows and to Telegram." in notes
+    assert "Your reply goes to: web/terminal windows and Telegram." in eng.runner.calls[1][0]
+    await eng.stop()
+    # error path routes the same way
+    d = tmp_path / "e"; d.mkdir(); sent = []
+    gate = asyncio.Event(); r = BoomRunner()
+    eng = _qeng(d, r, sent); await eng.start()
+    eng.runner = FakeRunner(gate); eng.submit("A", "web"); await asyncio.sleep(0.03)
+    eng.runner = r
+    eng.submit(_rep(1), "helper", internal=True, reply_via="telegram")
+    eng.submit(_rep(2), "helper", internal=True)
+    gate.set(); await _drain(eng)
+    assert len(sent) == 1 and sent[0].startswith("(covers 2 reports, some from other windows) ")
+    assert "Stopped:" in sent[0]
+    await eng.stop()
+
+
+@aio
+async def test_t6_no_preemption(tmp_path):
+    t = [0.0]
+    gate = asyncio.Event(); r = FakeRunner(gate)
+    eng = _qeng(tmp_path, r, clock=lambda: t[0], internal_max_age_s=10); await eng.start()
+    for i in (1, 2):
+        eng.submit(_rep(i), "helper", internal=True)
+    await asyncio.sleep(0.03)
+    eng.submit("hello", "web"); t[0] += 100
+    eng.submit(_rep(3), "helper", internal=True)
+    await asyncio.sleep(0.05)
+    assert len(r.calls) == 1
+    gate.set(); await _drain(eng)
+    assert len(r.calls) == 3
+    await eng.stop()
+
+
+@aio
+async def test_t6b_cancel_batch(tmp_path):
+    gate = asyncio.Event(); r = FakeRunner(gate); eng = _qeng(tmp_path, r); await eng.start()
+    ms = [eng.submit(_rep(i), "helper", internal=True) for i in (1, 2, 3)]
+    await asyncio.sleep(0.03)
+    assert len(r.calls) == 1 and eng.busy
+    op = eng.submit("hello", "web"); m4 = eng.submit(_rep(4), "helper", internal=True)
+    assert eng.cancel() is True
+    gate.set(); await _drain(eng)
+    for m in ms:
+        assert _status(eng.store, m["id"]) == ["queued", "running", "error"]
+    assert [e["detail"] for e in eng.store.history() if e.get("state") == "error"] == ["cancelled by operator"] * 3
+    assert _status(eng.store, op["id"])[-1] == "done" and _status(eng.store, m4["id"])[-1] == "done"
+    assert [c[0] for c in r.calls][1] == "hello" and "h4 done" in r.calls[2][0]
+    await eng.stop()
+
+
+class StubAP:
+    def __init__(self, why=None):
+        self.why = why
+    def command(self, text): return None
+    def operator_turn(self): pass
+    def runnable(self, **kw): return self.why
+    def decide(self, outcome, **kw): return ("none", "")
+    def started(self): pass
+
+
+@aio
+async def test_t7_autopilot_never_merged_order_kept(tmp_path):
+    gate = asyncio.Event(); r = FakeRunner(gate)
+    eng = _qeng(tmp_path, r, autopilot=StubAP()); await eng.start()
+    eng.submit("A", "web"); await asyncio.sleep(0.03)
+    eng.submit(_rep(1), "helper", internal=True)
+    eng.submit("[autopilot] item", "autopilot", internal=True)
+    eng.submit(_rep(2), "helper", internal=True)
+    eng.submit("hello", "web")
+    gate.set(); await _drain(eng)
+    raw = r.raw
+    assert raw[1].endswith("hello")
+    assert "h1 done" in raw[2] and "h2" not in raw[2] and "arrived together" not in raw[2]
+    assert raw[3].startswith("[autopilot] ") and "h2 done" in raw[4]
+    await eng.stop()
+
+
+@aio
+async def test_t7_autopilot_skipped_and_after_turn_sees_both_lanes(tmp_path):
+    r = FakeRunner(); eng = _qeng(tmp_path, r, autopilot=StubAP(why="quiet hours")); await eng.start()
+    m = eng.submit("[autopilot] item", "autopilot", internal=True); await _drain(eng)
+    assert _status(eng.store, m["id"]) == ["queued", "skipped"] and r.calls == []
+    await eng.stop()
+    # a waiting internal item keeps queue_len > 0, so _after_turn asks autopilot nothing
+    (tmp_path / "q").mkdir(); asked = []
+    ap = StubAP(); ap.decide = lambda outcome, **kw: asked.append(outcome) or ("none", "")
+    gate = asyncio.Event(); eng = _qeng(tmp_path / "q", FakeRunner(gate), autopilot=ap); await eng.start()
+    eng.submit("A", "web"); await asyncio.sleep(0.03)
+    eng.submit(_rep(1), "helper", internal=True)
+    gate.set(); await _drain(eng)
+    assert asked == ["done"]  # only after the last turn
+    await eng.stop()
+
+
+@aio
+async def test_t8_fifo_and_nothing_lost(tmp_path):
+    gate = asyncio.Event(); r = FakeRunner(gate); eng = _qeng(tmp_path, r); await eng.start()
+    eng.submit("A", "web"); await asyncio.sleep(0.03)
+    ids = [eng.submit(t, s, **k)["id"] for t, s, k in [
+        ("o1", "web", {}), (_rep(1), "helper", {"internal": True}), ("o2", "telegram", {}),
+        (_rep(2), "helper", {"internal": True}), ("o3", "terminal", {})]]
+    gate.set(); await _drain(eng)
+    assert [c[0] for c in r.calls][:4] == ["A", "o1", "o2", "o3"]
+    assert r.calls[4][0].index("h1 done") < r.calls[4][0].index("h2 done")
+    states = _terminal_states(eng)
+    assert all(states[i] == "done" for i in ids)
+    await eng.stop()
+
+
+@aio
+async def test_t9_queue_len_and_queued_detail(tmp_path):
+    gate = asyncio.Event(); r = FakeRunner(gate); eng = _qeng(tmp_path, r)
+    assert eng.queue_len == 0
+    await eng.start(); assert eng.queue_len == 0
+    eng.submit("A", "web"); await asyncio.sleep(0.03)
+    for i in (1, 2, 3):
+        eng.submit(_rep(i), "helper", internal=True)
+    assert eng.queue_len == 3
+    hello = eng.submit("hello", "web")
+    assert eng.queue_len == 4
+    q = {e["msg_id"]: e.get("detail") for e in eng.store.history() if e.get("state") == "queued"}
+    assert q[hello["id"]] == 1  # busy + zero operator items ahead; waiting internals go behind it
+    gate.set(); await _drain(eng)
+    assert eng.queue_len == 0
+    await eng.stop()
+
+
+@aio
+async def test_t9_internal_detail_counts_both_lanes(tmp_path):
+    gate = asyncio.Event(); eng = _qeng(tmp_path, FakeRunner(gate)); await eng.start()
+    eng.submit("A", "web"); await asyncio.sleep(0.03)
+    eng.submit("o1", "web")
+    h = eng.submit(_rep(1), "helper", internal=True)
+    q = {e["msg_id"]: e.get("detail") for e in eng.store.history() if e.get("state") == "queued"}
+    assert q[h["id"]] == 2
+    gate.set(); await _drain(eng); await eng.stop()
+
+
+@aio
+async def test_t11_submit_via_call_soon_threadsafe(tmp_path):
+    gate = asyncio.Event(); r = FakeRunner(gate); eng = _qeng(tmp_path, r); await eng.start()
+    eng.submit("A", "web"); await asyncio.sleep(0.03)
+    loop = asyncio.get_running_loop()
+
+    def work(n):
+        for i in range(4):
+            if i % 2:
+                loop.call_soon_threadsafe(eng.submit, _rep(n * 10 + i), "helper", True)
+            else:
+                loop.call_soon_threadsafe(eng.submit, f"op{n}{i}", "web")
+    ts = [threading.Thread(target=work, args=(n,)) for n in (1, 2, 3)]
+    for t in ts: t.start()
+    for t in ts: await asyncio.to_thread(t.join)
+    await asyncio.sleep(0.05)
+    assert len(eng._ops) == 6 and len(eng._internal) == 6
+    gate.set()
+    await asyncio.wait_for(_drain(eng), 2)
+    ops = [c[0] for c in r.calls[1:7]]
+    for n in (1, 2, 3):
+        assert [o for o in ops if o.startswith(f"op{n}")] == [f"op{n}0", f"op{n}2"]
+    batch = " ".join(c[0] for c in r.calls[7:])
+    for n in (1, 2, 3):
+        assert batch.index(f"h{n*10+1} done") < batch.index(f"h{n*10+3} done")
+    assert all(s == "done" for s in _terminal_states(eng).values())
     await eng.stop()

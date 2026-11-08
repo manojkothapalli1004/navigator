@@ -401,9 +401,44 @@ def test_no_merge_or_approval_calls_in_conductor_package():
 
 # ---- build cards (A, C): files reach the proposal, the reply names the reason
 def test_delegate_schema_files_is_array():
-    from claude_agent_sdk import _python_type_to_json_schema
-    assert _python_type_to_json_schema(tools.DELEGATE_SCHEMA["files"]) == {"type": "array",
-                                                                           "items": {"type": "string"}}
+    assert tools.DELEGATE_SCHEMA["properties"]["files"] == {"type": "array", "items": {"type": "string"}}
+
+
+def test_delegate_wire_schema_requires_only_kind_title_task():
+    """T10: the SDK passes a full JSON schema through; a type dict made every key required."""
+    from claude_agent_sdk import _build_input_schema, tool
+
+    async def handler(args):
+        return {}
+    wire = _build_input_schema(tool("delegate", tools.DELEGATE_DESCRIPTION, tools.DELEGATE_SCHEMA)(handler))
+    assert wire == tools.DELEGATE_SCHEMA
+    assert wire["required"] == ["kind", "title", "task"]
+    for k in ("project", "files", "spec_path", "timeout_s"):
+        assert k in wire["properties"] and k not in wire["required"]
+
+
+class _NoProjectBuilds:
+    def __init__(self):
+        self.filed = []
+
+    def file(self, project, *a, **k):
+        if not project:
+            raise B.BuildRefused("project is required")
+        self.filed.append(project)
+        return {}
+
+
+def test_build_without_project_still_refused_guard():
+    """T12a (guard): a build with no project is refused and nothing is filed."""
+    fb = _NoProjectBuilds()
+    out = asyncio.run(tools.delegate_text(None, {"kind": "build", "title": "t", "task": "x" * 450}, fb))
+    assert out.startswith("refused") and not fb.filed
+
+
+def test_undeclared_files_still_overlap_guard():
+    """T12b (guard): undeclared files on either side count as overlap for autopilot."""
+    assert "does not declare" in blocked_by({"a.py"}, [WorkItem("helper", "h1", None)])
+    assert "does not declare" in blocked_by(None, [WorkItem("helper", "h1", frozenset({"a.py"}))])
 
 
 def test_files_string_forms():

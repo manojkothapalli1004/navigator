@@ -16,9 +16,13 @@ import httpx
 
 MIN_TASK_CHARS = 40  # "fix it" is not a task a helper can do alone
 TOOL_NAMES = ["delegate", "helpers", "cancel_helper"]
-# `[str]` (an instance, not a type) used to become {"type": "string"}; list[str] is a real array
-DELEGATE_SCHEMA = {"kind": str, "title": str, "task": str, "project": str, "files": list[str],
-                   "spec_path": str, "timeout_s": int}
+# a full JSON schema, which the SDK passes through as is; a {name: type} dict would make every key required
+DELEGATE_SCHEMA = {
+    "type": "object",
+    "properties": {"kind": {"type": "string"}, "title": {"type": "string"}, "task": {"type": "string"},
+                   "project": {"type": "string"}, "files": {"type": "array", "items": {"type": "string"}},
+                   "spec_path": {"type": "string"}, "timeout_s": {"type": "integer"}},
+    "required": ["kind", "title", "task"]}
 DELEGATE_DESCRIPTION = (
     "Hand work off. Returns at once; the result arrives later as a [helper …] or [build …] message. Check "
     "helpers first so the same work is never started twice. kind=\"quick\" (default): a helper does a lookup or "

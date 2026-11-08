@@ -181,4 +181,5 @@ def test_delegate_build_refuses_timeout_s_and_quick_refuses_spec_path():
 
 
 def test_delegate_schema_has_new_fields():
-    assert "spec_path" in tools.DELEGATE_SCHEMA and "timeout_s" in tools.DELEGATE_SCHEMA
+    props = tools.DELEGATE_SCHEMA["properties"]
+    assert "spec_path" in props and "timeout_s" in props
