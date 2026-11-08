@@ -61,7 +61,8 @@ def test_build_navigator_wires_claude_sdk_driver(tmp_path, monkeypatch):
 
 def test_main_once_prints_summary_and_exits_zero(tmp_path, monkeypatch, capsys):
     repo = _seed_repo(tmp_path)
-    for k in ["NAVIGATOR_DRIVER","NAVIGATOR_MODE","NAVIGATOR_ACT_BASE_URL","NAVIGATOR_ORC_BASE_URL"]:
+    for k in ["NAVIGATOR_DRIVER","NAVIGATOR_MODE","NAVIGATOR_ACT_BASE_URL","NAVIGATOR_ORC_BASE_URL",
+              "NAVIGATOR_REPOS_FILE"]:
         monkeypatch.delenv(k, raising=False)
     monkeypatch.setenv("NAVIGATOR_REPO", str(repo))
     monkeypatch.setenv("NAVIGATOR_LOCK_PATH", str(tmp_path/"nav.lock"))
@@ -80,7 +81,8 @@ def test_negative_max_cycles_is_rejected():
 
 def _daemon_env(tmp_path, monkeypatch):
     repo = _seed_repo(tmp_path)
-    for k in ["NAVIGATOR_DRIVER","NAVIGATOR_MODE","NAVIGATOR_ACT_BASE_URL","NAVIGATOR_ORC_BASE_URL"]:
+    for k in ["NAVIGATOR_DRIVER","NAVIGATOR_MODE","NAVIGATOR_ACT_BASE_URL","NAVIGATOR_ORC_BASE_URL",
+              "NAVIGATOR_REPOS_FILE"]:
         monkeypatch.delenv(k, raising=False)
     monkeypatch.setenv("NAVIGATOR_REPO", str(repo))
     monkeypatch.setenv("NAVIGATOR_LOCK_PATH", str(tmp_path/"nav.lock"))
