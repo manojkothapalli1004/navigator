@@ -62,6 +62,20 @@ def _safe_read(wt, rel) -> tuple[str, bytes, tuple[int, int]]:
     return text, raw, (st.st_dev, st.st_ino)
 
 
+def _load_unshown(wt, rel, affected) -> tuple[str, tuple[int, int]]:
+    """Disk text of an existing in-scope file the builder was not shown (spec Part C): in
+    affected_files or a test file by phases._is_test_file, <= _MAX_FILE_CHARS, plus every
+    _safe_read rule. Returns (text, inode id); raises _UnsafeRead."""
+    if not isinstance(rel, str) or not rel:
+        raise _UnsafeRead("bad path")
+    if Path(rel).as_posix() not in (affected or ()) and not _is_test_file(rel):
+        raise _UnsafeRead("not in scope")
+    text, _raw, ident = _safe_read(wt, rel)
+    if len(text) > _MAX_FILE_CHARS:
+        raise _UnsafeRead("file too large to edit unshown")
+    return text, ident
+
+
 def _norm_large(large) -> dict:
     return ({Path(k).as_posix(): v for k, v in large.items() if isinstance(k, str) and isinstance(v, dict)}
             if isinstance(large, dict) else {})
@@ -95,6 +109,8 @@ _ROLE_OUTPUT_SPEC = {
                    'file_edits only, with old copied verbatim from an excerpt (or from Read if you have '
                    'a Read tool: offset/limit) and unique in the whole file; if unsure, include more '
                    'surrounding lines. '
+                   'You may also edit an existing file not in context.files if it is a test file or is '
+                   'listed in affected_files; old must occur exactly once in the real file. '
                    'Only write paths listed in context.files, plus test files; when context.editable_dir '
                    'is set you may instead edit or write any file under that directory (find it with '
                    'your tools) and nothing outside it. '
@@ -293,15 +309,19 @@ class ClaudeSDKDriver:
         self.budget_guard.record_spend(self.estimated_cost_per_call_usd)
         # N9: the builder's file_edits are resolved against the file contents it was
         # shown (context.files: relpath -> current text, None for a new file)
-        files, large, wt = None, {}, None
+        files, large, wt, affected = None, {}, None, set()
         if request.role == Role.builder and isinstance(request.context, dict):
             files = request.context.get("files")
             large = dict(request.context.get("large_files") or {})
+            prop = request.context.get("proposal")
+            aff = prop.get("affected_files") if isinstance(prop, dict) else None
+            affected = ({Path(a).as_posix() for a in aff if isinstance(a, str)}
+                        if isinstance(aff, list) else set())
             wt = Path(request.worktree_path) if request.worktree_path else None
             editable = request.context.get("editable_dir")
             if isinstance(editable, str) and editable and wt:
                 files = _with_editable(files, raw, wt, editable, large)
-        return self._parse(request.role, raw, files=files, large=large, wt=wt)
+        return self._parse(request.role, raw, files=files, large=large, wt=wt, affected=affected)
 
     def _build_prompt(self, request: DriverRequest) -> str:
         lines = [f"role: {request.role.value}", f"context: {json.dumps(request.context)}"]
@@ -313,7 +333,7 @@ class ClaudeSDKDriver:
         return "\n".join(lines)
 
     def _parse(self, role: Role, raw: str, files: dict | None = None, large: dict | None = None,
-               wt: Path | None = None) -> DriverResult:
+               wt: Path | None = None, affected: set | None = None) -> DriverResult:
         try:
             payload = json.loads(raw)
         except (ValueError, TypeError) as e:
@@ -364,7 +384,7 @@ class ClaudeSDKDriver:
             # and every downstream check (scope, skip gate, checkpoints, verification)
             # see exactly what a whole-file rewrite would have produced
             file_writes += self._apply_file_edits(file_edits, files, {rel for rel, _ in file_writes},
-                                                 large=large, wt=wt)
+                                                 large=large, wt=wt, affected=affected)
         commands = [self._parse_command(entry) for entry in payload.get("commands", [])]
         return DriverResult(role=role, proposals=proposals,
                             file_writes=file_writes, commands=commands, summary=summary)
@@ -388,7 +408,7 @@ class ClaudeSDKDriver:
     @staticmethod
     def _apply_file_edits(edits: list[tuple[str, str, str]], files: dict | None,
                           written: set[str], large: dict | None = None,
-                          wt: Path | None = None) -> list[tuple[str, str]]:
+                          wt: Path | None = None, affected: set | None = None) -> list[tuple[str, str]]:
         """Resolve [relpath, old, new] edits into (relpath, full new content) pairs.
 
         `files` is context.files (relpath -> current text, None for a new file).
@@ -439,6 +459,19 @@ class ClaudeSDKDriver:
                     base = base_files[rel]
                 elif key in norm_base:
                     base = norm_base[key]
+                elif wt is not None:
+                    try:
+                        base, ident = _load_unshown(wt, key, affected)
+                    except _UnsafeRead as e:
+                        raise _EditApplyError(
+                            f"file_edits[{i}]: {rel!r} is not in context.files and cannot be loaded "
+                            f"from disk ({e}); only an existing test file or a file in affected_files "
+                            f"under {_MAX_FILE_CHARS} chars can be edited unshown (new files need "
+                            f"file_writes)", rel, i, old) from e
+                    if ident in idents:
+                        raise _EditApplyError(f"file_edits[{i}]: {rel!r} is the same file as "
+                                              f"{idents[ident]!r}; edit refused", rel, i, old)
+                    idents[ident] = key
                 else:
                     raise _EditApplyError(
                         f"file_edits[{i}]: {rel!r} is not in context.files; only files the builder "
