@@ -26,11 +26,12 @@ def _info(text):
 
 def _driver(replies, prompts=None):
     it = iter(replies)
+    last = replies[-1]   # a repair turn re-asks; the scripted builder repeats its last reply
 
     def q(prompt):
         if prompts is not None:
             prompts.append(prompt)
-        return json.dumps(next(it))
+        return json.dumps(next(it, last))
     return ClaudeSDKDriver(query_fn=q, budget_guard=BudgetGuard(10.0))
 
 
