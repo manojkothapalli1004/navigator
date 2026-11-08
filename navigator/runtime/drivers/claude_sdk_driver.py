@@ -282,10 +282,9 @@ class ClaudeSDKDriver:
         driver.cooldowns = cooldowns
         return driver
 
-    def run_role(self, request: DriverRequest) -> DriverResult:
-        self.budget_guard.check_before_call(self.estimated_cost_per_call_usd)
-        query_fn = self.role_query_fns.get(request.role, self.query_fn)
-        prompt = self._build_prompt(request)
+    def _query_kwargs(self, request: DriverRequest, query_fn) -> dict:
+        """Keyword args for query_fn, built ONCE per run_role so a repair turn reuses the same
+        run_tests server and calls record (the per-build test_budget is never reset)."""
         if request.role == Role.builder and request.worktree_path is not None and _accepts_cwd(query_fn):
             # tooled builder: the SDK session's cwd is the run worktree (read-only tools stay inside it)
             if (self.builder_tests and request.runner is not None and request.run_dir
@@ -300,13 +299,29 @@ class ClaudeSDKDriver:
                                                       budget=request.test_budget,
                                                       worktree=request.worktree_path)
                 self.last_test_runs = calls
-                raw = query_fn(prompt, cwd=request.worktree_path, mcp_servers={"navigator": server},
-                               mcp_tools=(QUALIFIED_TOOL,))
-            else:
-                raw = query_fn(prompt, cwd=request.worktree_path)
-        else:
-            raw = query_fn(prompt)
+                return {"cwd": request.worktree_path, "mcp_servers": {"navigator": server},
+                        "mcp_tools": (QUALIFIED_TOOL,)}
+            return {"cwd": request.worktree_path}
+        return {}
+
+    def run_role(self, request: DriverRequest) -> DriverResult:
+        self.budget_guard.check_before_call(self.estimated_cost_per_call_usd)
+        query_fn = self.role_query_fns.get(request.role, self.query_fn)
+        prompt = self._build_prompt(request)
+        kwargs = self._query_kwargs(request, query_fn)
+        raw = query_fn(prompt, **kwargs)
         self.budget_guard.record_spend(self.estimated_cost_per_call_usd)
+        try:
+            return self._parse_reply(request, raw)
+        except _EditApplyError as e:
+            # ONE repair turn (spec 2026-11-08): the same call, the error and an excerpt of the
+            # current file; any error from the second parse propagates unchanged
+            self.budget_guard.check_before_call(self.estimated_cost_per_call_usd)
+            raw2 = query_fn(self._repair_prompt(request, prompt, raw, e), **kwargs)
+            self.budget_guard.record_spend(self.estimated_cost_per_call_usd)
+            return self._parse_reply(request, raw2)
+
+    def _parse_reply(self, request: DriverRequest, raw: str) -> DriverResult:
         # N9: the builder's file_edits are resolved against the file contents it was
         # shown (context.files: relpath -> current text, None for a new file)
         files, large, wt, affected = None, {}, None, set()
@@ -322,6 +337,48 @@ class ClaudeSDKDriver:
             if isinstance(editable, str) and editable and wt:
                 files = _with_editable(files, raw, wt, editable, large)
         return self._parse(request.role, raw, files=files, large=large, wt=wt, affected=affected)
+
+    @staticmethod
+    def _repair_excerpt(request: DriverRequest, err: _EditApplyError) -> str:
+        """Verbatim lines of the CURRENT file near the failed edit, only for a path that passes
+        the same gate as an edit (shown, large, affected, test file, or under editable_dir) and
+        _safe_read. Model-only: never logged, never in an exception."""
+        ctx = request.context if isinstance(request.context, dict) else {}
+        if not err.rel or not err.old or not request.worktree_path:
+            return ""
+        key = Path(err.rel).as_posix()
+        prop = ctx.get("proposal")
+        aff = prop.get("affected_files") if isinstance(prop, dict) else None
+        affected = {Path(a).as_posix() for a in aff if isinstance(a, str)} if isinstance(aff, list) else set()
+        shown = {Path(k).as_posix() for k in (ctx.get("files") or {}) if isinstance(k, str)}
+        editable = ctx.get("editable_dir")
+        in_editable = isinstance(editable, str) and bool(editable) and key.startswith(editable.rstrip("/") + "/")
+        if not (key in shown or key in _norm_large(ctx.get("large_files")) or key in affected
+                or _is_test_file(key) or in_editable):
+            return ""
+        try:
+            text, _raw, _ident = _safe_read(Path(request.worktree_path), key)
+        except _UnsafeRead:
+            return ""
+        first = err.old.split("\n", 1)[0]
+        pos = text.find(first) if first.strip() else -1
+        if pos < 0:
+            for ln in sorted(err.old.split("\n"), key=len, reverse=True):
+                if ln.strip() and ln in text:
+                    pos = text.find(ln)
+                    break
+        if pos < 0:
+            return ""
+        lines = text.split("\n")
+        centre = text.count("\n", 0, pos)
+        start = max(0, centre - 30)
+        body = "\n".join(lines[start:start + 60])[:4000]
+        return f"\ncurrent text of {key} near the failed edit (lines {start + 1}-{min(len(lines), start + 60)}):\n{body}"
+
+    def _repair_prompt(self, request: DriverRequest, prompt: str, raw: str, err: _EditApplyError) -> str:
+        return (f"{prompt}\nyour previous reply:\n{raw[:20000]}\n"
+                f"edit-application error (fix only the edits; reply with the full JSON object again): "
+                f"{err}{self._repair_excerpt(request, err)}")
 
     def _build_prompt(self, request: DriverRequest) -> str:
         lines = [f"role: {request.role.value}", f"context: {json.dumps(request.context)}"]
