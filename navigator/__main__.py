@@ -10,6 +10,7 @@ from pathlib import Path
 
 import httpx
 import structlog
+from navigator import credits
 from navigator.cli import COMMANDS, _safe, run_cli
 from navigator.config import (ENV_ONLY_FIELDS, HOT_FIELDS, WIRING_FIELDS, RepoConfig, Settings,
                               effective_repos)
@@ -49,6 +50,7 @@ def build_navigator(settings: Settings):
     if not repos:
         raise ValueError("NAVIGATOR_REPO must point at the target git repository")
     notifier = make_notifier()
+    credits.set_notifier(notifier.send)
     act = HTTPACTClient(settings.act_base_url) if settings.act_base_url else FakeACTClient()
     act = NotifyingACT(act, notifier)
     orc = HTTPORCClient(settings.orc_base_url) if settings.orc_base_url else FakeORCClient()

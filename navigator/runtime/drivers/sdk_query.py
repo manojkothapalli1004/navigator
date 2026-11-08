@@ -5,6 +5,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Callable, NoReturn
 
+from navigator import credits
 from navigator.safety.errors import QuotaExhaustedError
 
 DEFAULT_SYSTEM_PROMPT = (
@@ -178,13 +179,17 @@ def make_sdk_query_fn(*, model: str | None = None,
             pass
 
     def _run_query(prompt: str, meta: dict, use_model, *, cwd: str | None = None,
-                   mcp_servers: dict | None = None, mcp_tools: tuple[str, ...] = ()) -> str:
+                   mcp_servers: dict | None = None, mcp_tools: tuple[str, ...] = (),
+                   route=None) -> str:
         # max_turns=4 not 1: the CLI occasionally burns turns before the
         # final reply (observed live 2026-07-08, and again 2026-07-18 at 2).
         # Tools are disabled, so unused headroom costs nothing.
         # setting_sources=[] keeps the operator's hooks/plugins/skills out of
         # the subagent session \u2014 with them loaded, skill reminders push the
         # model into tool calls until max_turns errors (observed same day).
+        # credits path: the key lives only in this dict, handed straight to the options;
+        # options/env are never logged, formatted or put in an exception
+        env_kw = {"env": dict(route.env)} if route is not None and route.env else {}
         if tools and cwd:
             # tooled builder: read-only tools inside the worktree, more turns (reads cost turns),
             # deny list from _TOOLED_SETTINGS; the reply contract is unchanged. Build 2: in-process
@@ -196,11 +201,11 @@ def make_sdk_query_fn(*, model: str | None = None,
                                          + (TESTS_SYSTEM_PROMPT_SUFFIX if mcp_servers else ""),
                                          model=use_model, max_turns=max_turns, tools=list(tools),
                                          allowed_tools=allowed, cwd=cwd, setting_sources=[],
-                                         settings=_TOOLED_SETTINGS, **extra)
+                                         settings=_TOOLED_SETTINGS, **extra, **env_kw)
         else:
             options = ClaudeAgentOptions(system_prompt=system_prompt, model=use_model,
                                          max_turns=4, tools=[], allowed_tools=[],
-                                         setting_sources=[], settings=_LOCKED_SETTINGS)
+                                         setting_sources=[], settings=_LOCKED_SETTINGS, **env_kw)
         results: list[str] = []
         error: list[str] = []
 
@@ -211,7 +216,18 @@ def make_sdk_query_fn(*, model: str | None = None,
             try:
                 async for message in query(prompt=prompt, options=options):
                     if not isinstance(message, ResultMessage):
+                        if getattr(message, "rate_limit_info", None) is not None:
+                            meta["event"] = message
                         continue
+                    if route is not None and route.reservation is not None \
+                            and not meta.get("recorded"):
+                        try:
+                            credits.record(getattr(message, "total_cost_usd", None),
+                                           route.reservation, model=use_model,
+                                           usage=getattr(message, "usage", None))
+                            meta["recorded"] = True
+                        except Exception:
+                            pass
                     try:
                         meta["num_turns"] = getattr(message, "num_turns", None)
                         meta["subtype"] = getattr(message, "subtype", None)
@@ -233,14 +249,52 @@ def make_sdk_query_fn(*, model: str | None = None,
         except (asyncio.TimeoutError, TimeoutError) as e:
             raise TimeoutError(f"claude-agent-sdk query timed out after {timeout_s}s") from e
         if error:
-            raise RuntimeError(f"claude-agent-sdk error result: {error[-1]}")
+            raise RuntimeError(credits.redact(f"claude-agent-sdk error result: {error[-1]}"))
         if not results:
             raise RuntimeError("claude-agent-sdk returned no result message")
         return _strip_fences(results[-1])
 
     def _query_once(prompt: str, use_model, *, cwd: str | None = None,
                     mcp_servers: dict | None = None, mcp_tools: tuple[str, ...] = ()) -> str:
-        meta: dict = {"num_turns": None, "subtype": None}
+        # credits fallback: while a subscription limit window is open the query goes out on
+        # the API key; a subscription call that hits the account limit is retried ONCE on
+        # the key (builder queries are text-only, so the retry has no side effects).
+        # Model-scoped errors never reach here as limits: classify() ignores them and the
+        # model chain handles them first.
+        kw = dict(cwd=cwd, mcp_servers=mcp_servers, mcp_tools=mcp_tools)
+        rt = credits.route()
+        if rt.env:
+            return _query_routed(prompt, use_model, rt, **kw)
+        meta: dict = {}
+        try:
+            return _query_plain(prompt, use_model, meta=meta, **kw)
+        except TimeoutError:
+            raise
+        except Exception as e:
+            try:
+                limit = credits.classify(str(e), event=meta.get("event"))
+            except Exception:  # a malformed reset time must not mask the real error
+                limit = None
+            rt2 = credits.on_limit(limit) if limit is not None else None
+            if rt2 is None or not rt2.env:
+                raise
+            return _query_routed(prompt, use_model, rt2, **kw)
+
+    def _query_routed(prompt: str, use_model, rt, **kw) -> str:
+        meta: dict = {}
+        try:
+            return _query_plain(prompt, use_model, meta=meta, route=rt, **kw)
+        except Exception as e:
+            if credits.is_credits_exhausted(str(e)):
+                credits.mark_exhausted()
+            raise
+        finally:
+            if not meta.get("recorded"):
+                credits.release(rt.reservation)
+
+    def _query_plain(prompt: str, use_model, *, meta: dict, route=None, cwd: str | None = None,
+                     mcp_servers: dict | None = None, mcp_tools: tuple[str, ...] = ()) -> str:
+        meta.update({"num_turns": None, "subtype": None})
         start = time.monotonic()
 
         def _fields(reply_chars: int) -> dict:
@@ -251,16 +305,16 @@ def make_sdk_query_fn(*, model: str | None = None,
 
         try:
             text = _run_query(prompt, meta, use_model, cwd=cwd, mcp_servers=mcp_servers,
-                              mcp_tools=mcp_tools)
+                              mcp_tools=mcp_tools, route=route)
         except TimeoutError as e:
             fields = _fields(0)
             fields["timeout_s"] = timeout_s
-            fields["error"] = str(e)[:300]
+            fields["error"] = credits.redact(str(e))[:300]
             _emit(False, fields)
             raise
         except Exception as e:
             fields = _fields(0)
-            fields["error"] = str(e)[:300]
+            fields["error"] = credits.redact(str(e))[:300]
             _emit(False, fields)
             raise
         _emit(True, _fields(len(text)))
@@ -503,7 +557,7 @@ def _describe_error(message) -> str:
 
 # account/config failures: a retry just doubles the cost of a guaranteed error
 _NON_RETRYABLE = ("usage credits", "does not support this model", "session limit",
-                  "usage limit", "not logged in")
+                  "usage limit", "not logged in", "hit your limit")
 
 def _is_retryable(e: Exception) -> bool:
     msg = str(e).lower()
