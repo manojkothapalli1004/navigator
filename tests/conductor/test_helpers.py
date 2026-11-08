@@ -250,7 +250,7 @@ async def test_registry_keeps_running_plus_fifty_finished(tmp_path):
     hs = _helpers(tmp_path, Recorder())
     for i in range(60):
         hs.start(f"job {i}", TASK)
-    await _settle(10)
+    await _settle(100)  # 60 helpers x two file writes: 50 ms was a coin flip on a loaded machine
     recs = _file(tmp_path)
     assert len(recs) == 50 and recs[0]["title"] == "job 10" and recs[-1]["title"] == "job 59"
     assert hs.start("one more", TASK)["state"] == "running"
@@ -735,6 +735,119 @@ async def test_shutdown_cancels_inner_runner_task(tmp_path):
     await _settle(3)
     hs.shutdown(); await _settle(5)
     assert [t for t in asyncio.all_tasks() if t is not asyncio.current_task()] == []
+
+
+# ---- reaping a dead helper's tagged children (2026-11-08) ----
+
+def _alive(p):
+    return p.poll() is None
+
+
+def test_reap_kills_only_tagged():
+    import os
+    import subprocess
+    import time
+    tagged = lambda v: subprocess.Popen(["sleep", "60"], env={**os.environ, **({"NAV_HELPER_ID": v} if v else {})})
+    procs = [tagged("helper-T1"), tagged("helper-T1"), tagged("helper-T10"), tagged(None)]
+    try:
+        time.sleep(0.5)
+        probe = subprocess.run(["/bin/ps", "-A", "-ww", "-E", "-o", "pid=,command="], capture_output=True, text=True)
+        if " NAV_HELPER_ID=helper-T1 " not in probe.stdout.replace("\n", " ") + " ":
+            pytest.skip("ps -E does not show the tag here")
+        H.reap("helper-T1")
+        time.sleep(0.5)
+        assert [_alive(p) for p in procs] == [False, False, True, True]
+    finally:
+        for p in procs:
+            p.kill(); p.wait()
+
+
+@aio
+async def test_tagged_pids_exact_match_same_uid_not_self(monkeypatch):
+    import os
+    import subprocess
+    me, uid = os.getpid(), os.getuid()
+    rows = [f"101 1 {uid} sleep 60 A=b NAV_HELPER_ID=helper-T1 C=d",
+            f"102 1 {uid} sleep 60 NAV_HELPER_ID=helper-T1",          # tag at end of line
+            f"103 1 {uid} sleep 60 NAV_HELPER_ID=helper-T10 X=y",     # prefix near-miss
+            f"104 1 {uid} sleep 60 XNAV_HELPER_ID=helper-T1 X=y",     # suffix near-miss
+            f"105 1 {uid + 1} sleep 60 NAV_HELPER_ID=helper-T1",      # another user
+            f"{me} 1 {uid} python NAV_HELPER_ID=helper-T1",           # ourselves
+            f"106 1 {uid} sleep 60"]                                  # untagged
+    fake = subprocess.CompletedProcess([], 0, stdout="\n".join(rows) + "\n", stderr="")
+    monkeypatch.setattr(H.subprocess, "run", lambda *a, **k: fake)
+    assert sorted(H._tagged_pids("helper-T1")) == [101, 102]
+
+
+@aio
+async def test_end_reap_policy(tmp_path, monkeypatch):
+    # cancelled and failed (timed out) launched helpers reap once; done / exact / never-launched do not
+    for state in ("cancelled", "failed", "done"):
+        calls = []
+        hs = _helpers(tmp_path / state, Recorder(gate=asyncio.Event()))
+        hs._reap = calls.append
+        A = hs.start("A", TASK)
+        await _settle(3)
+        r = _rec(hs, A)
+        hs._end(r, state, **({"error": "timed out"} if state == "failed" else {}))
+        await _settle(5)
+        assert calls == ([A["id"]] if state != "done" else []), state
+        hs._end(r, "failed")  # idempotent: no second reap
+        await _settle(5)
+        assert len(calls) == (0 if state == "done" else 1)
+        hs.shutdown(); await _settle(3)
+    calls = []
+    hs = _helpers(tmp_path / "exact", Recorder(gate=asyncio.Event()))
+    hs._reap = calls.append
+    X = hs.start("X", TASK, exact={"tool": "Bash", "input": {}, "cwd": "/"})
+    await _settle(3)
+    hs._end(_rec(hs, X), "cancelled"); await _settle(5)
+    assert calls == []
+    hs.shutdown(); await _settle(3)
+    # queued then cancelled: nothing ran
+    calls = []
+    hs = _helpers(tmp_path / "queued", Recorder(gate=asyncio.Event()))
+    hs._reap = calls.append
+    hs.start("L1", TASK, timeout_s=900)
+    Q = hs.start("L2", TASK, timeout_s=900)
+    assert hs.cancel(Q["id"]); await _settle(5)
+    assert calls == []
+    hs.shutdown(); await _settle(3)
+    # a raising reap never stops the report or the queue
+    finished = []
+    hs = _helpers(tmp_path / "raises", Recorder(gate=asyncio.Event()), finished=finished)
+
+    def boom(hid):
+        raise RuntimeError("boom")
+    hs._reap = boom
+    L1 = hs.start("L1", TASK, timeout_s=900)
+    L2 = hs.start("L2", TASK, timeout_s=900)
+    await _settle(3)
+    hs._end(_rec(hs, L1), "cancelled"); await _settle(5)
+    assert [f["id"] for f in finished] == [L1["id"]] and _rec(hs, L2)["state"] == "running"
+    hs.shutdown(); await _settle(3)
+
+
+@aio
+async def test_reap_off_switch(tmp_path, monkeypatch):
+    monkeypatch.setenv("CONDUCTOR_HELPER_REAP", "0")
+    calls = []
+    hs = _helpers(tmp_path, Recorder(gate=asyncio.Event()))
+    hs._reap = calls.append
+    A = hs.start("A", TASK)
+    await _settle(3)
+    hs._end(_rec(hs, A), "cancelled"); await _settle(5)
+    assert calls == []
+    hs.shutdown(); await _settle(3)
+
+
+def test_helper_options_sets_env_tag():
+    base = H.helper_options(None)
+    assert not base.env
+    tagged = H.helper_options(None, helper_id="helper-X")
+    assert tagged.env == {"NAV_HELPER_ID": "helper-X"}
+    exact = {"tool": "Bash", "input": {"command": "ls"}, "cwd": "/Users/Manoj/calwbot"}
+    assert not H.helper_options(None, exact=exact, helper_id="helper-X").env
 
 
 def test_prompt_is_portable_on_macos():

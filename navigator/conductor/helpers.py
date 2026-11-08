@@ -12,6 +12,9 @@ import json
 import logging
 import math
 import os
+import signal
+import subprocess
+import threading
 import time
 from collections import deque
 from pathlib import Path
@@ -113,7 +116,7 @@ def _only(exact: dict):
     return hook
 
 
-def helper_options(hook, exact: dict | None = None) -> ClaudeAgentOptions:
+def helper_options(hook, exact: dict | None = None, helper_id: str | None = None) -> ClaudeAgentOptions:
     from navigator.conductor import runner  # runner imports engine; a module-level import would cycle
     # Kill switch CONDUCTOR_HELPER_ORC, read at call time so a live engine follows a change without a
     # restart: unset or any value other than the exact string "0" = on; "0" = today's helper, byte for
@@ -141,7 +144,55 @@ def helper_options(hook, exact: dict | None = None) -> ClaudeAgentOptions:
         max_turns=HELPER_MAX_TURNS, include_partial_messages=True,
         # the fence runs first: a call it refuses must not consume an approved card
         hooks={"PreToolUse": [HookMatcher(hooks=[_only(exact) if exact else scratch_only_hook, hook])]},
-        can_use_tool=gate.can_use_tool)
+        can_use_tool=gate.can_use_tool,
+        # tags the whole process tree (children inherit it) so reap() can find what a dead helper left behind;
+        # never for an approved-card helper: its options stay as they were
+        env={"NAV_HELPER_ID": helper_id} if helper_id and exact is None else {})
+
+
+MAX_REAP = 50
+
+
+def _tagged_pids(helper_id: str) -> list[int]:
+    """Pids of this user's processes whose environment holds exactly NAV_HELPER_ID=<helper_id> (an exact
+    token, so helper-1 never matches helper-10). Not found: no env visible, other user, ours."""
+    out = subprocess.run(["/bin/ps", "-A", "-ww", "-E", "-o", "pid=,ppid=,uid=,command="],
+                         capture_output=True, text=True, timeout=10).stdout
+    rows, parent = [], {}
+    for line in out.splitlines():
+        f = line.split(None, 3)
+        if len(f) < 3 or not (f[0].isdigit() and f[1].isdigit() and f[2].isdigit()):
+            continue
+        pid, ppid, uid = int(f[0]), int(f[1]), int(f[2])
+        parent[pid] = ppid
+        rows.append((pid, uid, f[3] if len(f) > 3 else ""))
+    skip, p = {os.getpid()}, os.getpid()
+    while p in parent and parent[p] > 1 and parent[p] not in skip:
+        p = parent[p]
+        skip.add(p)
+    token = f" NAV_HELPER_ID={helper_id} "
+    return [pid for pid, uid, cmd in rows
+            if uid == os.getuid() and pid not in skip and token in f" {cmd} "]
+
+
+def reap(helper_id: str) -> int:
+    """Kill what a cancelled/timed-out/failed helper left running: SIGTERM, 3 s, SIGKILL for survivors, only
+    processes tagged with this helper's id (exact), same uid. Never by name or process group. Returns the count."""
+    pids = _tagged_pids(helper_id)[:MAX_REAP]
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+    if pids:
+        time.sleep(3)
+        for pid in set(_tagged_pids(helper_id)) & set(pids):  # re-matched now: a recycled pid is never hit
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+        _log.warning("conductor.helper_reaped: %d", len(pids))
+    return len(pids)
 
 
 async def sdk_helper(task: str, helper_id: str, emit, *, hook, exact: dict | None = None) -> str:
@@ -150,7 +201,7 @@ async def sdk_helper(task: str, helper_id: str, emit, *, hook, exact: dict | Non
     uses, so a gated action here raises a card exactly as before; `exact` (an approved card) narrows
     the session to that one call."""
     parts: list[str] = []
-    async with ClaudeSDKClient(options=helper_options(hook, exact)) as client:
+    async with ClaudeSDKClient(options=helper_options(hook, exact, helper_id)) as client:
         await client.query(task)
         async for m in client.receive_response():
             if isinstance(m, StreamEvent):
@@ -298,6 +349,19 @@ class Helpers:
         except Exception as e:  # the next helper must start even if the engine choked on the report
             _log.warning("conductor.helper_finish_failed: %s", type(e).__name__)
         self._start_queued()
+        if (state in ("cancelled", "failed") and rec.get("launched") and not rec.get("exact")
+                and os.environ.get("CONDUCTOR_HELPER_REAP", "1") != "0"):
+            hid = rec["id"]
+
+            def work() -> None:
+                try:
+                    self._reap(hid)
+                except Exception as e:
+                    _log.warning("conductor.helper_reap_failed: %s", type(e).__name__)
+            threading.Thread(target=work, daemon=True).start()
+
+    def _reap(self, helper_id: str) -> int:
+        return reap(helper_id)
 
     @staticmethod
     def _inner_done(t: asyncio.Task) -> None:
