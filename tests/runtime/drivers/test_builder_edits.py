@@ -152,6 +152,16 @@ def test_builder_prompt_tells_the_model_to_use_file_edits_for_existing_files():
     assert "new or changed behaviour" in p and "context.test_files" in p
 
 
+def test_builder_prompt_asks_for_a_minimal_diff():
+    prompts = []
+    _run({"file_writes": [], "commands": [], "summary": "s"}, files={"a.py": BASE}, prompts=prompts)
+    p = prompts[0]
+    assert "smallest change that solves the task" in p and "no refactors, renames or reformatting" in p
+    assert "EXISTING test file for that module" in p and "one or two focused test functions" in p
+    assert "create a new test file only if none exists" in p
+    assert "existing style and error messages" in p
+
+
 # N9b: phases._read_affected cuts context.files at _MAX_FILE_CHARS without a marker;
 # an edit resolved against that base would silently drop the rest of the file.
 def test_driver_truncation_cap_is_the_one_phases_truncates_at():
