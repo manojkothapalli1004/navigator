@@ -24,8 +24,10 @@ def cenv(tmp_path, monkeypatch):
     monkeypatch.setenv("NAVIGATOR_CREDITS_ENV_FILE", str(envf))
     for k in ("CREDITS_FALLBACK", "CREDITS_DAILY_CAP_USD", "CREDITS_FLOOR_USD",
               "CREDITS_START_BALANCE_USD", "CREDITS_EXPIRES", "CREDITS_CALL_RESERVE_USD",
-              "ANTHROPIC_API_KEY"):
+              "CREDITS_CALL_MAX_USD", "CREDITS_PROBE", "ANTHROPIC_API_KEY"):
         monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("NAVIGATOR_CREDITS_LOG", str(tmp_path / "events.jsonl"))
+    monkeypatch.setattr(credits, "_probe_runner", lambda timeout_s=60: ("limited", "stub"), raising=False)
     credits.set_notifier(None)
     st.write_text(json.dumps({"verified": True, "est_balance": 83.58}))
     yield types.SimpleNamespace(state=st)
@@ -38,10 +40,10 @@ def _install(monkeypatch, steps):
     calls = []
 
     class ResultMessage:
-        def __init__(self, result=None, is_error=False):
+        def __init__(self, result=None, is_error=False, subtype="success"):
             self.result, self.is_error = result, is_error
             self.total_cost_usd, self.usage = 0.5, None
-            self.num_turns, self.subtype = 1, "success"
+            self.num_turns, self.subtype = 1, subtype
 
     class ClaudeAgentOptions:
         def __init__(self, **kw):
@@ -51,8 +53,14 @@ def _install(monkeypatch, steps):
             return "OPTIONS"
 
     async def query(*, prompt, options):
-        calls.append({"env": options.kw.get("env"), "model": options.kw.get("model")})
+        calls.append({"env": options.kw.get("env"), "model": options.kw.get("model"),
+                      "budget": options.kw.get("max_budget_usd", "absent")})
         kind, text = steps[min(len(calls), len(steps)) - 1]
+        if kind == "budget":
+            yield ResultMessage(result=None, is_error=True, subtype="error_max_budget_usd")
+            raise Exception("error result: error_max_budget_usd")
+        if kind == "crash":  # no ResultMessage at all; "not logged in" keeps it non-retryable
+            raise Exception("crash: not logged in")
         yield ResultMessage(result=text, is_error=kind == "error")
         if kind == "error":
             raise Exception("error result: success")
@@ -84,6 +92,12 @@ def test_limit_retries_once_with_key_and_records(cenv, monkeypatch):
     assert notes
 
 
+def test_credits_call_carries_budget_and_plain_call_has_none(cenv, monkeypatch):
+    calls = _install(monkeypatch, [("error", LIMIT), ("ok", GOOD)])
+    assert make_sdk_query_fn()("p") == GOOD
+    assert calls[0]["budget"] == "absent" and calls[1]["budget"] == round(5.0 / 1.1, 4)
+
+
 def test_next_query_routes_to_credits_while_window_open(cenv, monkeypatch):
     calls = _install(monkeypatch, [("error", LIMIT), ("ok", GOOD), ("ok", GOOD)])
     fn = make_sdk_query_fn()
@@ -104,7 +118,24 @@ def test_retry_failing_releases_reservation(cenv, monkeypatch):
     _install(monkeypatch, [("error", LIMIT), ("error", "boom")])
     with pytest.raises(RuntimeError):
         make_sdk_query_fn()("p")
-    assert _st(cenv)["reserved"] == []
+    s = _st(cenv)
+    assert s["reserved"] == [] and s["spent_today"] > 0      # each attempt's result was recorded
+
+
+def test_launched_key_call_without_result_is_charged_its_hold(cenv, monkeypatch):
+    # the CLI crashed after launch with no ResultMessage: charge the hold (the most it could have spent)
+    _install(monkeypatch, [("error", LIMIT), ("crash", "")])
+    with pytest.raises(Exception, match="crash"):      # the fake SDK's bare exception propagates
+        make_sdk_query_fn()("p")
+    s = _st(cenv)
+    assert s["reserved"] == [] and abs(s["spent_today"] - 5.0 * 1.1) < 1e-9
+
+
+def test_budget_stop_is_final_and_explained(cenv, monkeypatch):
+    calls = _install(monkeypatch, [("error", LIMIT), ("budget", "")])
+    with pytest.raises(RuntimeError, match="max_budget"):
+        make_sdk_query_fn()("p")
+    assert len(calls) == 2                       # no third attempt on a fresh budget
 
 
 def test_model_scoped_error_falls_back_model_first_without_credits(cenv, monkeypatch):

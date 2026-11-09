@@ -184,8 +184,11 @@ def cred(tmp_path, monkeypatch):
     monkeypatch.setenv("NAVIGATOR_CREDITS_STATE", str(st))
     monkeypatch.setenv("NAVIGATOR_CREDITS_ENV_FILE", str(envf))
     for k in ("CREDITS_FALLBACK", "CREDITS_DAILY_CAP_USD", "CREDITS_FLOOR_USD", "CREDITS_START_BALANCE_USD",
-              "CREDITS_EXPIRES", "CREDITS_CALL_RESERVE_USD", "ANTHROPIC_API_KEY"):
+              "CREDITS_EXPIRES", "CREDITS_CALL_RESERVE_USD", "CREDITS_CALL_MAX_USD", "CREDITS_PROBE",
+              "ANTHROPIC_API_KEY"):
         monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("NAVIGATOR_CREDITS_LOG", str(tmp_path / "events.jsonl"))
+    monkeypatch.setattr(credits, "_probe_runner", lambda timeout_s=60: ("limited", "stub"), raising=False)
     msgs = []
     credits.set_notifier(msgs.append)
     yield type("C", (), {"state": st, "msgs": msgs})
@@ -195,8 +198,10 @@ def cred(tmp_path, monkeypatch):
 class AttemptClient(FakeClient):
     attempts: list = []
     envs: list = []
+    budgets: list = []
     def __init__(self, options):
         AttemptClient.envs.append(dict(options.env))
+        AttemptClient.budgets.append(options.max_budget_usd)
         self._m = AttemptClient.attempts.pop(0)
     async def receive_response(self):
         for m in self._m:
@@ -206,7 +211,7 @@ class AttemptClient(FakeClient):
 
 
 def _attempts(monkeypatch, *atts):
-    AttemptClient.attempts, AttemptClient.envs = list(atts), []
+    AttemptClient.attempts, AttemptClient.envs, AttemptClient.budgets = list(atts), [], []
     monkeypatch.setattr(runner, "ClaudeSDKClient", AttemptClient)
 
 
@@ -239,8 +244,9 @@ def test_key_never_in_errors_or_logs(cred, monkeypatch, caplog, capsys):
     assert KEY not in caplog.text and KEY not in out.out + out.err
 
 
-def test_reservation_released_when_no_result(cred, monkeypatch):
-    # route() already reserved; a crash with no ResultMessage must release it
+def test_launched_key_call_without_result_is_charged_its_hold(cred, monkeypatch):
+    # route() already reserved; a crash after launch with no ResultMessage charges the hold (the most
+    # the CLI could have spent) instead of freeing it
     st = _json.loads(cred.state.read_text())
     st["until"] = _time.time() + 3600
     cred.state.write_text(_json.dumps(st))
@@ -248,7 +254,8 @@ def test_reservation_released_when_no_result(cred, monkeypatch):
     with pytest.raises(RuntimeError):
         asyncio.run(runner.sdk_turn("hi", None, lambda e: None))
     assert AttemptClient.envs[0]["ANTHROPIC_API_KEY"] == KEY
-    assert _json.loads(cred.state.read_text())["reserved"] == []
+    s = _json.loads(cred.state.read_text())
+    assert s["reserved"] == [] and abs(s["spent_today"] - 5.0 * 1.1) < 1e-9
 
 
 def test_engine_notice_notes_history(tmp_path):
@@ -274,6 +281,13 @@ def test_rate_limit_assistant_message_does_not_count_as_started(cred, monkeypatc
     _attempts(monkeypatch, [_rl_asst(), _result(is_error=True, result=LIMIT)], [_delta("hi"), _result("s-c")])
     assert asyncio.run(runner.sdk_turn("hi", None, lambda e: None)) == "s-c"
     assert AttemptClient.envs[1]["ANTHROPIC_API_KEY"] == KEY
+
+
+def test_credits_attempt_carries_its_budget_and_subscription_attempt_none(cred, monkeypatch):
+    _attempts(monkeypatch, [_result(is_error=True, result=LIMIT)], [_delta("hi"), _result("s-c")])
+    asyncio.run(runner.sdk_turn("hi", None, lambda e: None))
+    assert AttemptClient.budgets == [None, round(5.0 / 1.1, 4)]   # hold 5.0 (call max) / MARGIN
+    assert runner.options(None).max_budget_usd is None
 
 
 def test_credit_balance_error_on_credits_call_marks_exhausted(cred, monkeypatch):

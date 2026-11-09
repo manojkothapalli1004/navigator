@@ -1028,8 +1028,8 @@ def _asst(*blocks):
     return AssistantMessage(content=list(blocks), model="m", parent_tool_use_id=None)
 
 
-def _creds_route(res="r1"):
-    return C.Route({"ANTHROPIC_API_KEY": KEY}, None, C.Reservation(res, 2.0, 0.0))
+def _creds_route(res="r1", budget=2.0):
+    return C.Route({"ANTHROPIC_API_KEY": KEY}, None, C.Reservation(res, budget, 0.0), budget)
 
 
 def test_limit_before_anything_retries_once_with_credits_env(monkeypatch):
@@ -1108,7 +1108,8 @@ def test_reservation_released_on_crash_and_recorded_on_result(monkeypatch):
     f.install(monkeypatch, [[ValueError("boom " + KEY)]])
     with pytest.raises(RuntimeError) as ei:
         asyncio.run(H.sdk_helper(TASK, "helper-1", lambda e: None, hook=_hook))
-    assert KEY not in str(ei.value) and f.released == [res] and not f.recorded
+    # launched, then crashed with no result: the hold is charged (record None cost), never freed
+    assert KEY not in str(ei.value) and f.released == [] and f.recorded == [(None, res)]
     f = Fake([C.Route({"ANTHROPIC_API_KEY": KEY}, None, res)])
     f.install(monkeypatch, [[_start(), _delta("x"), _result()]])
     asyncio.run(H.sdk_helper(TASK, "helper-1", lambda e: None, hook=_hook))
@@ -1226,6 +1227,18 @@ def test_card_helper_on_subscription_records_no_credits_spend(monkeypatch):
     exact = {"tool": "Bash", "input": {"command": CARD_CMD}, "cwd": "/r"}
     asyncio.run(H.sdk_helper(TASK, "helper-1", lambda e: None, hook=_hook, exact=exact))
     assert f.recorded == []
+
+
+def test_credits_attempt_carries_its_budget_and_subscription_attempt_none(monkeypatch):
+    f = Fake([C.Route(), _creds_route(budget=3.5)])
+    f.install(monkeypatch, [[_limit_result()], [_start(), _delta("fine"), _result()]])
+    asyncio.run(H.sdk_helper(TASK, "helper-1", lambda e: None, hook=_hook))
+    assert [o.max_budget_usd for o in AttemptClient.opts] == [None, 3.5]
+    f = Fake([C.Route()])
+    f.install(monkeypatch, [[_start(), _delta("ran"), _result()]])
+    exact = {"tool": "Bash", "input": {"command": CARD_CMD}, "cwd": "/r"}
+    asyncio.run(H.sdk_helper(TASK, "helper-1", lambda e: None, hook=_hook, exact=exact))
+    assert AttemptClient.opts[0].max_budget_usd is None
 
 
 def test_credits_helper_records_exactly_its_reservation(monkeypatch):
