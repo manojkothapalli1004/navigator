@@ -1140,3 +1140,40 @@ def test_options_equal_apart_from_env_and_piddir_kept(tmp_path, monkeypatch):
     asyncio.run(H.sdk_helper(TASK, "helper-Z", lambda e: None, hook=_hook, pid_root=tmp_path))
     e = AttemptClient.opts[0].env
     assert e["ANTHROPIC_API_KEY"] == KEY and e["NAV_HELPER_PIDDIR"].endswith("helper-Z")
+
+
+# ---- UNVERIFIED rule (2026-11-09)
+UNV = "For every claim you did not verify with a tool in this task, prefix the line with UNVERIFIED:"
+
+
+def test_helper_prompt_has_unverified_rule():
+    assert UNV in H.HELPER_PROMPT
+    assert H.HELPER_PROMPT.index(UNV) < H.HELPER_PROMPT.index("Keep the closing report")
+
+
+def test_unverified_rule_reaches_helper_options(monkeypatch):
+    monkeypatch.setenv("CONDUCTOR_HELPER_ORC", "0")
+    opts = H.helper_options(hook=lambda *a: {})
+    assert UNV in opts.system_prompt["append"] and opts.system_prompt["append"] == H.HELPER_PROMPT
+    exact = {"tool": "Bash", "input": {"command": "git push origin main"}, "cwd": "/r"}
+    assert UNV in H.helper_options(lambda *a: {}, exact=exact).system_prompt["append"]
+
+
+@aio
+async def test_report_with_probably_is_untouched(tmp_path):
+    text = "tests should pass, probably fine"
+    hs = _helpers(tmp_path, Recorder(result=text))
+    hs.start("a", TASK)
+    await _settle(10)
+    (rec,) = _file(tmp_path)
+    assert rec["state"] == "done" and rec["result"] == text
+
+
+@aio
+async def test_unverified_line_kept_verbatim_across_cut(tmp_path):
+    text = "UNVERIFIED: the port is 8080\n" + "y" * (H.RESULT_CHARS + 50)
+    hs = _helpers(tmp_path, Recorder(result=text))
+    hs.start("a", TASK)
+    await _settle(10)
+    (rec,) = _file(tmp_path)
+    assert rec["result"].startswith("UNVERIFIED: the port is 8080\n")
