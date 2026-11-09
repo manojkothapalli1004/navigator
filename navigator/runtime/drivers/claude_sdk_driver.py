@@ -125,7 +125,8 @@ _ROLE_OUTPUT_SPEC = {
                    'naming of context.test_files. context.related_files are for reference: use them '
                    'to get models, fixtures and APIs right. Never write non-test related files; '
                    'DO update existing test files among them when your change alters an API '
-                   'they call. If a run_tests tool is available, its result describes the worktree '
+                   'they call. A test file in context.files that covers the changed module is the '
+                   'place for new tests; prefer file_edits on it over a new file. If a run_tests tool is available, its result describes the worktree '
                    'BEFORE your edits; still reply with the full JSON object.'),
     Role.verifier: ('Choose commands that prove context.proposal works, each starting with an entry '
                     'of context.allowed_commands. Commands run inside context.workdir; use paths '

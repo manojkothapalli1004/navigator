@@ -62,6 +62,10 @@ _MAX_FILE_CHARS = 60_000
 
 _LARGE_DIGEST_BUDGET = 40_000
 _LARGE_TOTAL_BUDGET = 80_000
+_TEST_CONTEXT_BUDGET = 25_000       # share of _LARGE_TOTAL_BUDGET for related test files
+_TEST_CONTEXT_MAX_FILES = 2
+_IMPORT_SCAN_FILES = 200
+_IMPORT_SCAN_BYTES = 64 * 1024
 _IDENT = re.compile(r"[A-Za-z_]\w{2,}")
 _DEF_LINE = re.compile(
     r"^\s*(?:export\s+|pub\s+|async\s+)*(def|class|function|func|fn|interface|struct|impl|type)\b[ \t]*([A-Za-z_]\w*)?")
@@ -89,7 +93,8 @@ def _py_symbols(text: str):
                                 f"{node.name}.{sub.name}"))
     return out
 
-def _large_digest(rel: str, text: str, mention_text: str = "", budget: int = _LARGE_DIGEST_BUDGET) -> str:
+def _large_digest(rel: str, text: str, mention_text: str = "", budget: int = _LARGE_DIGEST_BUDGET,
+                  focus: list[str] = ()) -> str:
     """Orientation digest for a file too big to hand over whole: header, outline, then
     verbatim excerpts (imports, plus windows aimed at identifiers in mention_text). Never a
     write base; edits are matched against the real file by the driver."""
@@ -123,6 +128,19 @@ def _large_digest(rel: str, text: str, mention_text: str = "", budget: int = _LA
         by_name.setdefault(q, (a, b))
         by_name.setdefault(q.rsplit(".", 1)[-1], (a, b))
     cands: list[tuple[int, int]] = [(1, min(40, len(lines)))]
+    # focus (changed symbols): test classes / test_* defs about them win under the budget
+    nfocus = 0
+    for s in focus:
+        camel = "".join(part.capitalize() for part in s.split("_")).lower()
+        low = s.lower()
+        for a, b, kind, q in (syms or []):
+            name = q.rsplit(".", 1)[-1]
+            if (kind == "class" and camel in name.lower()) or (
+                    kind != "class" and name.startswith("test_") and low in name.lower()):
+                cands.append((a, min(b, a + 199)))
+                nfocus += 1
+        if nfocus >= 40:
+            break
     seen: set[str] = set()
     for tok in _IDENT.findall(mention_text or ""):
         if tok in seen:
@@ -169,11 +187,12 @@ def _large_digest(rel: str, text: str, mention_text: str = "", budget: int = _LA
     return out
 
 def _read_affected(wt: Path, relpaths: list[str], mention_text: str = "",
-                   ) -> tuple[dict[str, str | None], dict[str, dict]]:
+                   test_paths: list[str] = ()) -> tuple[dict[str, str | None], dict[str, dict]]:
     # tools are disabled for subagents, so the builder only sees what we hand it;
     # None marks a file the proposal expects to create. A file of >= _MAX_FILE_CHARS is shown
     # as a digest and declared in `large` ({rel: chars, lines, sha256}); the driver resolves
-    # its edits against the real file on disk
+    # its edits against the real file on disk. test_paths (related test files) are read last,
+    # from their own _TEST_CONTEXT_BUDGET share, so source digests are never starved.
     import hashlib
     files: dict[str, str | None] = {}
     large: dict[str, dict] = {}
@@ -197,7 +216,129 @@ def _read_affected(wt: Path, relpaths: list[str], mention_text: str = "",
         files[rel] = digest
         large[rel] = {"chars": len(text), "lines": text.count("\n") + 1,
                       "sha256": hashlib.sha256(raw).hexdigest()}
+    test_used = 0
+    focus = _focus_symbols(wt, relpaths, mention_text) if test_paths else []
+    for rel in test_paths:
+        if rel in files or (wt / rel).is_symlink():
+            continue
+        try:
+            target = _resolve_write_target(wt, rel)
+            if not target.is_file():
+                continue
+            raw = target.read_bytes()
+            text = raw.decode()
+        except (ValueError, OSError, UnicodeDecodeError):
+            continue
+        room = min(_TEST_CONTEXT_BUDGET - test_used, _LARGE_TOTAL_BUDGET - used - test_used)
+        if not _is_large(text):
+            if len(text) <= room:
+                files[rel] = text
+                test_used += len(text)
+            continue
+        if room < 2000:
+            continue
+        digest = _large_digest(rel, text, mention_text, budget=min(_LARGE_DIGEST_BUDGET, room), focus=focus)
+        test_used += len(digest)
+        files[rel] = digest
+        large[rel] = {"chars": len(text), "lines": text.count("\n") + 1,
+                      "sha256": hashlib.sha256(raw).hexdigest()}
     return files, large
+
+def _read_head(path: Path) -> str | None:
+    """First _IMPORT_SCAN_BYTES of a regular, UTF-8, LF file; None if unreadable or unsuitable."""
+    try:
+        if path.is_symlink() or not path.is_file():
+            return None
+        with open(path, "rb") as fh:
+            raw = fh.read(_IMPORT_SCAN_BYTES)
+    except OSError:
+        return None
+    if b"\r\n" in raw:
+        return None
+    for cut in range(0, 4):   # the byte limit may split a multi-byte character
+        try:
+            return (raw[:len(raw) - cut] if cut else raw).decode()
+        except UnicodeDecodeError:
+            continue
+    return None
+
+def _source_symbol_names(wt: Path, rel: str) -> set[str]:
+    try:
+        text = _resolve_write_target(wt, rel).read_text()
+    except (ValueError, OSError, UnicodeDecodeError):
+        return set()
+    return {q.rsplit(".", 1)[-1] for _a, _b, _k, q in (_py_symbols(text) or [])}
+
+def _focus_symbols(wt: Path, relpaths: list[str], mention_text: str) -> list[str]:
+    """Changed-symbol names: identifiers in mention_text that exist in an affected
+    non-test python file, plus each such file's module stem."""
+    out: list[str] = []
+    idents = list(dict.fromkeys(_IDENT.findall(mention_text or "")))
+    for rel in relpaths:
+        if not rel.endswith(".py") or _is_test_file(rel):
+            continue
+        names = _source_symbol_names(wt, rel)
+        out += [t for t in idents if t in names]
+        stem = Path(rel).stem
+        if stem != "__init__":
+            out.append(stem)
+    return list(dict.fromkeys(out))
+
+def _related_tests_enabled() -> bool:
+    return os.environ.get("NAVIGATOR_RELATED_TEST_CONTEXT", "1").strip().lower() not in ("0", "false", "off")
+
+def _related_tests(wt: Path, tracked: list[str], affected: list[str], workdir: str,
+                   mention_text: str = "", exclude: set[str] | frozenset = frozenset()) -> list[str]:
+    """Up to _TEST_CONTEXT_MAX_FILES tracked test files covering the affected python modules:
+    name matches (test_<module>.py) first, then a bounded import scan. Local reads only."""
+    if not _related_tests_enabled():
+        return []
+    wd = "" if workdir in (".", "") else workdir.strip("/")
+    tracked_set = set(tracked)
+    skip = set(affected) | set(exclude)
+    tests = sorted(t for t in tracked_set if _is_test_file(t))
+    scan_pool = [t for t in tests if t not in skip][:_IMPORT_SCAN_FILES]
+    ranked: list[tuple[int, int, str]] = []
+    seen: set[str] = set()
+    for rel in affected:
+        if wd and rel not in tracked_set and f"{wd}/{rel}" in tracked_set:
+            rel = f"{wd}/{rel}"
+        if not rel.endswith(".py") or _is_test_file(rel):
+            continue
+        m = Path(rel).stem
+        symbols = {t for t in _IDENT.findall(mention_text or "") if t in _source_symbol_names(wt, rel)}
+        by_name = [t for t in tests if t not in skip and Path(t).name == f"test_{m}.py"] if m != "__init__" else []
+        if by_name:
+            matches = [(0, t) for t in by_name]
+        else:
+            dotted = {m}
+            mod = Path(rel).with_suffix("")
+            if m == "__init__":
+                mod = mod.parent
+                dotted = set()
+            for base in (mod, mod.relative_to(wd) if wd and mod.is_relative_to(wd) else None):
+                if base is not None and base.parts:
+                    dotted.add(".".join(base.parts))
+            alts = "|".join(re.escape(d) for d in sorted(dotted))
+            pat = re.compile(rf"^[ \t]*(?:from[ \t]+(?:{alts})(?:\.|[ \t])|import[ \t]+(?:{alts})\b"
+                             rf"|from[ \t]+\S+[ \t]+import[ \t]+.*\b{re.escape(m)}\b)", re.M) if dotted else None
+            matches = []
+            if pat:
+                for t in scan_pool:
+                    head = _read_head(wt / t)
+                    if head is not None and pat.search(head):
+                        matches.append((1, t))
+        for tier, t in matches:
+            if t in seen:
+                continue
+            seen.add(t)
+            head = _read_head(wt / t)
+            if head is None:
+                continue
+            mentions = any(re.search(rf"\b{re.escape(sym)}\b", head) for sym in symbols)
+            ranked.append((tier, 0 if mentions else 1, t))
+    ranked.sort()
+    return [t for _a, _b, t in ranked[:_TEST_CONTEXT_MAX_FILES]]
 
 def _is_test_file(rel: str) -> bool:
     # tests may be added beyond the approved list: they can't change runtime behaviour
@@ -904,8 +1045,11 @@ def _attempt(driver: SubagentDriver, wt: Path, base: str, run_id: str, runner: C
     mention_text = f"{proposal.get('intended_changes') or ''} {proposal.get('rationale') or ''}"
     digest_text = (f"{proposal.get('title') or ''} {mention_text} "
                    f"{(proposal.get('previous_attempt_failure') or '')[-2000:]}")
-    files, large = _read_affected(wt, list(dict.fromkeys(proposal.get("affected_files", [])
-                                                         + list(prior_writes) + failing)), digest_text)
+    affected = proposal.get("affected_files", [])
+    test_paths = _related_tests(wt, tracked, affected, workdir or ".", digest_text,
+                                exclude=set(prior_writes) | set(failing))
+    files, large = _read_affected(wt, list(dict.fromkeys(affected + list(prior_writes) + failing)),
+                                  digest_text, test_paths=test_paths)
     build_ctx = {"proposal": proposal, "files": files, "large_files": large,
                  "test_files": [f for f in tracked if _is_test_file(f)][:200],
                  "related_files": _related_files(wt, tracked, set(files),
