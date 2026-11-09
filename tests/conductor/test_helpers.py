@@ -1241,6 +1241,17 @@ def test_credits_attempt_carries_its_budget_and_subscription_attempt_none(monkey
     assert AttemptClient.opts[0].max_budget_usd is None
 
 
+def test_route_is_called_off_the_loop(monkeypatch):
+    import threading
+    idents = []
+    f = Fake([C.Route()])
+    f.install(monkeypatch, [[_start(), _delta("fine"), _result()]])
+    inner = C.route
+    monkeypatch.setattr(C, "route", lambda *a, **k: (idents.append(threading.get_ident()), inner(*a, **k))[1])
+    asyncio.run(H.sdk_helper(TASK, "helper-1", lambda e: None, hook=_hook))
+    assert idents and idents[0] != threading.main_thread().ident
+
+
 def test_approved_card_helper_on_the_key_carries_its_budget(monkeypatch):
     f = Fake([_creds_route(budget=1.25)])
     f.install(monkeypatch, [[_start(), _delta("ran"), _result()]])

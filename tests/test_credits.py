@@ -438,6 +438,9 @@ def test_on_limit_async_releases_a_hold_when_cancelled(env, monkeypatch):
         return "limited", "late"
 
     monkeypatch.setattr(credits, "_probe_runner", slow_probe)
+    released = []
+    real_release = credits.release
+    monkeypatch.setattr(credits, "release", lambda r, *a, **k: (released.append(r), real_release(r, *a, **k)))
 
     async def go():
         task = asyncio.ensure_future(credits.on_limit_async(credits.Limit(NOW + 600, "five_hour")))
@@ -446,13 +449,51 @@ def test_on_limit_async_releases_a_hold_when_cancelled(env, monkeypatch):
         with pytest.raises(asyncio.CancelledError):
             await task
         gate.set()
-        for _ in range(100):                     # the worker finishes and its Route is released
+        for _ in range(150):                     # the worker finishes, switches, and its Route is dropped
             await asyncio.sleep(0.02)
-            if not credits.state()["reserved"] and credits.state()["until"] > 0:
+            if released:
                 break
         return credits.state()
     s = asyncio.run(go())
-    assert s["reserved"] == []
+    assert len(released) == 1 and released[0].amount > 0 and s["reserved"] == [] and s["until"] > 0
+
+
+def test_route_async_runs_off_the_loop_and_returns_the_route(env, monkeypatch):
+    import asyncio
+    import threading
+    idents = []
+    real = credits.route
+    monkeypatch.setattr(credits, "route", lambda *a, **k: (idents.append(threading.get_ident()), real(*a, **k))[1])
+    put(env, until=time.time() + 600, day=credits._today(time.time()))   # route_async uses the real clock
+    rt = asyncio.run(credits.route_async())
+    assert rt.env and idents and idents[0] != threading.main_thread().ident
+    credits.release(rt.reservation)
+
+
+def test_open_window_probe_skipped_when_the_guard_denies(env):
+    put(env, until=NOW + 600, spent_today=14.9)
+    assert credits.route(NOW).denied == "daily cap"
+    assert env.probes == []                                   # no point probing: the call could not run anyway
+
+
+def test_pending_probe_keeps_concurrent_callers_on_the_subscription(env):
+    put(env, until=NOW + 600, probe_result="pending", probe_at=NOW - 5)
+    assert credits.route(NOW).env == {}                       # window open, another caller is probing: stay
+    put(env, until=0, probe_result="pending", probe_at=NOW - 5)
+    assert credits.on_limit(credits.Limit(None, "text"), NOW) is None   # a new limit while a probe is pending
+    assert credits.last_denial() == "probe pending" and env.probes == []
+    assert not [m for m in env.msgs if "probe" in m.lower() or "limit" in m.lower()]
+    put(env, until=NOW + 600, probe_result="pending", probe_at=NOW - 61)   # a stale claim is ignored
+    assert credits.route(NOW).env and env.probes == [1]
+
+
+def test_probe_notices_once_per_day_per_result(env, monkeypatch):
+    results = iter(["ok", "unknown", "ok", "unknown"])
+    monkeypatch.setattr(credits, "_probe_runner", lambda timeout_s=60: (next(results), "t"))
+    for i in range(4):
+        credits.on_limit(credits.Limit(None, "text"), NOW + i * 61)
+    assert len([m for m in env.msgs if "still works" in m]) == 1
+    assert len([m for m in env.msgs if "could not confirm" in m]) == 1
 
 
 def test_cli_events_clamps_n(env, capsys):
@@ -469,7 +510,7 @@ def test_events_written_and_key_free(env):
     put(env, spent_today=14.9)
     assert credits.route(NOW + 2).denied == "daily cap"
     kinds = [e["kind"] for e in events(env)]
-    assert kinds == ["probe", "switch", "spend", "probe", "denied"]   # route() re-checks (reused probe) before denying
+    assert kinds == ["probe", "switch", "spend", "denied"]   # guard denies first: no probe when nothing could run
     spend = [e for e in events(env) if e["kind"] == "spend"][0]
     assert spend["model"] == "claude-sonnet-5-5" and abs(spend["cost"] - 0.55) < 1e-9
     assert spend["tokens"] == {"input": 10, "output": 2, "cache_read": 0, "cache_creation": 0}

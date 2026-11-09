@@ -249,7 +249,7 @@ def _defaults(now: float) -> dict:
     return {"until": 0, "day": _today(now), "spent_today": 0.0,
             "est_balance": start_balance(), "exhausted": False, "switched_at": 0,
             "reserved": [], "verified": False, "verified_date": "", "notice_key": "",
-            "probe_at": 0, "probe_result": "", "probe_notice_key": ""}
+            "probe_at": 0, "probe_result": "", "probe_notices": {}}
 
 
 @contextlib.contextmanager
@@ -488,19 +488,22 @@ def route(now: float | None = None, path: str | None = None) -> Route:
     now = time.time() if now is None else now
     if _active():
         return Route()
-    if state(path, now)["until"] <= now:
+    s = state(path, now)
+    if s["until"] <= now:
         return Route()
-    # the window is open: keep checking (one probe a minute at most) that the subscription is still out, so a
-    # window that was opened by mistake, or a subscription that recovered early, never spends credits
-    res = _confirm(now, path)
-    if res == "ok":
-        with _locked(path, now) as s:
-            s["until"] = 0
-        _event("window_closed", reason="probe ok")
-        _unconfirmed_notice("recovered", now, path)
-        return Route()
-    if res == "unknown":
-        return Route()  # fail closed: unconfirmed means no credits
+    # the window is open: keep checking (one probe a minute at most, and only when a call could actually run on
+    # the key) that the subscription is still out, so a window opened by mistake, or a subscription that recovered
+    # early, never spends credits. Async callers use route_async(): the probe blocks for seconds.
+    if _guard(s, now) is None:
+        res = _confirm(now, path)
+        if res == "ok":
+            with _locked(path, now) as s:
+                s["until"] = 0
+            _event("window_closed", reason="probe ok")
+            _unconfirmed_notice("recovered", now, path)
+            return Route()
+        if res in ("unknown", "pending"):
+            return Route()  # fail closed: unconfirmed means no credits
     rt = _credits_route(now, path)
     if rt.denied:
         with _locked(path, now) as s:
@@ -575,10 +578,13 @@ def _confirm(now: float, path: str | None) -> str:
     One probe per PROBE_REUSE_S; the stored result is reused inside that window."""
     if os.environ.get("CREDITS_PROBE", "1") == "0":
         return "skipped"
-    s = state(path, now)
-    if s.get("probe_result") and now - float(s.get("probe_at") or 0) < PROBE_REUSE_S:
-        _event("probe", result=s["probe_result"], reused=True)
-        return str(s["probe_result"])
+    with _locked(path, now) as s:
+        if s.get("probe_result") and now - float(s.get("probe_at") or 0) < PROBE_REUSE_S:
+            res = str(s["probe_result"])
+            if res != "pending":
+                _event("probe", result=res, reused=True)
+            return res  # "pending": another caller is probing right now; this one stays on the subscription
+        s["probe_at"], s["probe_result"] = now, "pending"  # claim, then probe outside the lock
     t0 = time.time()
     try:
         res, text = _probe_runner()
@@ -594,11 +600,13 @@ def _confirm(now: float, path: str | None) -> str:
 
 def _unconfirmed_notice(res: str, now: float, path: str | None) -> None:
     """Once per day per result: the operator learns why a reported limit did not switch to credits."""
-    nk = f"{_today(now)}:{res}"
+    day = _today(now)
     with _locked(path, now) as s:
-        if s.get("probe_notice_key") == nk:
+        notices = s.get("probe_notices") if isinstance(s.get("probe_notices"), dict) else {}
+        if notices.get(res) == day:
             return
-        s["probe_notice_key"] = nk
+        notices[res] = day
+        s["probe_notices"] = notices
     if res == "ok":
         _notify("A subscription limit was reported, but a probe shows the subscription still works; "
                 "staying on it (no API credits).")
@@ -620,11 +628,12 @@ def on_limit(limit: Limit, now: float | None = None, path: str | None = None) ->
         return None
     if pre["until"] <= now:  # not on credits yet: confirm before switching
         res = _confirm(now, path)
-        if res in ("ok", "unknown"):
+        if res in ("ok", "unknown", "pending"):
             global _last_denial
             _last_denial = f"probe {res}"
             log.info("credits.limit_unconfirmed probe=%s", res)
-            _unconfirmed_notice(res, now, path)
+            if res != "pending":
+                _unconfirmed_notice(res, now, path)
             return None
     with _locked(path, now) as s:
         if not s.get("verified"):
@@ -653,20 +662,33 @@ def on_limit(limit: Limit, now: float | None = None, path: str | None = None) ->
     return rt
 
 
-async def on_limit_async(limit: Limit, path: str | None = None) -> Route | None:
-    """on_limit() off the event loop (the probe can take seconds). If the awaiting task is cancelled while
-    the worker still runs, the Route it eventually returns is released, so no hold is orphaned."""
+async def _threaded(fn, *args, path: str | None = None):
+    """Run fn(*args) in a worker thread (it may probe the subscription for seconds). If the awaiting task is
+    cancelled while the worker still runs, the Route the worker eventually returns is released, so no hold
+    is orphaned."""
     import asyncio
 
-    task = asyncio.ensure_future(asyncio.to_thread(on_limit, limit, None, path))
+    task = asyncio.ensure_future(asyncio.to_thread(fn, *args))
     try:
         return await asyncio.shield(task)
     except asyncio.CancelledError:
         def _drop(t) -> None:
-            if not t.cancelled() and t.exception() is None and t.result() is not None:
-                release(t.result().reservation, path)
+            if not t.cancelled() and t.exception() is None:
+                r = t.result()
+                if r is not None and getattr(r, "reservation", None) is not None:
+                    release(r.reservation, path)
         task.add_done_callback(_drop)
         raise
+
+
+async def on_limit_async(limit: Limit, path: str | None = None) -> Route | None:
+    """on_limit() off the event loop; cancel-safe (see _threaded)."""
+    return await _threaded(on_limit, limit, None, path, path=path)
+
+
+async def route_async(path: str | None = None) -> Route:
+    """route() off the event loop (it may probe while a window is open); cancel-safe (see _threaded)."""
+    return await _threaded(route, None, path, path=path)
 
 
 def mark_exhausted(path: str | None = None) -> None:

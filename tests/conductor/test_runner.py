@@ -313,6 +313,16 @@ def test_credits_attempt_carries_its_budget_and_subscription_attempt_none(cred, 
     assert runner.options(None).max_budget_usd is None
 
 
+def test_route_is_called_off_the_loop(cred, monkeypatch):
+    import threading
+    idents = []
+    real = credits.route
+    monkeypatch.setattr(credits, "route", lambda *a, **k: (idents.append(threading.get_ident()), real(*a, **k))[1])
+    _attempts(monkeypatch, [_delta("hi"), _result("s-1")])
+    asyncio.run(runner.sdk_turn("hi", None, lambda e: None))
+    assert idents and idents[0] != threading.main_thread().ident
+
+
 def test_budget_stop_text_is_clear(cred, monkeypatch):
     st = _json.loads(cred.state.read_text())
     st["until"] = _time.time() + 3600

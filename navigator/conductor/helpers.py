@@ -276,7 +276,7 @@ async def sdk_helper(task: str, helper_id: str, emit, *, hook, exact: dict | Non
     closing report), so that is what survives the result cap. `hook` is the card hook the main turn
     uses, so a gated action here raises a card exactly as before; `exact` (an approved card) narrows
     the session to that one call."""
-    rt = credits.route()
+    rt = await credits.route_async()  # probes off the loop while a window is open
     retried = False
     while True:
         try:

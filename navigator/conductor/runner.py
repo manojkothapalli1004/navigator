@@ -106,7 +106,7 @@ class _Limit(Exception):
 
 async def sdk_turn(prompt: str, session_id: str | None, emit: Callable[[dict], None],
                    hook=None, *, conductor_server=None) -> str | None:
-    rt = credits.route()  # already reserved when it carries credits
+    rt = await credits.route_async()  # already reserved when it carries credits; probes off the loop
     try:
         return await _attempt(prompt, session_id, emit, hook, conductor_server, rt.env, rt.reservation,
                               rt.budget_usd)
