@@ -14,6 +14,7 @@ from pathlib import Path, PurePosixPath
 
 from navigator.checker.filing import ACT_REPO
 from navigator.conductor.activity import _SECRET
+from navigator.conductor.cards import _est, card_cap_usd
 from navigator.contracts.enums import ProposalStatus, RunPhase, RunStatus
 from navigator.contracts.proposal import Proposal, compute_origin_hash
 from navigator.runtime.loop import DRAFT_PREFIX, OPERATOR_ORIGIN
@@ -174,7 +175,8 @@ def file_build(act, project: str, title: str, task: str, files=(), base_sha_fn=_
 
 class Builds:
     def __init__(self, path, act, settings=None, on_finish=None, base_sha_fn=_head_sha, loop=None,
-                 on_needs_approval=None):
+                 on_needs_approval=None, est_cost_usd=None):
+        self.est_cost_usd = est_cost_usd  # Navigator's per-run cap: an upper bound shown on the build card
         self.path = Path(path)
         self.act = act
         self.settings = settings
@@ -280,11 +282,15 @@ class Builds:
         tier1 = (not was_draft) and project in BUILD_REPOS and self._tier1(project, fl)
         reason = None if tier1 else (self._approval_reason(project, fl, was_draft) if project in BUILD_REPOS
                                      else None)
+        est = _est(self.est_cost_usd)
+        if tier1 and est is not None and est > card_cap_usd():  # no card caps an auto-approval: send it to one
+            tier1, reason = False, "estimated cost over the per-card cap"
         p = file_build(self.act, project, title, task, files=fl, base_sha_fn=self.base_sha_fn,
                        rationale=rationale)
         rec = {"spec_chars": spec_chars,"proposal_id": p.id, "project": project, "title": _strip_draft(title), "files": fl,
                "tier1": False, "state": "filed", "reply_via": via, "filed": time.time(), "ended": None,
-               "summary": "", "reported": [], "approval_reason": reason}
+               "summary": "", "reported": [], "approval_reason": reason,
+               "est_cost_usd": self.est_cost_usd}
         with self._lock:  # persisted BEFORE approving: a crash after approval must not leave it unwatched
             self._records.append(rec)
             self._save()

@@ -257,3 +257,7 @@ def test_engine_notice_notes_history(tmp_path):
     e = Engine(Store(tmp_path), runner=None)
     e.notice("credits on")
     assert any(x.get("kind") == "note" and x.get("text") == "credits on" for x in e.store.history(limit=10))
+
+
+def test_windows_prompt_has_unverified_rule():
+    assert "UNVERIFIED:" in runner.WINDOWS_PROMPT and "not checked" in runner.WINDOWS_PROMPT

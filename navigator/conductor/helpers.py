@@ -64,6 +64,7 @@ HELPER_PROMPT = (
     "writing to a log file in the scratch folder and a DONE marker when it ends, then wait with ONE Bash call "
     "that loops `until [ -f DONE_MARKER ]; do sleep 15; done` for at most 9 minutes, and repeat that single "
     "wait call; never poll with many separate model turns. "
+    "For every claim you did not verify with a tool in this task, prefix the line with UNVERIFIED:. "
     "Keep the closing report under 10000 characters.")
 # appended for a normal helper when CONDUCTOR_HELPER_ORC is on (never for an approved-card helper)
 HELPER_ORC_PROMPT = (

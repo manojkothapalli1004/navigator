@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import secrets
 import tempfile
@@ -19,6 +20,22 @@ TTL_S = 3600
 APPROVED_MIN_TTL_S = 600  # an approved card stays consumable at least this long (its helper needs time)
 MAX_SUMMARY = 2000
 DECLINE_COOLDOWN_S = 600  # a declined action can't raise a fresh card for 10 minutes
+
+
+DEFAULT_CARD_CAP_USD = 5.0  # a build card whose estimated cost is over this cannot be approved
+
+
+def card_cap_usd() -> float:
+    """CONDUCTOR_CARD_CAP_USD read at call time; unset, blank, not a finite number or <= 0 means the default."""
+    try:
+        v = float(os.getenv("CONDUCTOR_CARD_CAP_USD", ""))
+    except ValueError:
+        return DEFAULT_CARD_CAP_USD
+    return v if math.isfinite(v) and v > 0 else DEFAULT_CARD_CAP_USD
+
+
+def _est(v) -> float | None:
+    return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) and v > 0 else None
 
 
 class CardError(Exception):
@@ -144,12 +161,22 @@ class Cards:
             raise CardError(f"already {card['state']}")
         if not self._live(card):
             raise CardError("expired")
+        if state == "approved" and (why := self.over_cap(card)):
+            raise CardError(why)  # before any state change; decline is never blocked
         now = self.clock()
         card["state"], card["via"], card["decided"] = state, via, now
         if state == "approved":
             card["expires"] = max(card["expires"], now + APPROVED_MIN_TTL_S)
         self._save()
         return dict(card)
+
+    def over_cap(self, card: dict) -> str | None:
+        """The refusal text when the card's estimated cost is over the cap in force now, else None."""
+        est, cap = _est(card.get("est_cost_usd")), card_cap_usd()
+        if est is None or est <= cap:
+            return None
+        return (f"estimated cost ${est:.2f} is over the ${cap:.2f} per-card cap; not approved. "
+                "Lower the run's cost cap or ask for a smaller task")
 
     def approve(self, key: str, via: str) -> dict:
         return self._decide(key, via, "approved")
@@ -176,7 +203,7 @@ class Cards:
             return None
 
     def raise_build_card(self, proposal_id: str, project: str, title: str, files: list[str],
-                         reason: str) -> tuple[dict, bool]:
+                         reason: str, est_cost_usd: float | None = None) -> tuple[dict, bool]:
         """An Approve/Decline card for a build that waits for the operator. One card per proposal, ever:
         an expired or decided card is not raised again. Not an action card: no input, no cwd, and a
         fingerprint that is not a sha256, so consume() can never match it."""
@@ -192,6 +219,13 @@ class Cards:
             if len(summary) <= MAX_SUMMARY or not shown:
                 break
             shown.pop()  # drop file names, never the title, project or the count
+        est, cap = _est(est_cost_usd), card_cap_usd()
+        extra = {}
+        if est is not None:  # the cost line sits outside the shrink loop and the final cut
+            cost = (f"est. cost: up to ${est:.2f} per run - OVER the ${cap:.2f} card cap, cannot be approved"
+                    if est > cap else f"est. cost: up to ${est:.2f} per run (Navigator per-run cap)")
+            summary = summary[:MAX_SUMMARY - len(cost) - 1] + "\n" + cost
+            extra = {"est_cost_usd": round(est, 2), "cap_usd": cap}
         summary = summary[:MAX_SUMMARY]
         now = self.clock()
         codes = {c["code"] for c in self._cards}
@@ -200,7 +234,7 @@ class Cards:
             code = "".join(secrets.choice(CODE_ALPHABET) for _ in range(CODE_LEN))
         card = {"id": secrets.token_urlsafe(16), "code": code, "tool": "build", "summary": summary,
                 "reason": reason, "fingerprint": fp, "build": True, "proposal_id": proposal_id,
-                "state": "pending", "created": now, "expires": now + self.ttl_s}
+                "state": "pending", "created": now, "expires": now + self.ttl_s, **extra}
         self._cards.append(card)
         self._save()
         return dict(card), True
