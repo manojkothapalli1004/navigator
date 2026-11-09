@@ -200,3 +200,33 @@ def test_plugins_writes_and_others_stay_gated(cmd):
 @pytest.mark.parametrize("tool", ["Write", "Edit"])
 def test_plugins_file_writes_still_gated(tool):
     assert gated_reason(tool, {"file_path": str(HOME / ".claude/plugins/x")}, CWD)
+
+
+NAV_LOGS = "/Users/Manoj/calwbot/logs/navigator"
+
+
+@pytest.mark.parametrize("tool,key", [("Edit", "file_path"), ("Write", "file_path"),
+                                      ("MultiEdit", "file_path"), ("NotebookEdit", "notebook_path")])
+@pytest.mark.parametrize("name", ["repos.json", "repos.json.bak", "repos.json.20261108", "credits.json"])
+def test_navigator_control_files_write_gated(tool, key, name):
+    assert gated_reason(tool, {key: f"{NAV_LOGS}/{name}"}, CWD)
+
+
+@pytest.mark.parametrize("cmd", [
+    f"cp x {NAV_LOGS}/repos.json", f"echo '[]' > {NAV_LOGS}/repos.json.bak",
+    f"mv y {NAV_LOGS}/credits.json", "cd /Users/Manoj/calwbot/logs/navigator && cp x repos.json",
+])
+def test_navigator_control_files_bash_gated(cmd):
+    assert gated_reason("Bash", {"command": cmd}, CWD)
+
+
+@pytest.mark.parametrize("tool,key", [("Read", "file_path"), ("Grep", "path"), ("Glob", "path")])
+def test_navigator_control_files_read_allowed(tool, key):
+    assert gated_reason(tool, {key: f"{NAV_LOGS}/repos.json"}, CWD) is None
+    assert gated_reason(tool, {key: f"{NAV_LOGS}/repos.json.bak"}, CWD) is None
+
+
+def test_other_navigator_logs_not_gated():
+    assert gated_reason("Edit", {"file_path": f"{NAV_LOGS}/foo.md"}, CWD) is None
+    assert gated_reason("Write", {"file_path": f"{NAV_LOGS}/runs/x.json"}, CWD) is None
+    assert gated_reason("Bash", {"command": f"echo hi > {NAV_LOGS}/foo.md"}, CWD) is None

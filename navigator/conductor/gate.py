@@ -12,6 +12,10 @@ HOME = Path.home()
 CONDUCTOR_DIR = Path("/Users/Manoj/calwbot/logs/conductor")
 GATED_DIRS = (HOME / ".claude", HOME / "Library" / "LaunchAgents", Path("/Users/Manoj/calwbot/trader"),
               CONDUCTOR_DIR)
+# files the daemon reads to decide what it builds and spends (repos, credits): writes stop for the
+# operator, reads stay open; other files under logs/navigator are not gated
+NAVIGATOR_CONTROL_DIR = Path("/Users/Manoj/calwbot/logs/navigator")
+_NAV_CONTROL_NAME = re.compile(r"^(repos\.json(\..*)?|credits\.json(\..*)?)$")
 READ_TOOLS = {"Read": "file_path", "Grep": "path", "Glob": "path", "NotebookRead": "notebook_path"}
 MEMORY_DIR = re.compile(r"^" + re.escape(str(HOME / ".claude" / "projects")) + r"/[^/]+/memory/")
 GATED_NAMES = {"settings.json", "settings.local.json", "CLAUDE.md", ".claude.json", ".mcp.json"}
@@ -136,6 +140,8 @@ def _plugins_read_only(command: str) -> bool:
 # forge cards.json, restart the conductor to reload a forged file)
 _CONDUCTOR_TEXT = re.compile(r"navigator\.conductor|conductor\.sock|logs/conductor|com\.calwbot\.conductor"
                              r"|api/v1/chat|cards\.json|tools/chat\.sh")
+# bare names too: `cd logs/navigator && cp x repos.json` must not slip past
+_NAV_CONTROL_TEXT = re.compile(r"repos\.json|credits\.json|NAVIGATOR_REPOS_FILE|NAVIGATOR_CREDITS_STATE")
 _TRADER = re.compile(r"(^|[\s/'\"=:])trader(/|\s|$)")
 _SPLIT = re.compile(r"[\s;&|(){}<>`$]+")
 _REVISION = re.compile(r"^(HEAD|@)([~^]\d*)+$|^[0-9a-f]{7,40}$")
@@ -172,6 +178,8 @@ def _bash_reason(command: str) -> str | None:
         return "touches trader/ (money paths)"
     if m := _CONDUCTOR_TEXT.search(command):
         return f"touches the chat service's own approvals ({m.group(0)})"
+    if m := _NAV_CONTROL_TEXT.search(command):
+        return f"touches {m.group(0)} (which repos Navigator builds, its credits state)"
     if m := _PROTECTED_TEXT.search(command):
         return f"touches {m.group(0)} (permissions, hooks or services)"
     if (m := _PLUGINS_TEXT.search(command)) and not _plugins_read_only(command):
@@ -198,6 +206,8 @@ def _path_reason(raw: str, cwd: Path) -> str | None:
     p = (p if p.is_absolute() else Path(cwd) / p).resolve()
     if p.name in GATED_NAMES:
         return f"edits {p.name} (permissions, instructions or tools)"
+    if p.parent == NAVIGATOR_CONTROL_DIR and _NAV_CONTROL_NAME.match(p.name):
+        return f"writes {p.name} (which repos Navigator builds, its credits state)"
     if MEMORY_DIR.match(str(p)):
         return None
     if ".claude" in p.parts or ".git" in p.parts and "hooks" in p.parts:
