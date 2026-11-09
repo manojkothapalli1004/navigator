@@ -262,7 +262,12 @@ from navigator.runtime.drivers.base import DriverResult
 _MOD = "def nth_product(xs, n):\n    return xs[n]\n"
 
 
-def _filler_tests(n=300, tag="t"):
+def _sub(tmp_path, name):
+    (tmp_path / name).mkdir()
+    return tmp_path / name
+
+
+def _filler_tests(n=400, tag="t"):
     return "".join(f"def test_{tag}_{i:04d}():\n    # pad {'x' * 200}\n    assert {i} == {i}\n\n" for i in range(n))
 
 
@@ -324,7 +329,7 @@ def test_related_tests_cap_two_and_deterministic(tmp_path):
     assert a == phases._related_tests(wt, tracked, ["pkg/mod.py"], ".", "")
     assert len(a) == 2 and set(a) == {"tests/test_mod.py", "pkg/tests/test_mod.py"}   # name tier beats import tier
     # import tier only: the file mentioning a symbol from mention_text ranks first
-    h2, wt2 = _wt_with(tmp_path / "b", {
+    h2, wt2 = _wt_with(_sub(tmp_path, "b"), {
         "pkg/mod.py": _MOD,
         "tests/test_a.py": "from pkg.mod import other\n",
         "tests/test_b.py": "from pkg.mod import other\n",
@@ -386,7 +391,7 @@ def test_edit_to_large_related_test_applies(tmp_path):
 # 8
 def test_test_budget_caps(tmp_path):
     h, wt = _wt_with(tmp_path, {"pkg/mod.py": _big_py(), "tests/test_mod.py": _toy_test(),
-                                "tests/test_extra.py": "from pkg.mod import nth_product\n" + _filler_tests(300, "e")})
+                                "tests/test_extra.py": "from pkg.mod import nth_product\n" + _filler_tests(400, "e")})
     assert phases._LARGE_TOTAL_BUDGET == 80_000
     files, large = phases._read_affected(wt, ["pkg/mod.py"], "f_0100 nth_product",
                                          test_paths=["tests/test_mod.py", "tests/test_extra.py"])
@@ -432,7 +437,7 @@ def test_import_scan_is_bounded_and_kill_switch(tmp_path, monkeypatch):
     (wt / "tests/test_n000.py").write_text("import os\n" + "#" * 200_000 + "\nfrom pkg.mod import nth_product\n")
     assert phases._related_tests(wt, tracked, ["pkg/mod.py"], ".", "") == []
     # kill switch
-    h2, wt2 = _wt_with(tmp_path / "k", {"pkg/mod.py": _MOD, "tests/test_mod.py": "x = 1\n"})
+    h2, wt2 = _wt_with(_sub(tmp_path, "k"), {"pkg/mod.py": _MOD, "tests/test_mod.py": "x = 1\n"})
     tr = ["pkg/mod.py", "tests/test_mod.py"]
     assert phases._related_tests(wt2, tr, ["pkg/mod.py"], ".", "") == ["tests/test_mod.py"]
     for off in ("0", "false", "off"):
