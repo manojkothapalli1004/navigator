@@ -1241,6 +1241,22 @@ def test_credits_attempt_carries_its_budget_and_subscription_attempt_none(monkey
     assert AttemptClient.opts[0].max_budget_usd is None
 
 
+def test_approved_card_helper_on_the_key_carries_its_budget(monkeypatch):
+    f = Fake([_creds_route(budget=1.25)])
+    f.install(monkeypatch, [[_start(), _delta("ran"), _result()]])
+    exact = {"tool": "Bash", "input": {"command": CARD_CMD}, "cwd": "/r"}
+    asyncio.run(H.sdk_helper(TASK, "helper-1", lambda e: None, hook=_hook, exact=exact))
+    assert AttemptClient.opts[0].max_budget_usd == 1.25 and AttemptClient.opts[0].env["ANTHROPIC_API_KEY"] == KEY
+
+
+def test_budget_stop_is_explained(monkeypatch):
+    f = Fake([_creds_route()])
+    f.install(monkeypatch, [[_start(), _result(is_error=True, result=None)]])
+    AttemptClient.attempts[0][-1].subtype = "error_max_budget_usd"
+    with pytest.raises(RuntimeError, match="max_budget"):
+        asyncio.run(H.sdk_helper(TASK, "helper-1", lambda e: None, hook=_hook))
+
+
 def test_credits_helper_records_exactly_its_reservation(monkeypatch):
     f = Fake([_creds_route()])
     f.install(monkeypatch, [[_start(), _delta("ok"), _result()]])

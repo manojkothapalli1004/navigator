@@ -173,7 +173,16 @@ def test_reserve_admits_exactly_k(env):
     [t.join() for t in ts]
     got = [r for r in res if r]
     assert len(got) == 3 and abs(sum(r.amount for r in got) - 15.0) < 1e-9
-    assert credits.last_denial() == "daily cap"
+    assert credits.last_denial() == "busy"            # nothing spent yet: holds, not the cap, filled the room
+
+
+def test_busy_is_not_a_cap_notice(env):
+    for _ in range(3):
+        assert credits.reserve(NOW) is not None
+    put(env, until=NOW + 600)
+    assert credits.route(NOW).denied == "busy"
+    assert not [m for m in env.msgs if "paused" in m]  # a 4th concurrent call waits quietly
+    assert [e for e in events(env) if e["kind"] == "denied"][-1]["reason"] == "busy"
 
 
 def test_cap_edge(env):
@@ -213,7 +222,7 @@ def test_concurrent_reservations_share_the_headroom(env):
     put(env, spent_today=8.0)                                  # 7 left; a holds 5 -> 2 for the next
     b = credits.reserve(NOW)
     assert a.amount == 5.0 and b.amount == 2.0
-    assert credits.reserve(NOW) is None and credits.last_denial() == "daily cap"
+    assert credits.reserve(NOW) is None and credits.last_denial() == "busy"
     rt = credits.on_limit(credits.Limit(NOW + 600, "five_hour"), NOW)
     assert rt is None                                          # nothing left to hand out
     credits.release(a)
@@ -280,7 +289,7 @@ def test_record_cost_margin_and_release(env):
 def test_missing_cost_never_free(env):
     r = credits.reserve(NOW)
     credits.record(None, r, now=NOW)
-    assert abs(credits.state(now=NOW)["spent_today"] - r.amount * 1.1) < 1e-9   # the most it could have spent
+    assert abs(credits.state(now=NOW)["spent_today"] - r.amount) < 1e-9   # the hold: the most it could have spent
     r = credits.reserve(NOW)
     before = credits.state(now=NOW)["spent_today"]
     credits.record(None, r, usage={"input_tokens": 1_000_000, "output_tokens": 0}, now=NOW)
@@ -304,11 +313,11 @@ def test_record_at_cap_closes_window_once(env):
     credits.record(5.0, r, model="opus", now=NOW)            # 10 + 5.5 >= 15
     s = credits.state(now=NOW)
     assert s["until"] == 0 and s["spent_today"] >= 15.0
-    stops = [m for m in env.msgs if "paused" in m and "daily cap" in m]
+    stops = [m for m in env.msgs if "daily cap" in m and "reached" in m]
     assert len(stops) == 1
     assert [e["kind"] for e in events(env)][-2:] == ["spend", "cap_reached"]
     credits.record(0.1, None, model="opus", now=NOW + 1)     # already closed: no second notice
-    assert len([m for m in env.msgs if "paused" in m]) == 1
+    assert len([m for m in env.msgs if "reached" in m]) == 1
 
 
 # confirmed limits (2026-11-09): credits only when the subscription really is out
@@ -368,6 +377,90 @@ def test_probe_switch_off(env, monkeypatch):
     assert credits.on_limit(credits.Limit(NOW + 600, "five_hour"), NOW) is not None
 
 
+def test_open_window_closes_when_the_subscription_answers(env, monkeypatch):
+    put(env, until=NOW + 3600, switched_at=NOW - 10)
+    monkeypatch.setattr(credits, "_probe_runner", lambda timeout_s=60: ("ok", "ok"))
+    rt = credits.route(NOW)
+    assert rt.env == {} and rt.denied is None
+    s = credits.state(now=NOW)
+    assert s["until"] == 0 and s["reserved"] == []
+    assert [e["kind"] for e in events(env)] == ["probe", "window_closed"]
+    assert len([m for m in env.msgs if "answers again" in m]) == 1
+    put(env, until=NOW + 3600)
+    credits.route(NOW + 61)                                          # a second close that day: no second notice
+    assert len([m for m in env.msgs if "answers again" in m]) == 1
+
+
+def test_open_window_unknown_probe_stays_on_subscription_without_closing(env, monkeypatch):
+    put(env, until=NOW + 3600)
+    monkeypatch.setattr(credits, "_probe_runner", lambda timeout_s=60: ("unknown", "timeout"))
+    assert credits.route(NOW).env == {}
+    assert credits.state(now=NOW)["until"] == NOW + 3600            # left open for a later confirming probe
+
+
+def test_open_window_probe_once_a_minute(env):
+    put(env, until=NOW + 3600)
+    for t in (NOW, NOW + 10, NOW + 59):
+        rt = credits.route(t)
+        assert rt.env
+        credits.release(rt.reservation)
+    assert env.probes == [1]
+    credits.release(credits.route(NOW + 61).reservation)
+    assert env.probes == [1, 1]
+
+
+def test_probe_interpretation_order():
+    I = credits._probe_interpret
+    assert I({"is_error": False, "text": "ok", "limited": True})[0] == "ok"     # an answer wins
+    assert I({"is_error": True, "text": "boom", "limited": True})[0] == "limited"
+    assert I({"is_error": True, "text": "You've hit your limit"})[0] == "limited"
+    assert I({"is_error": True, "text": "error_max_turns"})[0] == "unknown"
+    assert I({"exc": "CLIConnectionError: no cli"})[0] == "unknown"
+    assert I({"exc": "ResultError: session limit reached"})[0] == "limited"
+    assert I({})[0] == "unknown"
+    assert I({"is_error": False, "on_key": True})[0] == "unknown"
+    out = {}
+    credits._probe_observe(out, ev(typ="seven_day_opus"))               # model-scoped rejection: not a limit
+    assert "limited" not in out
+    credits._probe_observe(out, ev(typ="five_hour"))
+    assert out["limited"] is True
+    credits._probe_observe(out, SimpleNamespace(data={"apiKeySource": "ANTHROPIC_API_KEY"}))
+    assert out["on_key"] is True
+
+
+def test_on_limit_async_releases_a_hold_when_cancelled(env, monkeypatch):
+    import asyncio
+    import threading
+    gate = threading.Event()
+
+    def slow_probe(timeout_s=60):
+        gate.wait(5)
+        return "limited", "late"
+
+    monkeypatch.setattr(credits, "_probe_runner", slow_probe)
+
+    async def go():
+        task = asyncio.ensure_future(credits.on_limit_async(credits.Limit(NOW + 600, "five_hour")))
+        await asyncio.sleep(0.05)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        gate.set()
+        for _ in range(100):                     # the worker finishes and its Route is released
+            await asyncio.sleep(0.02)
+            if not credits.state()["reserved"] and credits.state()["until"] > 0:
+                break
+        return credits.state()
+    s = asyncio.run(go())
+    assert s["reserved"] == []
+
+
+def test_cli_events_clamps_n(env, capsys):
+    credits.on_limit(credits.Limit(NOW + 600, "five_hour"), NOW)
+    assert credits.main(["events", "0"]) == 0
+    assert capsys.readouterr().out.count('"kind"') == 1
+
+
 # events file
 def test_events_written_and_key_free(env):
     rt = credits.on_limit(credits.Limit(NOW + 600, "five_hour"), NOW)
@@ -376,7 +469,7 @@ def test_events_written_and_key_free(env):
     put(env, spent_today=14.9)
     assert credits.route(NOW + 2).denied == "daily cap"
     kinds = [e["kind"] for e in events(env)]
-    assert kinds == ["probe", "switch", "spend", "denied"]
+    assert kinds == ["probe", "switch", "spend", "probe", "denied"]   # route() re-checks (reused probe) before denying
     spend = [e for e in events(env) if e["kind"] == "spend"][0]
     assert spend["model"] == "claude-sonnet-5-5" and abs(spend["cost"] - 0.55) < 1e-9
     assert spend["tokens"] == {"input": 10, "output": 2, "cache_read": 0, "cache_creation": 0}

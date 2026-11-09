@@ -93,6 +93,10 @@ def options(session_id: str | None, hook=None, *, conductor_server=None, env: di
         mcp_servers={"orchestrator": ORC_MCP, **({"conductor": conductor_server} if conductor_server else {})})
 
 
+BUDGET_STOP_TEXT = ("max_budget: this reply reached its API-credits budget and was stopped; "
+                    "shorter asks fit, or wait for the subscription")
+
+
 class _Limit(Exception):
     """Internal: the subscription limit hit this attempt (carries no options or env)."""
     def __init__(self, limit, started: bool, text: str):
@@ -107,7 +111,7 @@ async def sdk_turn(prompt: str, session_id: str | None, emit: Callable[[dict], N
         return await _attempt(prompt, session_id, emit, hook, conductor_server, rt.env, rt.reservation,
                               rt.budget_usd)
     except _Limit as lim:
-        rt2 = await asyncio.to_thread(credits.on_limit, lim.limit)  # may probe the subscription (seconds)
+        rt2 = await credits.on_limit_async(lim.limit)  # probes the subscription off the loop; cancel-safe
         if lim.started:
             if rt2 is not None:
                 credits.release(rt2.reservation)
@@ -157,7 +161,8 @@ async def _attempt(prompt: str, session_id: str | None, emit: Callable[[dict], N
                     if reservation is not None:
                         credits.record(m.total_cost_usd, reservation, MODEL, m.usage)
                     if m.is_error:
-                        text = m.result or m.subtype or "turn failed"
+                        text = (BUDGET_STOP_TEXT if m.subtype == "error_max_budget_usd"
+                                else m.result or m.subtype or "turn failed")
                         if reservation is not None and credits.is_credits_exhausted(text):
                             credits.mark_exhausted()
                         lim = None if reservation is not None else (credits.classify(text) or event_limit)

@@ -288,7 +288,7 @@ async def sdk_helper(task: str, helper_id: str, emit, *, hook, exact: dict | Non
                     + (" after work had begun, so it was not retried" if lim.started
                        else " while already on API credits" if rt.env and not retried else " again")) from None
             retried = True
-            rt = await asyncio.to_thread(credits.on_limit, lim.limit)  # may probe the subscription (seconds)
+            rt = await credits.on_limit_async(lim.limit)  # probes the subscription off the loop; cancel-safe
             if rt is None:
                 why = credits.last_denial() or "not available"
                 raise RuntimeError("stopped: a subscription limit was reported and API credits were not "
@@ -349,7 +349,10 @@ async def _attempt(task, helper_id, emit, hook, exact, pid_root, rt) -> str:
                                 credits.mark_exhausted()
                             limit = limit or credits.classify(m.result)
                             if limit is None:
-                                raise _Failed(credits.redact(m.result or m.subtype or "helper failed"))
+                                raise _Failed(credits.redact(
+                                    "max_budget: this helper reached its API-credits budget and was stopped"
+                                    if m.subtype == "error_max_budget_usd"
+                                    else m.result or m.subtype or "helper failed"))
                     elif type(m).__name__ == "RateLimitEvent":
                         limit = limit or credits.classify(None, event=m)
         except _Failed as e:

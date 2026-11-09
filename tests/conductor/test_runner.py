@@ -255,7 +255,7 @@ def test_launched_key_call_without_result_is_charged_its_hold(cred, monkeypatch)
         asyncio.run(runner.sdk_turn("hi", None, lambda e: None))
     assert AttemptClient.envs[0]["ANTHROPIC_API_KEY"] == KEY
     s = _json.loads(cred.state.read_text())
-    assert s["reserved"] == [] and abs(s["spent_today"] - 5.0 * 1.1) < 1e-9
+    assert s["reserved"] == [] and abs(s["spent_today"] - 5.0) < 1e-9   # the hold itself, no margin
 
 
 def test_engine_notice_notes_history(tmp_path):
@@ -264,6 +264,29 @@ def test_engine_notice_notes_history(tmp_path):
     e = Engine(Store(tmp_path), runner=None)
     e.notice("credits on")
     assert any(x.get("kind") == "note" and x.get("text") == "credits on" for x in e.store.history(limit=10))
+
+
+def test_engine_notice_from_a_worker_thread_lands_on_the_loop(tmp_path):
+    import threading
+    from navigator.conductor.engine import Engine
+    from navigator.conductor.store import Store
+    e = Engine(Store(tmp_path), runner=None)
+    seen = []
+
+    async def go():
+        e._loop = asyncio.get_running_loop()
+        q: asyncio.Queue = asyncio.Queue()
+        e._subs.add(q) if isinstance(e._subs, set) else e._subs.append(q)
+        t = threading.Thread(target=e.notice, args=("from worker",))
+        t.start(); t.join()
+        for _ in range(50):                       # scheduled via call_soon_threadsafe, so it lands on the next ticks
+            await asyncio.sleep(0.01)
+            if any(x.get("text") == "from worker" for x in e.store.history(limit=10)):
+                break
+        seen.append(q.get_nowait() if not q.empty() else None)
+    asyncio.run(go())
+    assert any(x.get("kind") == "note" and x.get("text") == "from worker" for x in e.store.history(limit=10))
+    assert seen and seen[0] is not None            # the subscriber queue was fed on the loop thread
 
 
 def test_windows_prompt_has_unverified_rule():
@@ -288,6 +311,17 @@ def test_credits_attempt_carries_its_budget_and_subscription_attempt_none(cred, 
     asyncio.run(runner.sdk_turn("hi", None, lambda e: None))
     assert AttemptClient.budgets == [None, round(5.0 / 1.1, 4)]   # hold 5.0 (call max) / MARGIN
     assert runner.options(None).max_budget_usd is None
+
+
+def test_budget_stop_text_is_clear(cred, monkeypatch):
+    st = _json.loads(cred.state.read_text())
+    st["until"] = _time.time() + 3600
+    cred.state.write_text(_json.dumps(st))
+    r = _result(is_error=True, result=None)
+    r.subtype = "error_max_budget_usd"
+    _attempts(monkeypatch, [r])
+    with pytest.raises(RuntimeError, match="max_budget"):
+        asyncio.run(runner.sdk_turn("hi", None, lambda e: None))
 
 
 def test_credit_balance_error_on_credits_call_marks_exhausted(cred, monkeypatch):

@@ -345,12 +345,15 @@ def _budget(s: dict) -> tuple[float | None, str | None]:
     """(budget for one more call, None) or (None, reason). The budget is what the call may spend:
     min(call_max, daily headroom, balance headroom above the floor) net of live reservations."""
     held = sum(float(r[1]) for r in s["reserved"])
-    daily = daily_cap() - float(s["spent_today"]) - held
-    bal = float(s["est_balance"]) - held - floor()
-    if daily < call_min() - 1e-9:
-        return None, "daily cap"
-    if bal < call_min() - 1e-9:
+    spent_room = daily_cap() - float(s["spent_today"])
+    bal_room = float(s["est_balance"]) - floor()
+    if spent_room < call_min() - 1e-9:
+        return None, "daily cap"          # really spent: worth a notice
+    if bal_room < call_min() - 1e-9:
         return None, "floor"
+    daily, bal = spent_room - held, bal_room - held
+    if min(daily, bal) < call_min() - 1e-9:
+        return None, "busy"               # headroom exists but in-flight calls hold it: this call waits, no notice
     return round(min(call_max(), daily, bal), 4), None
 
 
@@ -409,10 +412,14 @@ def record(total_cost_usd, reservation: Reservation | None, model: str | None = 
            path: str | None = None) -> float:
     """Call with every ResultMessage of a call that ran on the key."""
     now = time.time() if now is None else now
-    fallback = reservation.amount if reservation is not None else None
-    cost = (float(total_cost_usd) * MARGIN if total_cost_usd is not None
-            else _estimate(usage, model, fallback) * MARGIN)
+    if total_cost_usd is not None:
+        cost = float(total_cost_usd) * MARGIN
+    elif not usage and reservation is not None:
+        cost = float(reservation.amount)  # no result at all: the hold is already the most it could have spent
+    else:
+        cost = _estimate(usage, model) * MARGIN
     capped = False
+    notice: tuple | None = None
     with _locked(path, now) as s:
         if reservation is not None:
             s["reserved"] = [r for r in s["reserved"] if r[0] != reservation.id]
@@ -421,9 +428,14 @@ def record(total_cost_usd, reservation: Reservation | None, model: str | None = 
         if s["spent_today"] >= daily_cap() - 1e-9 and float(s.get("until") or 0) > now:
             s["until"] = 0  # the cap is spent: close the window so nothing else routes to the key today
             capped = True
-            _stop_notice(s, "daily cap", now)
+            nk = f"{s['day']}:daily cap"
+            if s.get("notice_key") != nk:
+                s["notice_key"] = nk
+                notice = ("daily cap",)
         spent, bal = s["spent_today"], s["est_balance"]
         log.info("credits.spend model=%s cost=%.2f day=%.2f est_balance=%.2f", model, cost, spent, bal)
+    if notice:  # outside the lock: the notifier may talk to Telegram
+        _notify(f"API credits daily cap ${daily_cap():g} reached; back on the subscription until tomorrow.")
     _event("spend", model=model, cost=round(cost, 4), total_cost_usd=total_cost_usd, tokens=_tokens(usage),
            reservation=reservation.id if reservation is not None else None,
            spent_today=round(spent, 4), est_balance=round(bal, 4))
@@ -440,7 +452,7 @@ def _hhmm(epoch: float) -> str:
 
 def _stop_notice(s: dict, why: str, now: float) -> None:
     """Guard-stop notice, once per day/reason. Mutates s."""
-    if why in ("unverified", "no key", "disabled", "already on key"):
+    if why in ("unverified", "no key", "disabled", "already on key", "busy"):
         return
     nk = f"{s['day']}:{why}"
     if s.get("notice_key") == nk:
@@ -478,6 +490,17 @@ def route(now: float | None = None, path: str | None = None) -> Route:
         return Route()
     if state(path, now)["until"] <= now:
         return Route()
+    # the window is open: keep checking (one probe a minute at most) that the subscription is still out, so a
+    # window that was opened by mistake, or a subscription that recovered early, never spends credits
+    res = _confirm(now, path)
+    if res == "ok":
+        with _locked(path, now) as s:
+            s["until"] = 0
+        _event("window_closed", reason="probe ok")
+        _unconfirmed_notice("recovered", now, path)
+        return Route()
+    if res == "unknown":
+        return Route()  # fail closed: unconfirmed means no credits
     rt = _credits_route(now, path)
     if rt.denied:
         with _locked(path, now) as s:
@@ -504,17 +527,7 @@ def _probe_runner(timeout_s: float = PROBE_TIMEOUT_S) -> tuple[str, str]:  # pra
                                           strict_mcp_config=True, mcp_servers={}, tools=[], allowed_tools=[],
                                           cwd=os.path.dirname(state_path()) or ".")
                 async for m in query(prompt=PROBE_PROMPT, options=opts):
-                    info = getattr(m, "rate_limit_info", None)
-                    if info is not None and getattr(info, "status", None) == "rejected":
-                        out["limited"] = True
-                    if getattr(m, "error", None) == "rate_limit":
-                        out["limited"] = True
-                    data = getattr(m, "data", None)
-                    if isinstance(data, dict) and data.get("apiKeySource") not in (None, "none"):
-                        out["on_key"] = True  # the probe did not run on the subscription: inconclusive
-                    if type(m).__name__ == "ResultMessage":
-                        out["is_error"] = bool(getattr(m, "is_error", False))
-                        out["text"] = str(getattr(m, "result", None) or getattr(m, "subtype", "") or "")
+                    _probe_observe(out, m)
             asyncio.run(asyncio.wait_for(go(), timeout_s))
         except Exception as e:  # noqa: BLE001
             out["exc"] = f"{type(e).__name__}: {e}"
@@ -524,16 +537,35 @@ def _probe_runner(timeout_s: float = PROBE_TIMEOUT_S) -> tuple[str, str]:  # pra
     t.join(timeout_s)
     if t.is_alive():
         return "unknown", "probe timed out"
+    return _probe_interpret(out)
+
+
+def _probe_observe(out: dict, m) -> None:
+    """Collect what one SDK message says about the probe (pure bookkeeping on `out`)."""
+    if classify(None, event=m) is not None:          # account-wide rejected rate-limit event only
+        out["limited"] = True
+    if getattr(m, "error", None) == "rate_limit":
+        out["limited"] = True
+    data = getattr(m, "data", None)
+    if isinstance(data, dict) and data.get("apiKeySource") not in (None, "none"):
+        out["on_key"] = True                           # not the subscription: inconclusive
+    if type(m).__name__ == "ResultMessage":
+        out["is_error"] = bool(getattr(m, "is_error", False))
+        out["text"] = str(getattr(m, "result", None) or getattr(m, "subtype", "") or "")
+
+
+def _probe_interpret(out: dict) -> tuple[str, str]:
+    """("ok" | "limited" | "unknown", text). A successful answer always wins: the subscription works."""
     if out.get("on_key"):
         return "unknown", "probe ran on a key, not the subscription"
+    if out.get("is_error") is False:
+        return "ok", out.get("text", "")
     if out.get("limited"):
-        return "limited", out.get("text", "rate limit event")
+        return "limited", out.get("text") or "rate limit event"
     if "exc" in out:
         return ("limited" if classify(out["exc"]) else "unknown"), out["exc"]
     if "is_error" not in out:
         return "unknown", "probe returned no result"
-    if not out["is_error"]:
-        return "ok", out.get("text", "")
     text = out.get("text", "")
     return ("limited" if classify(text) else "unknown"), text
 
@@ -570,6 +602,8 @@ def _unconfirmed_notice(res: str, now: float, path: str | None) -> None:
     if res == "ok":
         _notify("A subscription limit was reported, but a probe shows the subscription still works; "
                 "staying on it (no API credits).")
+    elif res == "recovered":
+        _notify("The subscription answers again; back on it (API credits window closed).")
     else:
         _notify("A subscription limit was reported and the probe could not confirm it; staying on the "
                 "subscription (no API credits). Check `navigator.credits events`.")
@@ -617,6 +651,22 @@ def on_limit(limit: Limit, now: float | None = None, path: str | None = None) ->
                 f"(est. ${s['est_balance']:.2f} left, today ${s['spent_today']:.2f} "
                 f"of ${daily_cap():g})")
     return rt
+
+
+async def on_limit_async(limit: Limit, path: str | None = None) -> Route | None:
+    """on_limit() off the event loop (the probe can take seconds). If the awaiting task is cancelled while
+    the worker still runs, the Route it eventually returns is released, so no hold is orphaned."""
+    import asyncio
+
+    task = asyncio.ensure_future(asyncio.to_thread(on_limit, limit, None, path))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        def _drop(t) -> None:
+            if not t.cancelled() and t.exception() is None and t.result() is not None:
+                release(t.result().reservation, path)
+        task.add_done_callback(_drop)
+        raise
 
 
 def mark_exhausted(path: str | None = None) -> None:
@@ -676,7 +726,7 @@ def main(argv: list[str] | None = None, query=None) -> int:
         return 0
     if cmd == "events":
         try:
-            n = int(argv[1]) if len(argv) > 1 else 20
+            n = max(1, int(argv[1])) if len(argv) > 1 else 20
         except ValueError:
             print("usage: events [N]")
             return 2

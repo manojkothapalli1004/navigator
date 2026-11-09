@@ -128,7 +128,7 @@ def test_launched_key_call_without_result_is_charged_its_hold(cenv, monkeypatch)
     with pytest.raises(Exception, match="crash"):      # the fake SDK's bare exception propagates
         make_sdk_query_fn()("p")
     s = _st(cenv)
-    assert s["reserved"] == [] and abs(s["spent_today"] - 5.0 * 1.1) < 1e-9
+    assert s["reserved"] == [] and abs(s["spent_today"] - 5.0) < 1e-9   # the hold itself, no margin
 
 
 def test_budget_stop_is_final_and_explained(cenv, monkeypatch):
