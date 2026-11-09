@@ -75,7 +75,8 @@ def make_build_card_callback(cards, engine_ref: list):
     """Builds.on_needs_approval: runs on the event loop; one card per proposal, chat + Telegram told once."""
     def _raise_build_card(rec: dict) -> None:
         card, new = cards.raise_build_card(rec["proposal_id"], rec["project"], rec["title"], rec["files"],
-                                           rec.get("approval_reason") or "needs your approval")
+                                           rec.get("approval_reason") or "needs your approval",
+                                           est_cost_usd=rec.get("est_cost_usd"))
         if new:
             engine_ref[0].on_card(card)
     return _raise_build_card
@@ -268,6 +269,8 @@ def build_app(engine: Engine, manage_engine: bool = False, cards=None, helpers=N
         if action not in ("approve", "decline"):
             return JSONResponse({"error": "not found"}, status_code=404)
         bc = cards.get(req.path_params["key"])
+        if action == "approve" and bc and (why := cards.over_cap(bc)):
+            return JSONResponse({"error": why}, status_code=409)  # before ACT is touched
         if bc is not None and bc.get("build"):
             if builds is None:  # builds switched off after the card was raised: never start a card helper
                 return JSONResponse({"error": "builds are not configured; the card cannot be decided"},
@@ -392,8 +395,9 @@ def make_builds(root: Path, on_finish=None):
         from navigator.config import Settings
         from navigator.conductor.builds import Builds
         # Settings.from_env reads NAVIGATOR_REPOS_FILE like the daemon, so tier-1 uses the daemon's repo config
-        return Builds(Path(root) / "builds.json", HTTPACTClient(base), settings=Settings.from_env(),
-                      on_finish=on_finish)
+        settings = Settings.from_env()
+        return Builds(Path(root) / "builds.json", HTTPACTClient(base), settings=settings,
+                      on_finish=on_finish, est_cost_usd=settings.max_cost_usd)
     except Exception as e:  # the conductor must still start; builds are simply off
         print(f"conductor: builds disabled, setup failed ({type(e).__name__}: {e})", file=sys.stderr)
         return None
