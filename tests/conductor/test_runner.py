@@ -261,3 +261,26 @@ def test_engine_notice_notes_history(tmp_path):
 
 def test_windows_prompt_has_unverified_rule():
     assert "UNVERIFIED:" in runner.WINDOWS_PROMPT and "not checked" in runner.WINDOWS_PROMPT
+
+
+# ---- credits follow-ups (2026-11-09) ----
+
+def _rl_asst():
+    from claude_agent_sdk import AssistantMessage, TextBlock
+    return AssistantMessage(content=[TextBlock(text=LIMIT)], model="m", parent_tool_use_id=None, error="rate_limit")
+
+
+def test_rate_limit_assistant_message_does_not_count_as_started(cred, monkeypatch):
+    _attempts(monkeypatch, [_rl_asst(), _result(is_error=True, result=LIMIT)], [_delta("hi"), _result("s-c")])
+    assert asyncio.run(runner.sdk_turn("hi", None, lambda e: None)) == "s-c"
+    assert AttemptClient.envs[1]["ANTHROPIC_API_KEY"] == KEY
+
+
+def test_credit_balance_error_on_credits_call_marks_exhausted(cred, monkeypatch):
+    st = _json.loads(cred.state.read_text())
+    st["until"] = _time.time() + 3600
+    cred.state.write_text(_json.dumps(st))
+    _attempts(monkeypatch, [_result(is_error=True, result="Credit balance is too low")])
+    with pytest.raises(RuntimeError):
+        asyncio.run(runner.sdk_turn("hi", None, lambda e: None))
+    assert _json.loads(cred.state.read_text())["exhausted"] is True

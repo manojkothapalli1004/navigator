@@ -131,7 +131,7 @@ async def _attempt(prompt: str, session_id: str | None, emit: Callable[[dict], N
                         seen_text = started = True
                         emit({"type": "delta", "text": ev["delta"]["text"]})
                 elif isinstance(m, AssistantMessage):
-                    started = started or bool(m.content)
+                    started = started or (bool(m.content) and m.error != "rate_limit")
                     # each tool call is a step on the website's crew screens; helpers get their own
                     for b in m.content:
                         if isinstance(b, ToolUseBlock):
@@ -150,6 +150,8 @@ async def _attempt(prompt: str, session_id: str | None, emit: Callable[[dict], N
                         credits.record(m.total_cost_usd, reservation, MODEL, m.usage)
                     if m.is_error:
                         text = m.result or m.subtype or "turn failed"
+                        if reservation is not None and credits.is_credits_exhausted(text):
+                            credits.mark_exhausted()
                         lim = None if reservation is not None else (credits.classify(text) or event_limit)
                         if lim is not None:
                             raise _Limit(lim, started, text)
@@ -160,6 +162,8 @@ async def _attempt(prompt: str, session_id: str | None, emit: Callable[[dict], N
         raise
     except Exception as e:
         text = str(e)
+        if reservation is not None and credits.is_credits_exhausted(text):
+            credits.mark_exhausted()
         lim = None if reservation is not None else credits.classify(text)
         if lim is not None:
             raise _Limit(lim, started, text) from None
