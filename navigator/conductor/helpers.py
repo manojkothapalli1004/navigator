@@ -122,7 +122,8 @@ def _only(exact: dict):
 
 
 def helper_options(hook, exact: dict | None = None, helper_id: str | None = None,
-                   pid_root: Path | None = None, extra_env: dict | None = None) -> ClaudeAgentOptions:
+                   pid_root: Path | None = None, extra_env: dict | None = None,
+                   budget_usd: float | None = None) -> ClaudeAgentOptions:
     from navigator.conductor import runner  # runner imports engine; a module-level import would cycle
     # Kill switch CONDUCTOR_HELPER_ORC, read at call time so a live engine follows a change without a
     # restart: unset or any value other than the exact string "0" = on; "0" = today's helper, byte for
@@ -160,7 +161,9 @@ def helper_options(hook, exact: dict | None = None, helper_id: str | None = None
         can_use_tool=gate.can_use_tool,
         # where the helper records the pids of background jobs it starts, so reap() can stop them if the helper
         # is cancelled/times out/fails; never for an approved-card helper: its options stay as they were
-        env=env)
+        env=env,
+        # on the key only: the call's dollar budget (its credits reservation) stops the CLI at the cap
+        max_budget_usd=budget_usd)
 
 
 MAX_REAP = 50
@@ -285,10 +288,11 @@ async def sdk_helper(task: str, helper_id: str, emit, *, hook, exact: dict | Non
                     + (" after work had begun, so it was not retried" if lim.started
                        else " while already on API credits" if rt.env and not retried else " again")) from None
             retried = True
-            rt = credits.on_limit(lim.limit)
+            rt = await asyncio.to_thread(credits.on_limit, lim.limit)  # may probe the subscription (seconds)
             if rt is None:
-                raise RuntimeError("stopped: the subscription limit was reached and API credits "
-                                   "are not available") from None
+                why = credits.last_denial() or "not available"
+                raise RuntimeError("stopped: a subscription limit was reported and API credits were not "
+                                   f"used ({why})") from None
             continue
         return credits.redact(out)
 
@@ -306,11 +310,13 @@ async def _attempt(task, helper_id, emit, hook, exact, pid_root, rt) -> str:
     parts: list[str] = []
     started = False  # any content block or text delta; for an approved card only a tool use counts
     limit = None
-    done = False
+    done = launched = False
     try:
         try:
             async with ClaudeSDKClient(options=helper_options(
-                    hook, exact, helper_id, pid_root, rt.env or None)) as client:
+                    hook, exact, helper_id, pid_root, rt.env or None,
+                    rt.budget_usd if rt.env else None)) as client:
+                launched = True  # from here the CLI may have spent on the key even if no result arrives
                 await client.query(task)
                 async for m in client.receive_response():
                     if isinstance(m, StreamEvent):
@@ -357,8 +363,11 @@ async def _attempt(task, helper_id, emit, hook, exact, pid_root, rt) -> str:
         if limit is not None:
             raise _Limited(limit, started)
     finally:
-        if not done:
-            credits.release(rt.reservation)
+        if not done and rt.reservation is not None:
+            if launched:  # crash/cancel/timeout after launch: charge the hold (the most it could have spent)
+                credits.record(None, rt.reservation, model=HELPER_MODEL, usage=None)
+            else:
+                credits.release(rt.reservation)
     return "".join(parts)
 
 

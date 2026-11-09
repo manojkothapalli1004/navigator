@@ -189,7 +189,9 @@ def make_sdk_query_fn(*, model: str | None = None,
         # model into tool calls until max_turns errors (observed same day).
         # credits path: the key lives only in this dict, handed straight to the options;
         # options/env are never logged, formatted or put in an exception
-        env_kw = {"env": dict(route.env)} if route is not None and route.env else {}
+        # on the key only: the call's dollar budget (its credits reservation) stops the CLI at the cap
+        env_kw = ({"env": dict(route.env), "max_budget_usd": route.budget_usd}
+                  if route is not None and route.env else {})
         if tools and cwd:
             # tooled builder: read-only tools inside the worktree, more turns (reads cost turns),
             # deny list from _TOOLED_SETTINGS; the reply contract is unchanged. Build 2: in-process
@@ -213,6 +215,7 @@ def make_sdk_query_fn(*, model: str | None = None,
             # the SDK's own exception for an is_error result only says "error result:
             # success"; record the real reason and let the stream finish (raising
             # mid-iteration leaves the generator half-closed)
+            meta["launched"] = True  # from here the CLI may have spent on the key even if no result arrives
             try:
                 async for message in query(prompt=prompt, options=options):
                     if not isinstance(message, ResultMessage):
@@ -290,7 +293,10 @@ def make_sdk_query_fn(*, model: str | None = None,
             raise
         finally:
             if not meta.get("recorded"):
-                credits.release(rt.reservation)
+                if meta.get("launched"):  # crash/timeout after launch: charge the hold, not free it
+                    credits.record(None, rt.reservation, model=use_model, usage=None)
+                else:
+                    credits.release(rt.reservation)
 
     def _query_plain(prompt: str, use_model, *, meta: dict, route=None, cwd: str | None = None,
                      mcp_servers: dict | None = None, mcp_tools: tuple[str, ...] = ()) -> str:
@@ -549,6 +555,9 @@ _TOOLED_SETTINGS = json.dumps({
 
 
 def _describe_error(message) -> str:
+    if getattr(message, "subtype", None) == "error_max_budget_usd":
+        # the credits budget for this call (--max-budget-usd) stopped the CLI; final, never retried
+        return "max_budget: this call reached its API-credits budget and was stopped"
     if message.result:
         return str(message.result)
     errors = getattr(message, "errors", None) or []
@@ -557,7 +566,7 @@ def _describe_error(message) -> str:
 
 # account/config failures: a retry just doubles the cost of a guaranteed error
 _NON_RETRYABLE = ("usage credits", "does not support this model", "session limit",
-                  "usage limit", "not logged in", "hit your limit")
+                  "usage limit", "not logged in", "hit your limit", "max_budget")
 
 def _is_retryable(e: Exception) -> bool:
     msg = str(e).lower()
