@@ -335,8 +335,9 @@ async def _attempt(task, helper_id, emit, hook, exact, pid_root, rt) -> str:
                                       "state": "failed" if b.is_error else "done"})
                     elif isinstance(m, ResultMessage):
                         done = True
-                        credits.record(getattr(m, "total_cost_usd", None), rt.reservation,
-                                       model=HELPER_MODEL, usage=getattr(m, "usage", None))
+                        if rt.reservation is not None:  # only calls on the key touch the ledger
+                            credits.record(getattr(m, "total_cost_usd", None), rt.reservation,
+                                           model=HELPER_MODEL, usage=getattr(m, "usage", None))
                         if m.is_error:
                             if rt.reservation is not None and credits.is_credits_exhausted(m.result):
                                 credits.mark_exhausted()
