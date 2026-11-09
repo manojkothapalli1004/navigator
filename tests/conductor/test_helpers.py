@@ -1177,3 +1177,32 @@ async def test_unverified_line_kept_verbatim_across_cut(tmp_path):
     await _settle(10)
     (rec,) = _file(tmp_path)
     assert rec["result"].startswith("UNVERIFIED: the port is 8080\n")
+
+
+# ---- credits follow-ups (2026-11-09) ----
+
+def test_rate_limit_assistant_message_does_not_count_as_started(monkeypatch):
+    from claude_agent_sdk import TextBlock
+    rl = AssistantMessage(content=[TextBlock(text=LIMIT_TEXT)], model="m", parent_tool_use_id=None, error="rate_limit")
+    f = Fake([C.Route(), _creds_route()])
+    f.install(monkeypatch, [[rl, _limit_result()], [_start(), _delta("fine"), _result()]])
+    assert asyncio.run(H.sdk_helper(TASK, "helper-1", lambda e: None, hook=_hook)) == "fine"
+    assert len(AttemptClient.opts) == 2
+
+
+def test_limit_while_already_on_credits_is_not_retried(monkeypatch):
+    f = Fake([_creds_route(), _creds_route("r2")])
+    f.install(monkeypatch, [[_limit_result()], [_result()]])
+    with pytest.raises(RuntimeError) as ei:
+        asyncio.run(H.sdk_helper(TASK, "helper-1", lambda e: None, hook=_hook))
+    assert len(AttemptClient.opts) == 1 and not f.limits and KEY not in str(ei.value)
+
+
+def test_credit_balance_error_on_credits_call_marks_exhausted(monkeypatch):
+    f = Fake([_creds_route()])
+    f.install(monkeypatch, [[_result(is_error=True, result="Credit balance is too low")]])
+    marked = []
+    monkeypatch.setattr(C, "mark_exhausted", lambda *a, **k: marked.append(1))
+    with pytest.raises(RuntimeError):
+        asyncio.run(H.sdk_helper(TASK, "helper-1", lambda e: None, hook=_hook))
+    assert marked == [1]

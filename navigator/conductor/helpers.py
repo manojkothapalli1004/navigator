@@ -279,10 +279,11 @@ async def sdk_helper(task: str, helper_id: str, emit, *, hook, exact: dict | Non
         try:
             out = await _attempt(task, helper_id, emit, hook, exact, pid_root, rt)
         except _Limited as lim:
-            if retried or lim.started:
+            if retried or lim.started or rt.env:
                 raise RuntimeError(
                     "stopped: the subscription limit was reached"
-                    + (" after work had begun, so it was not retried" if lim.started else " again")) from None
+                    + (" after work had begun, so it was not retried" if lim.started
+                       else " while already on API credits" if rt.env and not retried else " again")) from None
             retried = True
             rt = credits.on_limit(lim.limit)
             if rt is None:
@@ -320,7 +321,8 @@ async def _attempt(task, helper_id, emit, hook, exact, pid_root, rt) -> str:
                             parts.append(ev["delta"]["text"])
                             started = started or exact is None
                     elif isinstance(m, AssistantMessage):
-                        started = started or exact is None or any(isinstance(b, ToolUseBlock) for b in m.content)
+                        if m.error != "rate_limit":
+                            started = started or exact is None or any(isinstance(b, ToolUseBlock) for b in m.content)
                         for b in m.content:
                             if isinstance(b, ToolUseBlock):
                                 emit({"type": "activity", "id": b.id, "tool": b.name,
@@ -336,6 +338,8 @@ async def _attempt(task, helper_id, emit, hook, exact, pid_root, rt) -> str:
                         credits.record(getattr(m, "total_cost_usd", None), rt.reservation,
                                        model=HELPER_MODEL, usage=getattr(m, "usage", None))
                         if m.is_error:
+                            if rt.reservation is not None and credits.is_credits_exhausted(m.result):
+                                credits.mark_exhausted()
                             limit = limit or credits.classify(m.result)
                             if limit is None:
                                 raise _Failed(credits.redact(m.result or m.subtype or "helper failed"))
@@ -344,6 +348,8 @@ async def _attempt(task, helper_id, emit, hook, exact, pid_root, rt) -> str:
         except _Failed as e:
             raise RuntimeError(str(e)) from None
         except Exception as e:  # noqa: BLE001
+            if rt.reservation is not None and credits.is_credits_exhausted(str(e)):
+                credits.mark_exhausted()
             limit = limit or credits.classify(str(e))
             if limit is None:
                 raise RuntimeError(credits.redact(f"{type(e).__name__}: {e}")) from None
