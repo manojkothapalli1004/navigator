@@ -177,6 +177,7 @@ class Engine:
         return len(self._ops) + len(self._internal)
 
     async def start(self) -> None:
+        self._loop = asyncio.get_running_loop()  # notice() may be called from a worker thread
         self._started = True  # first: the lost-helpers submit below runs inside start()
         self._mark_interrupted()
         if self.helpers is not None:
@@ -321,8 +322,18 @@ class Engine:
             self._send_telegram(text)
 
     def notice(self, text: str) -> None:
-        """A system notice (credits fallback): a note in history and on Telegram."""
-        self.note(text, via="telegram")
+        """A system notice (credits fallback): a note in history and on Telegram. Safe from any thread:
+        the credits probe runs on_limit in a worker, and _publish must touch the queues on the loop."""
+        try:
+            asyncio.get_running_loop()
+            on_loop = True
+        except RuntimeError:
+            on_loop = False
+        loop = getattr(self, "_loop", None)
+        if not on_loop and loop is not None and loop.is_running():
+            loop.call_soon_threadsafe(self.note, text, "telegram")
+        else:
+            self.note(text, via="telegram")
 
     def _send_telegram(self, text: str) -> None:
         if self.reply:
