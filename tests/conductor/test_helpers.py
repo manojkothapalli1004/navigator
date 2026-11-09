@@ -1039,7 +1039,7 @@ def test_limit_before_anything_retries_once_with_credits_env(monkeypatch):
     assert len(AttemptClient.opts) == 2 and len(f.limits) == 1
     assert "ANTHROPIC_API_KEY" not in (AttemptClient.opts[0].env or {})
     assert AttemptClient.opts[1].env["ANTHROPIC_API_KEY"] == KEY
-    assert [r.id for _, r in f.recorded if r] == ["r1"]
+    assert [r.id for _, r in f.recorded] == ["r1"]  # the subscription attempt records nothing
 
 
 def test_route_before_launch_uses_credits_env_first(monkeypatch):
@@ -1206,3 +1206,30 @@ def test_credit_balance_error_on_credits_call_marks_exhausted(monkeypatch):
     with pytest.raises(RuntimeError):
         asyncio.run(H.sdk_helper(TASK, "helper-1", lambda e: None, hook=_hook))
     assert marked == [1]
+
+
+# ---- credits ledger guard (2026-11-09): only calls that ran on the key are recorded ----
+
+def test_subscription_helper_records_no_credits_spend(monkeypatch):
+    """A helper on the subscription (plain Route, no reservation) must not touch the credits
+    ledger: the live ledger showed 54 flat $2.20 entries written by subscription helpers."""
+    f = Fake([C.Route()])
+    f.install(monkeypatch, [[_start(), _delta("fine"), _result()]])
+    assert asyncio.run(H.sdk_helper(TASK, "helper-1", lambda e: None, hook=_hook)) == "fine"
+    assert f.recorded == []
+    assert f.released == []
+
+
+def test_card_helper_on_subscription_records_no_credits_spend(monkeypatch):
+    f = Fake([C.Route()])
+    f.install(monkeypatch, [[_start(), _delta("ran"), _result()]])
+    exact = {"tool": "Bash", "input": {"command": CARD_CMD}, "cwd": "/r"}
+    asyncio.run(H.sdk_helper(TASK, "helper-1", lambda e: None, hook=_hook, exact=exact))
+    assert f.recorded == []
+
+
+def test_credits_helper_records_exactly_its_reservation(monkeypatch):
+    f = Fake([_creds_route()])
+    f.install(monkeypatch, [[_start(), _delta("ok"), _result()]])
+    asyncio.run(H.sdk_helper(TASK, "helper-1", lambda e: None, hook=_hook))
+    assert [r.id for _, r in f.recorded] == ["r1"]
