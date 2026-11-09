@@ -142,6 +142,12 @@ _CONDUCTOR_TEXT = re.compile(r"navigator\.conductor|conductor\.sock|logs/conduct
                              r"|api/v1/chat|cards\.json|tools/chat\.sh")
 # bare names too: `cd logs/navigator && cp x repos.json` must not slip past
 _NAV_CONTROL_TEXT = re.compile(r"repos\.json|credits\.json|NAVIGATOR_REPOS_FILE|NAVIGATOR_CREDITS_STATE")
+# the hot settings (mode dry_run/execute, merge toggles) are the ACT document navigator/settings at
+# /api/v1/agent/docs/<key>: a write needs a card, a GET and a bare mention stay open
+_SETTINGS_DOC_TEXT = re.compile(r"navigator(/|%2[Ff])settings")
+_HTTP_WRITE = re.compile(r"-X\s*(PUT|POST|PATCH)\b|--request[\s=]+(PUT|POST|PATCH)\b"
+                         r"|(^|\s)(-d|--data[\w-]*|--json|--upload-file|-T|-F|--form)(\s|=|'|\"|$)"
+                         r"|\.(put|post|patch|request)\(|\bmethod\s*=\s*['\"](PUT|POST|PATCH)", re.I)
 _TRADER = re.compile(r"(^|[\s/'\"=:])trader(/|\s|$)")
 _SPLIT = re.compile(r"[\s;&|(){}<>`$]+")
 _REVISION = re.compile(r"^(HEAD|@)([~^]\d*)+$|^[0-9a-f]{7,40}$")
@@ -180,6 +186,8 @@ def _bash_reason(command: str) -> str | None:
         return f"touches the chat service's own approvals ({m.group(0)})"
     if m := _NAV_CONTROL_TEXT.search(command):
         return f"touches {m.group(0)} (which repos Navigator builds, its credits state)"
+    if (m := _SETTINGS_DOC_TEXT.search(command)) and _HTTP_WRITE.search(command):
+        return f"writes the Navigator settings document ({m.group(0)}: mode, merge toggles)"
     if m := _PROTECTED_TEXT.search(command):
         return f"touches {m.group(0)} (permissions, hooks or services)"
     if (m := _PLUGINS_TEXT.search(command)) and not _plugins_read_only(command):
@@ -198,6 +206,8 @@ def _bash_reason(command: str) -> str | None:
             return "gh talks to GitHub (git stays local)"
         if prog == "navigator" and nxt in NAVIGATOR_GATED:
             return f"navigator {nxt} decides a run"
+        if prog == "navigator" and nxt == "settings" and tokens[i + 2:i + 3] in (["set"], ["unset"]):
+            return f"navigator settings {tokens[i + 2]} writes the Navigator settings document"
     return None
 
 
