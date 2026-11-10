@@ -526,8 +526,12 @@ def test_ambiguous_fix_name_lists_and_grants_nothing():
     lines = rec.sent[0].splitlines()
     assert lines[0] == ("Navigator: /fix s3a not applied - no single declined run named 's3a'; "
                         "2 declined:")
-    assert set(lines[1:]) == {f"S3a - S3a: second - reply: fix {b.id}",
-                              f"S3a - S3a: first - reply: fix {a.id}"}
+    # _reply_arg lines, as the merge precedent (test_ambiguous_name_applies_nothing)
+    assert lines[1:] == ["S3a - S3a: second - reply: fix S3a", "S3a - S3a: first - reply: fix S3a"]
+    # the run-id form picks one of them
+    results = apply_commands(act, [TelegramCommand("fix", b.id, 2)], rec)
+    assert results == [{"run_id": b.id, "action": "fix", "applied": True, "reason": None}]
+    assert len(_grants(act, b.proposal_id)) == 1 and _grants(act, a.proposal_id) == []
 
 
 def test_fix_refused_for_a_declined_proposal_and_a_rebuilt_run():

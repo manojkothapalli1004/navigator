@@ -24,6 +24,16 @@ forwarded and is less than an hour old (the clock is injectable for tests). A
 shorthand is resolved at apply time against live ACT state with every check the
 full-id form applies; zero or several candidates apply nothing and get a reply.
 
+'fix' / 'fix <name>' / 'fix <run-id>' (B4) asks for ONE rebuild of a run declined at the
+merge gate in the last runtime/fix.WINDOW_DAYS days, carrying its decline reason: it
+writes the same approved review-gate grant `navigator retry` writes (runtime/fix.py,
+note 'fix <run-id>'), which the daemon's approval_poll turns into a build in execute
+mode. The same target rules as merge; a `fix <name>` whose name is no declined run's
+short name is ordinary chat ('fix it', 'fix tests': result reason 'not a command', no
+reply) while bare 'fix' and the run-id form are always commands. The Fix button on the
+decline message (notify.py) arrives as the callback data 'fix:<run-id>' and is turned
+into the text 'fix <run-id>' by _card_tap, like the conductor card buttons.
+
 poll_updates(long_poll_s) is the always-on reader's entry point (N11,
 telegram_reader.py): same filtering, inbox file and offset as poll_once, but
 Telegram holds the request up to long_poll_s and (update_id, raw message) pairs
@@ -66,13 +76,14 @@ from navigator.contracts.enums import ApprovalDecision, ApprovalGate, RunPhase
 from navigator.contracts.event import Event
 from navigator.observability.logging import get_logger
 from navigator.observability.notify import load_telegram_credentials
+from navigator.runtime import fix
 from navigator.runtime.merge_tiers import batch_enabled
 
 log = get_logger("navigator.telegram_inbox")
 
 TELEGRAM_ACTOR = "operator-telegram"
 RUN_ID = re.compile(r"run-[0-9A-HJKMNP-TV-Z]{26}")
-_ACTIONS = {"/merge": "merge", "/reject": "reject"}
+_ACTIONS = {"/merge": "merge", "/reject": "reject", "/fix": "fix"}
 # 'merge <name>': a proposal short name such as 'N5b' or 'S3a' (never a run id prefix)
 SHORT_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,31}")
 DEFAULT_OFFSET_PATH = "/Users/Manoj/calwbot/logs/navigator/telegram_offset"
@@ -110,7 +121,7 @@ class TelegramError(RuntimeError):
 
 @dataclass(frozen=True)
 class TelegramCommand:
-    action: str  # "merge" | "reject"
+    action: str  # "merge" | "reject" | "fix"
     run_id: str | None  # full run id; None for the shorthand forms (resolved at apply time)
     update_id: int
     name: str | None = None  # 'merge <name>': proposal short name; None for bare 'merge'
@@ -152,6 +163,9 @@ def parse_command(text, update_id: int) -> TelegramCommand | None:
       'merge all' / 'merge all except a,b'    -> every audited tier A/B run at the gate
                                                  (3c; excluded names are short names or
                                                  FULL run ids, comma or space separated)
+      'fix' / 'fix <name>' / 'fix <run-id>'   -> one rebuild of a declined run (B4), the
+                                                 same target rules; 'fix <words>' and
+                                                 'fix all' are not commands
     Anything else is not a command ('merge looks good?' is ordinary chat; so is
     'merge <name> <words>'). 'reject <words>' parses as a reasoned reject of its first
     word, but apply_commands treats it as ordinary chat ('not a command', no reply)
@@ -215,20 +229,30 @@ def is_operator_message(msg: dict, chat_id: str) -> bool:
 
 
 _CARD_TAP = re.compile(r"^card:(approve|decline):([A-Z2-9]{6})$")
+# B4: the Fix button on a decline message (notify.NotifyingACT._markup); full run id only
+_FIX_TAP = re.compile(r"^fix:(run-[0-9A-HJKMNP-TV-Z]{26})$")
 
 
 def _card_tap(cq, now: float) -> dict | None:
     """A tap on an approval card's Approve/Reject button (conductor C3), as the 'ok CODE' /
-    'no CODE' message bot.py already handles. The chat and sender still go through the same
-    operator check as a typed message; any other button data is ignored."""
+    'no CODE' message bot.py already handles, or on a decline message's Fix button (B4), as
+    the 'fix <run-id>' message parse_command takes. The chat and sender still go through the
+    same operator check as a typed message; any other button data is ignored."""
     if not isinstance(cq, dict) or not isinstance(cq.get("data"), str):
         return None
-    m = _CARD_TAP.match(cq["data"])
     card_msg = cq.get("message")
-    if m is None or not isinstance(card_msg, dict):
+    if not isinstance(card_msg, dict):
         return None
+    m = _CARD_TAP.match(cq["data"])
+    if m is not None:
+        text = f"{'ok' if m.group(1) == 'approve' else 'no'} {m.group(2)}"
+    else:
+        f = _FIX_TAP.match(cq["data"])
+        if f is None:
+            return None
+        text = f"fix {f.group(1)}"
     return {"chat": card_msg.get("chat"), "from": cq.get("from"), "date": int(now),
-            "text": f"{'ok' if m.group(1) == 'approve' else 'no'} {m.group(2)}",
+            "text": text,
             "callback_query_id": cq.get("id"), "card_message_id": card_msg.get("message_id")}
 
 
@@ -590,7 +614,64 @@ def _apply_batch(act, cmd: TelegramCommand, notifier) -> dict:
             "approved": [rid for rid, _ in approved]}
 
 
+def _fix_lines(cands) -> str:
+    return _candidate_lines([(run, short, title) for run, short, title, _prop in cands], "fix")
+
+
+def _apply_fix(act, cmd: TelegramCommand, notifier) -> dict:
+    """'fix' / 'fix <name>' / 'fix <run-id>' (B4): one rebuild grant for a declined run.
+    Candidates are fix.declined_candidates (aborted, declined at the merge gate, newest run
+    of its proposal, within the window); the target resolves like merge - the run id, the
+    short name (case-insensitive) or the single candidate for bare 'fix'. A NAME matching no
+    candidate is ordinary chat (result reason 'not a command', no reply: SHORT_NAME accepts
+    any word, so 'fix it' must reach the chat); zero or several matches otherwise reply with
+    the list. fix.fix_reason then refuses a proposal that is not approved, a running or
+    merged build, or a grant that is already waiting (len(grants) >= len(runs)); else
+    fix.request_fix writes the grant and the reply names the decline reason on record."""
+    cands = fix.declined_candidates(act)
+    if cmd.run_id is not None:
+        matches = [c for c in cands if c[0].id == cmd.run_id]
+    elif cmd.name is not None:
+        matches = [c for c in cands if c[1].lower() == cmd.name.lower()]
+        if not matches:
+            log.info("telegram.fix_words_as_chat", name=cmd.name)
+            return {"run_id": None, "action": "fix", "applied": False, "reason": "not a command"}
+    else:
+        matches = cands
+    if len(matches) != 1:
+        if not cands:
+            reason = "nothing declined"
+            notifier.send(f"Navigator: {_label(cmd)} - nothing declined in the last "
+                          f"{fix.WINDOW_DAYS} days")
+        else:
+            if cmd.run_id is not None:
+                reason = "not a declined run"
+                shown = f"not a declined run from the last {fix.WINDOW_DAYS} days"
+            elif cmd.name is not None:
+                reason = shown = f"no single declined run named {cmd.name!r}"
+            else:
+                reason = shown = "ambiguous: several declined runs"
+            notifier.send(f"Navigator: {_label(cmd)} not applied - {shown}; "
+                          f"{len(cands)} declined:\n{_fix_lines(cands)}")
+        return {"run_id": cmd.run_id, "action": "fix", "applied": False, "reason": reason}
+    run, short, title, prop = matches[0]
+    reason = fix.fix_reason(act, prop, act.list_runs_for_proposal(run.proposal_id))
+    if reason is not None:
+        notifier.send(f"Navigator: {_label(cmd)} not applied - {reason}")
+        return {"run_id": run.id, "action": "fix", "applied": False, "reason": reason}
+    fix.request_fix(act, run, TELEGRAM_ACTOR, cmd.update_id)
+    # the grant stands from here on (request_fix swallows an event-log failure): read the
+    # reason the rebuild will carry and say so; never 're-send' after this point
+    note = fix.decline_note(act, run.id)
+    notifier.send(f"Navigator: {short} - {title} ({run.id}) fix requested - one rebuild "
+                  f"granted, decline reason on record: {note or 'no reason given'}; "
+                  "builds in execute mode")
+    return {"run_id": run.id, "action": "fix", "applied": True, "reason": None}
+
+
 def _apply_one(act, cmd: TelegramCommand, notifier) -> dict:
+    if cmd.action == "fix":
+        return _apply_fix(act, cmd, notifier)
     if cmd.batch:
         return _apply_batch(act, cmd, notifier)
     run_id = cmd.run_id

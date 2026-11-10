@@ -24,6 +24,10 @@ hour old) and then handles:
                                     run.telegram_decision event carries the update_id
                                     of the originating message (0 only when the
                                     caller has none)
+  'fix' / 'fix <name|run-id>'    -> telegram_inbox.apply_commands too (B4): one rebuild
+                                    grant for a run declined at the merge gate; a name
+                                    that is no declined run's short name is ordinary
+                                    chat (False), like a reasoned reject of a stranger
 Numbers refer to the list the operator last received (status/more/all or the daemon's
 top-3 push), stored as triage.json "shown" (N13): the live triage order may change
 between that message and the reply, so a number never decides a proposal the operator
@@ -61,6 +65,7 @@ HELP = ("Navigator commands:\n"
         "merge / merge N5b / reject N5b [reason...] - runs waiting at the merge gate\n"
         "merge all / merge all except N5b,S3a - approve every audited tier A/B run at the "
         "gate (tier C needs 'merge <name>')\n"
+        "fix N5b - rebuild a declined run with its reason\n"
         "decisions - everything waiting on you (merges, proposals, manual steps)\n"
         "run <id> / show <id> - run or read a pinned manual-step script")
 
