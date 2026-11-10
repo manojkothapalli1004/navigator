@@ -11,7 +11,15 @@ commands '/merge <run-id>' and '/reject <run-id>' (full run id, one line) are
 returned, as are the N8 shorthands 'merge' / 'reject' (no argument: the one run
 waiting for merge) and 'merge <name>' / 'reject <name>' (<name> = first token of
 the proposal title without a trailing ':', e.g. 'N5b'); the leading '/' is optional
-and the word is case-insensitive. Commands count only when the message is not
+and the word is case-insensitive. A reject may carry a reason after its target
+(B2): 'reject <name|run-id> [CODE] [free text]' stores the approval note
+'reason=CODE' / 'reason=CODE: text' (CODE one of navigator.cli.REASON_CODES, a
+trailing ':' tolerated; any other first word files the whole text under 'other').
+The target is required with a reason ('reject tests_weak flaky' takes tests_weak as
+a name); a reasoned reject whose target is neither a run id nor the short name of a
+run waiting for merge is treated as ordinary chat at apply time (result reason
+'not a command', no reply), so 'reject this one please' is never swallowed. Commands
+count only when the message is not
 forwarded and is less than an hour old (the clock is injectable for tests). A
 shorthand is resolved at apply time against live ACT state with every check the
 full-id form applies; zero or several candidates apply nothing and get a reply.
@@ -53,7 +61,7 @@ from pathlib import Path
 
 import httpx
 
-from navigator.cli import is_audited, merge_tier_of
+from navigator.cli import REASON_CODES, is_audited, merge_tier_of, reason_note
 from navigator.contracts.enums import ApprovalDecision, ApprovalGate, RunPhase
 from navigator.contracts.event import Event
 from navigator.observability.logging import get_logger
@@ -108,6 +116,7 @@ class TelegramCommand:
     name: str | None = None  # 'merge <name>': proposal short name; None for bare 'merge'
     batch: bool = False  # 'merge all [except ...]' (3c)
     exclude: tuple[str, ...] = ()  # names/run ids left out of 'merge all'
+    note: str | None = None  # reject only (B2): 'reason=CODE[: text]' decline note
 
 
 def short_name(title: str) -> str:
@@ -116,17 +125,39 @@ def short_name(title: str) -> str:
     return parts[0].rstrip(":") if parts else ""
 
 
+def _reason_note(words: list[str]) -> str | None:
+    """The words after a reject target as a decline note. A first word that is a
+    REASON_CODE (case-insensitive, trailing ':' tolerated) is the code and the rest the
+    text; otherwise the whole text is filed under 'other', the one code that asserts no
+    specific diagnosis. No words -> None (the decision is recorded without a note)."""
+    if not words:
+        return None
+    first = words[0].lower().rstrip(":")
+    if first in REASON_CODES:
+        return reason_note(first, " ".join(words[1:]))
+    return reason_note("other", " ".join(words))
+
+
 def parse_command(text, update_id: int) -> TelegramCommand | None:
     """One line, whole message, whitespace trimmed; the command word is case-insensitive
     and its leading '/' is optional:
       '/merge <run-id>' / '/reject <run-id>'  -> full run id (must match RUN_ID)
       'merge' / 'reject'                      -> the one run waiting for merge
       'merge <name>' / 'reject <name>'        -> the run whose proposal short name is <name>
+      'reject <target> [CODE] [text...]'      -> the same reject with a decline note (B2):
+                                                 'reason=CODE' / 'reason=CODE: text', or
+                                                 'reason=other: text' when the first word
+                                                 is not a REASON_CODE (target required:
+                                                 'reject tests_weak flaky' names tests_weak)
       'merge all' / 'merge all except a,b'    -> every audited tier A/B run at the gate
                                                  (3c; excluded names are short names or
                                                  FULL run ids, comma or space separated)
-    Anything else is not a command ('merge looks good?' is ordinary chat). Consequence:
-    a proposal short-named 'all' can no longer be merged by name; use its run id."""
+    Anything else is not a command ('merge looks good?' is ordinary chat; so is
+    'merge <name> <words>'). 'reject <words>' parses as a reasoned reject of its first
+    word, but apply_commands treats it as ordinary chat ('not a command', no reply)
+    when that word is not a waiting run's short name or a run id, so 'reject this one
+    please' reaches the chat. Consequence: a proposal short-named 'all' can no longer
+    be merged by name; use its run id."""
     if not isinstance(text, str) or "\n" in text or "\r" in text:
         return None
     parts = text.strip().split()
@@ -155,17 +186,18 @@ def parse_command(text, update_id: int) -> TelegramCommand | None:
             return None
         return TelegramCommand(action="merge", run_id=None, update_id=update_id, batch=True,
                                exclude=names)
-    if len(parts) > 2:
+    if len(parts) > 2 and action != "reject":
         return None
     if len(parts) == 1:
         return TelegramCommand(action=action, run_id=None, update_id=update_id)
     arg = parts[1]
+    note = _reason_note(parts[2:])  # reject only: words after the target
     if RUN_ID.fullmatch(arg):
-        return TelegramCommand(action=action, run_id=arg, update_id=update_id)
+        return TelegramCommand(action=action, run_id=arg, update_id=update_id, note=note)
     # a truncated run id is not a short name: never guess which run was meant
     if arg.lower().startswith("run-") or not SHORT_NAME.fullmatch(arg):
         return None
-    return TelegramCommand(action=action, run_id=None, update_id=update_id, name=arg)
+    return TelegramCommand(action=action, run_id=None, update_id=update_id, name=arg, note=note)
 
 
 def _is_int(value) -> bool:
@@ -564,6 +596,15 @@ def _apply_one(act, cmd: TelegramCommand, notifier) -> dict:
     run_id = cmd.run_id
     resolved = None
     if run_id is None:
+        if cmd.name is not None and cmd.note:
+            # a reasoned reject BY NAME whose name is no waiting run's short name is
+            # ordinary chat ('reject this one please'): SHORT_NAME accepts any word, so
+            # say nothing and let the caller forward the line. Ambiguous names and
+            # bare 'reject <name>' keep the candidate reply; a run id is always a command.
+            if not [c for c in _candidates(act) if c[1].lower() == cmd.name.lower()]:
+                log.info("telegram.reject_words_as_chat", name=cmd.name)
+                return {"run_id": None, "action": cmd.action, "applied": False,
+                        "reason": "not a command"}
         # shorthand: resolve to a run first; zero/ambiguous candidates reply and stop
         resolved, failed = _resolve(act, cmd, notifier)
         if failed is not None:
@@ -590,7 +631,9 @@ def _apply_one(act, cmd: TelegramCommand, notifier) -> dict:
     merge = cmd.action == "merge"
     decision = ApprovalDecision.approved if merge else ApprovalDecision.declined
     verb = "approved" if merge else "rejected"
-    act.decide_approval(pending[0].id, decision, actor=TELEGRAM_ACTOR)
+    # the note kwarg only when there is one: a Protocol-minimal ACT has no `note`
+    act.decide_approval(pending[0].id, decision, actor=TELEGRAM_ACTOR,
+                        **({"note": cmd.note} if cmd.note else {}))
     # the decision is recorded from here on: a failing event log must not make the
     # reply claim otherwise
     event_note = ""
@@ -604,8 +647,9 @@ def _apply_one(act, cmd: TelegramCommand, notifier) -> dict:
         event_note = " (event log failed)"
     # a shorthand resolved against live state: say which run it picked, by name
     who = run_id if resolved is None else f"{resolved[1]} - {resolved[2]} ({run_id})"
+    reason_suffix = f" - {cmd.note}" if cmd.note else ""
     notifier.send(f"Navigator: {who} merge {verb} from Telegram "
-                  f"({_apply_wording()}){event_note}")
+                  f"({_apply_wording()}){event_note}{reason_suffix}")
     return {"run_id": run_id, "action": cmd.action, "applied": True, "reason": None}
 
 

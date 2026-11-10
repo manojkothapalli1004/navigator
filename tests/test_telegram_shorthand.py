@@ -18,6 +18,7 @@ from navigator.contracts.enums import ApprovalDecision, ApprovalGate, RunPhase
 from navigator.contracts.event import Event
 from navigator.contracts.proposal import Proposal
 from navigator.contracts.run import Run
+from navigator.ids import new_id
 from navigator.observability.telegram_inbox import (TELEGRAM_ACTOR, TelegramCommand, _label,
                                                     apply_commands, parse_command, short_name)
 from tests.test_telegram_inbox import (VERIFIED_SHA, _Recorder, _decisions, _inbox, _merge,
@@ -82,6 +83,48 @@ def test_named_merge_parses_short_name():
     assert parse_command("merge N5b", 3) == TelegramCommand("merge", None, 3, name="N5b")
     assert parse_command("/MERGE n5b", 3) == TelegramCommand("merge", None, 3, name="n5b")
     assert parse_command("reject S3a", 4) == TelegramCommand("reject", None, 4, name="S3a")
+
+
+def test_reject_with_reason_words_parses_note():
+    """B2: the words after the reject target are the decline reason. A leading REASON_CODE
+    (case-insensitive, trailing ':' tolerated) is the code; anything else is free text
+    filed under 'other'. The target stays parts[1] (short name or full run id) with the
+    same rules as before; no words -> note None."""
+    cmd = parse_command("reject S3a unsafe touches auth", 4)
+    assert cmd is not None
+    assert cmd == TelegramCommand("reject", None, 4, name="S3a",
+                                  note="reason=unsafe: touches auth")
+    cmd = parse_command("reject S3a flaky on CI", 5)
+    assert cmd is not None
+    assert cmd == TelegramCommand("reject", None, 5, name="S3a",
+                                  note="reason=other: flaky on CI")
+    rid = new_id("run")
+    cmd = parse_command(f"Reject {rid} Unsafe:", 6)
+    assert cmd is not None
+    assert cmd == TelegramCommand("reject", rid, 6, note="reason=unsafe")
+    assert parse_command("/reject S3a tests_weak", 7) == TelegramCommand(
+        "reject", None, 7, name="S3a", note="reason=tests_weak")
+    assert parse_command("reject S3a  Duplicate:   of  N5b ", 8) == TelegramCommand(
+        "reject", None, 8, name="S3a", note="reason=duplicate: of N5b")
+    # no words: note None, so apply decides without a note (B1 renders 'no reason given')
+    assert parse_command("reject S3a", 9) == TelegramCommand("reject", None, 9, name="S3a")
+    assert parse_command("reject S3a", 9).note is None
+    # the target rules are unchanged: a truncated run id or a bad name is not a command,
+    # and bare 'reject' + reason is unsupported (tests_weak would be taken as a name)
+    assert parse_command("reject run-01M unsafe", 10) is None
+    assert parse_command("reject S3a? unsafe", 10) is None
+    assert parse_command("reject tests_weak flaky", 11) == TelegramCommand(
+        "reject", None, 11, name="tests_weak", note="reason=other: flaky")
+
+
+def test_merge_with_extra_words_is_still_not_a_command():
+    """GUARD (green on main): B2 widens only `reject`; 'merge <target> <words>' stays chat
+    and 'reject all ...' is still refused by the batch branch."""
+    rid = new_id("run")
+    for text in ("merge S3a now", "merge S3a looks good", "/merge S3a unsafe",
+                 "merge S3a unsafe touches auth", f"merge {rid} now", "reject all",
+                 "reject all unsafe", "/reject all except N5b"):
+        assert parse_command(text, 1) is None, text
 
 
 def test_ordinary_chat_is_not_a_command():
@@ -198,6 +241,91 @@ def test_named_merge_resolves_by_short_name_case_insensitively(tmp_path):
     results = apply_commands(act, [TelegramCommand("reject", None, 5, name="S3A")], rec)
     assert results[0]["applied"] is True and results[0]["run_id"] == b.id
     assert len(_merge(act, b.id, ApprovalDecision.declined)) == 1
+
+
+def test_named_reject_with_reason_records_note_and_says_so(tmp_path):
+    """B2: the note reaches ACT's approval (B1's decline_run writer reads it), the reply
+    echoes it after the event note, and the run.telegram_decision payload is unchanged."""
+    act = FakeACTClient()
+    run = _run(act, "S3a: squash merges")
+    rec = _Recorder()
+    cmds = _inbox(tmp_path, [_update(6, "reject S3a unsafe touches auth")]).poll_once()
+    assert len(cmds) == 1
+    assert cmds == [TelegramCommand("reject", None, 6, name="S3a",
+                                    note="reason=unsafe: touches auth")]
+    results = apply_commands(act, cmds, rec)
+    assert results == [{"run_id": run.id, "action": "reject", "applied": True, "reason": None}]
+    declined = _merge(act, run.id, ApprovalDecision.declined)
+    assert len(declined) == 1 and declined[0].actor == TELEGRAM_ACTOR
+    assert declined[0].note == "reason=unsafe: touches auth"
+    assert _pending(act, run.id) == 0
+    ev = _decisions(act)
+    assert len(ev) == 1
+    assert ev[0].payload == {"run_id": run.id, "decision": "rejected", "update_id": 6}
+    assert rec.sent == [f"Navigator: S3a - S3a: squash merges ({run.id}) merge rejected "
+                        f"from Telegram (applies this cycle) - reason=unsafe: touches auth"]
+
+
+def test_reject_without_reason_passes_no_note_kwarg():
+    """A note-less ACT (tests/support.py ProtocolOnlyACT shape: decide_approval without
+    `note`) still takes a bare reject; the note kwarg is only passed when there is one."""
+    class _NoteLessACT(FakeACTClient):
+        def decide_approval(self, approval_id, decision, actor):
+            return FakeACTClient.decide_approval(self, approval_id, decision, actor)
+
+    act = _NoteLessACT()
+    run = _run(act, "S3a: squash merges")
+    rec = _Recorder()
+    results = apply_commands(act, [TelegramCommand("reject", None, 1, name="S3a")], rec)
+    assert results[0]["applied"] is True and results[0]["run_id"] == run.id
+    declined = _merge(act, run.id, ApprovalDecision.declined)
+    assert len(declined) == 1 and declined[0].note is None
+    assert rec.sent == [f"Navigator: S3a - S3a: squash merges ({run.id}) merge rejected "
+                        f"from Telegram (applies this cycle)"]
+
+
+def test_reasoned_reject_with_unknown_name_is_chat_not_a_command(tmp_path):
+    """B2 guard: SHORT_NAME accepts any word, so 'reject this one please' parses as a
+    reasoned reject of 'this'. When the name matches no waiting run it is operator chat:
+    no reply, no decision, result reason 'not a command'."""
+    act = FakeACTClient()
+    run = _run(act, "S3a: squash merges")
+    rec = _Recorder()
+    cmd = parse_command("reject this one please", 7)
+    assert cmd is not None and cmd.name == "this" and cmd.note
+    results = apply_commands(act, [cmd], rec)
+    assert results == [{"run_id": None, "action": "reject", "applied": False,
+                        "reason": "not a command"}]
+    assert rec.sent == []
+    assert _pending(act, run.id) == 1 and _decisions(act) == []
+    assert _merge(act, run.id, ApprovalDecision.declined) == []
+
+
+def test_reasoned_reject_with_unknown_name_falls_through_to_chat_in_handle_operator_message():
+    """The bot forwards a False to the conductor chat; True would swallow the line."""
+    from navigator.observability.telegram_proposals import handle_operator_message
+    from tests.test_actions import CHAT, NOW, _msg
+
+    act = FakeACTClient()
+    run = _run(act, "S3a: squash merges")
+    rec = _Recorder()
+    assert handle_operator_message(_msg("reject this one please"), act, rec, CHAT,
+                                   now=NOW, update_id=8) is False
+    assert rec.sent == []
+    assert _pending(act, run.id) == 1 and _decisions(act) == []
+
+
+def test_bare_reject_with_unknown_name_still_lists_candidates():
+    """No note: 'reject nosuch' keeps the candidate reply (the operator typed a target)."""
+    act = FakeACTClient()
+    run = _run(act, "S3a: squash merges")
+    rec = _Recorder()
+    results = apply_commands(act, [parse_command("reject nosuch", 9)], rec)
+    assert results == [{"run_id": None, "action": "reject", "applied": False,
+                        "reason": "no single run named 'nosuch'"}]
+    assert len(rec.sent) == 1 and rec.sent[0].startswith("Navigator: /reject nosuch not applied")
+    assert "S3a - S3a: squash merges - reply: reject S3a" in rec.sent[0].splitlines()
+    assert _pending(act, run.id) == 1
 
 
 def test_named_merge_without_colon_in_title():

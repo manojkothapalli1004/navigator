@@ -288,6 +288,7 @@ def test_reject_declines_pending_merge(tmp_path):
     apply_commands(act, cmds, rec)
     declined = _merge(act, run.id, ApprovalDecision.declined)
     assert len(declined) == 1 and declined[0].actor == TELEGRAM_ACTOR
+    assert declined[0].note is None  # GUARD (B2): a reject without words stores no note
     assert _decisions(act)[0].payload["decision"] == "rejected"
     assert rec.sent == [f"Navigator: {run.id} merge rejected from Telegram (applies this cycle)"]
 

@@ -56,6 +56,45 @@ def test_reject_with_reason_stores_note():
     assert declined[0].actor == "operator"
 
 
+def test_reject_with_reason_and_text_stores_note():
+    """B2: words after the code are the free-text reason: 'reason=CODE: text'."""
+    act, run = _setup()
+    rc, out = _cli(act, "reject", run.id, "--reason", "unsafe", "touches", "auth")
+    assert rc == 0, out
+    assert _pending(act, run) == []
+    declined = _declined(act, run)
+    assert len(declined) == 1
+    assert declined[0].note == "reason=unsafe: touches auth"
+    assert declined[0].actor == "operator"
+    # an unknown code is still refused, text or not
+    act2, run2 = _setup()
+    rc, out = _cli(act2, "reject", run2.id, "--reason", "bogus", "touches", "auth")
+    assert rc == 2 and "bogus" in out
+    assert len(_pending(act2, run2)) == 1 and _declined(act2, run2) == []
+
+
+def test_reject_with_reason_code_trailing_colon_accepted():
+    """Rev2 item 4: '--reason unsafe:' (the natural 'CODE: text' spelling) is the code
+    'unsafe'; the note never carries the colon twice."""
+    act, run = _setup()
+    rc, out = _cli(act, "reject", run.id, "--reason", "unsafe:")
+    assert rc == 0, out
+    assert _declined(act, run)[0].note == "reason=unsafe"
+    act2, run2 = _setup()
+    rc, out = _cli(act2, "reject", run2.id, "--reason", "unsafe:", "touches", "auth")
+    assert rc == 0, out
+    assert _declined(act2, run2)[0].note == "reason=unsafe: touches auth"
+
+
+def test_reason_note_collapses_whitespace_and_omits_empty_text():
+    from navigator.cli import reason_note  # new in B2
+    assert reason_note("unsafe") == "reason=unsafe"
+    assert reason_note("unsafe", "") == "reason=unsafe"
+    assert reason_note("other", "   \t ") == "reason=other"
+    assert reason_note("unsafe", "  touches   auth \n") == "reason=unsafe: touches auth"
+    assert reason_note("low_value", "too small") == "reason=low_value: too small"
+
+
 def test_reject_with_unknown_reason_is_refused_and_lists_codes():
     act, run = _setup()
     rc, out = _cli(act, "reject", run.id, "--reason", "bogus")
@@ -91,6 +130,22 @@ def test_decline_run_records_reason_code_and_lesson(tmp_path):
     assert declined_events[0].payload["reason_code"] == "unsafe"
 
 
+def test_decline_run_keeps_reason_code_with_text(tmp_path):
+    """End to end: CLI free text does not pollute the outcome's reason_code or lesson."""
+    act, run = _setup()
+    assert _cli(act, "reject", run.id, "--reason", "unsafe", "touches", "auth")[0] == 0
+    settings = _settings(tmp_path)
+    decline_run(run, act=act, orc=FakeORCClient(), settings=settings)
+    o = OutcomeStore(settings.outcome_path).latest(1)[0]
+    assert o.status == "declined"
+    assert o.reason_code == "unsafe"
+    assert o.lessons[0] == DECLINED_LESSON
+    assert o.lessons[1] == "decline reason: unsafe"
+    declined_events = [e for e in act.events if e.kind == "run.declined"]
+    assert len(declined_events) == 1
+    assert declined_events[0].payload["reason_code"] == "unsafe"
+
+
 def test_decline_run_without_reason_has_no_reason_code(tmp_path):
     act, run = _setup()
     assert _cli(act, "reject", run.id)[0] == 0
@@ -109,6 +164,21 @@ def test_decline_reason_parsing_stops_at_separator():
     act.decide_approval(a.id, ApprovalDecision.declined, actor="operator",
                         note="reason=scope_creep; free text here")
     assert _decline_reason(act, run) == "scope_creep"
+
+
+def test_decline_reason_parses_code_before_colon():
+    """B2: a note 'reason=CODE: free text' (CLI --reason CODE TEXT, Telegram
+    'reject <name> CODE text', ACT's reason field) yields CODE: ':' is a stop like ';'
+    and whitespace. Without this, 'reason=unsafe: touches auth' parsed as 'unsafe:'."""
+    act, run = _setup()
+    a = _pending(act, run)[0]
+    act.decide_approval(a.id, ApprovalDecision.declined, actor="operator",
+                        note="reason=unsafe: touches auth")
+    assert _decline_reason(act, run) == "unsafe"
+    act2, run2 = _setup()
+    b = _pending(act2, run2)[0]
+    act2.decide_approval(b.id, ApprovalDecision.declined, actor="operator", note="reason=unsafe:")
+    assert _decline_reason(act2, run2) == "unsafe"
 
 
 def test_decline_reason_ignores_notes_without_prefix_and_errors():

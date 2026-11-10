@@ -58,7 +58,7 @@ RANGE = re.compile(r"(\d{1,4})-(\d{1,4})")
 HELP = ("Navigator commands:\n"
         "status - the top 3 proposals to decide / more - the next 3 / all - every one\n"
         "approve 1 3 / approve N1 / decline 4-33 - decide proposals\n"
-        "merge / merge N5b / reject N5b - runs waiting at the merge gate\n"
+        "merge / merge N5b / reject N5b [reason...] - runs waiting at the merge gate\n"
         "merge all / merge all except N5b,S3a - approve every audited tier A/B run at the "
         "gate (tier C needs 'merge <name>')\n"
         "decisions - everything waiting on you (merges, proposals, manual steps)\n"
@@ -239,8 +239,10 @@ def handle_operator_message(msg: dict, act, notifier, chat_id: str,
                             now: float | None = None, triage_file: str | None = None,
                             update_id: int = 0) -> bool:
     """True when the message was a Navigator command (handled or refused with a
-    reply); False for other senders and ordinary chat. update_id is the Telegram
-    update that delivered msg; merge/reject decisions record it in their event."""
+    reply); False for other senders and ordinary chat. A reasoned reject whose target
+    is not a waiting run's name ('reject this one please') is ordinary chat: False, no
+    reply, so the bot forwards it. update_id is the Telegram update that delivered
+    msg; merge/reject decisions record it in their event."""
     if not isinstance(msg, dict) or not is_operator_message(msg, chat_id):
         return False
     text = msg.get("text")
@@ -254,7 +256,9 @@ def handle_operator_message(msg: dict, act, notifier, chat_id: str,
         return True
     try:
         if merge_cmd is not None:
-            apply_commands(act, [merge_cmd], notifier)
+            results = apply_commands(act, [merge_cmd], notifier)
+            if results and results[0].get("reason") == "not a command":
+                return False
         elif prop_cmd.action in ("status", "more"):
             _page(act, notifier, triage_file, more=prop_cmd.action == "more")
         elif prop_cmd.action == "all":
