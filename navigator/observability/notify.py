@@ -6,11 +6,12 @@ import httpx
 
 
 class Notifier(Protocol):
-    def send(self, text: str) -> None: ...
+    # reply_markup (B4): a Telegram inline keyboard for the message, or None
+    def send(self, text: str, reply_markup: dict | None = None) -> None: ...
 
 
 class NullNotifier:
-    def send(self, text: str) -> None:
+    def send(self, text: str, reply_markup: dict | None = None) -> None:
         pass
 
 
@@ -20,10 +21,13 @@ class TelegramNotifier:
         self.chat_id = chat_id
         self.client = client or httpx.Client(timeout=10.0)
 
-    def send(self, text: str) -> None:
+    def send(self, text: str, reply_markup: dict | None = None) -> None:
         # best-effort: an unreachable Telegram must never fail a run or a cycle
+        body: dict = {"chat_id": self.chat_id, "text": text[:4000]}
+        if reply_markup is not None:  # only when given: the plain request stays byte-identical
+            body["reply_markup"] = reply_markup
         try:
-            self.client.post(self.url, json={"chat_id": self.chat_id, "text": text[:4000]})
+            self.client.post(self.url, json=body)
         except Exception:
             pass
 
@@ -106,8 +110,27 @@ class NotifyingACT:
     def emit_event(self, event) -> None:
         self.inner.emit_event(event)
         text = self._message(event.kind, event.payload)
-        if text:
+        if not text:
+            return
+        markup = self._markup(event.kind, event.payload)
+        if markup is None:
             self.notifier.send(text)
+            return
+        try:
+            self.notifier.send(text, reply_markup=markup)
+        except TypeError:
+            # a notifier whose send takes only the text (older fakes, other tools): the
+            # message still goes out, without the button
+            self.notifier.send(text)
+
+    @staticmethod
+    def _markup(kind: str, p: dict) -> dict | None:
+        """The inline keyboard for a kind, or None: run.declined gets one Fix button whose
+        callback data 'fix:<run-id>' telegram_inbox._card_tap turns into 'fix <run-id>'."""
+        run_id = p.get("run_id")
+        if kind == "run.declined" and isinstance(run_id, str) and run_id:
+            return {"inline_keyboard": [[{"text": "Fix", "callback_data": f"fix:{run_id}"}]]}
+        return None
 
     def _message(self, kind: str, p: dict) -> str | None:
         run_id = p.get("run_id", "?")
@@ -134,7 +157,8 @@ class NotifyingACT:
         if kind == "run.failed":
             return f"Navigator: {run_id} FAILED \u2014 {p.get('error') or 'see outcome'}"
         if kind == "run.declined":
-            return f"Navigator: {run_id} declined; worktree kept for inspection"
+            return (f"Navigator: {run_id} declined (reason: {p.get('reason_code') or 'none given'}); "
+                    f"worktree kept for inspection\nfix: tap Fix or reply 'fix {run_id}'")
         if kind == "run.completed":
             text = f"Navigator: {run_id} merged"
             if p.get("auto") and p.get("origin") == "site-checker":

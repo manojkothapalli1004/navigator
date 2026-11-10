@@ -56,6 +56,11 @@ returns, each with the exact actions the Telegram words accept, plus the runs at
 merge gate that are not audited yet (awaiting_audit, shown without buttons). A due digest
 is also kept as navigator/digest/latest plus one navigator.digest event, with the outcomes
 merged / failed since the previous digest (tracked by the last outcome id seen).
+B4: the snapshot also carries "declined" - runs declined at the merge gate in the last
+runtime/fix.WINDOW_DAYS days that one Fix (action "fix", reply 'fix <name>') would rebuild
+with their reason; only those fix.fix_reason accepts right now, so the page never shows a
+dead button. They are NOT items: the Telegram 'decisions' list, digest, nudges and the
+state file are unchanged.
 
 This module must not import telegram_proposals (telegram_proposals imports it).
 """
@@ -74,6 +79,7 @@ from navigator.contracts.event import Event
 from navigator.observability import actions
 from navigator.observability.logging import get_logger
 from navigator.observability.telegram_inbox import _candidates, _reply_arg, short_name
+from navigator.runtime import fix
 from navigator.runtime.outcome_store import OutcomeStore
 
 log = get_logger("navigator.decisions")
@@ -102,7 +108,7 @@ OUTCOMES_SCANNED = 200
 OUTCOMES_FALLBACK = 20
 # the actions the Telegram words accept for each kind (manual steps have no button)
 KIND_ACTIONS = {"merge": ("merge", "reject"), "proposal": ("approve", "decline"),
-                "manual": ()}
+                "manual": (), "declined": ("fix",)}
 
 
 def state_path() -> str:
@@ -625,10 +631,29 @@ def _awaiting_audit(act, open_runs, merge_keys: set) -> list[dict]:
     return out
 
 
+def _declined_items(act, now: datetime) -> list[dict]:
+    """B4: _snapshot_item-shaped entries (all 12 keys) for the declined runs a Fix would
+    rebuild right now - fix.declined_candidates filtered by fix.fix_reason is None."""
+    out = []
+    for run, short, title, prop in fix.declined_candidates(act, now):
+        if fix.fix_reason(act, prop, act.list_runs_for_proposal(run.proposal_id)) is not None:
+            continue
+        ended = _aware(run.ended_at)
+        repo = getattr(prop, "repo", None)
+        out.append({"key": f"declined:{run.id}", "kind": "declined",
+                    "title": _flat(title) or run.id, "reply": f"fix {_reply_arg(run, short)}",
+                    "since": ended.isoformat() if ended is not None else None,
+                    "repo": repo if isinstance(repo, str) else None,
+                    "run_id": run.id, "proposal_id": run.proposal_id, "approval_id": None,
+                    "tier": None, "actions": list(KIND_ACTIONS["declined"]), "how": None})
+    return out
+
+
 def snapshot(act, now: datetime | None = None, manual_file=None, candidates=None) -> dict:
     """The navigator/decisions document body: collect_with_status's items, each with the
     actions the Telegram words accept, plus awaiting_audit (unaudited runs at the merge
-    gate, no buttons) and the sorted kinds that failed to list. Never raises."""
+    gate, no buttons), declined (B4: runs one Fix would rebuild, not items) and the sorted
+    kinds that failed to list. Never raises."""
     now = _aware(now) or datetime.now(timezone.utc)
     try:
         items, failed = collect_with_status(act, manual_file, candidates)
@@ -664,8 +689,14 @@ def snapshot(act, now: datetime | None = None, manual_file=None, candidates=None
             log.warning("decisions.awaiting_audit_failed", error=type(e).__name__)
             awaiting = []
             failed.add("awaiting_audit")
+    declined: list[dict] = []
+    try:
+        declined = _declined_items(act, now)
+    except Exception as e:
+        log.warning("decisions.declined_failed", error=type(e).__name__)
+        failed.add("declined")
     return {"ts": now.isoformat(timespec="seconds"), "items": out,
-            "awaiting_audit": awaiting, "failed": sorted(failed)}
+            "awaiting_audit": awaiting, "failed": sorted(failed), "declined": declined}
 
 
 def digest_body(items: list[Decision], chunks: list[str], now, outcomes_since: list,

@@ -679,6 +679,45 @@ def test_card_button_tap_from_someone_else_or_odd_data_ignored(tmp_path):
     assert inbox.poll_updates(0) == []
 
 
+# ---- B4: the Fix button on a decline message arrives as a callback_query too ----
+
+def test_fix_button_tap_becomes_fix_run_id(tmp_path):
+    rid = new_id("run")
+    inbox = _inbox(tmp_path, [_tap(9, f"fix:{rid}")])
+    got = inbox.poll_updates(0)
+    assert [(u, m["text"]) for u, m in got] == [(9, f"fix {rid}")]
+    msg = got[0][1]
+    assert msg["callback_query_id"] == "cq9" and msg["card_message_id"] == 77
+    assert msg["date"] == NOW and msg["chat"] == {"id": int(CHAT), "type": "private"}
+    assert msg["from"] == {"id": int(CHAT)}
+    assert set(msg) == {"chat", "from", "date", "text", "callback_query_id", "card_message_id"}
+    # the daemon's short poll parses it as the run-id form of fix
+    inbox = _inbox(tmp_path, [_tap(10, f"fix:{rid}")])
+    assert inbox.poll_once() == [TelegramCommand("fix", rid, 10)]
+
+
+def test_fix_button_tap_with_bad_data_or_stranger_ignored(tmp_path):
+    rid = new_id("run")
+    inbox = _inbox(tmp_path, [_tap(5, "fix:bogus"), _tap(6, "fix:run-01M"),
+                              _tap(7, f"fix:{rid} now"), _tap(8, f"FIX:{rid}"),
+                              _tap(9, f"fix:{rid}", sender=999), _tap(10, f"fix:{rid}", chat=999),
+                              _tap(11, f"fix:{rid.lower()}"), _tap(12, "fix")])
+    assert inbox.poll_updates(0) == []
+    assert _inbox_lines(tmp_path) == []
+
+
+def test_card_tap_dict_is_unchanged_by_the_fix_branch(tmp_path):
+    from navigator.observability.telegram_inbox import _card_tap
+    cq = _tap(5, "card:approve:ABC234")["callback_query"]
+    assert _card_tap(cq, NOW) == {"chat": {"id": int(CHAT), "type": "private"},
+                                  "from": {"id": int(CHAT)}, "date": NOW, "text": "ok ABC234",
+                                  "callback_query_id": "cq5", "card_message_id": 77}
+    cq = _tap(6, "card:decline:XYZ789")["callback_query"]
+    assert _card_tap(cq, NOW)["text"] == "no XYZ789"
+    assert _card_tap({"data": "fix:run-x"}, NOW) is None  # no message: ignored
+    assert _card_tap(None, NOW) is None
+
+
 # ---- 2026-11-03: photos reach the bot (they were dropped: the operator's app-architecture picture) ----
 
 def _photo(uid, caption=None, **extra):

@@ -328,6 +328,274 @@ def test_bare_reject_with_unknown_name_still_lists_candidates():
     assert _pending(act, run.id) == 1
 
 
+# ---- B4: 'fix' - one rebuild for a declined run, carrying its reason ---------------
+
+def _declined(act, title, note=None, ended=None, status=None):
+    """A proposal (approved unless `status`) with one declined run: aborted, ended at
+    `ended` (default now), a declined merge approval carrying `note`. Returns the run."""
+    from navigator.contracts.enums import ProposalStatus, RunStatus
+    n = next(_seq)
+    prop = act.create_proposal(Proposal(origin="periodic", proposal_origin_hash=f"hash-{n}",
+                                        title=title, rationale="r", repo="/r",
+                                        base_commit_sha="abc", intended_changes="x",
+                                        affected_files=["a.py"],
+                                        status=status or ProposalStatus.approved))
+    ended = ended or datetime.now(timezone.utc)
+    run = act.create_run(Run(proposal_id=prop.id, base_commit_sha="abc", branch=f"nav/{n}",
+                             status=RunStatus.aborted, phase=RunPhase.finalizing,
+                             correlation_id=f"corr-{n}", started_at=ended - timedelta(hours=1),
+                             ended_at=ended))
+    appr = act.create_approval(target=run.id, gate=ApprovalGate.merge)
+    act.decide_approval(appr.id, ApprovalDecision.declined, actor=TELEGRAM_ACTOR,
+                        **({"note": note} if note else {}))
+    return run
+
+
+def _grants(act, proposal_id):
+    return act.list_approvals(target=proposal_id, gate=ApprovalGate.review,
+                              decision=ApprovalDecision.approved)
+
+
+def _fix_events(act):
+    return [e for e in act.events if e.kind == "run.fix_requested"]
+
+
+def test_fix_parses_like_merge():
+    rid = new_id("run")
+    for text in ("fix", "/fix", "/FIX", "Fix", "  fix  "):
+        assert parse_command(text, 1) == TelegramCommand("fix", None, 1), text
+    assert parse_command("fix S3a", 2) == TelegramCommand("fix", None, 2, name="S3a")
+    assert parse_command("/FIX n5b", 3) == TelegramCommand("fix", None, 3, name="n5b")
+    assert parse_command(f"fix {rid}", 4) == TelegramCommand("fix", rid, 4)
+    assert parse_command(f"/fix {rid}", 5) == TelegramCommand("fix", rid, 5)
+    assert parse_command("fix S3a", 2).note is None
+    for text in ("fix S3a now", "fix all", "fix all except N5b", "fix run-01M", "/fix run-01M",
+                 "fix S3a?", "fix it please", f"fix {rid} now", "fix\nS3a", "fixed", "fix?"):
+        assert parse_command(text, 6) is None, text
+    assert _label(TelegramCommand("fix", None, 1, name="S3a")) == "/fix S3a"
+    assert _label(TelegramCommand("fix", None, 1)) == "/fix"
+    assert _label(TelegramCommand("fix", rid, 1)) == f"/fix {rid}"
+
+
+def test_named_fix_grants_one_rebuild_and_says_so(tmp_path):
+    act = FakeACTClient()
+    run = _declined(act, "S3a: squash merges", note="reason=unsafe: touches auth")
+    rec = _Recorder()
+    cmds = _inbox(tmp_path, [_update(6, "fix s3a")]).poll_once()
+    assert cmds == [TelegramCommand("fix", None, 6, name="s3a")]
+    results = apply_commands(act, cmds, rec)
+    assert results == [{"run_id": run.id, "action": "fix", "applied": True, "reason": None}]
+    grants = _grants(act, run.proposal_id)
+    assert len(grants) == 1 and grants[0].actor == TELEGRAM_ACTOR
+    assert grants[0].note == f"fix {run.id}"
+    (ev,) = _fix_events(act)
+    assert ev.correlation_id == run.correlation_id
+    assert ev.payload == {"run_id": run.id, "proposal_id": run.proposal_id,
+                          "actor": TELEGRAM_ACTOR, "update_id": 6}
+    assert _decisions(act) == []  # not a merge decision
+    assert rec.sent == [f"Navigator: S3a - S3a: squash merges ({run.id}) fix requested - one "
+                        "rebuild granted, decline reason on record: reason=unsafe: touches auth; "
+                        "builds in execute mode"]
+    # the declined merge approval is untouched and the proposal stays approved
+    assert len(_merge(act, run.id, ApprovalDecision.declined)) == 1
+    from navigator.contracts.enums import ProposalStatus
+    assert act.get_proposal(run.proposal_id).status == ProposalStatus.approved
+
+
+def test_repeated_fix_is_already_queued_and_grants_nothing_more():
+    act = FakeACTClient()
+    run = _declined(act, "S3a: squash merges")
+    rec = _Recorder()
+    apply_commands(act, [TelegramCommand("fix", None, 1, name="S3a")], rec)
+    assert len(_grants(act, run.proposal_id)) == 1
+    assert rec.sent[0].endswith("decline reason on record: no reason given; builds in execute mode")
+    results = apply_commands(act, [TelegramCommand("fix", None, 2, name="S3a")], rec)
+    assert results == [{"run_id": run.id, "action": "fix", "applied": False,
+                        "reason": "already queued"}]
+    assert rec.sent[1] == "Navigator: /fix S3a not applied - already queued"
+    assert len(_grants(act, run.proposal_id)) == 1 and len(_fix_events(act)) == 1
+    # the run-id form hits the same guard
+    results = apply_commands(act, [TelegramCommand("fix", run.id, 3)], rec)
+    assert results[0]["applied"] is False and results[0]["reason"] == "already queued"
+    assert rec.sent[2] == f"Navigator: /fix {run.id} not applied - already queued"
+    assert len(_grants(act, run.proposal_id)) == 1
+
+
+def test_bare_fix_with_one_candidate_applies_and_with_two_lists_both():
+    act = FakeACTClient()
+    a = _declined(act, "N5b: Telegram inbox")
+    rec = _Recorder()
+    results = apply_commands(act, [TelegramCommand("fix", None, 1)], rec)
+    assert results == [{"run_id": a.id, "action": "fix", "applied": True, "reason": None}]
+    assert len(_grants(act, a.proposal_id)) == 1
+    assert rec.sent[0].startswith(f"Navigator: N5b - N5b: Telegram inbox ({a.id}) fix requested")
+    act2 = FakeACTClient()
+    a = _declined(act2, "N5b: Telegram inbox", ended=datetime.now(timezone.utc) - timedelta(hours=1))
+    b = _declined(act2, "S3a: squash merges")
+    rec = _Recorder()
+    results = apply_commands(act2, [TelegramCommand("fix", None, 2)], rec)
+    assert results == [{"run_id": None, "action": "fix", "applied": False,
+                        "reason": "ambiguous: several declined runs"}]
+    assert _grants(act2, a.proposal_id) == [] and _grants(act2, b.proposal_id) == []
+    assert _fix_events(act2) == []
+    lines = rec.sent[0].splitlines()
+    assert lines[0] == "Navigator: /fix not applied - ambiguous: several declined runs; 2 declined:"
+    assert lines[1:] == ["S3a - S3a: squash merges - reply: fix S3a",
+                         "N5b - N5b: Telegram inbox - reply: fix N5b"]  # newest first
+
+
+def test_bare_fix_and_run_id_fix_with_nothing_declined_reply():
+    act = FakeACTClient()
+    rec = _Recorder()
+    results = apply_commands(act, [TelegramCommand("fix", None, 1)], rec)
+    assert results == [{"run_id": None, "action": "fix", "applied": False,
+                        "reason": "nothing declined"}]
+    assert rec.sent == ["Navigator: /fix - nothing declined in the last 7 days"]
+    rid = new_id("run")
+    results = apply_commands(act, [TelegramCommand("fix", rid, 2)], rec)
+    assert results == [{"run_id": rid, "action": "fix", "applied": False,
+                        "reason": "nothing declined"}]
+    assert rec.sent[1] == f"Navigator: /fix {rid} - nothing declined in the last 7 days"
+
+
+def test_fix_by_run_id_not_a_candidate_lists_candidates():
+    """The run-id form is always a command: an unknown, old or rebuilt run gets the list."""
+    act = FakeACTClient()
+    run = _declined(act, "S3a: squash merges")
+    rec = _Recorder()
+    rid = new_id("run")
+    results = apply_commands(act, [TelegramCommand("fix", rid, 1)], rec)
+    assert results == [{"run_id": rid, "action": "fix", "applied": False,
+                        "reason": "not a declined run"}]
+    assert rec.sent[0].splitlines() == [
+        f"Navigator: /fix {rid} not applied - not a declined run from the last 7 days; 1 declined:",
+        "S3a - S3a: squash merges - reply: fix S3a"]
+    assert _grants(act, run.proposal_id) == []
+    # the exact id applies
+    results = apply_commands(act, [TelegramCommand("fix", run.id, 2)], rec)
+    assert results == [{"run_id": run.id, "action": "fix", "applied": True, "reason": None}]
+    assert rec.sent[1].startswith(f"Navigator: S3a - S3a: squash merges ({run.id}) fix requested")
+
+
+def test_fix_with_unknown_name_is_chat_not_a_command():
+    """Amendment 2: 'fix it' / 'fix tests' name no declined run -> no reply, result
+    'not a command', so handle_operator_message hands the line to chat."""
+    act = FakeACTClient()
+    run = _declined(act, "S3a: squash merges")
+    rec = _Recorder()
+    for text in ("fix it", "fix tests", "fix nosuch"):
+        cmd = parse_command(text, 7)
+        assert cmd is not None and cmd.name is not None
+        results = apply_commands(act, [cmd], rec)
+        assert results == [{"run_id": None, "action": "fix", "applied": False,
+                            "reason": "not a command"}], text
+    assert rec.sent == []
+    assert _grants(act, run.proposal_id) == [] and _fix_events(act) == []
+    # with nothing declined at all a named fix is chat too
+    results = apply_commands(FakeACTClient(), [parse_command("fix S3a", 8)], rec)
+    assert results[0]["reason"] == "not a command" and rec.sent == []
+
+
+def test_fix_with_unknown_name_falls_through_to_chat_in_handle_operator_message():
+    """Mirror of the B2 fall-through: False, no reply, nothing granted."""
+    from navigator.observability.telegram_proposals import handle_operator_message
+    from tests.test_actions import CHAT, NOW, _msg
+
+    act = FakeACTClient()
+    run = _declined(act, "S3a: squash merges")
+    rec = _Recorder()
+    assert handle_operator_message(_msg("fix it"), act, rec, CHAT, now=NOW, update_id=8) is False
+    assert rec.sent == []
+    assert _grants(act, run.proposal_id) == [] and _fix_events(act) == []
+    # the real name through the same handler is a command and applies
+    assert handle_operator_message(_msg("fix S3a"), act, rec, CHAT, now=NOW, update_id=9) is True
+    assert len(_grants(act, run.proposal_id)) == 1
+    assert _fix_events(act)[0].payload["update_id"] == 9
+    assert rec.sent[0].startswith(f"Navigator: S3a - S3a: squash merges ({run.id}) fix requested")
+
+
+def test_ambiguous_fix_name_lists_and_grants_nothing():
+    act = FakeACTClient()
+    a = _declined(act, "S3a: first", ended=datetime.now(timezone.utc) - timedelta(hours=1))
+    b = _declined(act, "S3a: second")
+    rec = _Recorder()
+    results = apply_commands(act, [TelegramCommand("fix", None, 1, name="s3a")], rec)
+    assert results == [{"run_id": None, "action": "fix", "applied": False,
+                        "reason": "no single declined run named 's3a'"}]
+    assert _grants(act, a.proposal_id) == [] and _grants(act, b.proposal_id) == []
+    lines = rec.sent[0].splitlines()
+    assert lines[0] == ("Navigator: /fix s3a not applied - no single declined run named 's3a'; "
+                        "2 declined:")
+    # _reply_arg lines, as the merge precedent (test_ambiguous_name_applies_nothing)
+    assert lines[1:] == ["S3a - S3a: second - reply: fix S3a", "S3a - S3a: first - reply: fix S3a"]
+    # the run-id form picks one of them
+    results = apply_commands(act, [TelegramCommand("fix", b.id, 2)], rec)
+    assert results == [{"run_id": b.id, "action": "fix", "applied": True, "reason": None}]
+    assert len(_grants(act, b.proposal_id)) == 1 and _grants(act, a.proposal_id) == []
+
+
+def test_fix_refused_for_a_declined_proposal_and_a_rebuilt_run():
+    from navigator.contracts.enums import ProposalStatus, RunStatus
+    act = FakeACTClient()
+    run = _declined(act, "S3a: squash merges", status=ProposalStatus.declined)
+    rec = _Recorder()
+    results = apply_commands(act, [TelegramCommand("fix", None, 1, name="S3a")], rec)
+    assert results == [{"run_id": run.id, "action": "fix", "applied": False,
+                        "reason": "proposal is declined"}]
+    assert rec.sent == ["Navigator: /fix S3a not applied - proposal is declined"]
+    assert _grants(act, run.proposal_id) == []
+    # a rebuild already running makes the declined run no candidate at all
+    act2 = FakeACTClient()
+    run = _declined(act2, "N5b: Telegram inbox")
+    act2.create_run(Run(proposal_id=run.proposal_id, base_commit_sha="abc", branch="nav/again",
+                        status=RunStatus.executing, phase=RunPhase.building))
+    rec = _Recorder()
+    results = apply_commands(act2, [TelegramCommand("fix", run.id, 2)], rec)
+    assert results[0]["applied"] is False and results[0]["reason"] == "nothing declined"
+    assert _grants(act2, run.proposal_id) == []
+
+
+def test_fix_apply_failure_replies_with_class_name_only(monkeypatch):
+    act = FakeACTClient()
+    run = _declined(act, "S3a: squash merges")
+    rec = _Recorder()
+
+    def boom(target, gate):
+        raise RuntimeError("https://api.telegram.org/botSECRET")
+
+    monkeypatch.setattr(act, "create_approval", boom)
+    results = apply_commands(act, [TelegramCommand("fix", None, 1, name="S3a")], rec)
+    assert results == [{"run_id": None, "action": "fix", "applied": False,
+                        "reason": "error: RuntimeError"}]
+    assert rec.sent == ["Navigator: could not apply /fix S3a: RuntimeError - re-send it"]
+    assert _grants(act, run.proposal_id) == []
+
+
+def test_fix_event_failure_still_reports_the_grant(monkeypatch):
+    """Amendment 8: the grant is written; a failing event log never says 're-send'."""
+    act = FakeACTClient()
+    run = _declined(act, "S3a: squash merges")
+    rec = _Recorder()
+    real = act.emit_event
+
+    def flaky(event):
+        if event.kind == "run.fix_requested":
+            raise RuntimeError("ACT down")
+        return real(event)
+
+    monkeypatch.setattr(act, "emit_event", flaky)
+    results = apply_commands(act, [TelegramCommand("fix", None, 1, name="S3a")], rec)
+    assert results == [{"run_id": run.id, "action": "fix", "applied": True, "reason": None}]
+    assert len(_grants(act, run.proposal_id)) == 1
+    assert len(rec.sent) == 1 and "re-send" not in rec.sent[0]
+    assert rec.sent[0].startswith(f"Navigator: S3a - S3a: squash merges ({run.id}) fix requested")
+
+
+def test_help_names_the_fix_word():
+    from navigator.observability.telegram_proposals import HELP
+    assert "fix N5b - rebuild a declined run with its reason" in HELP
+
+
 def test_named_merge_without_colon_in_title():
     act = FakeACTClient()
     run = _run(act, "S3a squash merges for public repos")
@@ -753,3 +1021,43 @@ def test_merge_all_through_poll_once_and_bare_merge_still_lists_both(tmp_path, m
     assert results[1]["applied"] is True and results[1]["approved"] == [a.id]
     assert _pending(act, a.id) == 0 and _pending(act, b.id) == 1
     assert "not applied" in rec.sent[0] and "excluded: S3a" in rec.sent[1]
+
+
+def test_fix_reply_or_note_failure_after_the_grant_never_says_resend(monkeypatch):
+    """Audit 2026-11-10: the decline note is read BEFORE the grant and the success reply goes
+    through _reply, so a failing ACT read or Telegram send after request_fix can never make
+    apply_commands tell the operator to re-send (a re-send would only be refused anyway)."""
+    act = FakeACTClient()
+    run = _declined(act, "S3a: squash merges")
+    real_list = act.list_approvals
+    state = {"granted": False}
+    real_decide = act.decide_approval
+
+    def decide(*a, **k):
+        state["granted"] = True
+        return real_decide(*a, **k)
+
+    def flaky_list(**kw):
+        if state["granted"]:
+            raise RuntimeError("ACT down after the grant")
+        return real_list(**kw)
+
+    monkeypatch.setattr(act, "decide_approval", decide)
+    monkeypatch.setattr(act, "list_approvals", flaky_list)
+
+    class _BoomNotifier:
+        def __init__(self):
+            self.sent = []
+
+        def send(self, text, *a, **k):
+            self.sent.append(text)
+            if "fix requested" in text:
+                raise RuntimeError("telegram down")
+
+    rec = _BoomNotifier()
+    results = apply_commands(act, [TelegramCommand("fix", None, 1, name="S3a")], rec)
+    assert results == [{"run_id": run.id, "action": "fix", "applied": True, "reason": None}]
+    monkeypatch.setattr(act, "list_approvals", real_list)
+    assert len(_grants(act, run.proposal_id)) == 1
+    assert all("re-send" not in t for t in rec.sent)
+    assert any(t.startswith(f"Navigator: S3a - S3a: squash merges ({run.id}) fix requested") for t in rec.sent)
