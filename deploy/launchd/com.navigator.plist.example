@@ -27,6 +27,10 @@
     <key>NAVIGATOR_SDK_MODEL</key>           <string>claude-opus-5-5</string>
     <key>NAVIGATOR_BUILDER_TOOLS</key>     <string>0</string>
     <key>NAVIGATOR_BUILDER_TESTS</key>     <string>0</string>
+    <!-- reviewer memory B1: per-repo log of declines/failures/audit notes tied to files (off by default);
+         `navigator audited` reads these two from the operator's shell, so export them there as well -->
+    <key>NAVIGATOR_REPO_MEMORY</key>        <string>0</string>
+    <key>NAVIGATOR_REPO_MEMORY_ROOT</key>   <string>/ABSOLUTE/PATH/TO/logs/navigator/repo_memory</string>
     <key>NAVIGATOR_MODE</key>                <string>dry_run</string>
     <key>NAVIGATOR_REPO</key>                <string>/ABSOLUTE/PATH/TO/target-repo</string>
     <key>NAVIGATOR_ACT_BASE_URL</key>        <string>http://127.0.0.1:8090</string>

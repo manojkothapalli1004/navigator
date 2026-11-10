@@ -30,3 +30,17 @@ def _isolate_credits_ledger(tmp_path, monkeypatch):
     monkeypatch.setattr(credits, "_probe_runner", lambda timeout_s=60: ("limited", "conftest stub"),
                         raising=False)
     yield
+
+
+@pytest.fixture(autouse=True)
+def _isolate_repo_memory(tmp_path, monkeypatch):
+    """No test may write the live per-repo memory log (reviewer memory B1, the same lesson): the
+    switch is off unless a test turns it on, the env root points under tmp, AND the module default
+    (what repo_memory.root_for() falls back to when neither Settings nor the env names a root)
+    points under tmp too - a test running Settings(repo_memory=True) without a root must still land
+    in tmp, never in /Users/Manoj/calwbot/logs/navigator/repo_memory."""
+    from navigator.runtime import repo_memory
+    monkeypatch.delenv("NAVIGATOR_REPO_MEMORY", raising=False)
+    monkeypatch.setenv("NAVIGATOR_REPO_MEMORY_ROOT", str(tmp_path / "_repo_memory"))
+    monkeypatch.setattr(repo_memory, "DEFAULT_ROOT", str(tmp_path / "_repo_memory_default"))
+    yield
