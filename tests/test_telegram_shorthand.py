@@ -1021,3 +1021,43 @@ def test_merge_all_through_poll_once_and_bare_merge_still_lists_both(tmp_path, m
     assert results[1]["applied"] is True and results[1]["approved"] == [a.id]
     assert _pending(act, a.id) == 0 and _pending(act, b.id) == 1
     assert "not applied" in rec.sent[0] and "excluded: S3a" in rec.sent[1]
+
+
+def test_fix_reply_or_note_failure_after_the_grant_never_says_resend(monkeypatch):
+    """Audit 2026-11-10: the decline note is read BEFORE the grant and the success reply goes
+    through _reply, so a failing ACT read or Telegram send after request_fix can never make
+    apply_commands tell the operator to re-send (a re-send would only be refused anyway)."""
+    act = FakeACTClient()
+    run = _declined(act, "S3a: squash merges")
+    real_list = act.list_approvals
+    state = {"granted": False}
+    real_decide = act.decide_approval
+
+    def decide(*a, **k):
+        state["granted"] = True
+        return real_decide(*a, **k)
+
+    def flaky_list(**kw):
+        if state["granted"]:
+            raise RuntimeError("ACT down after the grant")
+        return real_list(**kw)
+
+    monkeypatch.setattr(act, "decide_approval", decide)
+    monkeypatch.setattr(act, "list_approvals", flaky_list)
+
+    class _BoomNotifier:
+        def __init__(self):
+            self.sent = []
+
+        def send(self, text, *a, **k):
+            self.sent.append(text)
+            if "fix requested" in text:
+                raise RuntimeError("telegram down")
+
+    rec = _BoomNotifier()
+    results = apply_commands(act, [TelegramCommand("fix", None, 1, name="S3a")], rec)
+    assert results == [{"run_id": run.id, "action": "fix", "applied": True, "reason": None}]
+    monkeypatch.setattr(act, "list_approvals", real_list)
+    assert len(_grants(act, run.proposal_id)) == 1
+    assert all("re-send" not in t for t in rec.sent)
+    assert any(t.startswith(f"Navigator: S3a - S3a: squash merges ({run.id}) fix requested") for t in rec.sent)

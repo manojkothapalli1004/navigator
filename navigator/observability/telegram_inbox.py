@@ -659,13 +659,18 @@ def _apply_fix(act, cmd: TelegramCommand, notifier) -> dict:
     if reason is not None:
         notifier.send(f"Navigator: {_label(cmd)} not applied - {reason}")
         return {"run_id": run.id, "action": "fix", "applied": False, "reason": reason}
+    # the reason the rebuild will carry is read BEFORE the grant: nothing after request_fix
+    # may raise, or apply_commands would tell the operator to re-send a grant that stands
+    try:
+        note = fix.decline_note(act, run.id)
+    except Exception as e:  # noqa: BLE001
+        log.warning("telegram.fix_note_failed", run_id=run.id, error=type(e).__name__)
+        note = None
     fix.request_fix(act, run, TELEGRAM_ACTOR, cmd.update_id)
-    # the grant stands from here on (request_fix swallows an event-log failure): read the
-    # reason the rebuild will carry and say so; never 're-send' after this point
-    note = fix.decline_note(act, run.id)
-    notifier.send(f"Navigator: {short} - {title} ({run.id}) fix requested - one rebuild "
-                  f"granted, decline reason on record: {note or 'no reason given'}; "
-                  "builds in execute mode")
+    # the grant stands from here on (request_fix swallows an event-log failure); _reply never raises
+    _reply(notifier, f"Navigator: {short} - {title} ({run.id}) fix requested - one rebuild "
+                     f"granted, decline reason on record: {note or 'no reason given'}; "
+                     "builds in execute mode")
     return {"run_id": run.id, "action": "fix", "applied": True, "reason": None}
 
 
