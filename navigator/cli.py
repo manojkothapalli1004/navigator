@@ -5,9 +5,11 @@ Every decision here is recorded in ACT; the daemon acts on it next cycle.
 'run.audited' event carrying the run's verified_sha plus an approved review-gate
 approval targeting the run); only audited runs accept a merge decision from
 Telegram. The CLI `merge` does not need it.
-`reject <run-id> [--reason CODE]` declines the merge; the optional CODE (one of
-REASON_CODES) is stored as the approval note `reason=CODE` and recorded by the
-daemon as the declined outcome's reason_code.
+`reject <run-id> [--reason CODE [TEXT...]]` declines the merge; the optional CODE
+(one of REASON_CODES; a trailing ':' is tolerated) is stored as the approval note
+`reason=CODE`, or `reason=CODE: TEXT` when free text follows (B2: the words after
+the code, whitespace collapsed), and recorded by the daemon as the declined
+outcome's reason_code. Bare `reject <run-id>` stores no note.
 `inbox [--since UPDATE_ID]` prints the Telegram inbox file (JSON lines, newest
 last) so other tools read operator messages from the file instead of calling
 getUpdates themselves.
@@ -72,6 +74,14 @@ AUDITOR = "auditor"
 # merge-gate decline reasons accepted by `navigator reject <run> --reason CODE`
 REASON_CODES = ("wrong_behavior", "unsafe", "scope_creep", "docs_wrong", "tests_weak",
                 "low_value", "duplicate", "rebuild_rev2", "other")
+
+
+def reason_note(code: str, text: str = "") -> str:
+    """Decline approval note: 'reason=CODE' or 'reason=CODE: free text' (whitespace
+    collapsed; empty text is omitted). Shared with the Telegram inbox; the executor's
+    _decline_reason reads CODE back up to the first ';', ':' or whitespace."""
+    text = " ".join(text.split())
+    return f"reason={code}: {text}" if text else f"reason={code}"
 _log = get_logger("navigator.cli")
 
 # run statuses whose worktree/branch can go regardless of age
@@ -88,7 +98,7 @@ def run_cli(argv: list[str], *, act, out: TextIO, worktree_root: str | None = No
               f"(cleanup takes no id: navigator cleanup [--apply]; "
               f"navigator doctor [--plist PATH]; "
               f"navigator audited <run-id> [--note TEXT]; "
-              f"navigator reject <run-id> [--reason CODE]; "
+              f"navigator reject <run-id> [--reason CODE [TEXT...]]; "
               f"navigator inbox [--since UPDATE_ID]; "
               f"navigator settings | navigator settings set <field> <value> | "
               f"navigator settings unset <field>)", file=out)
@@ -109,12 +119,13 @@ def run_cli(argv: list[str], *, act, out: TextIO, worktree_root: str | None = No
             print("usage: navigator cleanup [--apply]", file=out)
             return 2
         return _cleanup(act, apply=bool(args), out=out, worktree_root=worktree_root)
-    if cmd == "reject" and len(args) == 3 and args[1] == "--reason":
-        if args[2] not in REASON_CODES:
+    if cmd == "reject" and len(args) >= 3 and args[1] == "--reason":
+        code = args[2].rstrip(":")  # 'unsafe:' is the natural 'CODE: text' spelling
+        if code not in REASON_CODES:
             print(f"unknown reason {args[2]!r}; one of: " + ", ".join(REASON_CODES), file=out)
             return 2
         return _decide_merge(act, args[0], out, ApprovalDecision.declined,
-                             note=f"reason={args[2]}")
+                             note=reason_note(code, " ".join(args[3:])))
     if len(args) != 1:
         print(f"navigator {cmd} needs exactly one id", file=out)
         return 2
