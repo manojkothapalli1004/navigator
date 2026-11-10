@@ -12,6 +12,7 @@ import sys
 from datetime import datetime, timedelta, timezone
 
 from navigator.clients.act_client import FakeACTClient
+from navigator.contracts.approval import Approval
 from navigator.contracts.enums import (ApprovalDecision, ApprovalGate, ProposalStatus, RunPhase,
                                        RunStatus)
 from navigator.contracts.proposal import Proposal
