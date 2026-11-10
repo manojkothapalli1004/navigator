@@ -140,6 +140,88 @@ def test_snapshot_source_failure_listed(tmp_path, monkeypatch):
     assert [i["kind"] for i in body["items"]] == ["merge", "manual"]
 
 
+# ---- B4: declined runs the operator may fix ------------------------------------------
+
+SNAPSHOT_KEYS = {"key", "kind", "title", "reply", "since", "repo", "run_id", "proposal_id",
+                 "approval_id", "tier", "actions", "how"}
+
+
+def _declined_run(act, title, note=None, days_ago=0, repo="/repo", status=ProposalStatus.approved):
+    from datetime import timezone
+    from navigator.contracts.enums import RunStatus
+    p = _proposal(act, title, repo=repo)
+    act.set_proposal_status(p.id, status)
+    ended = datetime.now(timezone.utc) - timedelta(days=days_ago)
+    run = act.create_run(Run(proposal_id=p.id, base_commit_sha="abc", branch=f"nav/{p.id}",
+                             status=RunStatus.aborted, phase=RunPhase.finalizing,
+                             started_at=ended - timedelta(hours=1), ended_at=ended))
+    appr = act.create_approval(target=run.id, gate=ApprovalGate.merge)
+    act.decide_approval(appr.id, ApprovalDecision.declined, actor="operator-telegram",
+                        **({"note": note} if note else {}))
+    return run
+
+
+def test_snapshot_declined_entry_shape_and_actions():
+    act = FakeACTClient()
+    run = _declined_run(act, "S3a: squash merges", note="reason=unsafe: auth", repo="/the/repo")
+    merge_run = _merge_run(act, "Quota: pause builds")
+    body = decisions.snapshot(act)
+    assert decisions.KIND_ACTIONS["declined"] == ("fix",)
+    (item,) = body["declined"]
+    assert set(item) == SNAPSHOT_KEYS
+    assert item == {"key": f"declined:{run.id}", "kind": "declined", "title": "S3a: squash merges",
+                    "reply": "fix S3a", "since": run.ended_at.isoformat(), "repo": "/the/repo",
+                    "run_id": run.id, "proposal_id": run.proposal_id, "approval_id": None,
+                    "tier": None, "actions": ["fix"], "how": None}
+    # NOT in items: the Telegram 'decisions' list, digest and nudges are unchanged
+    assert [i["kind"] for i in body["items"]] == ["merge"]
+    assert body["items"][0]["run_id"] == merge_run.id
+    assert [d.kind for d in decisions.collect(act)] == ["merge"]
+    assert body["failed"] == [] and body["awaiting_audit"] == []
+    # a title that is a run-id-like or non-ASCII name replies with the run id
+    act2 = FakeACTClient()
+    odd = _declined_run(act2, "run-like: title")
+    assert decisions.snapshot(act2)["declined"][0]["reply"] == f"fix {odd.id}"
+
+
+def test_snapshot_declined_excludes_old_queued_and_non_fixable():
+    act = FakeACTClient()
+    fresh = _declined_run(act, "S3a: fresh")
+    _declined_run(act, "Old: eight days", days_ago=8)
+    # already granted a rebuild (fix_reason 'already queued'): no dead Fix button
+    queued = _declined_run(act, "Q: queued")
+    g = act.create_approval(target=queued.proposal_id, gate=ApprovalGate.review)
+    act.decide_approval(g.id, ApprovalDecision.approved, actor="operator")
+    # proposal no longer approved: fix would be refused, so it is not offered
+    _declined_run(act, "D: declined proposal", status=ProposalStatus.declined)
+    body = decisions.snapshot(act)
+    assert [d["run_id"] for d in body["declined"]] == [fresh.id]
+    assert body["items"] == [] and body["failed"] == []
+
+
+def test_snapshot_declined_source_failure_is_listed(monkeypatch):
+    act = FakeACTClient()
+    _declined_run(act, "S3a: fresh")
+    run = _merge_run(act, "Quota: pause builds")
+
+    def broken(*a, **k):
+        raise RuntimeError("ACT hiccup")
+
+    monkeypatch.setattr(act, "list_all_runs", broken)
+    body = decisions.snapshot(act)
+    assert body["declined"] == [] and "declined" in body["failed"]
+    assert [i["run_id"] for i in body["items"]] == [run.id]  # the rest is intact
+    assert "merge" not in body["failed"]
+
+
+def test_snapshot_without_declines_has_an_empty_list():
+    act = FakeACTClient()
+    _merge_run(act, "Quota: pause builds")
+    body = decisions.snapshot(act)
+    assert body["declined"] == [] and body["failed"] == []
+    assert set(body) == {"ts", "items", "awaiting_audit", "failed", "declined"}
+
+
 # ---- the daemon step ------------------------------------------------------------
 
 def test_decisions_step_writes_snapshot_doc():
