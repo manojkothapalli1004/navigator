@@ -614,8 +614,17 @@ def _apply_batch(act, cmd: TelegramCommand, notifier) -> dict:
             "approved": [rid for rid, _ in approved]}
 
 
-def _fix_lines(cands) -> str:
-    return _candidate_lines([(run, short, title) for run, short, title, _prop in cands], "fix")
+def _fix_lines(cands, shown=None) -> str:
+    """Candidate lines for 'fix': 'fix <run-id>' for a short name several candidates share
+    (case-insensitive, as the name resolves - 'fix S3a' would be ambiguous again), else
+    _reply_arg's choice. Collisions are counted over ALL of `cands` (what the reply resolves
+    against); the lines are `shown` (the capped list) or all of them."""
+    seen: dict[str, int] = {}
+    for _run, short, _title, _prop in cands:
+        seen[short.lower()] = seen.get(short.lower(), 0) + 1
+    return "\n".join(f"{short} - {title} - reply: fix "
+                     f"{run.id if seen[short.lower()] > 1 else _reply_arg(run, short)}"
+                     for run, short, title, _prop in (cands if shown is None else shown))
 
 
 def _apply_fix(act, cmd: TelegramCommand, notifier) -> dict:
@@ -625,10 +634,13 @@ def _apply_fix(act, cmd: TelegramCommand, notifier) -> dict:
     short name (case-insensitive) or the single candidate for bare 'fix'. A NAME matching no
     candidate is ordinary chat (result reason 'not a command', no reply: SHORT_NAME accepts
     any word, so 'fix it' must reach the chat); zero or several matches otherwise reply with
-    the list. fix.fix_reason then refuses a proposal that is not approved, a running or
-    merged build, or a grant that is already waiting (len(grants) >= len(runs)); else
-    fix.request_fix writes the grant and the reply names the decline reason on record."""
-    cands = fix.declined_candidates(act)
+    the list. The target resolves against EVERY decline in the window (B4d: an older one
+    behind the ten shown is still fixable by name or id); only the shown list is capped at
+    fix.MAX_CANDIDATES. fix.fix_reason then refuses a proposal that is not approved, a
+    running or merged build, a grant that is already waiting (effective grants >= runs) or
+    a grant already noted for this run; else fix.request_fix writes the grant and the reply
+    names the decline reason on record."""
+    cands = fix.declined_candidates(act, limit=None)
     if cmd.run_id is not None:
         matches = [c for c in cands if c[0].id == cmd.run_id]
     elif cmd.name is not None:
@@ -652,10 +664,11 @@ def _apply_fix(act, cmd: TelegramCommand, notifier) -> dict:
             else:
                 reason = shown = "ambiguous: several declined runs"
             notifier.send(f"Navigator: {_label(cmd)} not applied - {shown}; "
-                          f"{len(cands)} declined:\n{_fix_lines(cands)}")
+                          f"{len(cands)} declined:\n"
+                          f"{_fix_lines(cands, cands[:fix.MAX_CANDIDATES])}")
         return {"run_id": cmd.run_id, "action": "fix", "applied": False, "reason": reason}
     run, short, title, prop = matches[0]
-    reason = fix.fix_reason(act, prop, act.list_runs_for_proposal(run.proposal_id))
+    reason = fix.fix_reason(act, prop, act.list_runs_for_proposal(run.proposal_id), run=run)
     if reason is not None:
         notifier.send(f"Navigator: {_label(cmd)} not applied - {reason}")
         return {"run_id": run.id, "action": "fix", "applied": False, "reason": reason}

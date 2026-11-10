@@ -21,6 +21,7 @@ from navigator.contracts.run import Run
 from navigator.ids import new_id
 from navigator.observability.telegram_inbox import (TELEGRAM_ACTOR, TelegramCommand, _label,
                                                     apply_commands, parse_command, short_name)
+from navigator.runtime import fix
 from tests.test_telegram_inbox import (VERIFIED_SHA, _Recorder, _decisions, _inbox, _merge,
                                        _update)
 
@@ -526,8 +527,9 @@ def test_ambiguous_fix_name_lists_and_grants_nothing():
     lines = rec.sent[0].splitlines()
     assert lines[0] == ("Navigator: /fix s3a not applied - no single declined run named 's3a'; "
                         "2 declined:")
-    # _reply_arg lines, as the merge precedent (test_ambiguous_name_applies_nothing)
-    assert lines[1:] == ["S3a - S3a: second - reply: fix S3a", "S3a - S3a: first - reply: fix S3a"]
+    # B4d rev2 item 5: the run-id form - 'fix S3a' would be just as ambiguous on re-send
+    assert lines[1:] == [f"S3a - S3a: second - reply: fix {b.id}",
+                         f"S3a - S3a: first - reply: fix {a.id}"]
     # the run-id form picks one of them
     results = apply_commands(act, [TelegramCommand("fix", b.id, 2)], rec)
     assert results == [{"run_id": b.id, "action": "fix", "applied": True, "reason": None}]
@@ -1061,3 +1063,92 @@ def test_fix_reply_or_note_failure_after_the_grant_never_says_resend(monkeypatch
     assert len(_grants(act, run.proposal_id)) == 1
     assert all("re-send" not in t for t in rec.sent)
     assert any(t.startswith(f"Navigator: S3a - S3a: squash merges ({run.id}) fix requested") for t in rec.sent)
+
+
+def test_fix_with_a_ui_style_grant_for_the_run_is_already_queued():
+    """B4d: a grant noted 'fix <run>' (the ACT Fix button, or a Telegram tap a second
+    earlier) exists while grants < runs (an older failed run of the proposal): the note
+    rule refuses, nothing more is written."""
+    from navigator.contracts.enums import RunStatus
+    act = FakeACTClient()
+    run = _declined(act, "S3a: squash merges")
+    act.create_run(Run(proposal_id=run.proposal_id, base_commit_sha="abc", branch="nav/older",
+                       status=RunStatus.failed, phase=RunPhase.finalizing,
+                       started_at=run.started_at - timedelta(days=1),
+                       ended_at=run.started_at - timedelta(hours=23)))
+    g = act.create_approval(target=run.proposal_id, gate=ApprovalGate.review)
+    act.decide_approval(g.id, ApprovalDecision.approved, actor="operator-ui",
+                        note=f"fix {run.id}")
+    assert len(_grants(act, run.proposal_id)) == 1
+    assert len(act.list_runs_for_proposal(run.proposal_id)) == 2
+    rec = _Recorder()
+    for cmd in (TelegramCommand("fix", None, 1, name="S3a"), TelegramCommand("fix", run.id, 2)):
+        results = apply_commands(act, [cmd], rec)
+        assert results == [{"run_id": run.id, "action": "fix", "applied": False,
+                            "reason": "already queued"}]
+    assert rec.sent == ["Navigator: /fix S3a not applied - already queued",
+                        f"Navigator: /fix {run.id} not applied - already queued"]
+    assert len(_grants(act, run.proposal_id)) == 1 and _fix_events(act) == []
+
+
+def test_fix_resolves_an_older_decline_beyond_the_first_ten():
+    """B4d rev2 item 3: the target resolves against the UNCAPPED declined list; only the
+    shown list stays capped at fix.MAX_CANDIDATES (the header carries the full count)."""
+    act = FakeACTClient()
+    now = datetime.now(timezone.utc)
+    newer = [_declined(act, f"P{i}: newer", ended=now - timedelta(minutes=i))
+             for i in range(fix.MAX_CANDIDATES)]
+    old = _declined(act, "Old: eleventh", ended=now - timedelta(hours=1))
+    assert old.id not in {c[0].id for c in fix.declined_candidates(act)}
+    rec = _Recorder()
+    results = apply_commands(act, [TelegramCommand("fix", None, 1)], rec)
+    assert results == [{"run_id": None, "action": "fix", "applied": False,
+                        "reason": "ambiguous: several declined runs"}]
+    lines = rec.sent[0].splitlines()
+    assert lines[0] == ("Navigator: /fix not applied - ambiguous: several declined runs; "
+                        f"{fix.MAX_CANDIDATES + 1} declined:")
+    assert lines[1:] == [f"P{i} - P{i}: newer - reply: fix P{i}" for i in range(fix.MAX_CANDIDATES)]
+    results = apply_commands(act, [TelegramCommand("fix", None, 2, name="old")], rec)
+    assert results == [{"run_id": old.id, "action": "fix", "applied": True, "reason": None}]
+    assert len(_grants(act, old.proposal_id)) == 1
+    assert all(_grants(act, r.proposal_id) == [] for r in newer)
+    assert rec.sent[1].startswith(f"Navigator: Old - Old: eleventh ({old.id}) fix requested")
+    # the run-id form reaches past the shown ten as well
+    act2 = FakeACTClient()
+    for i in range(fix.MAX_CANDIDATES):
+        _declined(act2, f"P{i}: newer", ended=now - timedelta(minutes=i))
+    old2 = _declined(act2, "Old: eleventh", ended=now - timedelta(hours=1))
+    results = apply_commands(act2, [TelegramCommand("fix", old2.id, 3)], rec)
+    assert results == [{"run_id": old2.id, "action": "fix", "applied": True, "reason": None}]
+    assert len(_grants(act2, old2.proposal_id)) == 1
+
+
+def test_fix_listings_use_the_run_id_only_for_colliding_short_names():
+    """Rev2 item 5: bare 'fix' and the ambiguous-name listing reply 'fix <run-id>' for a
+    short name several candidates share (case-insensitive, as the name resolves) and keep
+    'fix <short>' for the rest; a twin beyond the shown ten still counts as a collision."""
+    act = FakeACTClient()
+    now = datetime.now(timezone.utc)
+    a = _declined(act, "S3a: first", ended=now - timedelta(hours=2))
+    _declined(act, "N5b: other", ended=now - timedelta(hours=1))
+    b = _declined(act, "s3a: second")
+    rec = _Recorder()
+    apply_commands(act, [TelegramCommand("fix", None, 1)], rec)
+    assert rec.sent[0].splitlines()[1:] == [f"s3a - s3a: second - reply: fix {b.id}",
+                                           "N5b - N5b: other - reply: fix N5b",
+                                           f"S3a - S3a: first - reply: fix {a.id}"]
+    assert _grants(act, a.proposal_id) == [] and _grants(act, b.proposal_id) == []
+    act2 = FakeACTClient()
+    shown = [_declined(act2, f"P{i}: newer", ended=now - timedelta(minutes=i))
+             for i in range(fix.MAX_CANDIDATES)]
+    _declined(act2, "P0: older twin", ended=now - timedelta(hours=1))
+    apply_commands(act2, [TelegramCommand("fix", None, 2)], rec)
+    lines = rec.sent[1].splitlines()[1:]
+    assert len(lines) == fix.MAX_CANDIDATES
+    assert lines[0] == f"P0 - P0: newer - reply: fix {shown[0].id}"
+    assert lines[1] == "P1 - P1: newer - reply: fix P1"
+    results = apply_commands(act2, [TelegramCommand("fix", None, 3, name="p0")], rec)
+    assert results == [{"run_id": None, "action": "fix", "applied": False,
+                        "reason": "no single declined run named 'p0'"}]
+    assert rec.sent[2].splitlines()[1] == f"P0 - P0: newer - reply: fix {shown[0].id}"
+    assert all(_grants(act2, r.proposal_id) == [] for r in shown)

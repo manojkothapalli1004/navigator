@@ -772,3 +772,32 @@ def test_memory_read_failure_warns_and_builds(tmp_path, monkeypatch):
     assert not any("disk on fire" in str(v) for v in warned[0].values())   # class name only
     assert "previous_decline" not in seen["proposal"]
     assert seen["repo_memory"] is None
+
+
+def test_grant_rebuild_counts_duplicate_fix_grants_once(tmp_path):
+    """B4d: two Fix grants both noted 'fix <run1>' are ONE effective grant, so a stale
+    failure of run2 still earns its rebuild grant (raw count 2 >= 2 would have refused);
+    once that plain grant exists (effective 2 >= runs 2) _grant_rebuild refuses."""
+    from navigator.contracts.run import Run
+    from navigator.runtime.executor import _grant_rebuild
+    repo, sha = _seed(tmp_path); d = _deps(tmp_path, repo)
+    act = d["act"]
+    p = act.create_proposal(_proposal(repo, sha))
+    run1 = act.create_run(Run(proposal_id=p.id, base_commit_sha=sha, branch="nav/run-1",
+                              status=RunStatus.aborted, phase=RunPhase.finalizing))
+    run2 = act.create_run(Run(proposal_id=p.id, base_commit_sha=sha, branch="nav/run-2",
+                              status=RunStatus.failed, phase=RunPhase.finalizing))
+    for actor in ("operator-telegram", "operator-ui"):
+        g = act.create_approval(target=p.id, gate=ApprovalGate.review)
+        act.decide_approval(g.id, ApprovalDecision.approved, actor=actor, note=f"fix {run1.id}")
+
+    def grants():
+        return act.list_approvals(target=p.id, gate=ApprovalGate.review,
+                                  decision=ApprovalDecision.approved)
+
+    assert len(grants()) == 2
+    assert _grant_rebuild(act, run2) is True
+    plain = [g for g in grants() if g.note is None]
+    assert len(grants()) == 3 and len(plain) == 1 and plain[0].actor == ACTOR
+    assert _grant_rebuild(act, run2) is False  # effective 2 (one fix id + one plain) >= 2
+    assert len(grants()) == 3

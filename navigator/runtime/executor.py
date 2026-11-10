@@ -20,7 +20,7 @@ from navigator.runtime.merge_tiers import (CHECKER_ORIGIN, changed_files_for_run
 from navigator.checker.store import FindingStore
 from navigator.safety.command_runner import FRONTEND_SUITE
 from navigator.runtime.outcome_store import OutcomeStore
-from navigator.runtime import repo_memory
+from navigator.runtime import fix, repo_memory
 from navigator.runtime.phases import (FRONTEND_SUFFIXES, NO_CHANGE_SUMMARY, reverify,
                                       run_build_and_verify, run_dir_for)
 from navigator.ids import new_id
@@ -826,7 +826,7 @@ def _grant_rebuild(act, run: Run) -> bool:
     runs = act.list_runs_for_proposal(run.proposal_id)
     grants = act.list_approvals(target=run.proposal_id, gate=ApprovalGate.review,
                                 decision=ApprovalDecision.approved)
-    if len(grants) >= len(runs):
+    if fix.effective_grants(grants) >= len(runs):
         return False
     appr = act.create_approval(target=run.proposal_id, gate=ApprovalGate.review)
     act.decide_approval(appr.id, ApprovalDecision.approved, actor=ACTOR)

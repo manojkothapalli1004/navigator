@@ -9,7 +9,14 @@ Decisions page. This module writes exactly that record on request - the same app
 cli retry writes - with the note 'fix <run-id>' (B3's hook for which decline reason the
 rebuild carries) and a run.fix_requested event. It never re-approves a proposal (unlike
 _retry) and never writes a second grant while one is unused: fix_reason refuses when
-len(grants) >= len(runs), the _grant_rebuild rule.
+effective_grants(grants) >= len(runs), the _grant_rebuild rule, or when a grant noted for
+the same declined run already exists.
+
+B4d: a UI tap and a Telegram tap within a second both pass fix_reason and write two
+grants for one decline. Those are ONE effective grant: effective_grants counts the grants
+without a 'fix ' note (cli retry, _grant_rebuild) each and the 'fix <run-id>' notes once
+per DISTINCT run id, and loop._may_run, executor._grant_rebuild and fix_reason all count
+that way - so the spare grant never pays for an unattended second rebuild.
 
 Imports only contracts and the logger: telegram_inbox and decisions import this module, so
 it must never import them (or cli / executor / loop) back. The proposal short name is
@@ -27,6 +34,8 @@ log = get_logger("navigator.fix")
 # declines older than this are not offered (the worktree may be gone, the base moved on)
 WINDOW_DAYS = 7
 MAX_CANDIDATES = 10
+# fixable_candidates looks at this many declines (newest first) for MAX_CANDIDATES fixable
+SCAN_LIMIT = 50
 # the grant's note: FIX_NOTE + run id of the declined run whose reason the rebuild carries
 FIX_NOTE = "fix "
 EVENT_KIND = "run.fix_requested"
@@ -49,8 +58,25 @@ def _floor() -> datetime:
     return datetime.min.replace(tzinfo=timezone.utc)
 
 
-def declined_candidates(act, now: datetime | None = None) -> list[tuple]:
-    """Runs the operator may fix, newest decline first, at most MAX_CANDIDATES: the newest
+def effective_grants(approvals) -> int:
+    """How many rebuilds a list of approved review grants buys: every grant whose note
+    does not start with FIX_NOTE (cli retry, _grant_rebuild: no note) counts, and the
+    notes that do count once per DISTINCT note - two Fix grants both noted 'fix run1'
+    are one. Pure; a missing or None note is a plain grant."""
+    plain = 0
+    fixes: set[str] = set()
+    for a in approvals:
+        note = getattr(a, "note", None)
+        if isinstance(note, str) and note.startswith(FIX_NOTE):
+            fixes.add(note)
+        else:
+            plain += 1
+    return plain + len(fixes)
+
+
+def declined_candidates(act, now: datetime | None = None,
+                        limit: int | None = MAX_CANDIDATES) -> list[tuple]:
+    """Runs the operator may fix, newest decline first, at most `limit` (None: all): the newest
     run of its proposal OVERALL (a proposal already rebuilding or rebuilt is never offered),
     status aborted, ended within WINDOW_DAYS, with a declined merge approval (an N16 quota
     deferral is aborted too but has none). Each entry is (run, short name, title, proposal).
@@ -86,16 +112,37 @@ def declined_candidates(act, now: datetime | None = None) -> list[tuple]:
             continue
         title = (prop.title or "").strip()
         out.append((run, short_name(title) or run.id, title or run.id, prop))
-        if len(out) >= MAX_CANDIDATES:
+        if limit is not None and len(out) >= limit:
             break
     return out
 
 
-def fix_reason(act, proposal, runs) -> str | None:
+def fixable_candidates(act, now: datetime | None = None, declined=None) -> list[tuple]:
+    """declined_candidates filtered by fix_reason(..., run=run) is None and THEN capped at
+    MAX_CANDIDATES, scanning at most SCAN_LIMIT declines: when the newest declines are all
+    queued or rebuilding, an older fixable one is still offered. One fix_reason (one
+    list_runs_for_proposal, one list_approvals) per decline scanned. `declined`: a
+    declined_candidates list the caller already holds (decisions passes the uncapped one it
+    counts name collisions over); only its first SCAN_LIMIT are scanned."""
+    if declined is None:
+        declined = declined_candidates(act, now, limit=SCAN_LIMIT)
+    out = []
+    for run, short, title, prop in declined[:SCAN_LIMIT]:
+        if fix_reason(act, prop, act.list_runs_for_proposal(run.proposal_id), run=run) is None:
+            out.append((run, short, title, prop))
+            if len(out) >= MAX_CANDIDATES:
+                break
+    return out
+
+
+def fix_reason(act, proposal, runs, run=None) -> str | None:
     """Why a fix is refused right now, or None when one grant may be written. Mirrors
     cli._retry (a proposal with an executing or completed run has nothing to retry) and
-    executor._grant_rebuild (refuse when len(approved review grants) >= len(runs): every
-    extra run already has its grant, so a second Fix would queue a second rebuild)."""
+    executor._grant_rebuild (refuse when effective_grants(approved review grants) >=
+    len(runs): every extra run already has its grant, so a second Fix would queue a second
+    rebuild). With `run` (the declined run) a grant noted 'fix <run.id>' refuses too, even
+    while the count allows: the same decline is never fixed twice (a new decline has a new
+    run id and may be)."""
     if proposal is None:
         return "proposal not found"
     if proposal.status != ProposalStatus.approved:
@@ -106,7 +153,10 @@ def fix_reason(act, proposal, runs) -> str | None:
         return "already merged"
     grants = act.list_approvals(target=proposal.id, gate=ApprovalGate.review,
                                 decision=ApprovalDecision.approved)
-    if len(grants) >= len(runs):
+    if effective_grants(grants) >= len(runs):
+        return "already queued"
+    if run is not None and any(getattr(a, "note", None) == f"{FIX_NOTE}{run.id}"
+                               for a in grants):
         return "already queued"
     return None
 

@@ -12,6 +12,7 @@ import sys
 from datetime import datetime, timedelta, timezone
 
 from navigator.clients.act_client import FakeACTClient
+from navigator.contracts.approval import Approval
 from navigator.contracts.enums import (ApprovalDecision, ApprovalGate, ProposalStatus, RunPhase,
                                        RunStatus)
 from navigator.contracts.proposal import Proposal
@@ -255,3 +256,122 @@ def test_fix_module_does_not_import_telegram_inbox_or_cli():
                          cwd=str(fix.__file__).rsplit("/navigator/", 1)[0])
     assert out.returncode == 0, out.stderr
     assert out.stdout.strip() == "[]"
+
+
+# ---- B4d: effective grants (one rebuild per decline) and filter-before-cap ---------------
+
+def _grant(act, proposal_id, note=None, actor="operator"):
+    """An approved review-gate grant for the proposal: the cli retry / _grant_rebuild
+    record when `note` is None, the Fix record ('fix <run-id>') otherwise."""
+    appr = act.create_approval(target=proposal_id, gate=ApprovalGate.review)
+    act.decide_approval(appr.id, ApprovalDecision.approved, actor=actor,
+                        **({"note": note} if note is not None else {}))
+    return appr
+
+
+def _appr(note=None):
+    return Approval(target="prop-1", gate=ApprovalGate.review,
+                    decision=ApprovalDecision.approved, actor="x", note=note)
+
+
+def test_effective_grants_counts_plain_grants_plus_distinct_fix_notes():
+    """Rev2 item 1: a grant without a 'fix ' note counts each; 'fix <id>' notes count
+    once per DISTINCT id, so two taps that both wrote 'fix run1' never buy a second
+    rebuild. Pure: a list of Approval objects, note None tolerated."""
+    assert fix.effective_grants([]) == 0
+    assert fix.effective_grants([_appr()]) == 1                                    # one plain
+    assert fix.effective_grants([_appr("fix run-1")]) == 1                         # one fix
+    assert fix.effective_grants([_appr("fix run-1"), _appr("fix run-1")]) == 1     # same id
+    assert fix.effective_grants([_appr("fix run-1"), _appr("fix run-2")]) == 2     # two ids
+    assert fix.effective_grants([_appr(), _appr("fix run-1")]) == 2                # plain + fix
+    assert fix.effective_grants([_appr(""), _appr("retry"), _appr("fixed")]) == 3  # not 'fix '
+    assert fix.effective_grants([_appr(), _appr(), _appr("fix r"), _appr("fix r"),
+                                 _appr("fix s")]) == 4
+
+
+def test_fix_reason_refuses_a_grant_already_noted_for_the_run():
+    """A grant noted 'fix <run.id>' refuses a second Fix for the SAME decline even while
+    effective grants < runs; a grant noted for another run id does not block; duplicate
+    notes count once; a plain (cli retry) grant counts on its own."""
+    act = FakeACTClient()
+    prop, run = _declined(act, "S3a: squash merges")
+    older = act.create_run(Run(proposal_id=prop.id, base_commit_sha="abc", branch="nav/old",
+                               status=RunStatus.failed, phase=RunPhase.finalizing,
+                               started_at=NOW - timedelta(days=1),
+                               ended_at=NOW - timedelta(days=1) + timedelta(minutes=5)))
+    runs = act.list_runs_for_proposal(prop.id)
+    assert len(runs) == 2
+    _grant(act, prop.id, note=f"fix {run.id}")
+    assert len(_grants(act, prop.id)) == 1  # < runs: the count rule alone allows
+    assert fix.fix_reason(act, prop, runs) is None
+    assert fix.fix_reason(act, prop, runs, run=run) == "already queued"  # the note rule
+    assert fix.fix_reason(act, prop, runs, run=older) is None  # another run id: no block
+    # the ACT button and Telegram raced: a second 'fix <run>' note counts once
+    _grant(act, prop.id, note=f"fix {run.id}", actor="operator-ui")
+    assert len(_grants(act, prop.id)) == 2
+    assert fix.fix_reason(act, prop, runs, run=older) is None  # effective 1 < runs 2
+    assert fix.fix_reason(act, prop, runs, run=run) == "already queued"
+    _grant(act, prop.id)  # a plain grant: effective 2 >= runs 2
+    assert fix.fix_reason(act, prop, runs, run=older) == "already queued"
+    assert fix.fix_reason(act, prop, runs) == "already queued"
+
+
+def test_fixable_candidates_filter_before_the_cap_and_uncapped_declines():
+    """12 declines, the 10 newest already queued (a Fix grant each): declined_candidates'
+    cap hides the 2 older fixable ones; fixable_candidates returns exactly them.
+    limit=None lists every decline, limit=n the n newest."""
+    act = FakeACTClient()
+    runs = []
+    for i in range(fix.MAX_CANDIDATES + 2):
+        _, run = _declined(act, f"P{i}: title", ended=NOW - timedelta(minutes=i))
+        runs.append(run)
+    for run in runs[:fix.MAX_CANDIDATES]:
+        _grant(act, run.proposal_id, note=f"fix {run.id}")
+    capped = fix.declined_candidates(act, now=NOW)
+    assert len(capped) == fix.MAX_CANDIDATES
+    assert not {runs[10].id, runs[11].id} & {c[0].id for c in capped}
+    fixable = fix.fixable_candidates(act, now=NOW)
+    assert [c[0].id for c in fixable] == [runs[10].id, runs[11].id]
+    assert [c[1] for c in fixable] == ["P10", "P11"]
+    assert [c[2] for c in fixable] == ["P10: title", "P11: title"]
+    assert [c[3].id for c in fixable] == [runs[10].proposal_id, runs[11].proposal_id]
+    everything = fix.declined_candidates(act, now=NOW, limit=None)
+    assert [c[0].id for c in everything] == [r.id for r in runs]
+    assert [c[0].id for c in fix.declined_candidates(act, now=NOW, limit=3)] == \
+        [r.id for r in runs[:3]]
+
+
+def test_fixable_candidates_caps_at_max_and_scans_at_most_scan_limit(monkeypatch):
+    """At most MAX_CANDIDATES fixable are returned and at most SCAN_LIMIT declines are
+    scanned (one fix_reason - one list_runs_for_proposal - per decline scanned)."""
+    act = FakeACTClient()
+    runs = []
+    for i in range(fix.SCAN_LIMIT + 2):
+        _, run = _declined(act, f"P{i}: title", ended=NOW - timedelta(minutes=i))
+        runs.append(run)
+    calls = []
+    real = act.list_runs_for_proposal
+    monkeypatch.setattr(act, "list_runs_for_proposal",
+                        lambda pid: calls.append(pid) or real(pid))
+    assert [c[0].id for c in fix.fixable_candidates(act, now=NOW)] == \
+        [r.id for r in runs[:fix.MAX_CANDIDATES]]
+    assert len(calls) == fix.MAX_CANDIDATES  # stops at the cap
+    for run in runs[:fix.SCAN_LIMIT]:
+        _grant(act, run.proposal_id, note=f"fix {run.id}")
+    calls.clear()
+    assert fix.fixable_candidates(act, now=NOW) == []  # the 2 beyond the scan are not reached
+    assert len(calls) == fix.SCAN_LIMIT
+
+
+def test_fixable_candidates_scans_only_scan_limit_of_a_passed_list(monkeypatch):
+    """A caller-held declined list (decisions passes the uncapped one) is scanned only up
+    to SCAN_LIMIT and is not fetched again."""
+    act = FakeACTClient()
+    runs = [_declined(act, f"P{i}: title", ended=NOW - timedelta(minutes=i))[1]
+            for i in range(fix.SCAN_LIMIT + 2)]
+    for run in runs[:fix.SCAN_LIMIT]:
+        _grant(act, run.proposal_id, note=f"fix {run.id}")
+    declined = fix.declined_candidates(act, now=NOW, limit=None)
+    assert len(declined) == fix.SCAN_LIMIT + 2
+    monkeypatch.setattr(act, "list_all_runs", lambda: (_ for _ in ()).throw(AssertionError))
+    assert fix.fixable_candidates(act, now=NOW, declined=declined) == []

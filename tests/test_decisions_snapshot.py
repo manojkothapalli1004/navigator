@@ -357,3 +357,49 @@ def test_digest_publish_failure_keeps_marks(tmp_path, monkeypatch):
     assert decisions.read_state(state)["digest"] == "2026-10-25"
     assert len(rec.sent) == 1 and rec.sent[0].startswith("Morning digest")
     assert _digest_events(act) == []
+
+
+# ---- B4d: filter before the cap; run-id replies for colliding names -------------------
+
+def test_snapshot_shows_an_older_fixable_decline_behind_ten_queued():
+    """P2: the 10 newest declines are already queued (a Fix grant each, as the ACT button
+    writes); the snapshot still offers the older fixable one (fix.fixable_candidates
+    filters before the cap) and nothing queued."""
+    act = FakeACTClient()
+    for i in range(10):
+        run = _declined_run(act, f"Q{i}: queued", days_ago=i / 1000)
+        g = act.create_approval(target=run.proposal_id, gate=ApprovalGate.review)
+        act.decide_approval(g.id, ApprovalDecision.approved, actor="operator-ui",
+                            note=f"fix {run.id}")
+    old = _declined_run(act, "Old: fixable", days_ago=1)
+    body = decisions.snapshot(act)
+    assert [d["run_id"] for d in body["declined"]] == [old.id]
+    assert body["declined"][0]["reply"] == "fix Old"
+    assert body["failed"] == []
+
+
+def test_snapshot_colliding_short_names_reply_with_the_run_id():
+    """Rev2 item 5: 'fix S3a' would be ambiguous in Telegram, so an entry whose short
+    name another entry shares (case-insensitive, as Telegram resolves) replies with the
+    run id; the others keep 'fix <short>'."""
+    act = FakeACTClient()
+    a = _declined_run(act, "S3a: first", days_ago=0.5)
+    n = _declined_run(act, "N5b: other", days_ago=0.25)
+    b = _declined_run(act, "s3a: second")
+    body = decisions.snapshot(act)
+    assert [(d["run_id"], d["reply"]) for d in body["declined"]] == [
+        (b.id, f"fix {b.id}"), (n.id, "fix N5b"), (a.id, f"fix {a.id}")]
+
+
+def test_snapshot_reply_counts_a_queued_twin_as_a_collision():
+    """The reply is what Telegram accepts, and Telegram resolves 'fix <name>' against
+    EVERY decline in the window (queued ones too): a fixable S3a whose twin is already
+    queued (not shown) replies with its run id - 'fix S3a' would come back ambiguous."""
+    act = FakeACTClient()
+    queued = _declined_run(act, "S3a: first", days_ago=0.5)
+    g = act.create_approval(target=queued.proposal_id, gate=ApprovalGate.review)
+    act.decide_approval(g.id, ApprovalDecision.approved, actor="operator-ui",
+                        note=f"fix {queued.id}")
+    fresh = _declined_run(act, "S3a: second")
+    body = decisions.snapshot(act)
+    assert [(d["run_id"], d["reply"]) for d in body["declined"]] == [(fresh.id, f"fix {fresh.id}")]
