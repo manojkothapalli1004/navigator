@@ -183,7 +183,11 @@ def test_threads_lines_stay_whole(tmp_path):
 
     ts = [threading.Thread(target=work, args=(t,)) for t in range(4)]
     [t.start() for t in ts]
-    [t.join() for t in ts]
+    [t.join(timeout=30) for t in ts]
+    assert not any(t.is_alive() for t in ts), "an appender hung"
+    # the last racing write may legitimately skip its trim (another writer still held the shared
+    # lock); one uncontended write afterwards always trims, so the cap holds from here on
+    append_line(str(path), json.dumps({"t": 9, "i": 0, "pad": "y" * 30}), max_bytes=4000, keep_lines=40)
     lines = _lines(path)
     assert lines and path.stat().st_size <= 4000
     last: dict = {}

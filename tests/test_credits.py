@@ -657,7 +657,8 @@ def test_inherited_key_warns_once_per_process(env, monkeypatch, caplog):
 
     ts = [threading.Thread(target=go) for _ in range(8)]
     [t.start() for t in ts]
-    [t.join() for t in ts]
+    [t.join(timeout=30) for t in ts]
+    assert not any(t.is_alive() for t in ts), "a racing route() hung"
     assert len(inherited_events()) == 3 and len(notices()) == 3
     assert inherited not in env.events.read_text() + "".join(env.msgs) + caplog.text
 
