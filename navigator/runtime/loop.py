@@ -12,6 +12,7 @@ from navigator.contracts.enums import (ProposalStatus, RunStatus, RunPhase, Appr
                                        ApprovalDecision)
 from navigator.runtime.executor import (execute_proposal, merge_after_approval, decline_run,
                                         rebase_stale_runs, needs_rebase, _stale_skip_reason, AUTO_ACTOR, auto_merge_ok, _as_utc)
+from navigator.runtime import fix
 from navigator.runtime.lock import SingleFlightLock
 from navigator.runtime.outcome_store import OutcomeStore, title_lessons
 from navigator.observability.logging import get_logger
@@ -415,7 +416,7 @@ class Navigator:
             return False
         grants = self.act.list_approvals(target=proposal_id, gate=ApprovalGate.review,
                                          decision=ApprovalDecision.approved)
-        return len(runs) <= len(grants)
+        return len(runs) <= fix.effective_grants(grants)
 
     def _merges_enabled(self) -> bool:
         # N8: the operator may opt in to acting on merge decisions while the daemon

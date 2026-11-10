@@ -633,15 +633,23 @@ def _awaiting_audit(act, open_runs, merge_keys: set) -> list[dict]:
 
 def _declined_items(act, now: datetime) -> list[dict]:
     """B4: _snapshot_item-shaped entries (all 12 keys) for the declined runs a Fix would
-    rebuild right now - fix.declined_candidates filtered by fix.fix_reason is None."""
+    rebuild right now - fix.fixable_candidates (declines filtered by fix.fix_reason BEFORE
+    the cap, so ten queued or rebuilding newer declines never hide an older fixable one).
+    An entry whose short name another decline in the window shares (case-insensitive, over
+    the uncapped declined list Telegram resolves 'fix <name>' against - a queued twin
+    counts) replies with the run id: 'fix <short>' would be ambiguous."""
+    declined = fix.declined_candidates(act, now, limit=None)
+    cands = fix.fixable_candidates(act, now, declined=declined)
+    seen: dict[str, int] = {}
+    for _run, short, _title, _prop in declined:
+        seen[short.lower()] = seen.get(short.lower(), 0) + 1
     out = []
-    for run, short, title, prop in fix.declined_candidates(act, now):
-        if fix.fix_reason(act, prop, act.list_runs_for_proposal(run.proposal_id)) is not None:
-            continue
+    for run, short, title, prop in cands:
         ended = _aware(run.ended_at)
         repo = getattr(prop, "repo", None)
+        arg = run.id if seen[short.lower()] > 1 else _reply_arg(run, short)
         out.append({"key": f"declined:{run.id}", "kind": "declined",
-                    "title": _flat(title) or run.id, "reply": f"fix {_reply_arg(run, short)}",
+                    "title": _flat(title) or run.id, "reply": f"fix {arg}",
                     "since": ended.isoformat() if ended is not None else None,
                     "repo": repo if isinstance(repo, str) else None,
                     "run_id": run.id, "proposal_id": run.proposal_id, "approval_id": None,

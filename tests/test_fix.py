@@ -361,3 +361,17 @@ def test_fixable_candidates_caps_at_max_and_scans_at_most_scan_limit(monkeypatch
     calls.clear()
     assert fix.fixable_candidates(act, now=NOW) == []  # the 2 beyond the scan are not reached
     assert len(calls) == fix.SCAN_LIMIT
+
+
+def test_fixable_candidates_scans_only_scan_limit_of_a_passed_list(monkeypatch):
+    """A caller-held declined list (decisions passes the uncapped one) is scanned only up
+    to SCAN_LIMIT and is not fetched again."""
+    act = FakeACTClient()
+    runs = [_declined(act, f"P{i}: title", ended=NOW - timedelta(minutes=i))[1]
+            for i in range(fix.SCAN_LIMIT + 2)]
+    for run in runs[:fix.SCAN_LIMIT]:
+        _grant(act, run.proposal_id, note=f"fix {run.id}")
+    declined = fix.declined_candidates(act, now=NOW, limit=None)
+    assert len(declined) == fix.SCAN_LIMIT + 2
+    monkeypatch.setattr(act, "list_all_runs", lambda: (_ for _ in ()).throw(AssertionError))
+    assert fix.fixable_candidates(act, now=NOW, declined=declined) == []

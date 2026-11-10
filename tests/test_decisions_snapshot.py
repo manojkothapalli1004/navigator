@@ -389,3 +389,17 @@ def test_snapshot_colliding_short_names_reply_with_the_run_id():
     body = decisions.snapshot(act)
     assert [(d["run_id"], d["reply"]) for d in body["declined"]] == [
         (b.id, f"fix {b.id}"), (n.id, "fix N5b"), (a.id, f"fix {a.id}")]
+
+
+def test_snapshot_reply_counts_a_queued_twin_as_a_collision():
+    """The reply is what Telegram accepts, and Telegram resolves 'fix <name>' against
+    EVERY decline in the window (queued ones too): a fixable S3a whose twin is already
+    queued (not shown) replies with its run id - 'fix S3a' would come back ambiguous."""
+    act = FakeACTClient()
+    queued = _declined_run(act, "S3a: first", days_ago=0.5)
+    g = act.create_approval(target=queued.proposal_id, gate=ApprovalGate.review)
+    act.decide_approval(g.id, ApprovalDecision.approved, actor="operator-ui",
+                        note=f"fix {queued.id}")
+    fresh = _declined_run(act, "S3a: second")
+    body = decisions.snapshot(act)
+    assert [(d["run_id"], d["reply"]) for d in body["declined"]] == [(fresh.id, f"fix {fresh.id}")]
