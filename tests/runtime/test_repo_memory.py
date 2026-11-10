@@ -139,6 +139,26 @@ def test_write_failure_warns_and_never_raises(tmp_path):
     assert not any("/r/nav" in str(v) or "afile" in str(v) for v in failed[0].values())
 
 
+def test_remember_trims_an_oversize_log(tmp_path, monkeypatch):
+    """Housekeeping 2026-11-10: remember() appends through navigator.jsonl_log, so past the cap
+    (jsonl_log.MAX_BYTES, read at call time) only the newest entries stay and recent() reads them."""
+    from navigator import jsonl_log
+    monkeypatch.setattr(jsonl_log, "MAX_BYTES", 2000)
+    s = _settings(tmp_path)
+    for i in range(40):
+        assert remember(s, "/repos/navigator", kind="decline", run_id=f"run-{i}", proposal_id="p",
+                        reason_code="unsafe", text="x" * 60, files=["a.py"], source="operator") is True
+    path = tmp_path / "mem" / "navigator.jsonl"
+    assert path.stat().st_size <= 2000
+    entries = [json.loads(l) for l in path.read_text(encoding="utf-8").splitlines()]
+    assert 1 <= len(entries) < 40
+    assert entries[-1]["run_id"] == "run-39"          # the entry being written is never the one dropped
+    assert all(set(e) == SCHEMA for e in entries)     # the schema is unchanged
+    assert recent("/repos/navigator", root=root_for(s))[0]["run_id"] == "run-39"
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert not list((tmp_path / "mem").glob("*.tmp"))
+
+
 def test_unknown_kind_is_refused_without_raising(tmp_path):
     assert KINDS == ("decline", "failure", "audit")
     s = _settings(tmp_path)
