@@ -549,7 +549,7 @@ def test_events_trimmed_past_cap(env):
     assert rt
     assert env.events.stat().st_size <= 1024 * 1024
     evs = events(env)
-    assert len(evs) <= 2000
+    assert len(evs) == 2001        # the probe's write trimmed to KEEP_LINES (2000), the switch appended one
     assert [e["kind"] for e in evs[-2:]] == ["probe", "switch"]
     assert KEY not in env.events.read_text()
     assert stat.S_IMODE(os.stat(env.events).st_mode) == 0o600

@@ -24,6 +24,8 @@ import uuid
 from dataclasses import dataclass, field
 from zoneinfo import ZoneInfo
 
+from navigator import jsonl_log
+
 log = logging.getLogger("navigator.credits")
 
 HARD_EXPIRY = dt.date(2026, 11, 18)
@@ -195,15 +197,14 @@ def redact(text):
 
 
 def _event(kind: str, **fields) -> None:
-    """Append one JSON line to the events file (0600). Never raises; never holds the key."""
+    """Append one JSON line to the events file (0600, trimmed to its newest lines past
+    jsonl_log.MAX_BYTES). Never raises; never holds the key."""
     rec = {"ts": dt.datetime.now().isoformat(timespec="seconds"), "kind": kind, **fields}
     try:
         line = redact(json.dumps(rec, default=str))
         path = events_path()
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-        with os.fdopen(fd, "a", encoding="utf-8") as fh:
-            fh.write(line + "\n")
+        jsonl_log.append_line(path, line)
     except Exception:
         log.warning("credits.event_failed kind=%s", kind)
 
