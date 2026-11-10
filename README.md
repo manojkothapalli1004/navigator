@@ -4,7 +4,7 @@
 
 **An AI coding agent that plans, builds and verifies a change, then stops for a human decision.**
 
-![tests](https://img.shields.io/badge/tests-2500%2B%20passing-2ea44f)
+![tests](https://img.shields.io/badge/tests-2490%2B%20passing-2ea44f)
 ![python](https://img.shields.io/badge/python-3.12-3776ab)
 ![status](https://img.shields.io/badge/status-preview-orange)
 ![license](https://img.shields.io/badge/license-all%20rights%20reserved-lightgrey)
@@ -100,12 +100,12 @@ at the parent commit, never merged or pushed, and was scored against upstream te
 
 | Measure | Result |
 | --- | --- |
-| Runs / distinct replays | 17 / 13 |
-| Correct on first pass | **10 of 13** |
-| Wrong | 2, both from ambiguous issue text (which exception to raise) |
-| Honest failures | 1 (reported failing rather than claiming success) |
+| Distinct replays (more-itertools) | 19 |
+| Correct | **15 of 19** |
+| Misses from ambiguous issue text | 2 (only the hidden upstream tests could see the expected behaviour) |
+| Honest fails | 2 (Navigator's own checks failed and it rolled back) |
 | Broken work passed that its own checks could have caught | 0 |
-| After tuning, re-run of 4 replays | 4/4 correct; average diff 53 to 22 lines (upstream fixes average ~5) |
+| Fix size | In several replays the source change was identical or near-identical to the upstream fix; after tuning, tests go into the existing test file |
 
 Caveats: small sample, one repository, a library with a fast and strong test suite, and the
 tuning happened on the same replays it was then re-run on. Treat this as a smoke signal, not a benchmark.
