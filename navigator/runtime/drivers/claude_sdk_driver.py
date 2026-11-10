@@ -93,6 +93,10 @@ _ROLE_OUTPUT_SPEC = {
                    'If context.proposal.previous_attempt_failure is present, a previous attempt '
                    'failed with that output: fix its cause (e.g. update existing tests that call '
                    'changed APIs). '
+                   'If context.proposal.previous_decline is present, the operator declined the last '
+                   'build for that reason: address it. context.repo_memory (if present) lists earlier '
+                   'declines, failures and audit notes on these files, newest first: do not repeat '
+                   'them. '
                    'Make the smallest change that solves the task: no refactors, renames or '
                    'reformatting. Add tests to the EXISTING test file for that module when there is '
                    'one (e.g. tests/test_recipes.py), with at most one or two focused test '
@@ -130,7 +134,9 @@ _ROLE_OUTPUT_SPEC = {
                    'BEFORE your edits; still reply with the full JSON object.'),
     Role.verifier: ('Choose commands that prove context.proposal works, each starting with an entry '
                     'of context.allowed_commands. Commands run inside context.workdir; use paths '
-                    'relative to it (context.changed_files already are). Respond with ONLY a JSON '
+                    'relative to it (context.changed_files already are). If context.repo_memory is '
+                    'present, prefer commands that would have caught those earlier failures. '
+                    'Respond with ONLY a JSON '
                     'object: {"commands": [[argv...], ...], "summary": "..."}'),
 }
 

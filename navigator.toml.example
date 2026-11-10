@@ -63,7 +63,9 @@ quota_pause_path = ""             # NAVIGATOR_QUOTA_PAUSE_PATH: JSON file {"unti
 # Reviewer memory B1 (2026-11-09): a per-repo memory log OUTSIDE the repos - one JSON line per declined run
 # (reason code + note), failed attempt (summary + test-output tail) or `navigator audited --note`, each tied to
 # the files it touched: <root>/<repo basename>.jsonl, mode 0600. Writers are best-effort (a failed write is a
-# warning, the run is unaffected). Nothing reads it yet (B3 feeds it to the builder/verifier). `navigator audited`
+# warning, the run is unaffected). B3: read back into builder/verifier context - the same switch feeds the
+# declined run's reason (proposal.previous_decline) and earlier declines/failures/audits on the same files
+# (context.repo_memory) to the next build; off = context byte-identical, no memory file read. `navigator audited`
 # reads the env only, so export both in the operator's shell as well as the daemon plist.
 repo_memory = false               # NAVIGATOR_REPO_MEMORY: "1"/"true" on; "0"/"false"/unset off; anything else is an error
 repo_memory_root = ""             # NAVIGATOR_REPO_MEMORY_ROOT: directory of the per-repo logs; "" = unset = the code

@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta, timezone
 import shlex
+import string
 import subprocess
 import time
 from pathlib import Path
@@ -165,14 +166,19 @@ def execute_proposal(proposal: Proposal, *, act, orc, driver, runner, settings,
     run.worktree_path = str(handle.path)
     run.phase = RunPhase.building; _save(act, run); _emit(act, run, "run.building")
     try:
+        # B3: the declined run's reason and earlier declines/failures/audits on these files
+        # (({}, []) while Settings.repo_memory is off: the dict and kwargs below are then
+        # byte-identical to before and no memory file is read)
+        extra, memory = _memory_context(settings, proposal)
         result = run_build_and_verify(
             driver=driver, worktree=handle, run_id=run.id, runner=runner,
             proposal={"title": proposal.title, "rationale": proposal.rationale,
                       "intended_changes": proposal.intended_changes,
                       "affected_files": list(proposal.affected_files),
-                      **_previous_failure(settings, proposal.id)},
+                      **_previous_failure(settings, proposal.id), **extra},
             breakers=breakers, started_monotonic=started, workdir=workdir,
             repair_turns=getattr(settings, "builder_repair_turns", 0),
+            repo_memory=memory or None,
             **_frontend_kwargs(settings, proposal))
     except QuotaExhaustedError as e:
         # the run is finalized here; the re-raise lets the loop pause until resets_at
@@ -351,6 +357,55 @@ def _previous_failure(settings, proposal_id: str) -> dict:
     last = with_tests[-1] if with_tests else failed[-1]
     detail = (last.verification_notes or "; ".join(last.lessons) or last.summary)[-2000:]
     return {"previous_attempt_failure": f"{last.summary}: {detail}"}
+
+# reviewer memory B3 (2026-11-10): the proposal's previous_decline value is capped at this
+DECLINE_CHARS = 500
+
+def _decline_text(text, code) -> str:
+    """The operator's free text out of a B2 decline note. A text starting with "reason=" loses
+    that prefix and the code up to the first ';', ':' or whitespace, then leading ';:' and
+    whitespace; any other text is stripped; an empty result is "no reason given". Cases:
+    "reason=unsafe: x" -> "x"; "reason=low_value; meh" -> "meh"; "reason=unsafe" -> "no reason
+    given"; "looks wrong" -> "looks wrong". `code` is the spec's signature: the rule is
+    code-agnostic (the separator, not the stored code, ends the code)."""
+    s = str(text or "")
+    if s.startswith("reason="):
+        rest = s[len("reason="):]
+        cut = next((i for i, ch in enumerate(rest) if ch in ";:" or ch.isspace()), len(rest))
+        s = rest[cut:].lstrip(";:" + string.whitespace)
+    return s.strip() or "no reason given"
+
+def _memory_context(settings, proposal) -> tuple[dict, list[dict]]:
+    """B3: (extra proposal keys, compact repo_memory list) for a build of `proposal`. ({}, [])
+    when the switch is off (nothing is read), nothing is recorded for its files, or the reader
+    fails (one repo_memory.read_failed warning, class name only). Never raises.
+
+    previous_decline = "declined (CODE): text" from the newest decline recorded for THIS
+    proposal (the retry after a `navigator reject --reason`). The list holds the rest, newest
+    first: that rendered decline once, never same-proposal failures (previous_attempt_failure
+    already carries the last one in full), same-proposal audits kept (a Fix rebuild wants
+    them), other proposals' declines/failures/audits on the same files. Entries whose "repo"
+    names another repo with the same basename (B1's accepted collision) are dropped."""
+    if not repo_memory.enabled(settings):
+        return {}, []
+    try:
+        entries = [e for e in repo_memory.recent(proposal.repo, limit=40,
+                                                 files=list(proposal.affected_files) or None,
+                                                 root=repo_memory.root_for(settings))
+                   if e.get("repo") in (None, proposal.repo)]
+        mine = [e for e in entries if e.get("proposal_id") == proposal.id and e.get("kind") == "decline"]
+        keys = {}
+        if mine:
+            keys["previous_decline"] = (f"declined ({mine[0].get('reason_code') or 'no code'}): "
+                                        f"{_decline_text(mine[0].get('text'), mine[0].get('reason_code'))}"
+                                        )[:DECLINE_CHARS]
+        shown = mine[0] if mine else None
+        rest = [e for e in entries if e is not shown
+                and not (e.get("proposal_id") == proposal.id and e.get("kind") == "failure")]
+        return keys, repo_memory.compact(rest, affected=proposal.affected_files)
+    except Exception as e:
+        _log.warning("repo_memory.read_failed", proposal_id=proposal.id, error=type(e).__name__)
+        return {}, []
 
 def merge_after_approval(run: Run, *, act, orc, driver, runner, settings, squash: bool = False,
                          allow_auto: bool = False) -> Run:

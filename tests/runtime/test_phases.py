@@ -1009,6 +1009,7 @@ def test_no_repo_memory_key_when_none(tmp_path):
     import inspect
     assert "repo_memory" in inspect.signature(run_build_and_verify).parameters
     for i, value in enumerate((None, [])):
+        (tmp_path / f"c{i}").mkdir()
         h, runner = _seed_a(tmp_path / f"c{i}", f"run-nomem{i}")
         drv = _RecordingDriver()
         run_build_and_verify(driver=drv, worktree=h, run_id=f"run-nomem{i}", runner=runner,

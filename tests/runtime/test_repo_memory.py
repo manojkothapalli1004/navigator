@@ -257,7 +257,9 @@ def test_compact_caps_entries_chars_text_and_files():
     seven = compact([_entry(1, files=["a", "b", "c", "d", "e", "f", "g"])], affected=("g", "e", "zzz"))
     assert seven[0]["files"] == ["e", "g", "a", "b", "c", "d"]
     # defensive coercion: text not a str, files not a list / not strings
-    odd = compact([_entry(1, text=None, files="a.py"), _entry(0, text=42, files=[1, None, "b.py"])])
+    corrupt = _entry(1, text=None)
+    corrupt["files"] = "a.py"                      # the corrupt-line shape recent() tolerates
+    odd = compact([corrupt, _entry(0, text=42, files=[1, None, "b.py"])])
     assert odd[0]["text"] == "" and odd[0]["files"] == []
     assert odd[1]["text"] == "42" and odd[1]["files"] == ["1", "None", "b.py"]
     # a title of None stays None
