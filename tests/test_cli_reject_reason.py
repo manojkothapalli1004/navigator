@@ -111,6 +111,21 @@ def test_decline_reason_parsing_stops_at_separator():
     assert _decline_reason(act, run) == "scope_creep"
 
 
+def test_decline_reason_parses_code_before_colon():
+    """B2: a note 'reason=CODE: free text' (CLI --reason CODE TEXT, Telegram
+    'reject <name> CODE text', ACT's reason field) yields CODE: ':' is a stop like ';'
+    and whitespace. Without this, 'reason=unsafe: touches auth' parsed as 'unsafe:'."""
+    act, run = _setup()
+    a = _pending(act, run)[0]
+    act.decide_approval(a.id, ApprovalDecision.declined, actor="operator",
+                        note="reason=unsafe: touches auth")
+    assert _decline_reason(act, run) == "unsafe"
+    act2, run2 = _setup()
+    b = _pending(act2, run2)[0]
+    act2.decide_approval(b.id, ApprovalDecision.declined, actor="operator", note="reason=unsafe:")
+    assert _decline_reason(act2, run2) == "unsafe"
+
+
 def test_decline_reason_ignores_notes_without_prefix_and_errors():
     act, run = _setup()
     a = _pending(act, run)[0]
