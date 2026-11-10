@@ -16,8 +16,10 @@ and the word is case-insensitive. A reject may carry a reason after its target
 'reason=CODE' / 'reason=CODE: text' (CODE one of navigator.cli.REASON_CODES, a
 trailing ':' tolerated; any other first word files the whole text under 'other').
 The target is required with a reason ('reject tests_weak flaky' takes tests_weak as
-a name), and 'reject <words>' is a command attempt whenever the first word resolves
-to a run or name. Commands count only when the message is not
+a name); a reasoned reject whose target is neither a run id nor the short name of a
+run waiting for merge is treated as ordinary chat at apply time (result reason
+'not a command', no reply), so 'reject this one please' is never swallowed. Commands
+count only when the message is not
 forwarded and is less than an hour old (the clock is injectable for tests). A
 shorthand is resolved at apply time against live ACT state with every check the
 full-id form applies; zero or several candidates apply nothing and get a reply.
@@ -151,8 +153,10 @@ def parse_command(text, update_id: int) -> TelegramCommand | None:
                                                  (3c; excluded names are short names or
                                                  FULL run ids, comma or space separated)
     Anything else is not a command ('merge looks good?' is ordinary chat; so is
-    'merge <name> <words>', but 'reject <words>' is a command attempt when the first word
-    resolves to a run or name). Consequence: a proposal short-named 'all' can no longer
+    'merge <name> <words>'). 'reject <words>' parses as a reasoned reject of its first
+    word, but apply_commands treats it as ordinary chat ('not a command', no reply)
+    when that word is not a waiting run's short name or a run id, so 'reject this one
+    please' reaches the chat. Consequence: a proposal short-named 'all' can no longer
     be merged by name; use its run id."""
     if not isinstance(text, str) or "\n" in text or "\r" in text:
         return None
@@ -592,6 +596,15 @@ def _apply_one(act, cmd: TelegramCommand, notifier) -> dict:
     run_id = cmd.run_id
     resolved = None
     if run_id is None:
+        if cmd.name is not None and cmd.note:
+            # a reasoned reject BY NAME whose name is no waiting run's short name is
+            # ordinary chat ('reject this one please'): SHORT_NAME accepts any word, so
+            # say nothing and let the caller forward the line. Ambiguous names and
+            # bare 'reject <name>' keep the candidate reply; a run id is always a command.
+            if not [c for c in _candidates(act) if c[1].lower() == cmd.name.lower()]:
+                log.info("telegram.reject_words_as_chat", name=cmd.name)
+                return {"run_id": None, "action": cmd.action, "applied": False,
+                        "reason": "not a command"}
         # shorthand: resolve to a run first; zero/ambiguous candidates reply and stop
         resolved, failed = _resolve(act, cmd, notifier)
         if failed is not None:
