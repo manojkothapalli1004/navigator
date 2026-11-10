@@ -620,3 +620,42 @@ def test_planned_recently_hours_parameter(tmp_path):
     assert nav._planned_recently() is False
     assert nav._planned_recently(hours=1) is True
     assert nav._planned_recently(hours=0) is False
+
+
+# --- B4d: duplicate Fix grants buy one rebuild (fix.effective_grants in _may_run) ---------
+
+def test_may_run_counts_duplicate_fix_grants_once(tmp_path):
+    """Two review grants both noted 'fix run1' (a UI tap and a Telegram tap within a
+    second) are ONE effective grant: after run2 exists _may_run is False, so the spare
+    grant never rebuilds unattended. A plain grant (cli retry / _grant_rebuild, no note)
+    plus a fix grant count 2; a note for the NEW decline (run2) is distinct and counts."""
+    from navigator.contracts.enums import ApprovalDecision, ApprovalGate, RunPhase
+    from navigator.contracts.run import Run
+    repo, sha = _seed(tmp_path)
+    nav = _nav(tmp_path, repo, mode="execute")
+    p = _approved_proposal(nav, repo, sha)
+
+    def _run(n):
+        return nav.act.create_run(Run(proposal_id=p.id, base_commit_sha=sha,
+                                      branch=f"nav/run-{n}", status=RunStatus.aborted,
+                                      phase=RunPhase.finalizing))
+
+    def _grant(note=None):
+        g = nav.act.create_approval(target=p.id, gate=ApprovalGate.review)
+        nav.act.decide_approval(g.id, ApprovalDecision.approved, actor="operator",
+                                **({"note": note} if note else {}))
+
+    assert nav._may_run(p.id) is True  # no run yet
+    run1 = _run(1)
+    assert nav._may_run(p.id) is False  # runs=1, grants=0
+    _grant(f"fix {run1.id}")
+    _grant(f"fix {run1.id}")
+    assert nav._may_run(p.id) is True  # one effective grant: the rebuild may start
+    run2 = _run(2)
+    assert nav._may_run(p.id) is False  # runs=2, raw grants=2, effective=1
+    _grant()  # a plain grant counts on its own
+    assert nav._may_run(p.id) is True  # effective 2 >= runs 2
+    _run(3)
+    assert nav._may_run(p.id) is False
+    _grant(f"fix {run2.id}")  # a Fix for the NEW decline: a distinct note
+    assert nav._may_run(p.id) is True  # effective 3 >= runs 3
