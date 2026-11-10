@@ -514,3 +514,108 @@ def test_merge_tier_of_unwraps_notifying_act_and_fails_closed_without_events():
     assert merge_tier_of(NotifyingACT(inner, _Rec()), run.id) == "B"
     # no list_events, no .inner: the tier is unknown (fail closed), never guessed
     assert merge_tier_of(ProtocolOnlyACT(inner), run) is None
+
+
+# ---- reviewer memory B1: the audit writer (env-only: run_cli carries no Settings) ---------
+
+def _proposal_and_run(act, repo="/tmp/some/repo", files=("b.py", "a.py")):
+    from navigator.contracts.proposal import Proposal, compute_origin_hash
+    p = act.create_proposal(Proposal(
+        title="t", rationale="r", repo=repo, base_commit_sha="a" * 40, intended_changes="x",
+        affected_files=list(files), origin="periodic",
+        proposal_origin_hash=compute_origin_hash(repo, "x", list(files), "periodic", None)))
+    run = act.create_run(Run(proposal_id=p.id, base_commit_sha="abc", branch="nav/x",
+                             phase=RunPhase.awaiting_review, correlation_id="corr-x",
+                             verified_sha=VERIFIED_SHA))
+    act.emit_event(Event(kind="run.awaiting_review", correlation_id="corr-x",
+                         ts=datetime.now(timezone.utc) - timedelta(seconds=1),
+                         payload={"run_id": run.id, "verified_sha": VERIFIED_SHA}))
+    act.create_approval(target=run.id, gate=ApprovalGate.merge)
+    return p, run
+
+
+def _audit_entries(root, name="repo"):
+    from pathlib import Path
+    path = Path(root) / f"{name}.jsonl"
+    assert path.is_file(), "audit note was not remembered"
+    return [json.loads(l) for l in path.read_text(encoding="utf-8").splitlines() if l.strip()]
+
+
+def test_audited_note_is_remembered_for_the_repo(tmp_path, monkeypatch):
+    monkeypatch.setenv("NAVIGATOR_REPO_MEMORY", "1")
+    monkeypatch.setenv("NAVIGATOR_REPO_MEMORY_ROOT", str(tmp_path / "mem"))
+    act = FakeACTClient()
+    p, run = _proposal_and_run(act)
+    rc, out = _cli(act, "audited", run.id, "--note", "diff reviewed")
+    assert rc == 0, out
+    entries = _audit_entries(tmp_path / "mem")
+    assert len(entries) == 1
+    e = entries[0]
+    assert e["kind"] == "audit"
+    assert e["text"] == "diff reviewed"
+    assert e["source"] == "auditor"
+    assert e["files"] == ["a.py", "b.py"]
+    assert e["repo"] == "/tmp/some/repo" and e["title"] == "t"
+    assert e["run_id"] == run.id and e["proposal_id"] == p.id
+    assert e["verified_sha"] == VERIFIED_SHA and e["base_sha"] == "abc"
+    assert e["reason_code"] is None
+    # the audit records themselves are untouched
+    assert is_audited(act, run.id)
+    events = [ev for ev in act.events if ev.kind == "run.audited"]
+    assert len(events) == 1
+    assert events[0].payload == {"run_id": run.id, "note": "diff reviewed", "actor": "auditor",
+                                 "verified_sha": VERIFIED_SHA}
+
+
+def test_audited_without_note_writes_no_memory(tmp_path, monkeypatch):
+    # guard: an audit without --note has nothing to remember
+    monkeypatch.setenv("NAVIGATOR_REPO_MEMORY", "1")
+    monkeypatch.setenv("NAVIGATOR_REPO_MEMORY_ROOT", str(tmp_path / "mem"))
+    act = FakeACTClient()
+    _, run = _proposal_and_run(act)
+    rc, _ = _cli(act, "audited", run.id)
+    assert rc == 0
+    assert is_audited(act, run.id)
+    assert not (tmp_path / "mem").exists()
+
+
+def test_audited_memory_is_off_unless_the_env_says_so(tmp_path, monkeypatch):
+    # guard: switch unset -> no file and no proposal lookup (byte-identical to before B1)
+    monkeypatch.delenv("NAVIGATOR_REPO_MEMORY", raising=False)
+    monkeypatch.setenv("NAVIGATOR_REPO_MEMORY_ROOT", str(tmp_path / "mem"))
+    act = FakeACTClient()
+    _, run = _proposal_and_run(act)
+    calls = []
+    real = act.get_proposal
+    act.get_proposal = lambda pid: (calls.append(pid), real(pid))[1]
+    rc, _ = _cli(act, "audited", run.id, "--note", "diff reviewed")
+    assert rc == 0 and is_audited(act, run.id)
+    assert not (tmp_path / "mem").exists()
+    assert calls == []
+
+
+def test_audited_with_unknown_proposal_still_succeeds_and_warns(tmp_path, monkeypatch):
+    monkeypatch.setenv("NAVIGATOR_REPO_MEMORY", "1")
+    monkeypatch.setenv("NAVIGATOR_REPO_MEMORY_ROOT", str(tmp_path / "mem"))
+    act = FakeACTClient()
+    run = _run(act)                     # proposal-x is not in ACT: no repo to file the note under
+    with capture_logs() as logs:
+        rc, out = _cli(act, "audited", run.id, "--note", "diff reviewed")
+    assert rc == 0, out
+    assert is_audited(act, run.id)
+    assert not (tmp_path / "mem").exists()
+    assert [l["kind"] for l in logs if l["event"] == "repo_memory.no_repo"] == ["audit"]
+
+
+def test_audited_memory_failure_never_fails_the_audit(tmp_path, monkeypatch):
+    monkeypatch.setenv("NAVIGATOR_REPO_MEMORY", "1")
+    clash = tmp_path / "afile"
+    clash.write_text("x")
+    monkeypatch.setenv("NAVIGATOR_REPO_MEMORY_ROOT", str(clash / "sub"))   # root under a FILE
+    act = FakeACTClient()
+    _, run = _proposal_and_run(act)
+    with capture_logs() as logs:
+        rc, out = _cli(act, "audited", run.id, "--note", "diff reviewed")   # must NOT raise
+    assert rc == 0, out
+    assert is_audited(act, run.id)
+    assert [l["kind"] for l in logs if l["event"] == "repo_memory.write_failed"] == ["audit"]

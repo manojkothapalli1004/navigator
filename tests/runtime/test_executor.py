@@ -503,3 +503,128 @@ def test_tier_git_failure_never_loses_the_awaiting_review_event(tmp_path, monkey
     ev = [e for e in d["act"].events
           if e.kind == "run.awaiting_review" and e.payload["run_id"] == run.id][0]
     assert ev.payload["merge_tier"] is None
+
+
+# ---- reviewer memory B1: the failure writer ----------------------------------------------
+
+LIVE_REPO_MEMORY_ROOT = "/Users/Manoj/calwbot/logs/navigator/repo_memory"
+
+
+def _memory_lines(root, repo):
+    path = Path(root) / f"{Path(repo).name}.jsonl"
+    assert path.is_file(), f"no repo memory entry written at {path}"
+    return [json.loads(l) for l in path.read_text(encoding="utf-8").splitlines() if l.strip()]
+
+
+def _failing_build(monkeypatch, extra_file=None):
+    """Force a verify failure whose output ends in a pytest FAILED line; optionally leave an
+    extra STAGED (uncommitted) file in the worktree that affected_files does not name."""
+    from navigator.runtime import phases
+    real = phases.run_build_and_verify
+
+    def failing(*a, **k):
+        r = real(*a, **k)
+        if extra_file:
+            wt = Path(k["worktree"].path)
+            (wt / extra_file).write_text("x = 1\n")
+            subprocess.run(["git", "add", extra_file], cwd=wt, check=True, capture_output=True)
+        r.verify_returncode = 1
+        r.verify_output = "=== test session starts ===\n" + "x" * 2000 + "\nFAILED tests/t.py::test_x - boom"
+        return r
+    monkeypatch.setattr("navigator.runtime.executor.run_build_and_verify", failing)
+
+
+def test_failed_verify_remembers_failure_with_files(tmp_path, monkeypatch):
+    repo, sha = _seed(tmp_path); d = _deps(tmp_path, repo)
+    d["settings"].repo_memory = True
+    d["settings"].repo_memory_root = str(tmp_path / "mem")
+    _failing_build(monkeypatch, extra_file="extra_touched.py")
+    run = execute_proposal(_proposal(repo, sha), **d)
+    assert run.status == RunStatus.failed
+    entries = _memory_lines(tmp_path / "mem", repo)
+    assert len(entries) == 1
+    e = entries[0]
+    assert e["kind"] == "failure" and e["source"] == "executor"
+    assert e["run_id"] == run.id and e["proposal_id"] == run.proposal_id
+    assert e["repo"] == str(repo) and e["title"] == "t"
+    assert e["base_sha"] == sha and e["verified_sha"] is None
+    assert e["reason_code"] is None
+    assert "verification failed" in e["text"] and "FAILED tests/t.py::test_x - boom" in e["text"]
+    # affected_files first, then what the build really touched: the staged, uncommitted extra file is
+    # NOT in affected_files and NOT in any commit, so only a working-tree-vs-base diff can see it
+    assert e["files"][0] == "navigator_touch.py"
+    assert "extra_touched.py" in e["files"]
+    # the rest of the failure path is unchanged
+    assert any(sec == "known_failures" for sec, _, _ in d["orc"].updates)
+    stored = OutcomeStore(d["settings"].outcome_path).for_proposal(run.proposal_id)
+    assert [o.status for o in stored] == ["failed"]
+
+
+def test_failure_memory_is_written_even_when_orc_is_down(tmp_path, monkeypatch):
+    # rev2 item 3: HTTPORCClient raises on a timeout; the memory entry must not be lost behind it
+    repo, sha = _seed(tmp_path); d = _deps(tmp_path, repo)
+    d["settings"].repo_memory = True
+    d["settings"].repo_memory_root = str(tmp_path / "mem")
+    _failing_build(monkeypatch)
+
+    def boom(section, note, replace=False):
+        raise RuntimeError("orc down")
+    d["orc"].apply_memory_update = boom
+    import pytest
+    with pytest.raises(RuntimeError):           # the ORC failure itself still propagates as on main
+        execute_proposal(_proposal(repo, sha), **d)
+    entries = _memory_lines(tmp_path / "mem", repo)
+    assert [e["kind"] for e in entries] == ["failure"]
+
+
+def test_memory_write_failure_does_not_fail_run(tmp_path, monkeypatch):
+    from structlog.testing import capture_logs
+    repo, sha = _seed(tmp_path); d = _deps(tmp_path, repo)
+    clash = tmp_path / "afile"; clash.write_text("x")
+    d["settings"].repo_memory = True
+    d["settings"].repo_memory_root = str(clash / "sub")      # root under a FILE: makedirs raises
+    _failing_build(monkeypatch)
+    with capture_logs() as logs:
+        run = execute_proposal(_proposal(repo, sha), **d)    # must NOT raise
+    assert run.status == RunStatus.failed and run.phase == RunPhase.finalizing
+    stored = OutcomeStore(d["settings"].outcome_path).for_proposal(run.proposal_id)
+    assert [o.status for o in stored] == ["failed"]           # the outcome trail is intact
+    assert any(e.kind == "run.failed" for e in d["act"].events)
+    warned = [l for l in logs if l["event"] == "repo_memory.write_failed"]
+    assert len(warned) == 1 and warned[0]["kind"] == "failure"
+    assert not (clash / "sub").exists()
+
+
+def test_memory_default_root_is_isolated_under_tmp(tmp_path, monkeypatch):
+    # rev2 item 2 guard: Settings(repo_memory=True) with NO root resolves through the env, then the module
+    # DEFAULT_ROOT, both of which tests/conftest.py points under tmp - the live log dir is never touched
+    from navigator.runtime import repo_memory
+    monkeypatch.delenv("NAVIGATOR_REPO_MEMORY_ROOT", raising=False)   # force the DEFAULT_ROOT fallback
+    repo, sha = _seed(tmp_path)
+    s = Settings(worktree_root=str(tmp_path / "wt"), outcome_path=str(tmp_path / "outcomes.jsonl"),
+                 repo_memory=True)
+    assert s.repo_memory_root is None
+    d = dict(act=FakeACTClient(), orc=FakeORCClient(), driver=FakeSubagentDriver(),
+             runner=CommandRunner(allowlist=s.allowed_commands, worktree_root=tmp_path / "wt"), settings=s)
+    _failing_build(monkeypatch)
+    run = execute_proposal(_proposal(repo, sha), **d)
+    assert run.status == RunStatus.failed
+    assert repo_memory.DEFAULT_ROOT.startswith(str(tmp_path)), repo_memory.DEFAULT_ROOT
+    entries = _memory_lines(repo_memory.DEFAULT_ROOT, repo)
+    assert [e["kind"] for e in entries] == ["failure"]
+    # nothing for this test repo ever lands under the live root (file-level: the directory itself will
+    # legitimately exist once the switch is on in production)
+    assert not (Path(LIVE_REPO_MEMORY_ROOT) / f"{repo.name}.jsonl").exists()
+
+
+def test_failure_memory_off_by_default_writes_nothing(tmp_path, monkeypatch):
+    # guard: a plain Settings() keeps the failure path byte-identical to before B1
+    repo, sha = _seed(tmp_path); d = _deps(tmp_path, repo)
+    assert d["settings"].repo_memory is False
+    monkeypatch.setenv("NAVIGATOR_REPO_MEMORY", "1")    # the daemon's Settings value wins over the env
+    _failing_build(monkeypatch)
+    run = execute_proposal(_proposal(repo, sha), **d)
+    assert run.status == RunStatus.failed
+    from navigator.runtime import repo_memory
+    assert not Path(repo_memory.root_for(d["settings"])).exists()
+    assert not Path(repo_memory.DEFAULT_ROOT).exists()

@@ -164,3 +164,121 @@ def test_outcome_line_without_reason_code_still_loads(tmp_path):
     assert len(outcomes) == 1
     assert outcomes[0].reason_code is None
     assert outcomes[0].run_id == "run-1"
+
+
+# ---- reviewer memory B1: the decline writer ------------------------------------------------
+
+def _mem_settings(tmp_path, on=True):
+    return SimpleNamespace(outcome_path=str(tmp_path / "o.jsonl"), repo_memory=on,
+                           repo_memory_root=str(tmp_path / "mem"))
+
+
+def _mem_entries(tmp_path):
+    path = tmp_path / "mem" / "r.jsonl"          # repo "/r" -> basename r
+    assert path.is_file(), "decline was not remembered"
+    return [json.loads(l) for l in path.read_text(encoding="utf-8").splitlines() if l.strip()]
+
+
+def test_decline_run_remembers_reason_note_and_files(tmp_path):
+    act, run = _setup()
+    assert _cli(act, "reject", run.id, "--reason", "unsafe")[0] == 0
+    settings = _mem_settings(tmp_path)
+    out_run = decline_run(run, act=act, orc=FakeORCClient(), settings=settings)
+    assert out_run.status.value == "aborted"
+    entries = _mem_entries(tmp_path)
+    assert len(entries) == 1
+    e = entries[0]
+    assert e["kind"] == "decline"
+    assert e["reason_code"] == "unsafe"
+    assert e["text"] == "reason=unsafe"             # today's note; B2 adds free text
+    assert e["files"] == ["a.py"]
+    assert e["source"] == "operator"
+    assert e["repo"] == "/r" and e["title"] == "t"
+    assert e["run_id"] == run.id and e["proposal_id"] == run.proposal_id
+    assert e["base_sha"] == "a" * 40 and e["verified_sha"] is None
+    # the outcome, its lessons and the run.declined payload are exactly as before
+    o = OutcomeStore(settings.outcome_path).latest(1)[0]
+    assert o.status == "declined" and o.reason_code == "unsafe"
+    assert o.lessons == [DECLINED_LESSON, "decline reason: unsafe"]
+    declined_events = [ev for ev in act.events if ev.kind == "run.declined"]
+    assert len(declined_events) == 1
+    assert declined_events[0].payload == {"run_id": run.id, "proposal_id": run.proposal_id,
+                                          "reason_code": "unsafe"}
+
+
+def test_decline_from_telegram_without_reason_is_remembered_as_telegram(tmp_path):
+    from navigator.observability.telegram_inbox import TELEGRAM_ACTOR
+    act, run = _setup()
+    a = _pending(act, run)[0]
+    act.decide_approval(a.id, ApprovalDecision.declined, actor=TELEGRAM_ACTOR)   # no note
+    decline_run(run, act=act, orc=FakeORCClient(), settings=_mem_settings(tmp_path))
+    e = _mem_entries(tmp_path)[0]
+    assert e["source"] == "telegram"
+    assert e["reason_code"] is None
+    assert e["text"] == "no reason given"
+    assert e["files"] == ["a.py"]
+
+
+def test_decline_with_unknown_actor_keeps_the_actor_string_and_never_the_word_none(tmp_path):
+    act, run = _setup()
+    a = _pending(act, run)[0]
+    act.decide_approval(a.id, ApprovalDecision.declined, actor="act-ui", note="reason=low_value; meh")
+    decline_run(run, act=act, orc=FakeORCClient(), settings=_mem_settings(tmp_path))
+    e = _mem_entries(tmp_path)[0]
+    assert e["source"] == "act-ui"
+    assert e["reason_code"] == "low_value" and e["text"] == "reason=low_value; meh"
+    # an approval whose actor is missing maps to the operator, never to the string "None"
+    act2, run2 = _setup()
+    a2 = _pending(act2, run2)[0]
+    act2.decide_approval(a2.id, ApprovalDecision.declined, actor=None)
+    (tmp_path / "mem" / "r.jsonl").unlink()
+    decline_run(run2, act=act2, orc=FakeORCClient(), settings=_mem_settings(tmp_path))
+    e2 = _mem_entries(tmp_path)[0]
+    assert e2["source"] == "operator" and "None" not in json.dumps(e2["source"])
+
+
+def test_decline_run_memory_off_writes_nothing(tmp_path, monkeypatch):
+    # guard: the plain _settings namespace (no repo_memory attribute) and env unset -> no file, no ACT lookup
+    monkeypatch.delenv("NAVIGATOR_REPO_MEMORY", raising=False)
+    monkeypatch.setenv("NAVIGATOR_REPO_MEMORY_ROOT", str(tmp_path / "mem"))
+    act, run = _setup()
+    assert _cli(act, "reject", run.id, "--reason", "unsafe")[0] == 0
+    calls = []
+    real = act.get_proposal
+    act.get_proposal = lambda pid: (calls.append(pid), real(pid))[1]
+    decline_run(run, act=act, orc=FakeORCClient(), settings=_settings(tmp_path))
+    assert not (tmp_path / "mem").exists()
+    assert calls == []                    # off = byte-identical: no extra ACT call
+    decline_run(run, act=act, orc=FakeORCClient(), settings=_mem_settings(tmp_path, on=False))
+    assert not (tmp_path / "mem").exists()
+
+
+def test_decline_run_memory_failure_never_changes_the_outcome(tmp_path):
+    from structlog.testing import capture_logs
+    act, run = _setup()
+    assert _cli(act, "reject", run.id, "--reason", "unsafe")[0] == 0
+    clash = tmp_path / "afile"; clash.write_text("x")
+    settings = SimpleNamespace(outcome_path=str(tmp_path / "o.jsonl"), repo_memory=True,
+                               repo_memory_root=str(clash / "sub"))
+    with capture_logs() as logs:
+        out_run = decline_run(run, act=act, orc=FakeORCClient(), settings=settings)   # must NOT raise
+    assert out_run.status.value == "aborted"
+    o = OutcomeStore(settings.outcome_path).latest(1)[0]
+    assert o.status == "declined" and o.reason_code == "unsafe" and o.lessons[0] == DECLINED_LESSON
+    assert len([ev for ev in act.events if ev.kind == "run.declined"]) == 1
+    assert [l["kind"] for l in logs if l["event"] == "repo_memory.write_failed"] == ["decline"]
+
+
+def test_decline_run_with_missing_proposal_skips_memory_with_a_warning(tmp_path):
+    from structlog.testing import capture_logs
+    act, run = _setup()
+    assert _cli(act, "reject", run.id, "--reason", "unsafe")[0] == 0
+    del act.proposals[run.proposal_id]
+    settings = _mem_settings(tmp_path)
+    with capture_logs() as logs:
+        out_run = decline_run(run, act=act, orc=FakeORCClient(), settings=settings)   # must NOT raise
+    assert out_run.status.value == "aborted"
+    assert OutcomeStore(settings.outcome_path).latest(1)[0].reason_code == "unsafe"
+    skipped = [l for l in logs if l["event"] == "repo_memory.decline_skipped"]
+    assert len(skipped) == 1 and skipped[0]["run_id"] == run.id
+    assert not (tmp_path / "mem").exists()

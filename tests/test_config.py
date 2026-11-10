@@ -341,3 +341,32 @@ def test_merge_tier_toggles_env_wiring(monkeypatch):
             with pytest.raises(ValueError, match=name):
                 cfg.Settings.from_env()
         monkeypatch.delenv(name, raising=False)
+
+
+def test_repo_memory_env_wiring(monkeypatch):
+    # reviewer memory B1: the per-repo memory log is off by default; the root is None (repo_memory.root_for
+    # falls back to NAVIGATOR_REPO_MEMORY_ROOT, then its DEFAULT_ROOT, at call time), never a baked-in literal
+    import pytest
+    for k in ("NAVIGATOR_REPO_MEMORY", "NAVIGATOR_REPO_MEMORY_ROOT"):
+        monkeypatch.delenv(k, raising=False)
+    assert cfg.Settings().repo_memory is False
+    assert cfg.Settings().repo_memory_root is None
+    s = cfg.Settings.from_env()
+    assert s.repo_memory is False
+    assert s.repo_memory_root is None
+    for v in ("1", "true"):
+        monkeypatch.setenv("NAVIGATOR_REPO_MEMORY", v)
+        assert cfg.Settings.from_env().repo_memory is True, v
+    monkeypatch.setenv("NAVIGATOR_REPO_MEMORY", "0")
+    assert cfg.Settings.from_env().repo_memory is False
+    monkeypatch.setenv("NAVIGATOR_REPO_MEMORY", "maybe")
+    with pytest.raises(ValueError, match="NAVIGATOR_REPO_MEMORY"):
+        cfg.Settings.from_env()
+    monkeypatch.setenv("NAVIGATOR_REPO_MEMORY", "0")
+    monkeypatch.setenv("NAVIGATOR_REPO_MEMORY_ROOT", "/tmp/nav-mem")
+    assert cfg.Settings.from_env().repo_memory_root == "/tmp/nav-mem"
+    monkeypatch.setenv("NAVIGATOR_REPO_MEMORY_ROOT", "")
+    assert cfg.Settings.from_env().repo_memory_root is None   # empty = unset
+    # the CLI writer reads the env only, so the document may never set either (one source of truth)
+    assert {"repo_memory", "repo_memory_root"} <= cfg.ENV_ONLY_FIELDS
+    assert not ({"repo_memory", "repo_memory_root"} & cfg.HOT_FIELDS)
