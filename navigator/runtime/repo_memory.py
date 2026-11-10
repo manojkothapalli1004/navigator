@@ -14,10 +14,11 @@ credits.events_path(), so tests/conftest.py can point every fallback under tmp.
 Entry: {"ts": UTC ISO seconds, "kind": decline|failure|audit, "repo": full path, "run_id",
 "proposal_id", "reason_code", "text": <= 2000 chars, "files": affected_files first (sorted) then the
 other touched files (sorted), <= 50 in all, "source": executor|operator|telegram|auditor,
-"verified_sha", "base_sha", "title"}. Append pattern copied from credits._event: directory 0700, file
-opened O_WRONLY|O_CREAT|O_APPEND with mode 0600, one write() per line, so the daemon and the CLI may
-append concurrently without tearing a line. Accepted risk: two repos with one basename share a file
-(the entry's "repo" disambiguates).
+"verified_sha", "base_sha", "title"}. Directory 0700; lines are appended through
+navigator.jsonl_log.append_line, as credits._event does: file mode 0600, one write() per line, so
+the daemon and the CLI may append concurrently without tearing a line, and past jsonl_log.MAX_BYTES
+the file is trimmed to its newest lines (housekeeping 2026-11-10). Accepted risk: two repos with
+one basename share a file (the entry's "repo" disambiguates).
 
 B3 (2026-11-10): compact() is the one reader view - executor._memory_context hands its result to
 run_build_and_verify(repo_memory=...) and phases puts it in builder and verifier context.
@@ -27,6 +28,7 @@ import os
 from datetime import datetime, timezone
 from pathlib import Path
 
+from navigator import jsonl_log
 from navigator.observability.logging import get_logger
 
 DEFAULT_ROOT = "/Users/Manoj/calwbot/logs/navigator/repo_memory"
@@ -98,11 +100,7 @@ def remember(settings, repo, *, kind, run_id, proposal_id, reason_code=None, tex
         line = json.dumps(entry, separators=(",", ":"), default=str)
         root = root_for(settings)
         os.makedirs(root, 0o700, exist_ok=True)
-        fd = os.open(str(path_for(repo, root)), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-        try:
-            os.write(fd, (line + "\n").encode("utf-8"))   # one write: the line lands whole
-        finally:
-            os.close(fd)
+        jsonl_log.append_line(str(path_for(repo, root)), line)   # one write: the line lands whole
         return True
     except Exception as e:
         _log.warning("repo_memory.write_failed", repo=Path(str(repo)).name if repo else None,

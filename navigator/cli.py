@@ -121,7 +121,7 @@ def run_cli(argv: list[str], *, act, out: TextIO, worktree_root: str | None = No
             return 2
         return _cleanup(act, apply=bool(args), out=out, worktree_root=worktree_root)
     if cmd == "reject" and len(args) >= 3 and args[1] == "--reason":
-        code = args[2].rstrip(":")  # 'unsafe:' is the natural 'CODE: text' spelling
+        code = args[2].rstrip(":").lower()  # 'unsafe:' is the natural 'CODE: text' spelling; any case, as Telegram
         if code not in REASON_CODES:
             print(f"unknown reason {args[2]!r}; one of: " + ", ".join(REASON_CODES), file=out)
             return 2

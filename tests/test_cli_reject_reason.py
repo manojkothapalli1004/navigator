@@ -86,6 +86,23 @@ def test_reject_with_reason_code_trailing_colon_accepted():
     assert _declined(act2, run2)[0].note == "reason=unsafe: touches auth"
 
 
+def test_reject_reason_code_is_case_insensitive():
+    """Housekeeping 2026-11-10: the code is matched lowercased (Telegram already lowercases it);
+    the free text after it keeps its case; a refusal still quotes what was typed."""
+    act, run = _setup()
+    rc, out = _cli(act, "reject", run.id, "--reason", "Unsafe")
+    assert rc == 0, out
+    assert _declined(act, run)[0].note == "reason=unsafe"
+    act2, run2 = _setup()
+    rc, out = _cli(act2, "reject", run2.id, "--reason", "UNSAFE:", "Touches", "Auth")
+    assert rc == 0, out
+    assert _declined(act2, run2)[0].note == "reason=unsafe: Touches Auth"
+    act3, run3 = _setup()
+    rc, out = _cli(act3, "reject", run3.id, "--reason", "Bogus")
+    assert rc == 2 and "'Bogus'" in out
+    assert len(_pending(act3, run3)) == 1 and _declined(act3, run3) == []
+
+
 def test_reason_note_collapses_whitespace_and_omits_empty_text():
     from navigator.cli import reason_note  # new in B2
     assert reason_note("unsafe") == "reason=unsafe"

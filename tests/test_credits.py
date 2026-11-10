@@ -537,6 +537,25 @@ def test_cli_events(env, capsys):
     assert credits.main(["events", "x"]) == 2
 
 
+def test_events_trimmed_past_cap(env):
+    """Housekeeping 2026-11-10: the events file is capped (navigator.jsonl_log, 2 MiB by default):
+    past it only the newest lines stay (at most half the cap), the line being written is never
+    the one lost, and the file stays 0600 and key-free."""
+    old = json.dumps({"ts": "2026-11-01T00:00:00", "kind": "spend", "pad": "x" * 200}) + "\n"
+    env.events.write_text(old * (2 * 1024 * 1024 // len(old) + 10))   # just over the default cap
+    os.chmod(env.events, 0o600)
+    assert env.events.stat().st_size > 2 * 1024 * 1024
+    rt = credits.on_limit(credits.Limit(NOW + 600, "five_hour"), NOW)
+    assert rt
+    assert env.events.stat().st_size <= 1024 * 1024
+    evs = events(env)
+    assert len(evs) == 2001        # the probe's write trimmed to KEEP_LINES (2000), the switch appended one
+    assert [e["kind"] for e in evs[-2:]] == ["probe", "switch"]
+    assert KEY not in env.events.read_text()
+    assert stat.S_IMODE(os.stat(env.events).st_mode) == 0o600
+    assert not list(env.tmp.glob("*.tmp"))
+
+
 # 5 key hygiene
 def test_load_key_call_time(env):
     assert credits.load_key() == KEY
@@ -593,6 +612,55 @@ def test_unverified_gate(env):
 def test_already_on_key_noop(env, monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "whatever")
     assert credits.on_limit(credits.Limit(NOW + 600, "x"), NOW) is None
+
+
+def test_inherited_key_warns_once_per_process(env, monkeypatch, caplog):
+    """Housekeeping 2026-11-10 option (c): an ANTHROPIC_API_KEY already in this process's environment
+    runs every call on the key with no budget, cap or ledger. It is announced ONCE per process (a
+    warning, an inherited_key event, a notice), even with CREDITS_FALLBACK=0, and never with the
+    key value; route()/on_limit() return exactly what they did before."""
+    inherited = "sk-ant-INHERITED-VALUE"
+    monkeypatch.setattr(credits, "_inherited_warned", False, raising=False)   # an earlier test consumed it
+    monkeypatch.setenv("ANTHROPIC_API_KEY", inherited)
+    caplog.set_level(logging.INFO, logger="navigator.credits")
+    put(env, until=NOW + 600)                          # a window that would otherwise route to credits
+    for i in range(2):
+        assert credits.route(NOW + i).env == {}
+        assert credits.on_limit(credits.Limit(NOW + 600, "x"), NOW + i) is None
+
+    def inherited_events():
+        return [e for e in events(env) if e["kind"] == "inherited_key"]
+
+    def notices():
+        return [m for m in env.msgs if "ANTHROPIC_API_KEY is in this process's environment" in m]
+
+    assert len(inherited_events()) == 1
+    e = inherited_events()[0]
+    assert e["pid"] == os.getpid() and isinstance(e["argv0"], str) and "/" not in e["argv0"]
+    assert len(notices()) == 1 and "--revert" in notices()[0]
+    assert env.msgs == notices()
+    warns = [r for r in caplog.records if r.getMessage() == "credits.inherited_key"]
+    assert len(warns) == 1 and warns[0].levelno == logging.WARNING
+    # the kill switch does not hide it: the announcement runs before the enabled() check
+    monkeypatch.setattr(credits, "_inherited_warned", False)
+    monkeypatch.setenv("CREDITS_FALLBACK", "0")
+    assert credits.route(NOW).env == {}
+    assert credits.on_limit(credits.Limit(NOW + 600, "x"), NOW) is None
+    assert len(inherited_events()) == 2 and len(notices()) == 2
+    # threads racing the first call announce it once: the flag is set before anything is emitted
+    monkeypatch.setattr(credits, "_inherited_warned", False)
+    barrier = threading.Barrier(8)
+
+    def go():
+        barrier.wait()
+        credits.route(NOW)
+
+    ts = [threading.Thread(target=go) for _ in range(8)]
+    [t.start() for t in ts]
+    [t.join(timeout=30) for t in ts]
+    assert not any(t.is_alive() for t in ts), "a racing route() hung"
+    assert len(inherited_events()) == 3 and len(notices()) == 3
+    assert inherited not in env.events.read_text() + "".join(env.msgs) + caplog.text
 
 
 def test_no_key_denies(env):
