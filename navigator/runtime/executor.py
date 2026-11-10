@@ -430,7 +430,7 @@ _REASON_PREFIX = "reason="
 def _decline_reason(act, run) -> str | None:
     """The operator's decline reason code recorded by `navigator reject --reason`: the
     first declined merge approval of the run whose note reads 'reason=<code>' yields
-    <code> (up to the first ';' or whitespace). None when no reason was given or the
+    <code> (up to the first ';', ':' or whitespace). None when no reason was given or the
     approvals cannot be read."""
     try:
         for a in act.list_approvals(target=run.id, gate=ApprovalGate.merge,
@@ -440,7 +440,7 @@ def _decline_reason(act, run) -> str | None:
                 rest = note[len(_REASON_PREFIX):]
                 end = len(rest)
                 for i, ch in enumerate(rest):
-                    if ch == ";" or ch.isspace():
+                    if ch in ";:" or ch.isspace():
                         end = i
                         break
                 return rest[:end].strip() or None
