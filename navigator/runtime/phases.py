@@ -1339,8 +1339,14 @@ def _run_full_suite(runner, run_dir: Path, res: PhaseResult, breakers) -> None:
     # (live 2026-10-11); Navigator always runs the repo's whole suite itself
     entry = next((a for a in runner.allowlist if "pytest" in a.split()), None)
     if entry is None:
+        # recorded like every other failure so the verification record shows WHY the
+        # run failed instead of ending in the verifier's rc-0 entries (review 2026-11-09)
+        out = "repo has tests but no pytest command is allowlisted"
+        res.verify_log.append({"argv": "pytest (full suite): not in allowed_commands",
+                               "argv_list": ["pytest"], "returncode": 1,
+                               "output_tail": out[-1500:]})
         res.verify_returncode = 1
-        res.verify_output = "repo has tests but no pytest command is allowlisted"
+        res.verify_output = out
         return
     argv = entry.split() + ["-q"]
     interpreter = None
