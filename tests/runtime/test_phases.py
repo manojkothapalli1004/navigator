@@ -295,6 +295,29 @@ def test_navigator_runs_the_full_suite_itself_when_repo_has_tests(tmp_path):
     assert res.verify_log[-1]["argv"] == "uv run pytest -q"
 
 
+def test_missing_pytest_allowlist_entry_is_recorded_in_the_verify_log(tmp_path):
+    # review 2026-11-09: with no pytest command allowlisted, _run_full_suite failed the
+    # run (rc 1) but appended nothing, so the verification record ended in rc-0 entries
+    # and nobody reading it (operator, ACT UI, `navigator diff`) could see why it failed
+    h, _ = _wt(tmp_path, "run-np")
+    (Path(h.path)/"tests").mkdir()
+    from navigator.safety.command_runner import CommandResult
+    class _Runner:
+        allowlist = ["git status"]          # no pytest entry at all
+        def run(self, argv, cwd):
+            return CommandResult(0, "3 passed", "")
+    drv = _ScriptedRoles([("a.py", "x = 1\n"), ("tests/test_a.py", "def test_a(): pass\n")],
+                         [["uv", "run", "pytest", "tests/test_a.py"]])
+    res = run_build_and_verify(driver=drv, worktree=h, run_id="run-np", runner=_Runner(),
+                               proposal={"affected_files": ["a.py"]})
+    assert res.verify_returncode == 1
+    last = res.verify_log[-1]
+    assert last["returncode"] == 1
+    assert "pytest" in last["argv"] and "allowed" in last["argv"]
+    assert set(last) >= {"argv", "argv_list", "returncode", "output_tail"}
+    assert "allowlist" in last["output_tail"] or "allowed" in last["output_tail"]
+
+
 def test_builder_gets_read_only_context_of_other_repo_files(tmp_path):
     # live 2026-10-11: a waker builder wrote tests creating Users without the
     # required phone_number because it never saw app/models.py
