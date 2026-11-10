@@ -184,7 +184,7 @@ def execute_proposal(proposal: Proposal, *, act, orc, driver, runner, settings,
         run.ended_at = datetime.now(timezone.utc); _save(act, run)
         _write_outcome(orc, run, status="failed", summary=f"exception: {e}",
                        lessons=[f"build/verify raised: {e}"], preserved=handle.path, settings=settings,
-                       repo=proposal.repo, files=_touched_files(proposal, handle.path, head),
+                       repo=proposal.repo, files=_touched_files(proposal, handle.path, head, settings),
                        affected_files=list(proposal.affected_files), title=proposal.title)
         _emit(act, run, "run.failed", Severity.error, error=str(e)); return run
     repair_used = getattr(result, "repair_turns_used", 0)
@@ -216,7 +216,7 @@ def execute_proposal(proposal: Proposal, *, act, orc, driver, runner, settings,
         _write_outcome(orc, run, status="failed", summary=summary, lessons=lessons,
                        verification_notes=result.verify_output[-1500:], preserved=handle.path,
                        checkpoints_made=len(result.checkpoints), settings=settings,
-                       repo=proposal.repo, files=_touched_files(proposal, handle.path, head),
+                       repo=proposal.repo, files=_touched_files(proposal, handle.path, head, settings),
                        affected_files=list(proposal.affected_files), title=proposal.title)
         _emit(act, run, "run.failed", Severity.error); return run
     # the merge gate merges only this exact commit
@@ -377,7 +377,7 @@ def merge_after_approval(run: Run, *, act, orc, driver, runner, settings, squash
         _write_outcome(orc, run, status="failed", summary=missing,
                        lessons=["run branch was deleted after verification — re-propose"],
                        preserved=run.worktree_path, settings=settings,
-                       repo=repo, files=changed_files_for_run(repo, run) or [])
+                       repo=repo, files=(changed_files_for_run(repo, run) or []) if repo_memory.enabled(settings) else [])
         _emit(act, run, "run.failed", Severity.error, error=missing)
         return run
     blocked = _merge_preflight(repo, run) or _verified_check(repo, run)
@@ -396,7 +396,7 @@ def merge_after_approval(run: Run, *, act, orc, driver, runner, settings, squash
         _write_outcome(orc, run, status="failed", summary=f"merge failed and was aborted: {detail}",
                        lessons=["merge conflict with main — rebase or re-propose against current HEAD"],
                        preserved=run.worktree_path, settings=settings,
-                       repo=repo, files=changed_files_for_run(repo, run) or [],
+                       repo=repo, files=(changed_files_for_run(repo, run) or []) if repo_memory.enabled(settings) else [],
                        affected_files=list(prop.affected_files) if prop else None,
                        title=prop.title if prop else None)
         _emit(act, run, "run.failed", Severity.error, error=detail)
@@ -460,18 +460,24 @@ def _decline_reason(act, run) -> str | None:
     return None
 
 def _decline_note(act, run) -> tuple[str | None, str | None]:
-    """(note, actor) of the run's first declined merge approval, the same loop as _decline_reason.
+    """(note, actor) of the run's declined merge approval: the first one whose note starts with
+    "reason=" (the same approval _decline_reason reads the code from), else the first declined one.
     actor is None (never the string "None") when the approval records none; (None, None) when
     there is no declined approval or the approvals cannot be read."""
+    first: tuple[str | None, str | None] | None = None
     try:
         for a in act.list_approvals(target=run.id, gate=ApprovalGate.merge,
                                     decision=ApprovalDecision.declined):
             note = getattr(a, "note", None)
             actor = getattr(a, "actor", None)
-            return (note if isinstance(note, str) else None, str(actor) if actor else None)
+            pair = (note if isinstance(note, str) else None, str(actor) if actor else None)
+            if pair[0] and pair[0].startswith("reason="):
+                return pair
+            if first is None:
+                first = pair
     except Exception:
-        return None, None
-    return None, None
+        return first or (None, None)
+    return first or (None, None)
 
 
 def _memory_source(actor: str | None) -> str:
@@ -519,11 +525,11 @@ def decline_run(run: Run, *, act, orc, settings) -> Run:
     # lessons[0] must stay the exact DECLINED_LESSON text: title_lessons matches it
     lessons = (["operator declined the change at the merge gate"]
                + ([f"decline reason: {code}"] if code else []))
+    _remember_decline(act, run, settings, code)  # first: _write_outcome raises when ORC is down
     _write_outcome(orc, run, status="declined", summary="merge declined by operator",
                    lessons=lessons, preserved=run.worktree_path, section="decisions",
                    settings=settings, reason_code=code)
     _emit(act, run, "run.declined", reason_code=code)
-    _remember_decline(act, run, settings, code)
     return run
 
 def _cleanup_worktree(run: Run, repo: str) -> None:
@@ -544,7 +550,7 @@ def _repo_for(run, act) -> str:
         raise LookupError(f"proposal {run.proposal_id} not found in ACT")
     return prop.repo
 
-def _touched_files(proposal, wt, base) -> list[str]:
+def _touched_files(proposal, wt, base, settings=None) -> list[str]:
     """Files a failed build touched: the proposal's affected_files plus every path that differs
     between the worktree's WORKING TREE and `base` (`git diff --name-only -z <base>`, no second
     rev). Unlike the tier diff `{head}..HEAD` this also sees checkpoint commits AND uncommitted or
@@ -552,6 +558,8 @@ def _touched_files(proposal, wt, base) -> list[str]:
     that were never added are missed (accepted). Sorted; never raises (_git_run catches only
     TimeoutExpired, so a missing cwd or a non-UTF-8 name is caught here)."""
     names: set[str] = set(getattr(proposal, "affected_files", None) or [])
+    if not repo_memory.enabled(settings):
+        return sorted(names)  # switch off: no git call, byte-identical to before B1
     try:
         proc = _git_run(wt, "diff", "--no-renames", "--name-only", "-z", base)
         if proc.returncode == 0:

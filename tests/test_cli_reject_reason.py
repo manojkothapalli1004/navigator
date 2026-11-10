@@ -282,3 +282,42 @@ def test_decline_run_with_missing_proposal_skips_memory_with_a_warning(tmp_path)
     skipped = [l for l in logs if l["event"] == "repo_memory.decline_skipped"]
     assert len(skipped) == 1 and skipped[0]["run_id"] == run.id
     assert not (tmp_path / "mem").exists()
+
+
+def test_decline_note_prefers_the_approval_that_carries_the_reason(tmp_path, monkeypatch):
+    """Two declines on one run (a bare Telegram one, then a CLI --reason one): the memory entry takes
+    the note and actor of the approval that carries the reason code (audit 2026-11-09)."""
+    from navigator.runtime import executor as ex
+    from navigator.runtime import repo_memory
+
+    class A:
+        def __init__(self, note, actor):
+            self.note, self.actor = note, actor
+
+    class Act:
+        def list_approvals(self, **kw):
+            return [A(None, "operator-telegram"), A("reason=unsafe: touches auth", "operator")]
+    run = SimpleNamespace(id="run-2")
+    assert ex._decline_note(Act(), run) == ("reason=unsafe: touches auth", "operator")
+
+    class ActBare:
+        def list_approvals(self, **kw):
+            return [A(None, None), A("free text", "someone")]
+    assert ex._decline_note(ActBare(), run) == (None, None)
+
+    class ActBoom:
+        def list_approvals(self, **kw):
+            raise RuntimeError("down")
+    assert ex._decline_note(ActBoom(), run) == (None, None)
+    assert repo_memory.enabled(SimpleNamespace(repo_memory=False)) is False
+
+
+def test_touched_files_runs_no_git_while_the_switch_is_off(monkeypatch):
+    from navigator.runtime import executor as ex
+    calls = []
+    monkeypatch.setattr(ex, "_git_run", lambda *a, **k: calls.append(a) or SimpleNamespace(returncode=0, stdout=""))
+    prop = SimpleNamespace(affected_files=["b.py", "a.py"])
+    assert ex._touched_files(prop, "/nowhere", "abc", SimpleNamespace(repo_memory=False)) == ["a.py", "b.py"]
+    assert calls == []
+    ex._touched_files(prop, "/nowhere", "abc", SimpleNamespace(repo_memory=True))
+    assert len(calls) == 1
