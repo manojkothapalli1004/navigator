@@ -235,3 +235,28 @@ def test_repair_no_false_missing_tests(tmp_path, monkeypatch):
     assert len(res.repair_failures) == 1
     assert res.repair_turns_used == 1
     assert len(d.builder_requests()) == 2
+
+
+def test_repair_turn_carries_repo_memory_and_previous_decline(tmp_path):
+    # reviewer memory B3 (rev2 item 4): the list rides in the `fe` bag, so the repair turn's
+    # builder AND verifier see the same context.repo_memory as the first attempt; the proposal's
+    # previous_decline is inherited by the repair copy of the proposal
+    import inspect
+    assert "repo_memory" in inspect.signature(run_build_and_verify).parameters
+    mem = [{"kind": "decline", "reason_code": "unsafe", "text": "touches auth", "files": ["mod.py"],
+            "ts": "2026-11-10T00:00:00+00:00", "title": "t"}]
+    d = _Driver([[("mod.py", BAD)], [("mod.py", GOOD)]])
+    repo, sha = _seed(tmp_path)
+    handle = create_worktree(repo=repo, base_commit_sha=sha, run_id="run-r", worktree_root=tmp_path / "wt")
+    runner = CommandRunner(allowlist=DEFAULT_ALLOWLIST, worktree_root=tmp_path / "wt")
+    proposal = {"title": "t", "rationale": "r", "intended_changes": "edit mod.py",
+                "affected_files": ["mod.py"], "previous_decline": "declined (unsafe): touches auth"}
+    res = run_build_and_verify(driver=d, worktree=handle, run_id="run-r", runner=runner,
+                               proposal=proposal, repair_turns=1, repo_memory=mem)
+    assert res.verify_returncode == 0 and res.repair_turns_used == 1
+    reqs = d.builder_requests()
+    assert len(reqs) == 2
+    assert [r.context.get("repo_memory") for r in d.requests] == [mem] * len(d.requests)
+    assert {r.role for r in d.requests} == {Role.builder, Role.verifier}
+    assert reqs[1].context["proposal"]["previous_decline"] == "declined (unsafe): touches auth"
+    assert reqs[1].context["proposal"]["previous_attempt_failure"].startswith("repair turn 1 of 1")

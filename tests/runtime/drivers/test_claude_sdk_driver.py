@@ -508,3 +508,26 @@ def test_builder_prompt_says_run_tests_describes_the_worktree_before_its_edits()
     # the sentence is the builder's alone
     d.run_role(DriverRequest(role=Role.verifier, context={}, worktree_path="/tmp/w"))
     assert "run_tests" not in prompts[1]
+
+
+def test_builder_and_verifier_are_told_how_to_use_repo_memory():
+    # reviewer memory B3: static instruction sentences (like the previous_attempt_failure one)
+    prompts = []
+    d = make_driver({"file_writes": [], "commands": [], "summary": ""}, prompts=prompts)
+    d.run_role(DriverRequest(role=Role.builder, context={}, worktree_path="/tmp/w"))
+    builder = prompts[-1]
+    assert "context.proposal.previous_decline" in builder
+    assert "context.repo_memory" in builder
+    assert "do not repeat them" in builder
+    # the memory sentences come before the run_tests sentence, which still closes the spec
+    assert builder.index("context.repo_memory") < builder.index("If a run_tests tool is available")
+    assert builder.endswith("still reply with the full JSON object.")
+    d.run_role(DriverRequest(role=Role.verifier, context={}, worktree_path="/tmp/w"))
+    verifier = prompts[-1]
+    assert "repo_memory" in verifier
+    assert "changed_files already are). If context.repo_memory is present" in verifier
+    assert "previous_decline" not in verifier
+    p = make_driver({"proposals": [], "summary": ""}, prompts=prompts)
+    p.run_role(DriverRequest(role=Role.planner, context={"repo": "trader"}))
+    planner = prompts[-1]
+    assert "repo_memory" not in planner and "previous_decline" not in planner
