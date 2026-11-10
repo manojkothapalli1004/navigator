@@ -1,40 +1,80 @@
+<div align="center">
+
 # Navigator
 
-Navigator is an AI coding agent that plans a change, builds it, tests it and checks its own
-work, then **stops and waits for a human OK before anything is merged**.
+**An AI coding agent that plans, builds and verifies a change, then stops for a human decision.**
 
-It is a personal project, public for a short feedback window. Please read the
-[status](#status) section before judging it as a product.
+![tests](https://img.shields.io/badge/tests-2500%2B%20passing-2ea44f)
+![python](https://img.shields.io/badge/python-3.12-3776ab)
+![status](https://img.shields.io/badge/status-preview-orange)
+![license](https://img.shields.io/badge/license-all%20rights%20reserved-lightgrey)
 
-## Why it is different
+</div>
 
-Most coding agents optimise for autonomy. Navigator optimises for being safe to leave running:
+Navigator is built to be safe to leave running. It never merges on its own by default
+(one opt-in exception for docs/tests-only changes), confines the builder to an isolated
+worktree, and has a fresh reviewer audit safety-relevant work before you see it.
 
-- **Never merges on its own.** Work reaches your branch only after two human decisions:
-  approve the proposal, then approve the merge. (One opt-in exception: with
-  `NAVIGATOR_MERGE_TIER_A_AUTO=1`, tests/docs-only changes with green verification may be
-  auto-approved. It is off by default.)
-- **Risk tiers** (`runtime/merge_tiers.py`). Every run is classified from the files it touched:
-  **A** = tests, fixtures, docs; **C** = money, auth, secrets, migrations, dependency files and
-  Navigator's own safety code (always needs its own explicit approval); **B** = everything else.
-  Unknown means stricter, not looser.
-- **Scope checks.** The builder may only write files the approved proposal names, and only
-  inside a per-run git worktree.
-- **Command allowlist.** Argv-only, no shell, no metacharacters, no absolute paths. A rejected
-  command counts as a failed verification. This is confinement by allowlist, **not** an OS sandbox.
-- **Self-checks before review.** Tests run, and new tests must actually exercise the change
-  (they are run against the base commit and are expected to fail there).
-  Empty diffs are failures, not merge candidates.
-- **Approval cards.** In the chat service, gated actions (merge, push, rebase, edits to
-  settings or service files, build starts over a cost cap) are denied until a card showing the
-  exact action is approved once. The approval covers that one identical call and expires.
-- **Cold audits.** Safety-relevant changes are re-reviewed by a fresh session that did not write
-  them, and findings are fixed before the work lands.
-- **Budget and circuit breakers.** Per-run duration, failed-test and tool-failure limits;
-  a dollar budget checked before each LLM call; an API-credits fallback that only engages after
-  a probe confirms the subscription is really exhausted, and is capped per day.
+Source is visible for review and feedback during a short window. Please read [Status](#status)
+before judging it as a product. Screenshots: on request (the live console can show private chat).
 
-## Parts
+## How it works
+
+```mermaid
+flowchart LR
+    P[Proposal] -->|human approves| PL[Plan]
+    PL --> B["Build<br/>isolated worktree"]
+    B --> V["Verify<br/>tests, full suite,<br/>exercise check"]
+    V --> A[Cold audit<br/>fresh session]
+    A --> C[Approval card]
+    C -->|human merges| M[Merged]
+    C -->|human rejects| X[Aborted<br/>worktree kept]
+```
+
+The conductor is the front door: one shared conversation, several ways in.
+
+```mermaid
+flowchart LR
+    W[Web] --> S
+    T[Telegram] --> S
+    TM[Terminal] --> S
+    S[Shared chat] --> H["Helpers<br/>short-lived sessions"]
+    H --> K[Cards]
+    K -->|approved once| D[Daemon pipeline]
+```
+
+## How a change flows
+
+A concrete example: "`parse_config` crashes on an empty file."
+
+1. The planner reads the repo and files a **proposal**: title, affected files
+   (`config.py`, `tests/test_config.py`) and a rationale. It sees about three at a time.
+2. You approve it from the web page, Telegram or the CLI. Nothing has been written yet.
+3. The builder creates a **per-run git worktree** and writes only the files the proposal names,
+   with a checkpoint commit per phase.
+4. The verifier runs the allowlisted test commands. The new test is also run against the base
+   commit and must **fail** there, so it proves it exercises the fix.
+5. The full suite runs, and empty diffs count as failures.
+6. Because the change touches code, a **cold audit** by a fresh session re-reviews the diff.
+   Findings are fixed before the run is offered to you.
+7. You get an **approval card** showing the diff, risk tier (here B) and verification result.
+8. You merge it, or reject it. Rejection keeps the worktree for inspection.
+
+## Features
+
+| Area | What it does |
+| --- | --- |
+| Gates | Two human decisions: approve the proposal, then approve the merge |
+| Risk tiers | **A** tests/docs, **B** everything else, **C** money, auth, secrets, migrations, dependencies and Navigator's own safety code. Unknown is stricter |
+| Scope | Builder may only write files the approved proposal names, inside a per-run worktree |
+| Commands | Argv-only allowlist: no shell, no metacharacters, no absolute paths. Confinement by allowlist, **not** an OS sandbox |
+| Self-checks | Tests run; new tests must fail on the base commit; empty diffs fail |
+| Approval cards | Gated actions (merge, push, rebase, settings edits, costly builds) are denied until one card for that exact call is approved. It covers one call and expires |
+| Cold audits | Safety-relevant changes are re-reviewed by a session that did not write them |
+| Budget | Per-run duration, failed-test and tool-failure limits; dollar budget checked before each LLM call; capped daily credits fallback, only after a probe confirms the subscription is exhausted |
+| Tier-A auto-merge | Opt-in (`NAVIGATOR_MERGE_TIER_A_AUTO=1`), off by default; tests/docs-only changes with green verification |
+
+## Components
 
 1. **Daemon pipeline** (`navigator/runtime`). Each cycle: expire stale proposals, plan,
    execute approved work, act on merge decisions. A *planner* proposes work, a *builder*
@@ -52,30 +92,22 @@ Most coding agents optimise for autonomy. Navigator optimises for being safe to 
 4. **Site checker** (`navigator/checker`). Drives a browser through a web console, records
    faults and files fixes as proposals into the same gated pipeline.
 
-```
-planner proposes -> proposal -> (human approves) -> build -> verify -> awaiting review
-                                                                 |-> (human merges) -> merged
-                                                                 `-> (human rejects) -> aborted, worktree kept
-```
-
 ## Shadow-mode results
 
-To measure quality without risk, Navigator replayed real historical bug fixes from the public
-[more-itertools](https://github.com/more-itertools/more-itertools) repo. It was given the issue
-text at the parent commit, never merged or pushed, and was scored against the upstream tests
-that it could not see.
+Navigator replayed real historical bug fixes from the public
+[more-itertools](https://github.com/more-itertools/more-itertools) repo. It saw the issue text
+at the parent commit, never merged or pushed, and was scored against upstream tests it could not see.
 
-- 17 runs, 13 distinct replays.
-- **10 of 13 correct on the first pass.**
-- 2 were wrong, both traced to **ambiguous issue text** (the issue did not say which
-  exception should be raised; Navigator chose differently from upstream).
-- 1 honest failure (it reported failing rather than claiming success).
-- **0 cases of passing broken work that its own checks could have caught.**
-- After tuning (large-file handling, minimal diffs, related-test context), re-runs of 4 replays
-  were 4/4 correct and the average diff fell from 53 to 22 lines (~60% smaller; real upstream
-  fixes average ~5).
+| Measure | Result |
+| --- | --- |
+| Runs / distinct replays | 17 / 13 |
+| Correct on first pass | **10 of 13** |
+| Wrong | 2, both from ambiguous issue text (which exception to raise) |
+| Honest failures | 1 (reported failing rather than claiming success) |
+| Broken work passed that its own checks could have caught | 0 |
+| After tuning, re-run of 4 replays | 4/4 correct; average diff 53 to 22 lines (upstream fixes average ~5) |
 
-Caveats: small sample, one repository, a library with a fast, strong test suite, and the
+Caveats: small sample, one repository, a library with a fast and strong test suite, and the
 tuning happened on the same replays it was then re-run on. Treat this as a smoke signal, not a benchmark.
 
 ## Status
@@ -106,6 +138,12 @@ Running the daemon for real needs a Claude subscription or API key and an ACT in
 4. **Safety holes:** where would you attack the allowlist, scope check or approval cards first?
 
 Open an issue, or comment wherever you found this. The repo is public for 48 hours.
+
+## License
+
+Copyright (c) 2026 Manoj Kothapalli. All rights reserved. Navigator is a product, not open
+source. Source is visible for review and feedback only; no license to use, copy, modify or
+distribute is granted. See [LICENSE.md](LICENSE.md).
 
 ## Layout
 
