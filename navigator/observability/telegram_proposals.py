@@ -58,7 +58,7 @@ RANGE = re.compile(r"(\d{1,4})-(\d{1,4})")
 HELP = ("Navigator commands:\n"
         "status - the top 3 proposals to decide / more - the next 3 / all - every one\n"
         "approve 1 3 / approve N1 / decline 4-33 - decide proposals\n"
-        "merge / merge N5b / reject N5b - runs waiting at the merge gate\n"
+        "merge / merge N5b / reject N5b [reason...] - runs waiting at the merge gate\n"
         "merge all / merge all except N5b,S3a - approve every audited tier A/B run at the "
         "gate (tier C needs 'merge <name>')\n"
         "decisions - everything waiting on you (merges, proposals, manual steps)\n"
