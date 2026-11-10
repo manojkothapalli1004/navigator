@@ -222,3 +222,67 @@ def test_root_for_resolves_settings_then_env_then_default(tmp_path, monkeypatch)
     assert f'DEFAULT_ROOT = "{LIVE_ROOT}"' in source
     assert repo_memory.DEFAULT_ROOT != LIVE_ROOT   # conftest isolation is in force for this test too
     assert path_for("/a/b/nav", "/root") == Path("/root/nav.jsonl")
+
+
+# ---- reviewer memory B3: the builder/verifier view (compact) ---------------------------------
+
+def _entry(i, text="t", files=("a.py",), title="title", kind="failure", code=None):
+    return {"ts": f"2026-11-10T00:00:{i:02d}+00:00", "kind": kind, "repo": "/r/nav", "run_id": f"r{i}",
+            "proposal_id": "p", "reason_code": code, "text": text, "files": list(files),
+            "source": "executor", "verified_sha": "v" * 40, "base_sha": "b" * 40, "title": title}
+
+
+def _size(e):
+    return len(json.dumps(e, separators=(",", ":")))
+
+
+def test_compact_caps_entries_chars_text_and_files():
+    compact = getattr(repo_memory, "compact", None)
+    assert compact, "repo_memory.compact is missing"
+    assert (repo_memory.CONTEXT_ENTRIES, repo_memory.CONTEXT_CHARS, repo_memory.CONTEXT_TEXT,
+            repo_memory.CONTEXT_FILES) == (8, 2500, 300, 6)
+    # 9 small entries, newest first as recent() hands them over -> the 8 newest, order kept
+    nine = [_entry(9 - i) for i in range(9)]
+    out = compact(nine)
+    assert [e["ts"] for e in out] == [e["ts"] for e in nine[:8]]
+    # the view carries only what a builder can use: no shas, source, run_id or repo
+    assert all(set(e) == {"kind", "reason_code", "text", "files", "ts", "title"} for e in out)
+    assert out[0]["kind"] == "failure" and out[0]["reason_code"] is None and out[0]["files"] == ["a.py"]
+    assert compact([]) == []
+    # text cut to 300, title to 80; reason_code passes through
+    long = compact([_entry(1, text="x" * 301, title="T" * 100, kind="decline", code="unsafe")])
+    assert len(long[0]["text"]) == 300 and len(long[0]["title"]) == 80
+    assert long[0]["reason_code"] == "unsafe" and long[0]["kind"] == "decline"
+    # 7 files -> 6: the proposal's own (affected) files first, then the rest, each in stored order
+    seven = compact([_entry(1, files=["a", "b", "c", "d", "e", "f", "g"])], affected=("g", "e", "zzz"))
+    assert seven[0]["files"] == ["e", "g", "a", "b", "c", "d"]
+    # defensive coercion: text not a str, files not a list / not strings
+    corrupt = _entry(1, text=None)
+    corrupt["files"] = "a.py"                      # the corrupt-line shape recent() tolerates
+    odd = compact([corrupt, _entry(0, text=42, files=[1, None, "b.py"])])
+    assert odd[0]["text"] == "" and odd[0]["files"] == []
+    assert odd[1]["text"] == "42" and odd[1]["files"] == ["1", "None", "b.py"]
+    # a title of None stays None
+    assert compact([_entry(1, title=None)])[0]["title"] is None
+
+
+def test_compact_stops_at_the_first_entry_over_the_char_budget():
+    compact = getattr(repo_memory, "compact", None)
+    assert compact, "repo_memory.compact is missing"
+    # each compact entry is ~500 chars: 8 would be ~4000 > 2500, so the view stops early, newest kept
+    fat = [_entry(9 - i, text="x" * 300, title="T" * 80, files=[f"f{i}_" + "p" * 20 for i in range(6)])
+           for i in range(9)]
+    out = compact(fat)
+    assert 0 < len(out) < 8
+    assert [e["ts"] for e in out] == [e["ts"] for e in fat[:len(out)]]   # a prefix: newest first
+    total = sum(_size(e) for e in out)
+    assert total <= 2500
+    nxt = compact([fat[len(out)]])[0]
+    assert total + _size(nxt) > 2500          # the first dropped entry is the one that would overflow
+    # STOP, do not skip: a small entry behind an oversize one is dropped with it
+    big = _entry(5, files=["F" * 600 for _ in range(6)])
+    small = _entry(4)
+    assert compact([_entry(6), big, small]) == compact([_entry(6)])
+    # a single newest entry over the budget -> []
+    assert compact([big]) == []
+    assert compact([big, small]) == []

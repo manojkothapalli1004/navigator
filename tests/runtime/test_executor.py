@@ -628,3 +628,147 @@ def test_failure_memory_off_by_default_writes_nothing(tmp_path, monkeypatch):
     from navigator.runtime import repo_memory
     assert not Path(repo_memory.root_for(d["settings"])).exists()
     assert not Path(repo_memory.DEFAULT_ROOT).exists()
+
+
+# ---- reviewer memory B3: what the memory recorded reaches the next build ----------------------
+
+def _memory_on(d, tmp_path):
+    d["settings"].repo_memory = True
+    d["settings"].repo_memory_root = str(tmp_path / "mem")
+    return d["settings"]
+
+
+def _spy_build(monkeypatch):
+    """Record the proposal dict and the repo_memory kwarg handed to run_build_and_verify."""
+    from navigator.runtime import phases
+    real = phases.run_build_and_verify
+    seen = {}
+
+    def spy(*a, **k):
+        seen["proposal"] = k["proposal"]
+        seen["repo_memory"] = k.get("repo_memory")
+        return real(*a, **k)
+    monkeypatch.setattr("navigator.runtime.executor.run_build_and_verify", spy)
+    return seen
+
+
+def test_decline_text_rule():
+    # rev2 item 2: "reason=CODE<sep>text" -> text; bare code or nothing -> "no reason given"
+    from navigator.runtime import executor
+    fn = getattr(executor, "_decline_text", None)
+    assert fn, "executor._decline_text is missing"
+    assert fn("reason=unsafe: x", "unsafe") == "x"
+    assert fn("reason=low_value; meh", "low_value") == "meh"
+    assert fn("reason=unsafe", "unsafe") == "no reason given"
+    assert fn("reason=unsafe:   ", "unsafe") == "no reason given"
+    assert fn("reason=unsafe touches auth", "unsafe") == "touches auth"
+    assert fn("looks wrong", None) == "looks wrong"
+    assert fn("  looks wrong \n", "unsafe") == "looks wrong"
+    assert fn("", None) == "no reason given"
+    assert fn(None, "unsafe") == "no reason given"
+    assert executor.DECLINE_CHARS == 500
+
+
+def test_rebuild_sees_the_decline_reason_and_repo_memory(tmp_path, monkeypatch):
+    from navigator.runtime import repo_memory
+    repo, sha = _seed(tmp_path); d = _deps(tmp_path, repo)
+    s = _memory_on(d, tmp_path)
+    p = _proposal(repo, sha)
+    assert repo_memory.remember(s, str(repo), kind="decline", run_id="run-old", proposal_id=p.id,
+                                reason_code="unsafe", text="reason=unsafe: touches auth",
+                                files=["navigator_touch.py"], affected_files=["navigator_touch.py"],
+                                source="operator", title="t") is True
+    assert repo_memory.remember(s, str(repo), kind="failure", run_id="run-x", proposal_id="prop-other",
+                                text="verification failed: FAILED tests/t.py::test_y", files=["navigator_touch.py"],
+                                source="executor", title="another proposal on the same file") is True
+    # an entry for an unrelated file never reaches this build
+    assert repo_memory.remember(s, str(repo), kind="audit", run_id="run-z", proposal_id="prop-z",
+                                text="elsewhere", files=["other.py"], source="auditor") is True
+    seen = _spy_build(monkeypatch)
+    run = execute_proposal(p, **d)
+    assert run.phase == RunPhase.awaiting_review
+    assert seen["proposal"].get("previous_decline") == "declined (unsafe): touches auth"
+    assert "previous_attempt_failure" not in seen["proposal"]      # no failed outcome: untouched
+    mem = seen.get("repo_memory")
+    assert mem, "repo_memory kwarg missing or empty"
+    assert mem[0]["kind"] == "failure"
+    assert mem[0]["title"] == "another proposal on the same file"
+    assert mem[0]["files"] == ["navigator_touch.py"]
+    assert set(mem[0]) == {"kind", "reason_code", "text", "files", "ts", "title"}
+    # the rendered decline is not repeated in the list; the other file's audit is filtered out
+    assert [e["kind"] for e in mem] == ["failure"]
+
+
+def test_same_proposal_failures_stay_out_of_repo_memory(tmp_path, monkeypatch):
+    # previous_attempt_failure already carries the last failure in full; a same-proposal audit stays
+    from navigator.runtime import repo_memory
+    repo, sha = _seed(tmp_path); d = _deps(tmp_path, repo)
+    s = _memory_on(d, tmp_path)
+    p = _proposal(repo, sha)
+    f = ["navigator_touch.py"]
+    repo_memory.remember(s, str(repo), kind="failure", run_id="r1", proposal_id=p.id, text="MINE-FAIL", files=f)
+    repo_memory.remember(s, str(repo), kind="audit", run_id="r2", proposal_id=p.id, text="MINE-AUDIT", files=f)
+    repo_memory.remember(s, str(repo), kind="failure", run_id="r3", proposal_id="prop-other", text="OTHER-FAIL",
+                         files=f)
+    repo_memory.remember(s, str(repo), kind="failure", run_id="r4", proposal_id=p.id, text="MINE-FAIL-2", files=f)
+    # same basename, another repo: never shown (B1's accepted collision)
+    other_repo = tmp_path / "elsewhere" / repo.name
+    repo_memory.remember(s, str(other_repo), kind="decline", run_id="r5", proposal_id="prop-q",
+                         text="reason=unsafe: foreign", files=f, reason_code="unsafe")
+    seen = _spy_build(monkeypatch)
+    run = execute_proposal(p, **d)
+    assert run.phase == RunPhase.awaiting_review
+    assert "previous_decline" not in seen["proposal"]
+    mem = seen.get("repo_memory")
+    assert mem, "repo_memory kwarg missing or empty"
+    assert [e["text"] for e in mem] == ["OTHER-FAIL", "MINE-AUDIT"]      # newest first
+
+
+def test_memory_off_injects_nothing(tmp_path, monkeypatch):
+    # GUARD (green on main): entries on disk, switch off -> proposal dict byte-identical to main, no
+    # repo_memory list, and NO file read at all (recent() raising proves it is never called)
+    from navigator.runtime import repo_memory
+    from types import SimpleNamespace
+    repo, sha = _seed(tmp_path); d = _deps(tmp_path, repo)
+    root = str(tmp_path / "mem")
+    writer = SimpleNamespace(repo_memory=True, repo_memory_root=root)
+    p = _proposal(repo, sha)
+    assert repo_memory.remember(writer, str(repo), kind="decline", run_id="run-old", proposal_id=p.id,
+                                reason_code="unsafe", text="reason=unsafe: touches auth",
+                                files=["navigator_touch.py"]) is True
+    d["settings"].repo_memory_root = root
+    assert d["settings"].repo_memory is False
+
+    def boom(*a, **k):
+        raise AssertionError("repo_memory.recent was called while the switch is off")
+    monkeypatch.setattr(repo_memory, "recent", boom)
+    seen = _spy_build(monkeypatch)
+    run = execute_proposal(p, **d)
+    assert run.phase == RunPhase.awaiting_review
+    assert seen["proposal"] == {"title": "t", "rationale": "r", "intended_changes": "x",
+                                "affected_files": ["navigator_touch.py"]}
+    assert seen["repo_memory"] is None
+
+
+def test_memory_read_failure_warns_and_builds(tmp_path, monkeypatch):
+    # rev2 item 1: recent() swallows OSError itself, so a reader fault is simulated by raising
+    from structlog.testing import capture_logs
+    from navigator.runtime import repo_memory
+    repo, sha = _seed(tmp_path); d = _deps(tmp_path, repo)
+    _memory_on(d, tmp_path)
+    p = _proposal(repo, sha)
+
+    def boom(*a, **k):
+        raise RuntimeError("disk on fire")
+    monkeypatch.setattr(repo_memory, "recent", boom)
+    seen = _spy_build(monkeypatch)
+    with capture_logs() as logs:
+        run = execute_proposal(p, **d)          # must NOT raise
+    assert run.phase == RunPhase.awaiting_review and run.status == RunStatus.executing
+    warned = [l for l in logs if l["event"] == "repo_memory.read_failed"]
+    assert len(warned) == 1, [l["event"] for l in logs]
+    assert warned[0]["log_level"] == "warning"
+    assert warned[0]["proposal_id"] == p.id and warned[0]["error"] == "RuntimeError"
+    assert not any("disk on fire" in str(v) for v in warned[0].values())   # class name only
+    assert "previous_decline" not in seen["proposal"]
+    assert seen["repo_memory"] is None

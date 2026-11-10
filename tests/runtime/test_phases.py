@@ -973,3 +973,49 @@ def test_run_tests_budget_is_one_dict_per_build_across_repair_turns(tmp_path):
     assert builder[0] is builder[1]  # the SAME dict on the first attempt and the repair turn
     assert builder[0] == {"used": 0}  # the fake driver never ran the tool
     assert verifier == [None, None]  # the verifier never gets a tool, nor its budget
+
+
+# ---- reviewer memory B3: repo_memory reaches both roles, and only when non-empty ------------
+
+def _seed_a(tmp_path, run_id):
+    repo, _ = _seed(tmp_path)
+    (repo/"a.py").write_text("x = 1\n")
+    subprocess.run(["git", "add", "a.py"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "a"], cwd=repo, check=True, capture_output=True)
+    sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True).stdout.strip()
+    h = create_worktree(repo=repo, base_commit_sha=sha, run_id=run_id, worktree_root=tmp_path/"wt")
+    return h, CommandRunner(allowlist=DEFAULT_ALLOWLIST, worktree_root=tmp_path/"wt")
+
+
+def test_repo_memory_reaches_builder_and_verifier_context(tmp_path):
+    import inspect
+    assert "repo_memory" in inspect.signature(run_build_and_verify).parameters
+    h, runner = _seed_a(tmp_path, "run-mem")
+    drv = _RecordingDriver()
+    mem = [{"kind": "failure", "reason_code": None, "text": "FAILED tests/t.py::test_x", "files": ["a.py"],
+            "ts": "2026-11-10T00:00:00+00:00", "title": "other"},
+           {"kind": "decline", "reason_code": "unsafe", "text": "reason=unsafe: touches auth",
+            "files": ["a.py"], "ts": "2026-11-09T00:00:00+00:00", "title": "t"}]
+    res = run_build_and_verify(driver=drv, worktree=h, run_id="run-mem", runner=runner,
+                               proposal={"affected_files": ["a.py"]}, repo_memory=mem)
+    assert res.verify_returncode == 0
+    assert drv.requests[Role.builder].context.get("repo_memory") == mem
+    assert drv.requests[Role.verifier].context.get("repo_memory") == mem
+    # the proposal itself is untouched by the list
+    assert "repo_memory" not in drv.requests[Role.builder].context["proposal"]
+
+
+def test_no_repo_memory_key_when_none(tmp_path):
+    import inspect
+    assert "repo_memory" in inspect.signature(run_build_and_verify).parameters
+    for i, value in enumerate((None, [])):
+        (tmp_path / f"c{i}").mkdir()
+        h, runner = _seed_a(tmp_path / f"c{i}", f"run-nomem{i}")
+        drv = _RecordingDriver()
+        run_build_and_verify(driver=drv, worktree=h, run_id=f"run-nomem{i}", runner=runner,
+                             proposal={"affected_files": ["a.py"]}, repo_memory=value)
+        b, v = drv.requests[Role.builder].context, drv.requests[Role.verifier].context
+        assert "repo_memory" not in b and "repo_memory" not in v, value
+        # byte-identical to a call without the kwarg
+        assert set(b) == {"proposal", "files", "large_files", "test_files", "related_files"}, value
+        assert set(v) == {"proposal", "changed_files", "allowed_commands", "workdir"}, value

@@ -18,6 +18,9 @@ other touched files (sorted), <= 50 in all, "source": executor|operator|telegram
 opened O_WRONLY|O_CREAT|O_APPEND with mode 0600, one write() per line, so the daemon and the CLI may
 append concurrently without tearing a line. Accepted risk: two repos with one basename share a file
 (the entry's "repo" disambiguates).
+
+B3 (2026-11-10): compact() is the one reader view - executor._memory_context hands its result to
+run_build_and_verify(repo_memory=...) and phases puts it in builder and verifier context.
 """
 import json
 import os
@@ -30,6 +33,9 @@ DEFAULT_ROOT = "/Users/Manoj/calwbot/logs/navigator/repo_memory"
 KINDS = ("decline", "failure", "audit")
 TEXT_CHARS = 2000
 MAX_FILES = 50
+# B3 builder/verifier view caps: entries, compact-JSON chars in all, text chars, files per entry
+CONTEXT_ENTRIES, CONTEXT_CHARS, CONTEXT_TEXT, CONTEXT_FILES = 8, 2500, 300, 6
+CONTEXT_TITLE = 80
 _log = get_logger("navigator.repo_memory")
 
 
@@ -133,3 +139,46 @@ def recent(repo, limit: int = 20, files=None, root=None) -> list[dict]:
         kept.append(entry)
     tail = kept[-limit:] if limit > 0 else []
     return list(reversed(tail))
+
+
+def _context_files(files, affected) -> list[str]:
+    """The entry's files for the view: those in `affected` first, then the rest, each in stored
+    order, CONTEXT_FILES in all. A non-list is no files; items are coerced to str."""
+    if not isinstance(files, (list, tuple)):
+        return []
+    names = [str(f) for f in files]
+    wanted = {str(a) for a in (affected or ())}
+    ordered = [n for n in names if n in wanted] + [n for n in names if n not in wanted]
+    return ordered[:CONTEXT_FILES]
+
+
+def compact(entries, affected=()) -> list[dict]:
+    """Builder/verifier view of `entries` (as recent() hands them over: newest first), in order:
+    {kind, reason_code, text[:300], files (affected first, <=6), ts, title[:80]} - no shas, source,
+    run_id or repo. Stops at CONTEXT_ENTRIES entries or at the FIRST entry that would push the
+    running compact-JSON total (sum of len(json.dumps(e, separators=(",", ":")))) past
+    CONTEXT_CHARS; that entry and everything behind it are dropped (stop, never skip), so a single
+    oversize newest entry gives []. text and files are coerced defensively; a corrupt entry is
+    never a reason to raise."""
+    out: list[dict] = []
+    total = 0
+    for entry in entries or ():
+        if len(out) >= CONTEXT_ENTRIES:
+            break
+        if not isinstance(entry, dict):
+            continue
+        title = entry.get("title")
+        view = {
+            "kind": entry.get("kind"),
+            "reason_code": entry.get("reason_code"),
+            "text": str(entry.get("text") if entry.get("text") is not None else "")[:CONTEXT_TEXT],
+            "files": _context_files(entry.get("files"), affected),
+            "ts": entry.get("ts"),
+            "title": str(title)[:CONTEXT_TITLE] if title is not None else None,
+        }
+        size = len(json.dumps(view, separators=(",", ":"), default=str))
+        if total + size > CONTEXT_CHARS:
+            break
+        out.append(view)
+        total += size
+    return out

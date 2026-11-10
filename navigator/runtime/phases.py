@@ -973,7 +973,8 @@ def run_build_and_verify(driver: SubagentDriver, worktree: WorktreeHandle,
                          started_monotonic: float | None = None,
                          workdir: str = ".", repair_turns: int = 0,
                          frontend_dir: str | None = None, repo_path: Path | None = None,
-                         checker_fingerprints: list[str] | None = None) -> PhaseResult:
+                         checker_fingerprints: list[str] | None = None,
+                         repo_memory: list[dict] | None = None) -> PhaseResult:
     """Build and verify `proposal` in `worktree`. With repair_turns > 0, a repairable
     verify failure (PhaseResult.repairable: a test/skip-gate/missing-tests failure) is fed
     back to the builder up to that many more times in the SAME worktree. The returned
@@ -981,9 +982,11 @@ def run_build_and_verify(driver: SubagentDriver, worktree: WorktreeHandle,
     attempt's verify_* and no_change. frontend_dir (RepoConfig.frontend_dir) turns on the fixed
     frontend suite for changes under it, cloning node_modules from repo_path's checkout;
     checker_fingerprints (not None for site-checker proposals) waives the frontend
-    test-change rule and adds the checker re-check."""
+    test-change rule and adds the checker re-check. repo_memory (reviewer memory B3: the
+    compact list of earlier declines/failures/audits on these files) reaches builder and
+    verifier context as context.repo_memory on every attempt; None or [] adds no key."""
     fe = {"frontend_dir": frontend_dir, "repo_path": repo_path,
-          "checker_fingerprints": checker_fingerprints}
+          "checker_fingerprints": checker_fingerprints, "repo_memory": repo_memory}
     wt = Path(worktree.path)
     # the worktree is created at the run's base commit and nothing has been committed
     # yet: this HEAD is the base the finished build is diffed against (N17)
@@ -1035,7 +1038,8 @@ def _attempt(driver: SubagentDriver, wt: Path, base: str, run_id: str, runner: C
              baseline: str | None, prior_writes: tuple[str, ...] = (),
              test_budget: dict | None = None, frontend_dir: str | None = None,
              repo_path: Path | None = None,
-             checker_fingerprints: list[str] | None = None) -> PhaseResult:
+             checker_fingerprints: list[str] | None = None,
+             repo_memory: list[dict] | None = None) -> PhaseResult:
     """One builder + verifier pass, filling and returning `res`. Checkpoint numbers start
     at cp_start. baseline=None is the first attempt (today's behaviour exactly);
     baseline=<base sha> is a repair turn: prior_writes (paths earlier attempts wrote) are
@@ -1055,6 +1059,9 @@ def _attempt(driver: SubagentDriver, wt: Path, base: str, run_id: str, runner: C
                  "related_files": _related_files(wt, tracked, set(files),
                                                  mention_text=mention_text,
                                                  workdir=workdir or ".")}
+    if repo_memory:
+        # B3: only when there is something to say, so the context is byte-identical otherwise
+        build_ctx["repo_memory"] = repo_memory
     if checker_fingerprints is not None and frontend_dir and not proposal.get("affected_files"):
         # site-checker faults name a page, not a file: the builder finds the file with
         # its tools and may edit any existing file under the frontend dir
@@ -1119,6 +1126,8 @@ def _attempt(driver: SubagentDriver, wt: Path, base: str, run_id: str, runner: C
     verify_ctx = {"proposal": proposal, "changed_files": rel_changed,
                   "allowed_commands": list(runner.allowlist),
                   "workdir": workdir or "."}
+    if repo_memory:
+        verify_ctx["repo_memory"] = repo_memory
     verify = driver.run_role(DriverRequest(role=Role.verifier, context=verify_ctx, worktree_path=str(wt)))
     if not verify.commands:
         res.verify_returncode = 1

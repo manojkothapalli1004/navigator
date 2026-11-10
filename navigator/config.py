@@ -101,6 +101,9 @@ class Settings:
     # repos). Off by default. root None = runtime/repo_memory.root_for() falls back to
     # NAVIGATOR_REPO_MEMORY_ROOT, then its DEFAULT_ROOT, at call time (never a literal baked in here).
     # Both env-only: the CLI audit writer reads the env, so the document could not be the truth.
+    # B3: read back into builder/verifier context - one knob: "on" means collect AND feed back
+    # (the declined run's reason as proposal.previous_decline, earlier entries on the same
+    # files as context.repo_memory); off = context byte-identical, no memory file read.
     repo_memory: bool = False
     repo_memory_root: str | None = None
     # U2a settings hot reload: decisions-inbox knobs settable from the UI document only (not
