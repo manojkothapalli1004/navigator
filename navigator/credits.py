@@ -19,6 +19,7 @@ import logging
 import os
 import re
 import sys
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -221,6 +222,8 @@ def _tokens(usage: dict | None) -> dict | None:
 
 _notifier = None
 _last_denial: str | None = None
+_inherited_warned = False  # the inherited-key announcement is made once per process (_active)
+_inherited_lock = threading.Lock()
 
 
 def set_notifier(fn) -> None:
@@ -322,13 +325,39 @@ class Route:
 
 
 def _active() -> str | None:
-    """Reason credits cannot be used at all (no notice), else None."""
+    """Reason credits cannot be used at all, else None. An ANTHROPIC_API_KEY already in this
+    process's environment runs every call on the key with no reservation, budget or record; the
+    first time per process it is announced (warning, inherited_key event, notice), BEFORE the
+    enabled() check so CREDITS_FALLBACK=0 still announces it. Later calls only log.info. The
+    return values are unchanged."""
+    on_key = KEY_NAME in os.environ
+    announced = on_key and _announce_inherited_key()
     if not enabled():
         return "disabled"
-    if KEY_NAME in os.environ:
-        log.info("credits.already_on_key")
+    if on_key:
+        if not announced:
+            log.info("credits.already_on_key")
         return "already on key"
     return None
+
+
+def _announce_inherited_key() -> bool:
+    """Once per process: warn that calls run on an inherited key. True when this call claimed the
+    announcement. The flag is set under a lock before anything is emitted (route_async runs in
+    worker threads), and nothing here may break routing."""
+    global _inherited_warned
+    try:
+        with _inherited_lock:
+            if _inherited_warned:
+                return False
+            _inherited_warned = True
+        log.warning("credits.inherited_key")
+        _event("inherited_key", pid=os.getpid(), argv0=os.path.basename((sys.argv[:1] or [""])[0]))
+        _notify("ANTHROPIC_API_KEY is in this process's environment: its calls run on the key with no "
+                "budget, cap or ledger (switch_to_credits.sh --revert undoes it).")
+    except Exception:  # noqa: BLE001
+        pass
+    return True
 
 
 def _guard(s: dict, now: float) -> str | None:
