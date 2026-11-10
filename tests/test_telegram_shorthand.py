@@ -284,6 +284,50 @@ def test_reject_without_reason_passes_no_note_kwarg():
                         f"from Telegram (applies this cycle)"]
 
 
+def test_reasoned_reject_with_unknown_name_is_chat_not_a_command(tmp_path):
+    """B2 guard: SHORT_NAME accepts any word, so 'reject this one please' parses as a
+    reasoned reject of 'this'. When the name matches no waiting run it is operator chat:
+    no reply, no decision, result reason 'not a command'."""
+    act = FakeACTClient()
+    run = _run(act, "S3a: squash merges")
+    rec = _Recorder()
+    cmd = parse_command("reject this one please", 7)
+    assert cmd is not None and cmd.name == "this" and cmd.note
+    results = apply_commands(act, [cmd], rec)
+    assert results == [{"run_id": None, "action": "reject", "applied": False,
+                        "reason": "not a command"}]
+    assert rec.sent == []
+    assert _pending(act, run.id) == 1 and _decisions(act) == []
+    assert _merge(act, run.id, ApprovalDecision.declined) == []
+
+
+def test_reasoned_reject_with_unknown_name_falls_through_to_chat_in_handle_operator_message():
+    """The bot forwards a False to the conductor chat; True would swallow the line."""
+    from navigator.observability.telegram_proposals import handle_operator_message
+    from tests.test_actions import CHAT, NOW, _msg
+
+    act = FakeACTClient()
+    run = _run(act, "S3a: squash merges")
+    rec = _Recorder()
+    assert handle_operator_message(_msg("reject this one please"), act, rec, CHAT,
+                                   now=NOW, update_id=8) is False
+    assert rec.sent == []
+    assert _pending(act, run.id) == 1 and _decisions(act) == []
+
+
+def test_bare_reject_with_unknown_name_still_lists_candidates():
+    """No note: 'reject nosuch' keeps the candidate reply (the operator typed a target)."""
+    act = FakeACTClient()
+    run = _run(act, "S3a: squash merges")
+    rec = _Recorder()
+    results = apply_commands(act, [parse_command("reject nosuch", 9)], rec)
+    assert results == [{"run_id": None, "action": "reject", "applied": False,
+                        "reason": "no single run named 'nosuch'"}]
+    assert len(rec.sent) == 1 and rec.sent[0].startswith("Navigator: /reject nosuch not applied")
+    assert "S3a - S3a: squash merges - reply: reject S3a" in rec.sent[0].splitlines()
+    assert _pending(act, run.id) == 1
+
+
 def test_named_merge_without_colon_in_title():
     act = FakeACTClient()
     run = _run(act, "S3a squash merges for public repos")
