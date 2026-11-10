@@ -19,6 +19,7 @@ from navigator.runtime.merge_tiers import (CHECKER_ORIGIN, changed_files_for_run
 from navigator.checker.store import FindingStore
 from navigator.safety.command_runner import FRONTEND_SUITE
 from navigator.runtime.outcome_store import OutcomeStore
+from navigator.runtime import repo_memory
 from navigator.runtime.phases import (FRONTEND_SUFFIXES, NO_CHANGE_SUMMARY, reverify,
                                       run_build_and_verify, run_dir_for)
 from navigator.ids import new_id
@@ -157,7 +158,9 @@ def execute_proposal(proposal: Proposal, *, act, orc, driver, runner, settings,
         run.status = RunStatus.failed; run.phase = RunPhase.finalizing
         run.ended_at = datetime.now(timezone.utc); _save(act, run)
         _write_outcome(orc, run, status="failed", summary=f"worktree creation failed: {e}",
-                       lessons=[f"create_worktree raised: {e}"], settings=settings)
+                       lessons=[f"create_worktree raised: {e}"], settings=settings,
+                       repo=proposal.repo, files=list(proposal.affected_files),
+                       affected_files=list(proposal.affected_files), title=proposal.title)
         _emit(act, run, "run.failed", Severity.error, error=str(e)); return run
     run.worktree_path = str(handle.path)
     run.phase = RunPhase.building; _save(act, run); _emit(act, run, "run.building")
@@ -180,7 +183,9 @@ def execute_proposal(proposal: Proposal, *, act, orc, driver, runner, settings,
         run.status = RunStatus.failed; run.phase = RunPhase.finalizing
         run.ended_at = datetime.now(timezone.utc); _save(act, run)
         _write_outcome(orc, run, status="failed", summary=f"exception: {e}",
-                       lessons=[f"build/verify raised: {e}"], preserved=handle.path, settings=settings)
+                       lessons=[f"build/verify raised: {e}"], preserved=handle.path, settings=settings,
+                       repo=proposal.repo, files=_touched_files(proposal, handle.path, head, settings),
+                       affected_files=list(proposal.affected_files), title=proposal.title)
         _emit(act, run, "run.failed", Severity.error, error=str(e)); return run
     repair_used = getattr(result, "repair_turns_used", 0)
     if repair_used > 0:
@@ -210,7 +215,9 @@ def execute_proposal(proposal: Proposal, *, act, orc, driver, runner, settings,
             lessons.append(f"repair turns used: {repair_used}")
         _write_outcome(orc, run, status="failed", summary=summary, lessons=lessons,
                        verification_notes=result.verify_output[-1500:], preserved=handle.path,
-                       checkpoints_made=len(result.checkpoints), settings=settings)
+                       checkpoints_made=len(result.checkpoints), settings=settings,
+                       repo=proposal.repo, files=_touched_files(proposal, handle.path, head, settings),
+                       affected_files=list(proposal.affected_files), title=proposal.title)
         _emit(act, run, "run.failed", Severity.error); return run
     # the merge gate merges only this exact commit
     run.verified_sha = _rev_parse(handle.path, "HEAD") or None
@@ -369,7 +376,8 @@ def merge_after_approval(run: Run, *, act, orc, driver, runner, settings, squash
         run.ended_at = datetime.now(timezone.utc); _save(act, run)
         _write_outcome(orc, run, status="failed", summary=missing,
                        lessons=["run branch was deleted after verification — re-propose"],
-                       preserved=run.worktree_path, settings=settings)
+                       preserved=run.worktree_path, settings=settings,
+                       repo=repo, files=(changed_files_for_run(repo, run) or []) if repo_memory.enabled(settings) else [])
         _emit(act, run, "run.failed", Severity.error, error=missing)
         return run
     blocked = _merge_preflight(repo, run) or _verified_check(repo, run)
@@ -387,7 +395,10 @@ def merge_after_approval(run: Run, *, act, orc, driver, runner, settings, squash
         run.ended_at = datetime.now(timezone.utc); _save(act, run)
         _write_outcome(orc, run, status="failed", summary=f"merge failed and was aborted: {detail}",
                        lessons=["merge conflict with main — rebase or re-propose against current HEAD"],
-                       preserved=run.worktree_path, settings=settings)
+                       preserved=run.worktree_path, settings=settings,
+                       repo=repo, files=(changed_files_for_run(repo, run) or []) if repo_memory.enabled(settings) else [],
+                       affected_files=list(prop.affected_files) if prop else None,
+                       title=prop.title if prop else None)
         _emit(act, run, "run.failed", Severity.error, error=detail)
         return run
     run.phase = RunPhase.finalizing; run.status = RunStatus.completed
@@ -448,6 +459,65 @@ def _decline_reason(act, run) -> str | None:
         return None
     return None
 
+def _decline_note(act, run) -> tuple[str | None, str | None]:
+    """(note, actor) of the run's declined merge approval: the first one whose note starts with
+    "reason=" (the same approval _decline_reason reads the code from), else the first declined one.
+    actor is None (never the string "None") when the approval records none; (None, None) when
+    there is no declined approval or the approvals cannot be read."""
+    first: tuple[str | None, str | None] | None = None
+    try:
+        for a in act.list_approvals(target=run.id, gate=ApprovalGate.merge,
+                                    decision=ApprovalDecision.declined):
+            note = getattr(a, "note", None)
+            actor = getattr(a, "actor", None)
+            pair = (note if isinstance(note, str) else None, str(actor) if actor else None)
+            if pair[0] and pair[0].startswith("reason="):
+                return pair
+            if first is None:
+                first = pair
+    except Exception:
+        return first or (None, None)
+    return first or (None, None)
+
+
+def _memory_source(actor: str | None) -> str:
+    """repo_memory `source` vocabulary for a decline: executor | operator | telegram | auditor. The
+    ACT actor maps TELEGRAM_ACTOR -> "telegram", ACTOR (or none) -> "operator", anything else is
+    kept as recorded."""
+    actor = actor or ACTOR
+    if actor == TELEGRAM_ACTOR:
+        return "telegram"
+    if actor == ACTOR:
+        return "operator"
+    return actor
+
+
+def _remember_decline(act, run: Run, settings, code: str | None) -> None:
+    """Reviewer memory B1: file the decline (reason code, the operator's note, who declined) under
+    the proposal's repo, tied to the proposal's files plus the run's own commits. Best effort and
+    only while the switch is on (off = no ACT lookup, byte-identical to before): a failure is one
+    warning and never changes the outcome, the run.declined payload or the run."""
+    try:
+        if not repo_memory.enabled(settings):
+            return
+        prop = act.get_proposal(run.proposal_id)
+        if prop is None:
+            _log.warning("repo_memory.decline_skipped", run_id=run.id, reason="proposal not found")
+            return
+        note, actor = _decline_note(act, run)
+        # files rely on verified_sha (None -> affected_files only); changed_files_for_run never raises
+        changed = changed_files_for_run(prop.repo, run) or []
+        repo_memory.remember(settings, prop.repo, kind="decline", run_id=run.id,
+                             proposal_id=run.proposal_id, reason_code=code,
+                             text=note or "no reason given",
+                             files=set(prop.affected_files) | set(changed),
+                             affected_files=prop.affected_files, source=_memory_source(actor),
+                             verified_sha=run.verified_sha, base_sha=run.base_commit_sha,
+                             title=prop.title)
+    except Exception as e:
+        _log.warning("repo_memory.decline_skipped", run_id=run.id, error=type(e).__name__)
+
+
 def decline_run(run: Run, *, act, orc, settings) -> Run:
     run.status = RunStatus.aborted; run.phase = RunPhase.finalizing
     run.ended_at = datetime.now(timezone.utc); _save(act, run)
@@ -455,6 +525,7 @@ def decline_run(run: Run, *, act, orc, settings) -> Run:
     # lessons[0] must stay the exact DECLINED_LESSON text: title_lessons matches it
     lessons = (["operator declined the change at the merge gate"]
                + ([f"decline reason: {code}"] if code else []))
+    _remember_decline(act, run, settings, code)  # first: _write_outcome raises when ORC is down
     _write_outcome(orc, run, status="declined", summary="merge declined by operator",
                    lessons=lessons, preserved=run.worktree_path, section="decisions",
                    settings=settings, reason_code=code)
@@ -479,9 +550,28 @@ def _repo_for(run, act) -> str:
         raise LookupError(f"proposal {run.proposal_id} not found in ACT")
     return prop.repo
 
+def _touched_files(proposal, wt, base, settings=None) -> list[str]:
+    """Files a failed build touched: the proposal's affected_files plus every path that differs
+    between the worktree's WORKING TREE and `base` (`git diff --name-only -z <base>`, no second
+    rev). Unlike the tier diff `{head}..HEAD` this also sees checkpoint commits AND uncommitted or
+    staged edits - what the builder really touched before verification failed. Untracked files
+    that were never added are missed (accepted). Sorted; never raises (_git_run catches only
+    TimeoutExpired, so a missing cwd or a non-UTF-8 name is caught here)."""
+    names: set[str] = set(getattr(proposal, "affected_files", None) or [])
+    if not repo_memory.enabled(settings):
+        return sorted(names)  # switch off: no git call, byte-identical to before B1
+    try:
+        proc = _git_run(wt, "diff", "--no-renames", "--name-only", "-z", base)
+        if proc.returncode == 0:
+            names |= {n for n in proc.stdout.split("\x00") if n}
+    except Exception as e:
+        _log.warning("repo_memory.touched_files_failed", error=type(e).__name__)
+    return sorted(names)
+
+
 def _write_outcome(orc, run, *, status, summary, lessons, verification_notes=None,
                    preserved=None, checkpoints_made=0, section=None, settings=None,
-                   reason_code=None):
+                   reason_code=None, repo=None, files=None, affected_files=None, title=None):
     out = Outcome(run_id=run.id, proposal_id=run.proposal_id, status=status, summary=summary,
                   lessons=lessons, verification_notes=verification_notes,
                   provenance=f"navigator {run.id}",
@@ -489,6 +579,15 @@ def _write_outcome(orc, run, *, status, summary, lessons, verification_notes=Non
                                     worktree_preserved=preserved is not None,
                                     preserved_path=str(preserved) if preserved else None),
                   code_sha=code_sha(), reason_code=reason_code)
+    if status == "failed" and repo:
+        # reviewer memory B1, BEFORE the ORC note: HTTPORCClient raises on a timeout and the entry
+        # must not be lost behind it. remember() never raises and is a no-op while the switch is off.
+        repo_memory.remember(settings, repo, kind="failure", run_id=run.id,
+                             proposal_id=run.proposal_id,
+                             text=f"{summary} | {verification_notes or '; '.join(lessons)}",
+                             files=files or [], affected_files=affected_files or [],
+                             source="executor", verified_sha=getattr(run, "verified_sha", None),
+                             base_sha=getattr(run, "base_commit_sha", None), title=title)
     target_section = section or ("known_failures" if status == "failed" else "status")
     note = f"[{run.id}] {summary} | lessons: {'; '.join(lessons)}"
     orc.apply_memory_update(section=target_section, note=note, replace=False)
@@ -680,14 +779,21 @@ def _grant_rebuild(act, run: Run) -> bool:
 
 
 def _fail_stale(act, orc, run: Run, settings, *, summary: str, lessons: list[str],
-                notes: str | None = None) -> None:
+                notes: str | None = None, repo: str | None = None,
+                title: str | None = None) -> None:
     """Fail a sibling that could not be carried over the merge, keep its worktree for
     inspection and schedule exactly one rebuild. Sets run.status first so a caller can
-    tell a failure that raised part-way from one that never started."""
+    tell a failure that raised part-way from one that never started. `repo` (passed through
+    by the caller, no extra ACT lookup) keys the repo-memory failure entry; None = no entry."""
     run.status = RunStatus.failed; run.phase = RunPhase.finalizing
     run.ended_at = datetime.now(timezone.utc); _save(act, run)
+    try:
+        files = changed_files_for_run(repo, run) if repo else None
+    except Exception:
+        files = None
     _write_outcome(orc, run, status="failed", summary=summary, lessons=lessons,
-                   verification_notes=notes, preserved=run.worktree_path, settings=settings)
+                   verification_notes=notes, preserved=run.worktree_path, settings=settings,
+                   repo=repo, files=files or [], title=title)
     _emit(act, run, "run.failed", Severity.error, error=summary)
     granted = _grant_rebuild(act, run)
     _emit(act, run, "run.rebuild_scheduled", granted=granted)
@@ -756,7 +862,7 @@ def _stale_operator_ok(act, run: Run) -> bool:
 
 
 def _rebase_one(run: Run, merged: Run, new_head: str, *, act, orc, runner, settings,
-                workdir: str, state: dict) -> bool:
+                workdir: str, state: dict, repo: str | None = None) -> bool:
     """Rebase one parked sibling onto new_head and re-verify it. True if the run is
     parked again (rebased); False if it failed (a rebuild was scheduled)."""
     wt = run.worktree_path
@@ -775,7 +881,7 @@ def _rebase_one(run: Run, merged: Run, new_head: str, *, act, orc, runner, setti
             first = next((l.strip() for l in output.splitlines() if l.strip()), "")[:200]
             summary = f"stale after merge of {merged.id or 'an earlier merge'}: rebase failed: {first}"
         _fail_stale(act, orc, run, settings, summary=summary, notes=output[-1500:],
-                    lessons=["a sibling merged first; rebuilt once against the new HEAD"])
+                    lessons=["a sibling merged first; rebuilt once against the new HEAD"], repo=repo)
         return False
     state["rebased"] = True
     names = _git_run(wt, "diff", "--name-only", f"{new_head}..HEAD")
@@ -796,7 +902,8 @@ def _rebase_one(run: Run, merged: Run, new_head: str, *, act, orc, runner, setti
             summary = f"stale after merge of {merged.id or 'an earlier merge'}: re-verify failed"
             lessons = [f"re-verify rc={res.verify_returncode}: {res.verify_output[-300:]}"]
         _fail_stale(act, orc, run, settings, summary=summary, lessons=lessons,
-                    notes=res.verify_output[-1500:])
+                    notes=res.verify_output[-1500:], repo=repo,
+                    title=prop.title if prop is not None else None)
         return False
     old_sha = run.verified_sha
     run.base_commit_sha = new_head
@@ -902,7 +1009,7 @@ def rebase_stale_runs(merged: Run | None, *, act, orc, runner, settings, repo: s
             if stats is not None:
                 stats["attempted"] = stats.get("attempted", 0) + 1
             if not _rebase_one(run, merged, new_head, act=act, orc=orc, runner=runner,
-                               settings=settings, workdir=workdir, state=state):
+                               settings=settings, workdir=workdir, state=state, repo=repo):
                 failed.append(run)
         except Exception as e:
             # class name only: a message may carry paths or command output
@@ -923,7 +1030,8 @@ def rebase_stale_runs(merged: Run | None, *, act, orc, runner, settings, repo: s
                 elif state["rebased"]:
                     _fail_stale(act, orc, run, settings,
                                 summary=f"stale after merge of {merged.id or 'an earlier merge'}: rebase bookkeeping failed",
-                                lessons=[f"rebase bookkeeping raised {type(e).__name__}"])
+                                lessons=[f"rebase bookkeeping raised {type(e).__name__}"],
+                                repo=repo, title=prop.title)
                     failed.append(run)
                 else:
                     _emit(act, run, "run.rebase_skipped", Severity.warning,

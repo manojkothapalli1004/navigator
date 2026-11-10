@@ -64,6 +64,7 @@ from navigator.observability.notify import format_verification
 from navigator.contracts.enums import (ApprovalDecision, ApprovalGate, ProposalStatus,
                                        RunPhase, RunStatus)
 from navigator.contracts.event import Event
+from navigator.runtime import repo_memory
 
 COMMANDS = ("status", "approve", "decline", "diff", "merge", "reject", "retry", "cleanup",
             "doctor", "audited", "inbox", "settings")
@@ -324,9 +325,31 @@ def _audited(act, args: list[str], out) -> int:
                                   "verified_sha": run.verified_sha}))
     grant = act.create_approval(target=run_id, gate=ApprovalGate.review)
     act.decide_approval(grant.id, ApprovalDecision.approved, actor=AUDITOR)
+    if note:
+        _remember_audit(act, run, note)
     print(f"{run_id} marked audited at {run.verified_sha[:12]} "
           f"(telegram /merge {run_id} is now accepted)", file=out)
     return 0
+
+
+def _remember_audit(act, run, note: str) -> None:
+    """Reviewer memory B1: file the audit note under the run's repo, tied to the proposal's files.
+    run_cli carries no Settings, so the switch and root are read from the environment only. Best
+    effort: any failure is one warning and the audit records above stand. An audit without --note
+    is never called here (nothing to remember)."""
+    try:
+        if not repo_memory.enabled(None):
+            return
+        prop = act.get_proposal(run.proposal_id)
+        files = list(prop.affected_files) if prop else []
+        repo_memory.remember(None, prop.repo if prop else None, kind="audit", run_id=run.id,
+                             proposal_id=run.proposal_id, text=note, files=files,
+                             affected_files=files, source=AUDITOR,
+                             verified_sha=run.verified_sha,
+                             base_sha=getattr(run, "base_commit_sha", None),
+                             title=prop.title if prop else None)
+    except Exception as e:
+        _log.warning("repo_memory.audit_skipped", run_id=run.id, error=type(e).__name__)
 
 
 # ---- inbox -------------------------------------------------------------------

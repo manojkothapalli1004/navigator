@@ -107,3 +107,11 @@ def test_new_decisions_fields_default_to_none_and_are_not_read_from_env():
     assert (s.digest_hour, s.decisions_nudges, s.decisions_tz) == (None, None, None)
     e = Settings.from_env()
     assert (e.digest_hour, e.decisions_nudges, e.decisions_tz) == (None, None, None)
+
+
+def test_repo_memory_fields_are_env_only():
+    # reviewer memory B1: the switch and the root are plumbing the document may not set
+    assert {"repo_memory", "repo_memory_root"} <= ENV_ONLY_FIELDS
+    new, rejected = Settings().overlay({"repo_memory": True, "repo_memory_root": "/x"})
+    assert new == Settings()
+    assert rejected == ["repo_memory: env-only", "repo_memory_root: env-only"]

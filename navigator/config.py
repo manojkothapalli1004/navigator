@@ -96,6 +96,13 @@ class Settings:
     # repair turns share one budget); requires builder_tools
     builder_tests: bool = False
     builder_test_runs: int = 5
+    # reviewer memory B1 (2026-11-09): per-repo memory log of declines (reason), failed attempts and
+    # audit notes, each tied to files, under <repo_memory_root>/<repo basename>.jsonl (outside the
+    # repos). Off by default. root None = runtime/repo_memory.root_for() falls back to
+    # NAVIGATOR_REPO_MEMORY_ROOT, then its DEFAULT_ROOT, at call time (never a literal baked in here).
+    # Both env-only: the CLI audit writer reads the env, so the document could not be the truth.
+    repo_memory: bool = False
+    repo_memory_root: str | None = None
     # U2a settings hot reload: decisions-inbox knobs settable from the UI document only (not
     # read from the environment). None = observability/decisions.py keeps reading its own env
     # variables; a later build makes decisions.py consult these.
@@ -152,6 +159,8 @@ class Settings:
             sdk_builder_timeout_s=_positive_float_env("NAVIGATOR_SDK_BUILDER_TIMEOUT_S", "900.0"),
             builder_tests=_bool_env("NAVIGATOR_BUILDER_TESTS", "0"),
             builder_test_runs=_positive_int_env("NAVIGATOR_BUILDER_TEST_RUNS", "5"),
+            repo_memory=_bool_env("NAVIGATOR_REPO_MEMORY", "0"),
+            repo_memory_root=os.getenv("NAVIGATOR_REPO_MEMORY_ROOT") or None,
         )
 
     def overlay(self, doc) -> tuple["Settings", list[str]]:
@@ -205,7 +214,7 @@ ENV_ONLY_FIELDS = frozenset({
     "max_tool_failures", "max_identical_failures", "max_run_duration_s", "max_cost_usd",
     "memory_chars_per_section", "command_timeout_s", "max_failed_tests", "repo", "repos",
     "lock_path", "outcome_path", "quota_pause_path", "sdk_model_fallbacks", "sdk_model_cooldown_s",
-    "rebase_per_tick",
+    "rebase_per_tick", "repo_memory", "repo_memory_root",
 })
 
 _HOT_BOOL_FIELDS = frozenset({"merge_in_dry_run", "operator_preapprove", "merge_tier_a_auto",
