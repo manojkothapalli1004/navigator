@@ -1,26 +1,43 @@
 <div align="center">
 
-# Veridian
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/banner-dark.svg">
+  <img alt="Veridian: plans, builds and verifies a change, then waits for you" src="docs/assets/banner-light.svg" width="100%">
+</picture>
 
-**An AI coding agent that plans, builds and verifies a change, then stops for a human decision.**
+<p>
+  <a href="docs/WALKTHROUGH.md"><strong>See one real run</strong></a>
+  &nbsp;·&nbsp;
+  <a href="#how-it-works">How it works</a>
+  &nbsp;·&nbsp;
+  <a href="#features">Safety gates</a>
+  &nbsp;·&nbsp;
+  <a href="#shadow-mode-results">Results</a>
+  &nbsp;·&nbsp;
+  <a href="#feedback-wanted">Give feedback</a>
+</p>
 
-![tests](https://img.shields.io/badge/tests-2490%2B%20passing-2ea44f)
-![python](https://img.shields.io/badge/python-3.12-3776ab)
-![status](https://img.shields.io/badge/status-preview-orange)
-![license](https://img.shields.io/badge/license-all%20rights%20reserved-lightgrey)
+![tests](https://img.shields.io/badge/tests-2700%2B%20passing-1f6f5c?style=flat-square)
+![python](https://img.shields.io/badge/python-3.12-1f6f5c?style=flat-square)
+![status](https://img.shields.io/badge/status-preview-b7791f?style=flat-square)
+![license](https://img.shields.io/badge/license-all%20rights%20reserved-56645e?style=flat-square)
 
 </div>
 
-(Working name. The code package is still named `navigator`.)
+**Veridian is an AI coding agent that plans, builds and verifies a change, then stops for a
+human decision.** It is built to be safe to leave running. (Working name; the code package is
+still named `navigator`.)
 
-Veridian is built to be safe to leave running. It never merges on its own by default
-(one opt-in exception for docs/tests-only changes), confines the builder to an isolated
-worktree, and has a fresh reviewer audit safety-relevant work before you see it.
-
-**See one real run, step by step:** [docs/WALKTHROUGH.md](docs/WALKTHROUGH.md)
+<table>
+<tr>
+<td width="33%" valign="top"><strong>Stops for you</strong><br><br>Nothing merges until you decide. The one opt-in exception is a docs-only or tests-only change.</td>
+<td width="33%" valign="top"><strong>Proves its tests</strong><br><br>New tests must fail on the old code, so a test that proves nothing can't get through.</td>
+<td width="33%" valign="top"><strong>Works in a sealed copy</strong><br><br>Each run gets its own git worktree and an argv-only command allowlist. Safety-relevant work gets a fresh reviewer.</td>
+</tr>
+</table>
 
 Source is visible for review and feedback during a short window. Please read [Status](#status)
-before judging it as a product. Screenshots: on request (the live console can show private chat).
+before judging it as a product.
 
 ## How it works
 
@@ -33,6 +50,8 @@ flowchart LR
     A --> C[Approval card]
     C -->|human merges| M[Merged]
     C -->|human rejects| X[Aborted<br/>worktree kept]
+    classDef you fill:#1f6f5c,stroke:#1f6f5c,color:#ffffff
+    class C,M you
 ```
 
 The conductor is the front door: one shared conversation, several ways in.
@@ -141,7 +160,8 @@ Running the daemon for real needs a Claude subscription or API key and an ACT in
    measure this? What repos or task types would make the numbers more convincing?
 4. **Safety holes:** where would you attack the allowlist, scope check or approval cards first?
 
-Open an issue, or comment wherever you found this. The repo is public for 48 hours.
+[Open a feedback issue](../../issues/new/choose) (there are short forms for general feedback
+and for safety holes), or comment wherever you found this. The repo is public until 13 November.
 
 ## License
 
@@ -155,5 +175,5 @@ distribute is granted. See [LICENSE.md](LICENSE.md).
 navigator/   config, cli, contracts/, clients/, safety/, runtime/, conductor/, checker/, observability/
 tests/       mirrors the package; tests/test_e2e.py drives the full operator journey
 deploy/      launchd plist templates
-docs/        RUNBOOK.md (operator runbook), WALKTHROUGH.md (one real run)
+docs/        RUNBOOK.md (operator runbook), WALKTHROUGH.md (one real run), assets/ (banner)
 ```

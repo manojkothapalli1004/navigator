@@ -1,0 +1,29 @@
+name: Feedback
+description: What works, what doesn't, and what would make you trust an agent like this
+labels: ["feedback"]
+body:
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Gates and approvals
+        - Self-checks and verification
+        - Evaluation (the shadow replays)
+        - Something else
+    validations:
+      required: true
+  - type: textarea
+    id: feedback
+    attributes:
+      label: Your feedback
+      description: Short is fine. Concrete examples help most.
+    validations:
+      required: true
+  - type: textarea
+    id: looked-at
+    attributes:
+      label: What did you look at?
+      description: The walkthrough, the README, a file or module, the tests.
+    validations:
+      required: false

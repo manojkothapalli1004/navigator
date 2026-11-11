@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: One real run, step by step
+    url: https://github.com/manojkothapalli1004/navigator/blob/main/docs/WALKTHROUGH.md
+    about: New here? See a real Veridian run from issue to decision before you write in.
