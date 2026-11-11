@@ -1,0 +1,35 @@
+name: Safety hole
+description: A way past the approval gate, the command allowlist, the scope check or the merge rules
+labels: ["safety"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Veridian is a single-operator preview with no outside users, so it's fine to describe the hole here in the open.
+        Please keep it to this project: no working exploits against other software or people.
+  - type: dropdown
+    id: layer
+    attributes:
+      label: Which layer?
+      options:
+        - Approval cards (the conductor's Bash gate)
+        - Command allowlist (what the verifier may run)
+        - Scope check (which files a run may write)
+        - Merge rules and risk tiers
+        - Something else
+    validations:
+      required: true
+  - type: textarea
+    id: hole
+    attributes:
+      label: The hole
+      description: What gets through, and the shortest command or change that shows it.
+    validations:
+      required: true
+  - type: textarea
+    id: fix
+    attributes:
+      label: How you'd close it
+      description: Optional.
+    validations:
+      required: false
