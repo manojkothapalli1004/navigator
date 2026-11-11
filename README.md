@@ -11,7 +11,7 @@
 
 </div>
 
-(The code package is still named `navigator`.)
+(Working name. The code package is still named `navigator`.)
 
 Nav is built to be safe to leave running. It never merges on its own by default
 (one opt-in exception for docs/tests-only changes), confines the builder to an isolated
