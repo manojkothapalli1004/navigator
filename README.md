@@ -1,6 +1,6 @@
 <div align="center">
 
-# Nav
+# Veridian
 
 **An AI coding agent that plans, builds and verifies a change, then stops for a human decision.**
 
@@ -13,7 +13,7 @@
 
 (Working name. The code package is still named `navigator`.)
 
-Nav is built to be safe to leave running. It never merges on its own by default
+Veridian is built to be safe to leave running. It never merges on its own by default
 (one opt-in exception for docs/tests-only changes), confines the builder to an isolated
 worktree, and has a fresh reviewer audit safety-relevant work before you see it.
 
@@ -67,7 +67,7 @@ A concrete example: "`parse_config` crashes on an empty file."
 | Area | What it does |
 | --- | --- |
 | Gates | Two human decisions: approve the proposal, then approve the merge |
-| Risk tiers | **A** tests/docs, **B** everything else, **C** money, auth, secrets, migrations, dependencies and Nav's own safety code. Unknown is stricter |
+| Risk tiers | **A** tests/docs, **B** everything else, **C** money, auth, secrets, migrations, dependencies and Veridian's own safety code. Unknown is stricter |
 | Scope | Builder may only write files the approved proposal names, inside a per-run worktree |
 | Commands | Argv-only allowlist: no shell, no metacharacters, no absolute paths. Confinement by allowlist, **not** an OS sandbox |
 | Self-checks | Tests run; new tests must fail on the base commit; empty diffs fail |
@@ -96,7 +96,7 @@ A concrete example: "`parse_config` crashes on an empty file."
 
 ## Shadow-mode results
 
-Nav replayed real historical bug fixes from the public
+Veridian replayed real historical bug fixes from the public
 [more-itertools](https://github.com/more-itertools/more-itertools) repo. It saw the issue text
 at the parent commit, never merged or pushed, and was scored against upstream tests it could not see.
 
@@ -105,7 +105,7 @@ at the parent commit, never merged or pushed, and was scored against upstream te
 | Distinct replays (more-itertools) | 19 |
 | Correct | **15 of 19** |
 | Misses from ambiguous issue text | 2 (only the hidden upstream tests could see the expected behaviour) |
-| Honest fails | 2 (Nav's own checks failed and it rolled back) |
+| Honest fails | 2 (Veridian's own checks failed and it rolled back) |
 | Broken work passed that its own checks could have caught | 0 |
 | Fix size | In several replays the source change was identical or near-identical to the upstream fix; after tuning, tests go into the existing test file |
 
@@ -143,7 +143,7 @@ Open an issue, or comment wherever you found this. The repo is public for 48 hou
 
 ## License
 
-Copyright (c) 2026 Manoj Kothapalli. All rights reserved. Nav is a product, not open
+Copyright (c) 2026 Manoj Kothapalli. All rights reserved. Veridian is a product, not open
 source. Source is visible for review and feedback only; no license to use, copy, modify or
 distribute is granted. See [LICENSE.md](LICENSE.md).
 
