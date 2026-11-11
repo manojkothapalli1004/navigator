@@ -515,7 +515,7 @@ def test_build_card_double_tap(tmp_path, monkeypatch):
 def test_model_cannot_approve(tmp_path, monkeypatch):
     from navigator.conductor import tools
     from navigator.contracts.enums import ProposalStatus
-    assert tools.TOOL_NAMES == ["delegate", "helpers", "cancel_helper"]
+    assert tools.TOOL_NAMES == ["delegate", "helpers", "cancel_helper", "restart"]
     tools.make_conductor_server(FakeHelpers(), None)  # builds with the array schema; exposes no approve tool
 
     async def body(c, eng, cards, act, bs, helpers, app, clock, pid, card):
