@@ -1,195 +1,157 @@
-# Navigator
+<div align="center">
 
-Navigator is a **stateless executor** for the ORC/ACT stack. ORC is the brain (canonical
-memory, decisions); ACT is durable truth + the operator console. Navigator **perceives**
-(ORC memory + ACT agent resource + git state), **proposes** work into ACT, **executes**
-operator-approved proposals inside per-run git worktrees with native-commit checkpoints,
-**gates merges** behind operator approval, and writes **outcomes** back to ORC.
+# Veridian
 
-No YOLO, no auto-merge, no general shell. Every change reaches your branch only through two
-explicit operator decisions: approve the proposal, then approve the merge.
+**An AI coding agent that plans, builds and verifies a change, then stops for a human decision.**
 
-## Lifecycle
+![tests](https://img.shields.io/badge/tests-2490%2B%20passing-2ea44f)
+![python](https://img.shields.io/badge/python-3.12-3776ab)
+![status](https://img.shields.io/badge/status-preview-orange)
+![license](https://img.shields.io/badge/license-all%20rights%20reserved-lightgrey)
 
+</div>
+
+(Working name. The code package is still named `navigator`.)
+
+Veridian is built to be safe to leave running. It never merges on its own by default
+(one opt-in exception for docs/tests-only changes), confines the builder to an isolated
+worktree, and has a fresh reviewer audit safety-relevant work before you see it.
+
+Source is visible for review and feedback during a short window. Please read [Status](#status)
+before judging it as a product. Screenshots: on request (the live console can show private chat).
+
+## How it works
+
+```mermaid
+flowchart LR
+    P[Proposal] -->|human approves| PL[Plan]
+    PL --> B["Build<br/>isolated worktree"]
+    B --> V["Verify<br/>tests, full suite,<br/>exercise check"]
+    V --> A[Cold audit<br/>fresh session]
+    A --> C[Approval card]
+    C -->|human merges| M[Merged]
+    C -->|human rejects| X[Aborted<br/>worktree kept]
 ```
-planner proposes ──► proposal (proposed) ──approve──► run: build → verify ──► awaiting_review
-                         │ expires after 7 days                │ fails → worktree preserved
-                         └─ decline                            ├─ merge  → merged into target branch
-                                                               └─ reject → aborted, worktree kept
+
+The conductor is the front door: one shared conversation, several ways in.
+
+```mermaid
+flowchart LR
+    W[Web] --> S
+    T[Telegram] --> S
+    TM[Terminal] --> S
+    S[Shared chat] --> H["Helpers<br/>short-lived sessions"]
+    H --> K[Cards]
+    K -->|approved once| D[Daemon pipeline]
 ```
 
-Each daemon cycle (default every 15 min): expire stale proposals → plan (skipped while
-`NAVIGATOR_MAX_OPEN_PROPOSALS` are open) → execute approved proposals → act on merge decisions.
+## How a change flows
 
-## Operator commands
+A concrete example: "`parse_config` crashes on an empty file."
+
+1. The planner reads the repo and files a **proposal**: title, affected files
+   (`config.py`, `tests/test_config.py`) and a rationale. It sees about three at a time.
+2. You approve it from the web page, Telegram or the CLI. Nothing has been written yet.
+3. The builder creates a **per-run git worktree** and writes only the files the proposal names,
+   with a checkpoint commit per phase.
+4. The verifier runs the allowlisted test commands. The new test is also run against the base
+   commit and must **fail** there, so it proves it exercises the fix.
+5. The full suite runs, and empty diffs count as failures.
+6. Because the change touches code, a **cold audit** by a fresh session re-reviews the diff.
+   Findings are fixed before the run is offered to you.
+7. You get an **approval card** showing the diff, risk tier (here B) and verification result.
+8. You merge it, or reject it. Rejection keeps the worktree for inspection.
+
+## Features
+
+| Area | What it does |
+| --- | --- |
+| Gates | Two human decisions: approve the proposal, then approve the merge |
+| Risk tiers | **A** tests/docs, **B** everything else, **C** money, auth, secrets, migrations, dependencies and Veridian's own safety code. Unknown is stricter |
+| Scope | Builder may only write files the approved proposal names, inside a per-run worktree |
+| Commands | Argv-only allowlist: no shell, no metacharacters, no absolute paths. Confinement by allowlist, **not** an OS sandbox |
+| Self-checks | Tests run; new tests must fail on the base commit; empty diffs fail |
+| Approval cards | Gated actions (merge, push, rebase, settings edits, costly builds) are denied until one card for that exact call is approved. It covers one call and expires |
+| Cold audits | Safety-relevant changes are re-reviewed by a session that did not write them |
+| Budget | Per-run duration, failed-test and tool-failure limits; dollar budget checked before each LLM call; capped daily credits fallback, only after a probe confirms the subscription is exhausted |
+| Tier-A auto-merge | Opt-in (`NAVIGATOR_MERGE_TIER_A_AUTO=1`), off by default; tests/docs-only changes with green verification |
+
+## Components
+
+1. **Daemon pipeline** (`navigator/runtime`). Each cycle: expire stale proposals, plan,
+   execute approved work, act on merge decisions. A *planner* proposes work, a *builder*
+   writes it in a worktree with a checkpoint commit per phase, a *verifier* runs the allowlisted
+   tests and checks. Failed runs keep their worktree for inspection. Proposals are ranked so the
+   operator sees about three at a time.
+2. **Conductor** (`navigator/conductor`). One shared conversation reachable from a web page,
+   Telegram or your own terminal (the terminal joins the same session). It holds the gate,
+   approval cards, build filing (it files specs with the daemon but never merges or declines),
+   optional autopilot through a plan file (off by default, capped, quiet hours) and the credits fallback.
+3. **Helpers** (`conductor/helpers.py`). The conversation turn only talks and delegates;
+   long work (builds, audits) runs as separate short-lived sessions on a cheaper model with a
+   write fence, and each reports back as a message. A registry survives restarts so lost helpers
+   are reported.
+4. **Site checker** (`navigator/checker`). Drives a browser through a web console, records
+   faults and files fixes as proposals into the same gated pipeline.
+
+## Shadow-mode results
+
+Veridian replayed real historical bug fixes from the public
+[more-itertools](https://github.com/more-itertools/more-itertools) repo. It saw the issue text
+at the parent commit, never merged or pushed, and was scored against upstream tests it could not see.
+
+| Measure | Result |
+| --- | --- |
+| Distinct replays (more-itertools) | 19 |
+| Correct | **15 of 19** |
+| Misses from ambiguous issue text | 2 (only the hidden upstream tests could see the expected behaviour) |
+| Honest fails | 2 (Veridian's own checks failed and it rolled back) |
+| Broken work passed that its own checks could have caught | 0 |
+| Fix size | In several replays the source change was identical or near-identical to the upstream fix; after tuning, tests go into the existing test file |
+
+Caveats: small sample, one repository, a library with a fast and strong test suite, and the
+tuning happened on the same replays it was then re-run on. Treat this as a smoke signal, not a benchmark.
+
+## Status
+
+A personal project with a single operator, built for macOS and run under launchd. Several
+paths and service labels are hard-coded to that setup. **Not production-ready**: no multi-user
+model, no OS-level sandbox, and APIs and file formats change without notice.
+
+## Running the tests
 
 ```bash
-cd ~/calwbot/navigator
-.venv/bin/python -m navigator status            # open proposals, approved work, open runs
-.venv/bin/python -m navigator approve <proposal_id>
-.venv/bin/python -m navigator decline <proposal_id>
-.venv/bin/python -m navigator diff    <run_id>  # review a run parked at the merge gate
-.venv/bin/python -m navigator merge   <run_id>  # applied on the daemon's next cycle
-.venv/bin/python -m navigator reject  <run_id>
-.venv/bin/python -m navigator retry   <proposal_id>  # one more run after a failure
+uv sync --extra sdk
+uv run pytest -q     # deterministic: no network, no API key, fake ACT and fake LLM
 ```
 
-Commands talk to ACT (`NAVIGATOR_ACT_BASE_URL`, default `http://127.0.0.1:8090`). The daemon
-acts on recorded decisions; with Telegram configured it messages you when a run is ready for
-review, fails, is merged, or when cycles keep failing.
+Running the daemon for real needs a Claude subscription or API key and an ACT instance; see
+[docs/RUNBOOK.md](docs/RUNBOOK.md) (operator commands, Telegram reader, configuration) and
+`navigator.toml.example`. The code default is the safe profile: fake driver + dry run.
 
-## Safety model
+## Feedback wanted
 
-- **Gates** (`safety/approval_engine.py`): execution requires an approved proposal (review
-  gate); merging requires an approved merge approval. Architecture/destructive/budget/deploy
-  gates are schema-only and raise `GateNotImplemented`.
-- **Scope**: the builder may only write the files the approved proposal names
-  (`affected_files`); writes are confined to the run's worktree.
-- **Command runner** (`safety/command_runner.py`): argv-only allowlist (no shell, no
-  metacharacters, no absolute paths, exact safe-flag set for git). A rejected command is a
-  verification failure. This is allowlist confinement, **not** an OS sandbox.
-- **Circuit breakers**: run duration, failed-test count, tool failures. **Budget guard**: checked
-  before every LLM call, per run.
-- **Merge preflight**: the main checkout must be on the run's target branch with no tracked
-  edits, otherwise the run stays parked (`run.merge_blocked`). A conflicting merge is aborted,
-  leaving the checkout clean, and fails the run.
-- **Restart safety**: runs parked at the merge gate survive daemon restarts; runs interrupted
-  mid-build are aborted with their worktree preserved.
-- Subagent sessions run with `allowed_tools=[]` and `setting_sources=[]`: the model only sees
-  what Navigator hands it (proposal, affected file contents, allowlist) and only returns JSON.
+1. **Gates:** are "two human decisions" plus risk tiers the right amount of friction? What would
+   make you trust an agent enough to turn on tier-A auto-merge, or not?
+2. **Verification:** the "new tests must fail on the base commit" check is meant to catch fake
+   tests. What other cheap self-checks would you add?
+3. **Evaluation:** is replaying historical fixes against hidden upstream tests a fair way to
+   measure this? What repos or task types would make the numbers more convincing?
+4. **Safety holes:** where would you attack the allowlist, scope check or approval cards first?
 
-## Running
+Open an issue, or comment wherever you found this. The repo is public for 48 hours.
 
-```bash
-uv sync --extra sdk                 # claude-agent-sdk >= 0.2.165 (uv.lock pins it)
-.venv/bin/python -m navigator --once        # one cycle, JSON summary on stdout
-.venv/bin/python -m navigator               # daemon: one JSON line per cycle on stdout
-```
+## License
 
-Deployed as launchd `com.calwbot.navigator` (template: `deploy/launchd/`). Restart with
-`launchctl kickstart -k gui/$(id -u)/com.calwbot.navigator`. Structured logs go to stderr.
-
-## Telegram reader operations
-
-Two launchd services share one bot:
-
-- `com.calwbot.navigator` - the daemon (`python -m navigator`). It polls Telegram
-  `getUpdates` only when `NAVIGATOR_TELEGRAM_COMMANDS=1`.
-- `com.calwbot.navigator-telegram` - the always-on reader (`python -m navigator
-  telegram-reader`, template `deploy/launchd/com.calwbot.navigator-telegram.plist.example`).
-  It long-polls `getUpdates` continuously and answers status / approve / decline / merge
-  at once instead of once per daemon cycle.
-
-Telegram allows **one `getUpdates` consumer per bot token**. While the reader runs, keep
-`NAVIGATOR_TELEGRAM_COMMANDS` unset (or `0`) on the daemon; the reader plist example sets no
-such key at all. Never run two consumers.
-
-### Reader refusals (exit 2)
-
-The reader prints one line on stderr and exits 2 when it must not start:
-
-- `refusing to start - NAVIGATOR_TELEGRAM_COMMANDS=1 makes the daemon poll getUpdates and
-  Telegram allows one consumer per bot; unset it to run the reader` - the variable is set in
-  the reader's own environment; remove it from the reader plist.
-- `no Telegram credentials (NAVIGATOR_TELEGRAM_BOT_TOKEN + NAVIGATOR_TELEGRAM_CHAT_ID or
-  NAVIGATOR_NOTIFY_ENV_FILE)` - point `NAVIGATOR_NOTIFY_ENV_FILE` at the env file holding
-  `TELEGRAM_BOT_TOKEN` / `AUTHORIZED_CHAT_ID`, or set the two variables directly.
-- `refusing to start - another telegram-reader is running (lock <path>); Telegram allows one
-  getUpdates consumer per bot` - a live process holds the reader lock. A lock left by a dead
-  process is reclaimed automatically; a lock held by a live reader means you already have one.
-
-### Environment
-
-| Variable | Meaning | Default |
-|---|---|---|
-| `NAVIGATOR_NOTIFY_ENV_FILE` | env file with `TELEGRAM_BOT_TOKEN` and `AUTHORIZED_CHAT_ID` | none |
-| `NAVIGATOR_TELEGRAM_BOT_TOKEN` + `NAVIGATOR_TELEGRAM_CHAT_ID` | credentials set directly (take precedence over the env file) | none |
-| `NAVIGATOR_ACT_BASE_URL` | ACT the reader records decisions in | `http://127.0.0.1:8090` |
-| `NAVIGATOR_TELEGRAM_OFFSET_PATH` | persisted `getUpdates` offset | `/Users/Manoj/calwbot/logs/navigator/telegram_offset` (`DEFAULT_OFFSET_PATH` in `navigator/observability/telegram_inbox.py`) |
-| `NAVIGATOR_TELEGRAM_INBOX_PATH` | JSONL inbox of operator messages | `/Users/Manoj/calwbot/logs/navigator/telegram_inbox.jsonl` (`DEFAULT_INBOX_PATH` in `navigator/observability/telegram_inbox.py`) |
-| `NAVIGATOR_TELEGRAM_READER_LOCK` | single-flight lock of the reader | `<offset path>.reader.lock`, i.e. `/Users/Manoj/calwbot/logs/navigator/telegram_offset.reader.lock` |
-
-The offset and inbox defaults are the absolute `DEFAULT_OFFSET_PATH` and
-`DEFAULT_INBOX_PATH` constants in `navigator/observability/telegram_inbox.py`; they do not
-depend on the plist's `WorkingDirectory`.
-
-**Warning:** the daemon (`make_telegram_inbox`), the reader and `navigator inbox` all fall
-back to the same two constants. If you override `NAVIGATOR_TELEGRAM_OFFSET_PATH` or
-`NAVIGATOR_TELEGRAM_INBOX_PATH`, set the SAME values in the daemon plist, in the reader
-plist and in the shell that runs `navigator inbox` - override all three together or none.
-A reader writing one inbox file while `navigator inbox` reads another silently loses
-messages; two offset files mean replayed or skipped updates.
-
-### 409 Conflict
-
-`TelegramError: another Telegram getUpdates consumer is active` in the reader log means a
-second consumer is polling the same bot token. The reader already copes: it retries every
-30 s and sends you at most one Telegram notice per hour per error kind, so there is nothing
-to restart. The fix is to find and stop the other consumer: the daemon with
-`NAVIGATOR_TELEGRAM_COMMANDS=1`, a second reader on another machine or checkout, a
-notebook or shell calling `getUpdates` by hand. Once it stops, the next retry succeeds.
-
-### Log files
-
-The reader logs to whatever `StandardOutPath` / `StandardErrorPath` its plist sets. The
-example uses `logs/navigator/telegram-reader.out.log` and
-`logs/navigator/telegram-reader.err.log` under the repo
-(`/Users/YOU/calwbot/logs/navigator/`). Structured warnings
-(`telegram_reader.poll_failed`, `telegram_reader.handle_failed`) go to stderr and name
-exceptions by class only: the `getUpdates` URL carries the bot token.
-
-### doctor
-
-`navigator doctor` checks only the daemon plist (`~/Library/LaunchAgents/com.calwbot.navigator.plist`,
-or the path given with `--plist`), not the reader's. Verify the reader plist by hand:
-`plutil -lint` it, then read its log after `launchctl bootstrap`.
-
-### Restart and rollback
-
-```bash
-# code-only change (no plist edit): restart in place
-launchctl kickstart -k gui/$(id -u)/com.calwbot.navigator-telegram
-
-# after ANY plist edit: launchd caches the plist, so unload and load it again
-launchctl bootout gui/$(id -u)/com.calwbot.navigator-telegram
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.calwbot.navigator-telegram.plist
-```
-
-The same two forms apply to the daemon label `com.calwbot.navigator`.
-
-Rollback to daemon-only polling, in this order:
-
-1. `launchctl bootout gui/$(id -u)/com.calwbot.navigator-telegram` - stop the reader first.
-2. Optionally set `NAVIGATOR_TELEGRAM_COMMANDS=1` in the daemon plist and `bootout` +
-   `bootstrap` the daemon so it polls `/merge` and `/reject` itself once per cycle.
-
-Never the reverse order and never both at once: two consumers mean 409 for both.
-
-## Configuration
-
-All settings are `NAVIGATOR_*` environment variables read by `Settings.from_env()`; see
-`navigator.toml.example` for every variable and its default. The code default is the safe
-profile `fake` driver + `dry_run`. The live deployment uses `claude_sdk` with
-`NAVIGATOR_SDK_MODEL=claude-opus-5-5`.
-
-## Develop / test
-
-```bash
-uv run pytest -q          # deterministic: no network, no API key, fake ACT + fake LLM
-```
+Copyright (c) 2026 Manoj Kothapalli. All rights reserved. Veridian is a product, not open
+source. Source is visible for review and feedback only; no license to use, copy, modify or
+distribute is granted. See [LICENSE.md](LICENSE.md).
 
 ## Layout
 
 ```
-navigator/        config, cli, contracts/, clients/, safety/, runtime/, observability/
-tests/            mirrors the package; tests/test_e2e.py drives the full operator journey
-act-patch/        ACT agent-resource patch (applied to ACT 2026-07-02) + apply README
-deploy/launchd/   daemon + Telegram reader plist templates
-KNOWN_FOLLOWUPS.md       resolved + remaining work
+navigator/   config, cli, contracts/, clients/, safety/, runtime/, conductor/, checker/, observability/
+tests/       mirrors the package; tests/test_e2e.py drives the full operator journey
+deploy/      launchd plist templates
+docs/        RUNBOOK.md (operator runbook)
 ```
-
-## Not built yet (v1+)
-
-Curator · ACT SSE/event push (polling is used) · ACT-backed lease (local single-flight lock is
-used) · gates beyond review+merge · memory-trust tagging (needs ORC HTTP support) · general
-shell (needs a real OS sandbox first).

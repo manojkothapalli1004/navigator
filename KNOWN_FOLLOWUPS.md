@@ -31,8 +31,7 @@ Each fixed via TDD (failing test first). Suite 46 → 63 tests.
 Found by the first live execute-mode run and a spec-vs-code audit. Each fixed test-first.
 
 - **Outage masking** (`drivers/sdk_query.py`): failed SDK sessions surfaced only as
-  `error result: success`; 216 cycles (2026-08-25 → 10-09) failed on "Usage credits are
-  required" for Fable. The real `ResultMessage.result` text is now raised; billing and
+  `error result: success`. The real `ResultMessage.result` text is now raised; billing and
   model-support errors are not retried. Model → `claude-opus-5-5`; SDK ≥ 0.2.165 (lock-pinned).
 - **Proposal spam** (`runtime/loop.py`): planner saw only proposal ids → 142 open duplicates.
   It now sees open titles, recent commits and the tracked file list; normalized-title dedup;
