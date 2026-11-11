@@ -12,6 +12,7 @@ import threading
 import time
 from pathlib import Path, PurePosixPath
 
+from navigator import ledger as _ledger_mod
 from navigator.checker.filing import ACT_REPO
 from navigator.conductor.activity import _SECRET
 from navigator.conductor.cards import _est, card_cap_usd
@@ -175,7 +176,7 @@ def file_build(act, project: str, title: str, task: str, files=(), base_sha_fn=_
 
 class Builds:
     def __init__(self, path, act, settings=None, on_finish=None, base_sha_fn=_head_sha, loop=None,
-                 on_needs_approval=None, est_cost_usd=None):
+                 on_needs_approval=None, est_cost_usd=None, ledger=None):
         self.est_cost_usd = est_cost_usd  # Navigator's per-run cap: an upper bound shown on the build card
         self.path = Path(path)
         self.act = act
@@ -185,6 +186,7 @@ class Builds:
         self.base_sha_fn = base_sha_fn
         self.loop = loop
         self.current_via: str | None = None  # set by the engine at each turn start
+        self._ledger = ledger if ledger is not None else _ledger_mod.append  # rec -> None; append never raises
         self._lock = threading.RLock()
         self._records: list[dict] = self._load()
 
@@ -294,6 +296,7 @@ class Builds:
         with self._lock:  # persisted BEFORE approving: a crash after approval must not leave it unwatched
             self._records.append(rec)
             self._save()
+            self._ledger_line(rec, None)
         if tier1:
             try:
                 self.act.set_proposal_status(p.id, ProposalStatus.approved)
@@ -359,7 +362,27 @@ class Builds:
                 if rec is not None:
                     self._apply(rec, p, run)
 
+    def _ledger_line(self, rec: dict, prev) -> None:
+        """One completion-ledger line for a state change (append-only, swallowed on failure)."""
+        try:
+            self._ledger({"v": 1, "kind": "build", "id": rec["proposal_id"],
+                          "title": _ledger_mod.scrub(rec.get("title"), _ledger_mod.TITLE_CHARS),
+                          "state": rec.get("state"), "prev": prev, "ts": time.time(),
+                          "project": rec.get("project"),
+                          "files": [_ledger_mod.scrub(f, _ledger_mod.FILE_CHARS)
+                                    for f in (rec.get("files") or [])[:_ledger_mod.MAX_FILES]]})
+        except Exception as e:  # noqa: BLE001
+            log.warning("conductor.build_ledger_failed: %s", type(e).__name__)
+
     def _apply(self, rec: dict, p: Proposal, run) -> None:
+        prev = rec.get("state")
+        try:
+            self._apply_state(rec, p, run)
+        finally:
+            if rec.get("state") != prev:  # poll re-applies the same state every minute: only a change is a line
+                self._ledger_line(rec, prev)
+
+    def _apply_state(self, rec: dict, p: Proposal, run) -> None:
         pid, seen = rec["proposal_id"], rec["reported"]
         title = rec["title"]
 

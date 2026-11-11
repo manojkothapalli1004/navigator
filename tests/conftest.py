@@ -44,3 +44,13 @@ def _isolate_repo_memory(tmp_path, monkeypatch):
     monkeypatch.setenv("NAVIGATOR_REPO_MEMORY_ROOT", str(tmp_path / "_repo_memory"))
     monkeypatch.setattr(repo_memory, "DEFAULT_ROOT", str(tmp_path / "_repo_memory_default"))
     yield
+
+
+@pytest.fixture(autouse=True)
+def _isolate_navigator_ledger(tmp_path, monkeypatch):
+    """No test may append to the real completion ledger (/Users/Manoj/calwbot/logs/navigator). Same rule as
+    the credits fixture above: live state is never touched by a test."""
+    from navigator import ledger
+    monkeypatch.setattr(ledger, "PATH", tmp_path / "_ledger.jsonl")
+    monkeypatch.delenv("CONDUCTOR_LEDGER", raising=False)
+    yield

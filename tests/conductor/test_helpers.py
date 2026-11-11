@@ -341,8 +341,10 @@ def test_helper_result_is_last_text_block(monkeypatch):
     events = []
     out = asyncio.run(H.sdk_helper(TASK, "helper-1", events.append, hook=_hook))
     assert out == "REPORT" and FakeClient.prompts == [TASK]
-    assert events == [{"type": "activity", "id": "t1", "tool": "Read", "title": "Reading b.py", "state": "running",
-                       "parent": None, "helper": False}]
+    assert events[0] == {"type": "ledger_step", "tool": "Read", "file": None, "cmd": None}  # Read is not a write
+    assert events[1:-1] == [{"type": "activity", "id": "t1", "tool": "Read", "title": "Reading b.py",
+                             "state": "running", "parent": None, "helper": False}]
+    assert events[-1]["type"] == "ledger_cost"
     o = FakeClient.seen_options
     assert o.resume is None and o.continue_conversation is False
     assert o.model == H.HELPER_MODEL and set(H.HELPER_TOOLS) <= set(o.tools) and o.max_turns == H.HELPER_MAX_TURNS
@@ -1273,3 +1275,113 @@ def test_credits_helper_records_exactly_its_reservation(monkeypatch):
     f.install(monkeypatch, [[_start(), _delta("ok"), _result()]])
     asyncio.run(H.sdk_helper(TASK, "helper-1", lambda e: None, hook=_hook))
     assert [r.id for _, r in f.recorded] == ["r1"]
+
+
+# ---- completion ledger (2026-11-09): every ledger sink here is a list; nothing reaches the real file ----
+
+def _ledgered(tmp_path, runner, sink, **kw):
+    seen = kw.pop("seen", None)
+    return _helpers(tmp_path, runner, ledger=sink.append,
+                    ledger_seen=(lambda: {r["id"] for r in sink}) if seen is None else seen, **kw)
+
+
+class Stepper:
+    def __init__(self, result="done\nUNVERIFIED: a claim\n", raise_exc=None, gate=None):
+        self.result, self.raise_exc, self.gate = result, raise_exc, gate
+
+    async def __call__(self, task, helper_id, emit, exact=None):
+        emit({"type": "ledger_step", "tool": "Read", "file": None, "cmd": None})
+        emit({"type": "activity", "id": "1", "tool": "Read", "title": "Read x", "state": "running"})
+        emit({"type": "ledger_step", "tool": "Edit", "file": "/w/a.py", "cmd": None})
+        emit({"type": "ledger_step", "tool": "Write", "file": "/w/b.py", "cmd": None})
+        emit({"type": "ledger_step", "tool": "Bash", "file": None, "cmd": "pytest -q tests/"})
+        emit({"type": "ledger_cost", "usd": 0.25})
+        if self.gate is not None:
+            await self.gate.wait()
+        if self.raise_exc:
+            raise self.raise_exc
+        return self.result
+
+
+@aio
+async def test_done_helper_writes_one_ledger_record(tmp_path):
+    sink = []
+    hs = _ledgered(tmp_path, Stepper(), sink)
+    rec = hs.start("t", TASK)
+    await _settle(20)
+    assert len(sink) == 1
+    r = sink[0]
+    assert r["id"] == rec["id"] and r["kind"] == "helper" and r["state"] == "done" and r["v"] == 1
+    assert r["tools"] == {"Read": 1, "Edit": 1, "Write": 1, "Bash": 1}
+    assert r["files"] == ["/w/a.py", "/w/b.py"] and r["commands"] == ["pytest -q tests/"]
+    assert r["cost_usd"] == 0.25 and r["unverified"] == 1
+    assert "task" not in r and "result" not in r
+
+
+@aio
+async def test_failed_cancelled_timeout_each_write_one_record(tmp_path, monkeypatch):
+    sink = []
+    hs = _ledgered(tmp_path, Stepper(raise_exc=RuntimeError("boom")), sink)
+    hs.start("f", TASK)
+    await _settle(20)
+    gate = asyncio.Event()
+    hs2 = _ledgered(tmp_path / "b", Stepper(gate=gate), sink)
+    r2 = hs2.start("c", TASK)
+    await _settle(5)
+    hs2.cancel(r2["id"])
+    await _settle(20)
+    monkeypatch.setattr(H, "HELPER_TIMEOUT_S", 0.05)
+    hs3 = _ledgered(tmp_path / "c", Stepper(gate=asyncio.Event()), sink)
+    hs3.start("t", TASK)
+    await _settle(60)
+    assert sorted(r["state"] for r in sink) == ["cancelled", "failed", "failed"]
+    n = len(sink)
+    for h in (hs, hs2, hs3):
+        for rec in list(h._records):
+            h._end(rec, "failed")  # a second end writes nothing
+    assert len(sink) == n
+
+
+@aio
+async def test_ledger_events_never_reach_on_event(tmp_path):
+    sink, events = [], []
+    hs = _ledgered(tmp_path, Stepper(), sink, events=events)
+    hs.start("t", TASK)
+    await _settle(20)
+    assert events and all(ev["type"] == "activity" for _h, ev in events)
+
+
+@aio
+async def test_ledger_failure_does_not_stop_finish_or_queue(tmp_path):
+    finished = []
+
+    def boom(rec):
+        raise OSError("disk")
+    hs = _helpers(tmp_path, Stepper(), finished, max_running=1, ledger=boom, ledger_seen=lambda: set())
+    hs.start("a", TASK)
+    hs.start("b", TASK)
+    await _settle(60)
+    assert [r["state"] for r in finished] == ["done", "done"]
+
+
+@aio
+async def test_mark_lost_and_shutdown_write_lost_once(tmp_path):
+    sink = []
+    gate = asyncio.Event()
+    hs = _ledgered(tmp_path, Stepper(gate=gate), sink)
+    a = hs.start("a", TASK)
+    await _settle(5)
+    hs.shutdown()  # in memory only; the file still says running
+    await _settle(5)
+    assert [(r["id"], r["state"]) for r in sink] == [(a["id"], "lost")]
+    assert sink[0]["tools"]["Edit"] == 1
+    hs2 = _ledgered(tmp_path, Recorder(), sink)  # restart: the id already has a line
+    assert [r["id"] for r in hs2.mark_lost()] == [a["id"]]
+    assert len(sink) == 1
+    # a helper killed with no line at all gets one, once
+    (tmp_path / "helpers.json").write_text(json.dumps({"helpers": [
+        {"id": "helper-zz", "title": "z", "state": "running", "started": 1.0}]}))
+    hs3 = _ledgered(tmp_path, Recorder(), sink)
+    hs3.mark_lost()
+    hs3.mark_lost()
+    assert [r["id"] for r in sink].count("helper-zz") == 1 and sink[-1]["state"] == "lost"
