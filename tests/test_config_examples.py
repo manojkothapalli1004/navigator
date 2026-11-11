@@ -9,7 +9,7 @@ document them for operators:
   EnvironmentVariables dict is what a deployed daemon actually runs with.
 * deploy/launchd/com.calwbot.navigator-telegram.plist.example: the always-on
   Telegram reader's launchd template.
-* README.md '## Telegram reader operations': the runbook. Its default paths are
+* docs/RUNBOOK.md '## Telegram reader operations' (moved out of README.md 2026-11-11): the runbook. Its default paths are
   checked against the DEFAULT_* constants in telegram_inbox.py so they cannot drift.
 
 If a key is misspelled in the plist, launchd silently runs on the code default.
@@ -32,6 +32,7 @@ TOML_EXAMPLE = ROOT / "navigator.toml.example"
 PLIST_EXAMPLE = ROOT / "deploy" / "launchd" / "com.navigator.plist.example"
 READER_PLIST_EXAMPLE = ROOT / "deploy" / "launchd" / "com.calwbot.navigator-telegram.plist.example"
 README = ROOT / "README.md"
+RUNBOOK = ROOT / "docs" / "RUNBOOK.md"  # the reader runbook moved here with the README rewrite (913f913)
 READER_SECTION = "## Telegram reader operations"
 PACKAGE_DIR = ROOT / "navigator"
 
@@ -252,9 +253,18 @@ def test_reader_plist_override_block_is_commented_out_and_explains_sharing():
 
 # ---- README runbook ------------------------------------------------------------
 
+_HOME = re.compile(r"/Users/[^/\s`]+/")
+
+
+def _anon(path: str) -> str:
+    """The runbook is written for outside readers: it spells the operator's home as /Users/YOU/.
+    Compare paths with the home segment normalised, so the check still catches a drifted path."""
+    return _HOME.sub("/Users/YOU/", path)
+
+
 def _readme_reader_section() -> str:
-    text = README.read_text()
-    assert READER_SECTION in text, f"README.md lacks the {READER_SECTION!r} section"
+    text = _anon(RUNBOOK.read_text())
+    assert READER_SECTION in text, f"docs/RUNBOOK.md lacks the {READER_SECTION!r} section"
     start = text.index(READER_SECTION)
     rest = text[start + len(READER_SECTION):]
     m = re.search(r"\n## ", rest)
@@ -263,8 +273,8 @@ def _readme_reader_section() -> str:
 
 def test_readme_reader_section_states_the_code_defaults():
     section = _readme_reader_section()
-    assert DEFAULT_OFFSET_PATH in section
-    assert DEFAULT_INBOX_PATH in section
+    assert _anon(DEFAULT_OFFSET_PATH) in section
+    assert _anon(DEFAULT_INBOX_PATH) in section
     assert ".reader.lock" in section
     assert "DEFAULT_OFFSET_PATH" in section and "DEFAULT_INBOX_PATH" in section
     assert "telegram_inbox.py" in section
