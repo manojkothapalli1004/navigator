@@ -382,7 +382,7 @@ def test_conductor_server_exposes_three_tools():
     hs = _helpers(__import__("pathlib").Path("/nonexistent"), Recorder())
     cfg = tools.make_conductor_server(hs)
     assert cfg["type"] == "sdk" and cfg["name"] == "conductor"
-    assert tools.TOOL_NAMES == ["delegate", "helpers", "cancel_helper"]
+    assert tools.TOOL_NAMES == ["delegate", "helpers", "cancel_helper", "restart"]
 
 
 @aio

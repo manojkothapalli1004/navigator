@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Awaitable, Callable
 
 from navigator import credits
-from navigator.conductor import activity
+from navigator.conductor import activity, restart
 from navigator.conductor.store import Store
 
 if TYPE_CHECKING:  # helpers imports the runner, which imports this module
@@ -188,6 +188,13 @@ class Engine:
                     return f"{r['id']} {r['title']}{tail}"
                 self.submit("[helpers lost on restart] " + ", ".join(_lost(r) for r in lost),
                             "helper", internal=True)
+        try:  # a planned restart says so, once; an unplanned one stays silent
+            msg = restart.announce(self.store.root)
+        except Exception as e:  # noqa: BLE001
+            _log.warning("conductor.restart_announce_failed: %s", type(e).__name__)
+            msg = None
+        if msg:
+            self.note(msg, via="telegram")
         self._task = asyncio.create_task(self._worker())
         if self.helpers is not None:
             self._tick_task = asyncio.create_task(self._tick_helpers())

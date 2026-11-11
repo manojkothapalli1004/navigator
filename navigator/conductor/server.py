@@ -18,7 +18,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
-from navigator.conductor import attachments
+from navigator.conductor import attachments, restart
 from navigator.conductor.engine import SOURCES, Engine
 from navigator.conductor.store import Store
 
@@ -82,8 +82,28 @@ def make_build_card_callback(cards, engine_ref: list):
     return _raise_build_card
 
 
+def _run_restart(engine, helpers, card: dict, via: str) -> None:
+    """The one call site of restart.schedule: the decide route, right after the operator approved the
+    restart card. The helper list is read again here so a change since the card was raised is visible."""
+    code = card["code"]
+    lost = restart.precheck(helpers)
+    try:
+        out = restart.schedule(card["label"], card.get("delay_s"), engine.store.root, helpers=lost,
+                               card_code=code, via=via)
+    except Exception as e:  # noqa: BLE001
+        _log.warning("conductor.restart_failed: %s", type(e).__name__)
+        out = {"ok": False, "reason": type(e).__name__}
+    if out.get("ok"):
+        engine.note(f"Restart scheduled in {out['delay_s']} s (approved by card {code}); "
+                    f"{len(lost)} helper(s) will be lost", via)
+    else:
+        engine.note(f"Card {code} was approved but the restart was not scheduled ({out.get('reason')}).", via)
+
+
 def start_card_helper(engine, helpers, card: dict, via: str) -> None:
     """An approved card runs in a helper or not at all: never a main-conversation turn."""
+    if card.get("restart"):
+        return  # never fed to a helper; _run_restart handles it
     code = card["code"]
     why = None
     if helpers is None:
@@ -285,6 +305,11 @@ def build_app(engine: Engine, manage_engine: bool = False, cards=None, helpers=N
         if card.get("build"):
             engine.on_card(card)
             return JSONResponse(_public(card))
+        if card.get("restart"):  # not an action card: the conductor schedules it itself, never a helper
+            engine.on_card(card)
+            if card["state"] == "approved":
+                _run_restart(engine, helpers, card, via)
+            return JSONResponse(_public(card))
         engine.on_card(card)
         if card["state"] == "approved":
             start_card_helper(engine, helpers, card, via)
@@ -425,7 +450,8 @@ def serve(socket_path: Path, root: Path, runner=None) -> None:
         builds.on_needs_approval = make_build_card_callback(cards, engine_ref)
     if runner is None:
         from navigator.conductor.runner import sdk_turn
-        runner = partial(sdk_turn, hook=hook, conductor_server=make_conductor_server(helpers, builds))
+        runner = partial(sdk_turn, hook=hook, conductor_server=make_conductor_server(
+            helpers, builds, cards=cards, on_card=lambda card: engine_ref[0].on_card(card)))
     socket_path = Path(socket_path)
     socket_path.parent.mkdir(parents=True, exist_ok=True)
     os.chmod(socket_path.parent, 0o700)  # nobody else can even reach the socket's directory

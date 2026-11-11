@@ -31,7 +31,7 @@ _MISSING_SESSION =re.compile(r"no conversation found|session.{0,40}(not found|do
 # tools and the orchestrator's READ tools. `tools` is the CLI's --tools (the base set), not
 # allowed_tools, which only pre-approves.
 MAIN_TOOLS = ["mcp__conductor__delegate", "mcp__conductor__helpers", "mcp__conductor__cancel_helper",
-              "mcp__orchestrator__get_canonical_memory", "mcp__orchestrator__search",
+              "mcp__conductor__restart", "mcp__orchestrator__get_canonical_memory", "mcp__orchestrator__search",
               "mcp__orchestrator__get_saved_prompt", "mcp__orchestrator__list_saved_prompts",
               "mcp__orchestrator__get_project_status", "mcp__orchestrator__get_session",
               "mcp__orchestrator__list_sessions", "mcp__orchestrator__get_idea", "mcp__orchestrator__list_ideas",
@@ -58,7 +58,8 @@ WINDOWS_PROMPT = (
     "settings/CLAUDE.md edits, launchd changes, trader paths) are refused here: say what you "
     "would run and ask the operator to approve it. When the operator approves a card a helper "
     "runs that one action by itself; you do not run it. Its report arrives as [helper … approved "
-    "card <code>]: tell the operator the outcome in one line. You never do work yourself and have no file, "
+    "card <code>]: tell the operator the outcome in one line. To restart the conductor or Navigator, call restart "
+    "and tell the operator how many helpers it will lose (it only raises a card). You never do work yourself and have no file, "
     "shell or web tools: for anything that needs reading, running, testing or building, call "
     "delegate with a complete self-contained task (what, where, what done looks like, what to "
     "report) and tell the operator in one line what you started. Check helpers first so you never "

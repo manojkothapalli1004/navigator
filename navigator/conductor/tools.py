@@ -15,7 +15,7 @@ import time
 import httpx
 
 MIN_TASK_CHARS = 40  # "fix it" is not a task a helper can do alone
-TOOL_NAMES = ["delegate", "helpers", "cancel_helper"]
+TOOL_NAMES = ["delegate", "helpers", "cancel_helper", "restart"]
 # a full JSON schema, which the SDK passes through as is; a {name: type} dict would make every key required
 DELEGATE_SCHEMA = {
     "type": "object",
@@ -153,7 +153,48 @@ async def cancel_text(helpers, args) -> str:
     return f"cancelled {hid}" if helpers.cancel(hid) else f"not running: {hid}"
 
 
-def make_conductor_server(helpers, builds=None):
+RESTART_SCHEMA = {
+    "type": "object",
+    "properties": {"label": {"type": "string", "enum": ["conductor", "navigator"]},
+                   "delay_s": {"type": "integer"}, "reason": {"type": "string"}},
+    "required": ["label", "reason"]}
+RESTART_DESCRIPTION = (
+    "Ask the operator to restart the conductor or Navigator (label conductor|navigator). This only raises an "
+    "approval card; nothing restarts until the operator approves it. Running helpers are lost by a restart "
+    "(the card lists them): tell the operator how many. delay_s is 5-60 seconds (default 10).")
+RESTART_RAISED = "card raised for the operator; nothing happens until it is approved"
+
+
+async def restart_text(helpers, cards, on_card, args) -> str:
+    """Raises the restart card and nothing else: no scheduling, and no code or id is returned (the model
+    must never hold what approves its own card). The restart itself runs from the decide route."""
+    from navigator.conductor import restart
+    from navigator.conductor.cards import CardError, Declined
+    if not restart.enabled():
+        return "restart is disabled"
+    args = args if isinstance(args, dict) else {}
+    label = args.get("label")
+    if not isinstance(label, str) or label not in restart.LABELS:
+        return f"refused: label must be one of {', '.join(restart.LABELS)}"
+    if cards is None:
+        return "refused: restart cards are not available"
+    if restart.pending_marker(cards.path.parent):
+        return "refused: a restart is already scheduled; wait for it to finish"
+    reason = " ".join(str(args.get("reason") or "").split())[:200] or "requested in chat"
+    try:
+        card, new = cards.raise_restart_card(label, restart.clamp_delay(args.get("delay_s")),
+                                             restart.precheck(helpers), reason)
+    except Declined as d:
+        ago = f"{d.minutes_ago} min ago" if d.minutes_ago else "under a minute ago"
+        return f"the operator declined this restart {ago}; don't retry, ask in chat"
+    except CardError:
+        return "refused: could not raise the card"
+    if new and on_card is not None:
+        on_card(card)
+    return RESTART_RAISED
+
+
+def make_conductor_server(helpers, builds=None, cards=None, on_card=None):
     from claude_agent_sdk import create_sdk_mcp_server, tool
 
     @tool("delegate", DELEGATE_DESCRIPTION, DELEGATE_SCHEMA)
@@ -168,4 +209,8 @@ def make_conductor_server(helpers, builds=None):
     async def cancel_helper(args):
         return _text(await cancel_text(helpers, args))
 
-    return create_sdk_mcp_server("conductor", tools=[delegate, list_helpers, cancel_helper])
+    @tool("restart", RESTART_DESCRIPTION, RESTART_SCHEMA)
+    async def restart_tool(args):
+        return _text(await restart_text(helpers, cards, on_card, args))
+
+    return create_sdk_mcp_server("conductor", tools=[delegate, list_helpers, cancel_helper, restart_tool])

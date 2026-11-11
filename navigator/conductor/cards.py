@@ -239,5 +239,54 @@ class Cards:
         self._save()
         return dict(card), True
 
+    def raise_restart_card(self, label: str, delay_s: int, helpers: list[dict], reason: str) -> tuple[dict, bool]:
+        """An Approve/Decline card for restarting a launchd job. Not an action card: no input, no cwd, a
+        fingerprint that is not a sha256 (consume() can never match it), and it is never handed to a
+        helper; the decide route schedules the restart itself. One pending card per label."""
+        from navigator.conductor.restart import LABELS
+        if label not in LABELS:
+            raise CardError("unknown label")
+        fp = f"restart:{label}"
+        now = self.clock()
+        for card in reversed(self._cards):
+            if card["fingerprint"] != fp:
+                continue
+            if card["state"] == "declined" and now - card.get("decided", 0) < DECLINE_COOLDOWN_S:
+                raise Declined(max(0, int((now - card["decided"]) // 60)))
+            if card["state"] == "pending" and self._live(card):
+                return dict(card), False
+        shown = list(helpers)
+        while True:
+            if helpers:
+                names = ", ".join(f"{h['id']} {h.get('title') or ''} {_age(h.get('age') or 0)}" for h in shown)
+                more = len(helpers) - len(shown)
+                lines = (f"{len(helpers)} helper(s) running or queued; they will be marked LOST and must be "
+                         f"re-delegated" + (f": {names}" if shown else ""))
+                if more and shown:
+                    lines += f" (+{more} more)"
+            else:
+                lines = "no helpers running"
+            summary = (f"Restart {label} (launchd job {LABELS[label]}) in {int(delay_s)}s.\n{lines}\n"
+                       "the turn in progress, if any, will be marked interrupted")
+            if len(summary) <= MAX_SUMMARY or not shown:
+                break
+            shown.pop()  # drop helper names, never the label or the count
+        summary = summary[:MAX_SUMMARY]
+        codes = {c["code"] for c in self._cards}
+        code = "".join(secrets.choice(CODE_ALPHABET) for _ in range(CODE_LEN))
+        while code in codes:
+            code = "".join(secrets.choice(CODE_ALPHABET) for _ in range(CODE_LEN))
+        card = {"id": secrets.token_urlsafe(16), "code": code, "tool": "restart", "summary": summary,
+                "reason": reason, "fingerprint": fp, "restart": True, "label": label, "delay_s": int(delay_s),
+                "state": "pending", "created": now, "expires": now + self.ttl_s}
+        self._cards.append(card)
+        self._save()
+        return dict(card), True
+
+
+def _age(s: float) -> str:
+    s = int(s)
+    return f"{s}s" if s < 120 else f"{s // 60}m"
+
 
 BUILD_FILES_SHOWN = 12  # file names listed on a build card; the rest become "(+N more)"
