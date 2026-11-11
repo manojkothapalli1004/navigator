@@ -261,3 +261,100 @@ def test_navigator_settings_doc_write_gated(cmd):
 ])
 def test_navigator_settings_doc_read_or_mention_not_gated(cmd):
     assert gated_reason("Bash", {"command": cmd}, CWD) is None
+
+
+# ---- restart-and-gates: specific gh rules, clone/fetch, GitHub API writes, pip/uv installs ----
+from navigator.conductor import gate as _gate  # noqa: E402
+
+GH_RULES = [
+    ("gh repo edit o/r --visibility public", "visibility"),
+    ("gh repo edit o/r --visibility private --accept-visibility-change-consequences", "visibility"),
+    ("gh repo create x --public", "gh repo create"),
+    ("gh repo delete o/r --yes", "gh repo delete"),
+    ("gh api -X PATCH repos/o/r -f private=false", "gh api"),
+    ("gh api repos/o/r --method POST -f name=x", "gh api"),
+    ("gh api repos/o/r -F visibility=public", "gh api"),
+    ("gh api -XPATCH repos/o/r -f private=false", "gh api"),
+    ("gh api --method=DELETE repos/o/r", "gh api"),
+    ("/opt/homebrew/bin/gh repo edit o/r --visibility public", "visibility"),
+    ("bash -lc 'gh repo create x'", "gh repo create"),
+    ("cd x && gh repo delete o/r", "gh repo delete"),
+    ("gh -R o/r repo edit --visibility public", "visibility"),
+]
+
+
+@pytest.mark.parametrize("cmd,word", GH_RULES)
+def test_gh_specific_reason(cmd, word):
+    assert word in gated_reason("Bash", {"command": cmd}, CWD)
+
+
+@pytest.mark.parametrize("cmd,word", GH_RULES)
+def test_gh_reason_direct_bypasses_blanket(cmd, word):
+    toks = [t for t in _gate._SPLIT.split(cmd.replace('"', " ").replace("'", " ")) if t]
+    i = next(k for k, t in enumerate(toks) if t.rsplit("/", 1)[-1] == "gh")
+    assert word in _gate._gh_reason(toks, i)
+
+
+@pytest.mark.parametrize("cmd", ["gh pr view 1", "gh repo view o/r", "gh api repos/o/r", "gh issue list"])
+def test_gh_reason_direct_does_not_stop_reads(cmd):
+    assert _gate._gh_reason(cmd.split(), 0) is None
+
+
+def test_github_api_curl_writes():
+    for cmd in ["curl -X PATCH -H 'Authorization: token t' https://api.github.com/repos/o/r -d '{\"private\":false}'",
+                "curl -X DELETE https://api.github.com/repos/o/r",
+                "curl --request DELETE https://api.github.com/repos/o/r",
+                "curl --request=DELETE https://api.github.com/repos/o/r",
+                "python3 -c \"import requests;requests.delete('https://api.github.com/repos/o/r')\"",
+                "curl -d x https://api.github.com/user/repos"]:
+        assert "GitHub API" in gated_reason("Bash", {"command": cmd}, CWD), cmd
+    assert gated_reason("Bash", {"command": "curl https://api.github.com/repos/o/r"}, CWD) is None
+
+
+def test_github_api_regex_is_fast():
+    import time
+    t = time.time()
+    gated_reason("Bash", {"command": "curl https://api.github.com/x " + "-X " * 20000}, CWD)
+    gated_reason("Bash", {"command": "curl https://api.github.com/x " + "A" * 200000}, CWD)
+    assert time.time() - t < 2
+
+
+@pytest.mark.parametrize("cmd", [
+    "git clone https://github.com/o/r", "git clone git@github.com:o/r.git /tmp/x", "git clone o/r",
+    "git -C /tmp clone ssh://h/r", "git fetch", "git fetch origin", "git fetch https://x/y.git main",
+    "git ls-remote https://x/y", "git submodule update --init", "git remote add u https://x/y",
+    "git remote show origin", "git remote update", "git remote prune origin", "git remote set-url o x",
+    "git clone host:path", "git config url.x.insteadOf y",
+])
+def test_git_network_gated(cmd):
+    assert gated_reason("Bash", {"command": cmd}, CWD), cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    "git clone /Users/Manoj/calwbot/navigator /tmp/w", "git clone ./a ../b",
+    "git fetch /Users/Manoj/calwbot/navigator main", "git status", "git remote -v", "git remote get-url origin",
+])
+def test_git_local_not_gated(cmd):
+    assert gated_reason("Bash", {"command": cmd}, CWD) is None, cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    "pip install requests", "pip3 install requests", "python3 -m pip install x", "uv pip install x", "uv add x",
+    "pip install git+https://x/y", ".venv/bin/pip install git+https://x/y",
+    "/Users/Manoj/calwbot/navigator/.venv/bin/pip install requests",
+    "uv sync", "uv run --with x y", "uv tool install x", "pipx install x", "uvx x", "cd a && pip install x",
+])
+def test_pip_installs_gated(cmd):
+    assert gated_reason("Bash", {"command": cmd}, CWD), cmd
+
+
+@pytest.mark.parametrize("cmd", ["pip list", "pip show x", "pip download x", "uv --version", "python3 -m pytest"])
+def test_pip_reads_not_gated(cmd):
+    assert gated_reason("Bash", {"command": cmd}, CWD) is None, cmd
+
+
+def test_later_piece_cannot_supply_the_local_path():
+    assert gated_reason("Bash", {"command": "git fetch; /bin/ls"}, CWD)
+    assert gated_reason("Bash", {"command": "git clone && ./x"}, CWD)
+    assert gated_reason("Bash", {"command": "git clone --depth 1 https://x/y ./z"}, CWD)
+    assert gated_reason("Bash", {"command": "git clone --depth 1 ./a ./b"}, CWD) is None

@@ -148,6 +148,15 @@ _SETTINGS_DOC_TEXT = re.compile(r"navigator(/|%2[Ff])settings")
 _HTTP_WRITE = re.compile(r"-X\s*(PUT|POST|PATCH)\b|--request[\s=]+(PUT|POST|PATCH)\b"
                          r"|(^|\s)(-d|--data[\w-]*|--json|--upload-file|-T|-F|--form)(\s|=|'|\"|$)"
                          r"|\.(put|post|patch|request)\(|\bmethod\s*=\s*['\"](PUT|POST|PATCH)", re.I)
+# writes to the GitHub API without gh (2026-11-11). Own regex, not _HTTP_WRITE: that one stops at
+# PUT/POST/PATCH, and `curl -X DELETE https://api.github.com/repos/o/r` deletes a repository. Case
+# matters for the short curl flags (-f is "fail", -F is "form"), not for the method words. Linear:
+# single scans, no nested quantifiers; the host literal is tested first so it only runs on matches.
+_GITHUB_API_HOST = ("api.github.com", "github.com/api")
+_GITHUB_API_WRITE = re.compile(
+    r"-X\s*(?i:PUT|POST|PATCH|DELETE)\b|--request[\s=]+(?i:PUT|POST|PATCH|DELETE)\b"
+    r"|(?:^|\s)(?:-d|--data[\w-]*|--json|--upload-file|-T|-F|--form)(?:\s|=|'|\"|$)"
+    r"|\.(?i:put|post|patch|delete|request)\(|\b(?i:method)\s*=\s*['\"](?i:PUT|POST|PATCH|DELETE)")
 _TRADER = re.compile(r"(^|[\s/'\"=:])trader(/|\s|$)")
 _SPLIT = re.compile(r"[\s;&|(){}<>`$]+")
 _REVISION = re.compile(r"^(HEAD|@)([~^]\d*)+$|^[0-9a-f]{7,40}$")
@@ -155,8 +164,134 @@ APPROVAL_HINT = ("needs the operator's approval (approval cards arrive in C3; un
                  "operator to run it from the terminal)")
 
 
-def _git_reason(tokens: list[str], i: int) -> str | None:
-    """tokens[i] is a git program; look at its subcommand."""
+_GH_WRITE_METHODS = {"POST", "PATCH", "PUT", "DELETE"}
+_GH_BODY_FLAGS = {"-f", "-F", "--field", "--raw-field", "--input"}
+_GH_REPOS_ENDPOINT = re.compile(r"^/?(repos/|user/repos|orgs/[^/]+/repos)")
+
+
+def _gh_reason(tokens: list[str], i: int) -> str | None:
+    """tokens[i] is gh. Specific rules (own reason text) so that relaxing the blanket "any gh" stop
+    later cannot silently ungate a visibility change, a create or a delete."""
+    j = i + 1
+    while j < len(tokens) and tokens[j].startswith("-"):
+        j += 2 if tokens[j] in ("-R", "--repo") else 1
+    if j >= len(tokens):
+        return None
+    group, rest = tokens[j], tokens[j + 1:j + 40]
+    sub = rest[0] if rest else ""
+    if group == "repo":
+        if sub == "edit" and any(t.startswith("--visibility") or t == "--accept-visibility-change-consequences"
+                                 for t in rest):
+            return "gh repo edit --visibility changes who can see a repository"
+        if sub == "create":
+            return "gh repo create makes a new repository (public unless told otherwise)"
+        if sub == "delete":
+            return "gh repo delete removes a repository"
+    if group == "api":
+        writes = False
+        for k, t in enumerate(rest):
+            if t in ("-X", "--method") and k + 1 < len(rest) and rest[k + 1].upper() in _GH_WRITE_METHODS:
+                writes = True
+            elif t.startswith("--method=") and t[9:].upper() in _GH_WRITE_METHODS:
+                writes = True
+            elif t.startswith("-X") and len(t) > 2 and t[2:].upper() in _GH_WRITE_METHODS:
+                writes = True
+            elif t in _GH_BODY_FLAGS or t.split("=", 1)[0] in _GH_BODY_FLAGS:
+                writes = True  # a body flag turns the call into a POST
+            elif len(t) > 2 and t[:2] in ("-f", "-F") and t[2] != "-":
+                writes = True  # -fprivate=false
+        if writes and any(_GH_REPOS_ENDPOINT.match(t) for t in rest):
+            return "gh api writes to a repository (visibility, create, delete, transfer)"
+    return None
+
+
+_LOCAL_SOURCE = re.compile(r"^(/|\./|\.\./|~)")
+_VALUE_OPTS = {"-b", "--branch", "--depth", "-o", "--origin", "--template", "-c", "--config", "--reference",
+               "--reference-if-able", "-j", "--jobs", "--separate-git-dir", "--filter", "--shallow-since",
+               "--shallow-exclude", "--server-option"}
+_REMOTE_NET_SUBS = {"add", "set-url", "show", "update", "prune", "set-head"}
+_SUBMODULE_NET_SUBS = {"update", "add", "init", "sync", "foreach", "set-url"}
+
+
+def _is_local_source(tok: str) -> bool:
+    if tok.startswith("file://"):
+        return Path(tok[7:]).is_absolute() and (str(HOME) + "/") in (tok[7:] + "/")
+    return bool(_LOCAL_SOURCE.match(tok)) and "://" not in tok
+
+
+def _first_source(rest: list[str]) -> str | None:
+    """The first non-option argument of a clone/fetch (skipping the values of known value options)."""
+    k = 0
+    while k < len(rest):
+        t = rest[k]
+        if t.startswith("-"):
+            k += 2 if t in _VALUE_OPTS else 1
+            continue
+        return t
+    return None
+
+
+def _git_network_reason(sub: str, rest: list[str]) -> str | None:
+    """Git subcommands that reach the network or pull outside code. `rest` is the same shell piece only."""
+    if any(t.startswith("--upload-pack") or t.startswith("--receive-pack") for t in rest):
+        return f"git {sub} with --upload-pack runs a program"
+    if sub == "clone":
+        src = _first_source(rest)
+        if src is None or not _is_local_source(src):
+            return "git clone brings in code from outside"
+    if sub == "fetch":
+        src = _first_source(rest)
+        if src is None or not _is_local_source(src):
+            return "git fetch reaches a remote (outside code)"
+    if sub == "ls-remote":
+        return "git ls-remote contacts a remote"
+    if sub == "submodule" and rest and rest[0] in _SUBMODULE_NET_SUBS:
+        return f"git submodule {rest[0]} pulls code from outside"
+    if sub == "remote" and rest and rest[0] in _REMOTE_NET_SUBS:
+        return f"git remote {rest[0]} adds, changes or contacts a remote"
+    if sub == "config" and any(re.match(r"(?i)^url\..*\.(push)?insteadof", t) for t in rest):
+        return "git config url.*.insteadOf redirects where git fetches from"
+    return None
+
+
+_PIP_PROG = re.compile(r"^pip(\d+(\.\d+)*)?$")
+_PY_PROG = re.compile(r"^python(\d+(\.\d+)*)?$")
+
+
+def _pip_reason(tokens: list[str], i: int) -> str | None:
+    """tokens[i] may be pip/pip3/python -m pip/uv/uvx/pipx. Every install brings code from outside:
+    no venv exception (operator decision 2026-11-11), a card per install."""
+    why = "installs code from outside"
+    prog = tokens[i].rsplit("/", 1)[-1]
+    rest = tokens[i + 1:i + 9]
+    if _PIP_PROG.match(prog):
+        return why if "install" in rest[:6] else None
+    if _PY_PROG.match(prog):
+        for k in range(len(rest) - 1):
+            if rest[k] == "-m" and rest[k + 1] == "pip":
+                return why if "install" in rest[k + 2:k + 8] else None
+        return None
+    if prog == "uvx":
+        return "uvx runs code downloaded from outside"
+    if prog == "pipx":
+        return why if rest and rest[0] in ("install", "inject") else None
+    if prog == "uv":
+        sub = next((t for t in rest if not t.startswith("-")), "")
+        after = rest[rest.index(sub) + 1:] if sub else []
+        if sub in ("add", "sync"):
+            return why
+        if sub == "pip":
+            return why if after and after[0] in ("install", "sync") else None
+        if sub == "tool":
+            return why if after and after[0] in ("install", "run", "upgrade") else None
+        if sub == "run":
+            return why if any(t == "--with" or t.startswith("--with-") or t.startswith("--with=") for t in after) else None
+    return None
+
+
+def _git_reason(tokens: list[str], i: int, end: int | None = None) -> str | None:
+    """tokens[i] is a git program; look at its subcommand. `end` is where its shell piece stops: the
+    network rules read only that far, so a later piece cannot supply the local path that clears them."""
     i += 1
     while i < len(tokens) and tokens[i].startswith("-"):
         i += 2 if tokens[i] in ("-C", "-c") else 1
@@ -173,7 +308,7 @@ def _git_reason(tokens: list[str], i: int) -> str | None:
         return "git branch moves, renames or deletes a branch"
     if sub in ("checkout", "switch") and {"-B", "-C", "--force-create"} & set(rest):
         return f"git {sub} resets a branch"
-    return None
+    return _git_network_reason(sub, tokens[i + 1:end] if end else rest)
 
 
 def _bash_reason(command: str) -> str | None:
@@ -188,15 +323,27 @@ def _bash_reason(command: str) -> str | None:
         return f"touches {m.group(0)} (which repos Navigator builds, its credits state)"
     if (m := _SETTINGS_DOC_TEXT.search(command)) and _HTTP_WRITE.search(command):
         return f"writes the Navigator settings document ({m.group(0)}: mode, merge toggles)"
+    if any(h in command for h in _GITHUB_API_HOST) and _GITHUB_API_WRITE.search(command):
+        return "writes to the GitHub API without gh (repository visibility, create, delete)"
     if m := _PROTECTED_TEXT.search(command):
         return f"touches {m.group(0)} (permissions, hooks or services)"
     if (m := _PLUGINS_TEXT.search(command)) and not _plugins_read_only(command):
         return f"touches {m.group(0)} (permissions, hooks or services)"
-    tokens =[t for t in _SPLIT.split(command.replace('"', " ").replace("'", " ")) if t]
+    cleaned = command.replace('"', " ").replace("'", " ")
+    tokens = [t for t in _SPLIT.split(cleaned) if t]
+    # where each token's shell piece ends (same separators as _SPLIT, so the flat list is identical)
+    ends: list[int] = []
+    for piece in re.split(r"[;&|\n`(){}<>]+", cleaned):
+        n = len([t for t in re.split(r"[\s$]+", piece) if t])
+        ends += [len(ends) + n] * n
     for i, tok in enumerate(tokens):
         prog = tok.rsplit("/", 1)[-1]
         nxt = tokens[i + 1] if i + 1 < len(tokens) else ""
-        if prog == "git" and (r := _git_reason(tokens, i)):
+        if prog == "git" and (r := _git_reason(tokens, i, ends[i])):
+            return r
+        if prog == "gh" and (r := _gh_reason(tokens, i)):
+            return r
+        if r := _pip_reason(tokens[:ends[i]], i):
             return r
         if prog == "launchctl" and nxt in LAUNCHCTL_GATED:
             return f"launchctl {nxt} installs or removes a service"
