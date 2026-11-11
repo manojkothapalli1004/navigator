@@ -17,6 +17,8 @@ Veridian is built to be safe to leave running. It never merges on its own by def
 (one opt-in exception for docs/tests-only changes), confines the builder to an isolated
 worktree, and has a fresh reviewer audit safety-relevant work before you see it.
 
+**See one real run, step by step:** [docs/WALKTHROUGH.md](docs/WALKTHROUGH.md)
+
 Source is visible for review and feedback during a short window. Please read [Status](#status)
 before judging it as a product. Screenshots: on request (the live console can show private chat).
 
@@ -153,5 +155,5 @@ distribute is granted. See [LICENSE.md](LICENSE.md).
 navigator/   config, cli, contracts/, clients/, safety/, runtime/, conductor/, checker/, observability/
 tests/       mirrors the package; tests/test_e2e.py drives the full operator journey
 deploy/      launchd plist templates
-docs/        RUNBOOK.md (operator runbook)
+docs/        RUNBOOK.md (operator runbook), WALKTHROUGH.md (one real run)
 ```
