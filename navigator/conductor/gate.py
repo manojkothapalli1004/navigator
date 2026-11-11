@@ -6,6 +6,7 @@ history): a command is split on shell separators and each piece is checked."""
 from __future__ import annotations
 
 import re
+from bisect import bisect_left
 from pathlib import Path
 
 HOME = Path.home()
@@ -219,11 +220,11 @@ def _is_local_source(tok: str) -> bool:
     return bool(_LOCAL_SOURCE.match(tok)) and "://" not in tok
 
 
-def _first_source(rest: list[str]) -> str | None:
-    """The first non-option argument of a clone/fetch (skipping the values of known value options)."""
-    k = 0
-    while k < len(rest):
-        t = rest[k]
+def _first_source(tokens: list[str], k: int, end: int) -> str | None:
+    """The first non-option argument of a clone/fetch in tokens[k:end] (skipping the values of known
+    value options)."""
+    while k < end:
+        t = tokens[k]
         if t.startswith("-"):
             k += 2 if t in _VALUE_OPTS else 1
             continue
@@ -231,39 +232,53 @@ def _first_source(rest: list[str]) -> str | None:
     return None
 
 
-def _git_network_reason(sub: str, rest: list[str]) -> str | None:
-    """Git subcommands that reach the network or pull outside code. `rest` is the same shell piece only."""
-    if any(t.startswith("--upload-pack") or t.startswith("--receive-pack") for t in rest):
+_INSTEADOF = re.compile(r"(?i)^url\..*\.(push)?insteadof")
+
+
+def _any_between(marks: list[int], lo: int, hi: int) -> bool:
+    """True when a sorted list of token positions has one in [lo, hi)."""
+    p = bisect_left(marks, lo)
+    return p < len(marks) and marks[p] < hi
+
+
+def _git_network_reason(sub: str, tokens: list[str], start: int, end: int,
+                        packs: list[int], insteadofs: list[int]) -> str | None:
+    """Git subcommands that reach the network or pull outside code. Reads tokens[start:end] only: the
+    same shell piece. `packs`/`insteadofs` are the sorted positions of the tokens that match those
+    rules, found once per command so a long command stays linear."""
+    if _any_between(packs, start, end):
         return f"git {sub} with --upload-pack runs a program"
     if sub == "clone":
-        src = _first_source(rest)
+        src = _first_source(tokens, start, end)
         if src is None or not _is_local_source(src):
             return "git clone brings in code from outside"
     if sub == "fetch":
-        src = _first_source(rest)
+        src = _first_source(tokens, start, end)
         if src is None or not _is_local_source(src):
             return "git fetch reaches a remote (outside code)"
     if sub == "ls-remote":
         return "git ls-remote contacts a remote"
-    if sub == "submodule" and rest and rest[0] in _SUBMODULE_NET_SUBS:
-        return f"git submodule {rest[0]} pulls code from outside"
-    if sub == "remote" and rest and rest[0] in _REMOTE_NET_SUBS:
-        return f"git remote {rest[0]} adds, changes or contacts a remote"
-    if sub == "config" and any(re.match(r"(?i)^url\..*\.(push)?insteadof", t) for t in rest):
+    first = tokens[start] if start < end else None
+    if sub == "submodule" and first in _SUBMODULE_NET_SUBS:
+        return f"git submodule {first} pulls code from outside"
+    if sub == "remote" and first in _REMOTE_NET_SUBS:
+        return f"git remote {first} adds, changes or contacts a remote"
+    if sub == "config" and _any_between(insteadofs, start, end):
         return "git config url.*.insteadOf redirects where git fetches from"
     return None
 
 
+_PIP_PREFIXES = {"pi", "py", "uv"}  # cheap pre-filter: pip*, pipx, python*, uv, uvx
 _PIP_PROG = re.compile(r"^pip(\d+(\.\d+)*)?$")
 _PY_PROG = re.compile(r"^python(\d+(\.\d+)*)?$")
 
 
-def _pip_reason(tokens: list[str], i: int) -> str | None:
+def _pip_reason(tokens: list[str], i: int, end: int) -> str | None:
     """tokens[i] may be pip/pip3/python -m pip/uv/uvx/pipx. Every install brings code from outside:
     no venv exception (operator decision 2026-11-11), a card per install."""
     why = "installs code from outside"
     prog = tokens[i].rsplit("/", 1)[-1]
-    rest = tokens[i + 1:i + 9]
+    rest = tokens[i + 1:min(i + 9, end)]
     if _PIP_PROG.match(prog):
         return why if "install" in rest[:6] else None
     if _PY_PROG.match(prog):
@@ -289,7 +304,7 @@ def _pip_reason(tokens: list[str], i: int) -> str | None:
     return None
 
 
-def _git_reason(tokens: list[str], i: int, end: int | None = None) -> str | None:
+def _git_reason(tokens: list[str], i: int, end: int, packs: list[int], insteadofs: list[int]) -> str | None:
     """tokens[i] is a git program; look at its subcommand. `end` is where its shell piece stops: the
     network rules read only that far, so a later piece cannot supply the local path that clears them."""
     i += 1
@@ -308,7 +323,7 @@ def _git_reason(tokens: list[str], i: int, end: int | None = None) -> str | None
         return "git branch moves, renames or deletes a branch"
     if sub in ("checkout", "switch") and {"-B", "-C", "--force-create"} & set(rest):
         return f"git {sub} resets a branch"
-    return _git_network_reason(sub, tokens[i + 1:end] if end else rest)
+    return _git_network_reason(sub, tokens, i + 1, end, packs, insteadofs)
 
 
 def _bash_reason(command: str) -> str | None:
@@ -336,14 +351,16 @@ def _bash_reason(command: str) -> str | None:
     for piece in re.split(r"[;&|\n`(){}<>]+", cleaned):
         n = len([t for t in re.split(r"[\s$]+", piece) if t])
         ends += [len(ends) + n] * n
+    packs = [k for k, t in enumerate(tokens) if t.startswith(("--upload-pack", "--receive-pack"))]
+    insteadofs = [k for k, t in enumerate(tokens) if _INSTEADOF.match(t)]
     for i, tok in enumerate(tokens):
         prog = tok.rsplit("/", 1)[-1]
         nxt = tokens[i + 1] if i + 1 < len(tokens) else ""
-        if prog == "git" and (r := _git_reason(tokens, i, ends[i])):
+        if prog == "git" and (r := _git_reason(tokens, i, ends[i], packs, insteadofs)):
             return r
         if prog == "gh" and (r := _gh_reason(tokens, i)):
             return r
-        if r := _pip_reason(tokens[:ends[i]], i):
+        if prog[:2] in _PIP_PREFIXES and (r := _pip_reason(tokens, i, ends[i])):
             return r
         if prog == "launchctl" and nxt in LAUNCHCTL_GATED:
             return f"launchctl {nxt} installs or removes a service"

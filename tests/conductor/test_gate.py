@@ -358,3 +358,26 @@ def test_later_piece_cannot_supply_the_local_path():
     assert gated_reason("Bash", {"command": "git clone && ./x"}, CWD)
     assert gated_reason("Bash", {"command": "git clone --depth 1 https://x/y ./z"}, CWD)
     assert gated_reason("Bash", {"command": "git clone --depth 1 ./a ./b"}, CWD) is None
+
+
+def _bash_ms(cmd: str) -> float:
+    import time
+    from navigator.conductor.gate import _bash_reason
+    best = 1e9
+    for _ in range(3):
+        t = time.perf_counter()
+        _bash_reason(cmd)
+        best = min(best, time.perf_counter() - t)
+    return best * 1000
+
+
+@pytest.mark.parametrize("unit,size", [
+    ("x ", 50_000), ("pip install x ", 48_000), ("uv pip install x ", 36_000),
+    ("curl https://api.github.com/x ", 48_000), ("pipx install x ", 48_000),
+    ("git status ", 48_000),
+])
+def test_bash_reason_linear_time(unit, size):
+    cmd = unit * (size // len(unit))
+    baseline = _bash_ms("x" * 50_000)  # one huge token: same size, no per-token work
+    took = _bash_ms(cmd)
+    assert took < 100 and took < max(20 * baseline, 30), f"{took:.0f} ms vs baseline {baseline:.0f} ms"
