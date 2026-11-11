@@ -302,3 +302,26 @@ def test_decide_idempotent_and_guarded(tmp_path):
         b.decide(pid, False)
     with pytest.raises(B.BuildRefused):
         b.decide("nope", True)
+
+
+def test_ledger_lines_per_state_change_not_per_poll(tmp_path):
+    sink = []
+    act = FakeACTClient()
+    b = B.Builds(tmp_path / "builds.json", act, settings=object(), on_finish=lambda r: None,
+                 base_sha_fn=lambda repo: "abc123", ledger=sink.append)
+    rec = b.file("navigator", "T", SPEC, ["docs/a.md"], via=None)
+    pid = rec["proposal_id"]
+    b.poll(); b.poll()  # still filed: no new line
+    r = run_for(act, pid)
+    b.poll(); b.poll()
+    r.phase = RunPhase.awaiting_review
+    b.poll(); b.poll()
+    r.status = RunStatus.completed
+    b.poll(); b.poll()
+    assert [(x["state"], x["prev"]) for x in sink] == [
+        ("filed", None), ("running", "filed"), ("review", "running"), ("done", "review")]
+    assert all(x["kind"] == "build" and x["id"] == pid and x["v"] == 1 for x in sink)
+    b2 = B.Builds(tmp_path / "builds.json", act, settings=object(), base_sha_fn=lambda repo: "abc123",
+                  ledger=sink.append)
+    b2.poll()
+    assert len(sink) == 4

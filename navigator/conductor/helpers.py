@@ -25,7 +25,7 @@ from claude_agent_sdk import (
     ToolResultBlock, ToolUseBlock, UserMessage,
 )
 
-from navigator import credits
+from navigator import credits, ledger
 from navigator.conductor import activity, gate
 from navigator.conductor.cards import fingerprint
 from navigator.ids import new_id
@@ -331,6 +331,10 @@ async def _attempt(task, helper_id, emit, hook, exact, pid_root, rt) -> str:
                             started = started or exact is None or any(isinstance(b, ToolUseBlock) for b in m.content)
                         for b in m.content:
                             if isinstance(b, ToolUseBlock):
+                                wk = gate.WRITE_TOOLS.get(b.name)
+                                emit({"type": "ledger_step", "tool": b.name,
+                                      "file": (b.input or {}).get(wk) if wk else None,
+                                      "cmd": (b.input or {}).get("command") if b.name == "Bash" else None})
                                 emit({"type": "activity", "id": b.id, "tool": b.name,
                                       "title": activity.describe(b.name, b.input), "state": "running",
                                       "parent": m.parent_tool_use_id, "helper": activity.is_helper(b.name)})
@@ -341,6 +345,7 @@ async def _attempt(task, helper_id, emit, hook, exact, pid_root, rt) -> str:
                                       "state": "failed" if b.is_error else "done"})
                     elif isinstance(m, ResultMessage):
                         done = True
+                        emit({"type": "ledger_cost", "usd": getattr(m, "total_cost_usd", None)})
                         if rt.reservation is not None:  # only calls on the key touch the ledger
                             credits.record(getattr(m, "total_cost_usd", None), rt.reservation,
                                            model=HELPER_MODEL, usage=getattr(m, "usage", None))
@@ -384,7 +389,7 @@ class Helpers:
     `on_finish(record)` its end, whatever the end was."""
 
     def __init__(self, path: Path, runner, on_event, on_finish, *, clock=time.time,
-                 max_running: int = MAX_RUNNING, mono=time.monotonic):
+                 max_running: int = MAX_RUNNING, mono=time.monotonic, ledger=None, ledger_seen=None):
         self.path = Path(path)
         self.runner, self.on_event, self.on_finish = runner, on_event, on_finish
         self.clock, self.max_running, self.mono = clock, max_running, mono
@@ -396,6 +401,9 @@ class Helpers:
         self._tasks: dict[str, asyncio.Task] = {}
         self._titles: dict[str, deque] = {}
         self._stopping = False
+        self._ledger = ledger if ledger is not None else globals()["ledger"].append
+        self._ledger_seen = ledger_seen if ledger_seen is not None else globals()["ledger"].seen_ids
+        self._tally: dict = {}  # helper id -> ledger.Tally, in memory only
 
     # ---- registry ----
 
@@ -485,6 +493,16 @@ class Helpers:
         except Exception as e:  # never strand the queue behind a failed save
             _log.warning("conductor.helper_save_failed: %s", type(e).__name__)
 
+    def _ledger_write(self, rec: dict, state: str) -> None:
+        """One completion-ledger line for this helper (whatever tally exists). Never raises."""
+        try:
+            t = self._tally.pop(rec["id"], None) or ledger.Tally()
+            self._ledger(t.record(id=rec["id"], title=rec.get("title"), state=state, started=rec.get("started"),
+                                  ended=rec.get("ended"), unverified=ledger.count_unverified(rec.get("result")),
+                                  card=bool(rec.get("exact"))))
+        except Exception as e:  # noqa: BLE001
+            _log.warning("conductor.helper_ledger_failed: %s", type(e).__name__)
+
     def _end(self, rec: dict, state: str, **fields) -> None:
         """One end, one report: idempotent, and it never raises (save, report and queue are each guarded)."""
         if rec.get("state") not in ACTIVE:
@@ -496,6 +514,7 @@ class Helpers:
             self._save()
         except Exception as e:
             _log.warning("conductor.helper_save_failed: %s", type(e).__name__)
+        self._ledger_write(rec, state)
         try:
             self.on_finish(rec)
         except Exception as e:  # the next helper must start even if the engine choked on the report
@@ -539,6 +558,16 @@ class Helpers:
         hid = rec["id"]
 
         def emit(ev: dict) -> None:
+            if ev.get("type") in ("ledger_step", "ledger_cost"):  # the ledger's own channel: never to the screens
+                try:
+                    t = self._tally.setdefault(hid, ledger.Tally())
+                    if ev["type"] == "ledger_step":
+                        t.step(ev.get("tool"), ev.get("file"), ev.get("cmd"))
+                    else:
+                        t.cost(ev.get("usd"))
+                except Exception as e:  # noqa: BLE001
+                    _log.warning("conductor.helper_tally_failed: %s", type(e).__name__)
+                return
             if ev.get("type") == "activity" and ev.get("state") == "running" and ev.get("title"):
                 self._titles.setdefault(hid, deque(maxlen=LAST_TITLES)).append(ev["title"])
             self.on_event(hid, ev)
@@ -588,8 +617,15 @@ class Helpers:
     def mark_lost(self) -> list[dict]:
         """Records a previous process left running/queued: lost, and reported once by the engine."""
         lost, self._stale = self._stale, []
+        try:
+            seen = set(self._ledger_seen()) if lost else set()
+        except Exception as e:  # noqa: BLE001
+            _log.warning("conductor.helper_ledger_failed: %s", type(e).__name__)
+            seen = set()
         for rec in lost:
             rec.update(state="lost", ended=self.clock())
+            if rec["id"] not in seen:  # shutdown may already have written it
+                self._ledger_write(rec, "lost")
         if lost:
             self._save()
         return [dict(r) for r in lost]
@@ -601,6 +637,7 @@ class Helpers:
         for rec in self._records:
             if rec.get("state") in ACTIVE:
                 rec.update(state="lost", ended=self.clock())
+                self._ledger_write(rec, "lost")
         for task in self._tasks.values():
             task.cancel()
         self._tasks.clear()

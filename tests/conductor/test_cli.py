@@ -56,3 +56,24 @@ def test_terminal_autopilot_switch(tmp_path):
         finally:
             await client.aclose(); await eng.stop()
     asyncio.run(go())
+
+
+def test_cli_ledger_prints_table(tmp_path, monkeypatch, capsys):
+    import time
+    from navigator import ledger
+    p = tmp_path / "ledger.jsonl"
+    monkeypatch.setattr(ledger, "PATH", p)
+    assert cli.main(["ledger"]) == 0
+    assert "no ledger yet" in capsys.readouterr().out
+    now = time.time()
+    ledger.append({"v": 1, "kind": "helper", "id": "helper-1", "title": "recent", "state": "done",
+                   "started": now - 60, "ended": now - 5, "tools": {"Read": 1}}, p)
+    ledger.append({"v": 1, "kind": "helper", "id": "helper-0", "title": "ancient", "state": "done",
+                   "started": now - 9 * 86400, "ended": now - 9 * 86400 + 3, "tools": {}}, p)
+    assert cli.main(["ledger"]) == 0
+    out = capsys.readouterr().out
+    assert "recent" in out and "ancient" in out
+    assert cli.main(["ledger", "--since", "1d"]) == 0
+    out = capsys.readouterr().out
+    assert "recent" in out and "ancient" not in out
+    assert cli.main(["ledger", "--since", "yesterday-ish"]) == 2
